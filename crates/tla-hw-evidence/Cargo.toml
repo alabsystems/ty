@@ -1,0 +1,16 @@
+[package]
+name = "tla-hw-evidence"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Frontend-parameterized shared-engine adoption evidence for hardware frontends (AIGER/BTOR2)"
+readme.workspace = true
+
+[dependencies]
+tla-mc-core = { path = "../tla-mc-core" }
+tla-ay = { path = "../tla-ay" }
+
+[lints]
+workspace = true

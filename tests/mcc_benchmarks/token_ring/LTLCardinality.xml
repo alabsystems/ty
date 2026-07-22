@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<!-- LTLCardinality properties for TokenRing model.
+     Property 00: A(G(tokens-count(p0) <= 1)) - TRUE
+     Property 01: A(G(F(tokens-count(p0) >= 1))) - TRUE
+-->
+<property-set xmlns="http://mcc.lip6.fr/">
+  <property>
+    <id>TokenRing-LTLCardinality-00</id>
+    <formula>
+      <all-paths>
+        <globally>
+          <integer-le>
+            <tokens-count><place>p0</place></tokens-count>
+            <integer-constant>1</integer-constant>
+          </integer-le>
+        </globally>
+      </all-paths>
+    </formula>
+  </property>
+  <property>
+    <id>TokenRing-LTLCardinality-01</id>
+    <formula>
+      <all-paths>
+        <globally>
+          <finally>
+            <integer-le>
+              <integer-constant>1</integer-constant>
+              <tokens-count><place>p0</place></tokens-count>
+            </integer-le>
+          </finally>
+        </globally>
+      </all-paths>
+    </formula>
+  </property>
+</property-set>

@@ -1,0 +1,181 @@
+[package]
+name = "tla-check"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "TY model checker - evaluation engine and state exploration"
+readme.workspace = true
+autobenches = false
+
+[dependencies]
+tla-core = { path = "../tla-core" }
+# Unified backend / engine-selection layer. Stage 2: the trust-cg dispatch consumes
+# tla-backend's canonical env truth-table (one source of truth shared with the CLI).
+tla-backend = { path = "../tla-backend" }
+tla-tir = { path = "../tla-tir" }
+# Value types extracted from tla-check (Phase 4, #1269)
+tla-value = { path = "../tla-value", features = ["im"] }
+tla-eval = { path = "../tla-eval" }
+tla-mc-core = { path = "../tla-mc-core" }
+# Single-source resource-aware memory guarding (platform probes + derived
+# budget) — replaces the crate-local duplicated libc probes.
+tla-resource = { path = "../tla-resource" }
+num-bigint = { workspace = true }
+num-integer = { workspace = true }
+num-traits = { workspace = true }
+thiserror.workspace = true
+# im is optional - disabled for Kani verification to avoid ptr_mask intrinsic.
+# Run `cargo kani --no-default-features` to use kani_types stubs instead.
+im = { workspace = true, optional = true }  # Persistent immutable collections (forked: crates/tla-im, Part of #4250)
+dashmap = "6.1"  # Concurrent HashMap for parallel state checking
+crossbeam-deque = "0.8"  # Work-stealing deque for parallel BFS
+crossbeam-channel = "0.5"  # MPMC channels for result coordination
+memmap2 = "0.9"  # Memory-mapped files for scalable fingerprint storage
+tempfile = { workspace = true }  # Temporary files for anonymous mmap backing (vendored as tla-tempfile, Part of #4250)
+sha2 = "0.10"  # SHA-256 for checkpoint spec/config content hashing
+serde = { version = "1.0", features = ["derive"] }  # Serialization for checkpoint/resume
+# `unbounded_depth`: cert-term (de)serialization opts OUT of the 128-deep recursion cap
+# (`Deserializer::disable_recursion_limit`), paired with serde_stacker so depth is bounded
+# by input size, not by the Rust stack. See `cleancic::expr_from_bytes` / `cert::from_json`.
+serde_json = { version = "1.0", features = ["unbounded_depth"] }  # JSON format for checkpoint frontier
+serde_stacker = "0.1"  # Stack-growing serde adapter for deep cert terms (quoted List folds)
+serde_path_to_error = "0.1.20" # Best-effort JSON path for user-facing decode errors
+toml = { workspace = true }
+rustc-hash = { workspace = true }  # Faster HashMap/HashSet for hot fingerprint tables
+chrono = { version = "0.4", features = ["serde"] }  # Timestamps for JSON output
+parking_lot = { workspace = true }  # Faster RwLock for sharded fingerprint set (vendored as tla-lock)
+triomphe = { workspace = true }  # Optimized Arc without weak reference support (vendored as tla-arc, Part of #4250)
+# bumpalo is optional - disabled for Kani verification to avoid ptr_mask intrinsic.
+# Points at local tla-arena fork via workspace alias (Part of #4250).
+bumpalo = { workspace = true, optional = true }  # Arena allocator
+smallvec = { workspace = true }  # Inline storage for small vectors (avoids heap allocation)
+xxhash-rust = { workspace = true }  # Fast hash for fingerprinting (forked: crates/tla-hash-xxh3)
+ahash = "0.8"  # Fast hash with streaming API (AES-NI accelerated)
+stacker.workspace = true  # Grow stack on demand (forked: crates/tla-stack, Part of #4250)
+libc = "0.2"  # Platform-specific process memory query (Part of #2751)
+# ay SMT-based Init enumeration (Part of #251)
+# Optional: disabled by default, enable with --features ay
+tla-ay = { path = "../tla-ay", optional = true }
+# JIT/native ABI types (JitCallOut, JitStatus, etc.) used by trust-cg_dispatch.rs.
+# This is the stable leaf crate shared with the trust-codegen native path.
+tla-jit-abi = { path = "../tla-jit-abi" }
+# trust-codegen backend: active opt-in native compilation path.
+# trust-codegen native execution pipeline. Non-optional: the JIT is the default
+# engine and is always compiled in; the interpreter is the runtime fallback.
+# Individual specs may still be declined by backend admission and routed to fallback.
+tla-trust-cg = { path = "../tla-trust-cg", features = ["native"] }
+tla-ir = { path = "../tla-ir" }
+trust-ir = { workspace = true }
+# The Clean CIC kernel — a small, independently-auditable dependent-type-theory
+# type-checker (the trusted base for the `Certified` tier). Optional + feature-gated
+# (`clean-cic`): only TY builds that want to PROMOTE an SMT-Discharged safety
+# certificate to a kernel-checked `Certified` verdict pull it in. The exact
+# workspace Git source uses TrustIR's immutable canonical cycle-cut so tla-check stays
+# consumable as a TY Git dependency with one Clean universe. TY-root integration
+# redirects the full canonical source to the provenance-checked current sibling.
+clean-kernel = { workspace = true, optional = true }
+# The genuinely tiny kernel (clean-ck0: ~8K LOC src, `#![forbid(unsafe_code)]`, deps only
+# num-bigint/num-traits/thiserror; shares ZERO production code with clean-kernel). Phase 1 of
+# `docs/kernel-checked-tla-plan.md`: the MANDATORY independent second checker for the Nat/Bool
+# obligation fragment. A ck0 REJECTION of a term clean-kernel accepted fails certification
+# closed; the "tiny auditable TCB" label attaches ONLY to ck0-corroborated legs.
+clean-ck0 = { workspace = true, optional = true }
+# trust-codegen dialect framework consumer (Part of #4253 Wave 14): unconditionally compiled
+# so the BFS worker can emit `verif.bfs_step` ops when `TY_DIALECT_TRACE=1` is set.
+# The dep is always linked (cheap, no heavy transitive surface) but the trace path
+# is env-gated and off by default, so production hot-paths pay no runtime cost.
+tla-dialect = { path = "../tla-dialect" }
+
+[dev-dependencies]
+criterion = { workspace = true }
+proptest = { workspace = true }
+insta = { workspace = true }
+ntest = "0.9"  # Test timeouts for memory stressor tests - Part of #318
+# clean's surface elaborator + parser — used ONLY by tests/clean_soundness_proofs.rs to drive the
+# full `clean check` pipeline (parse → elaborate → clean-KERNEL check) over TY's soundness meta-
+# theorems authored in clean's own surface language, putting them in the clean kernel's trust base
+# with no Lean/Mathlib. Test-only (dev-dependency), and clean-kernel is already
+# an exact workspace dependency above.
+clean-elab.workspace = true
+clean-parser.workspace = true
+clean-kernel.workspace = true
+# clean-mathverse — used ONLY by tests/clean_mathverse_stamp.rs to register TY's
+# clean-kernel-checked soundness proofs into a CleanNative KernelVerified mathverse
+# shard and re-verify them through clean's CIC kernel (the native, Lean-free path).
+# Additive to TY's Cargo only; writes shards to a TY-owned temp dir (no ~/clean edits).
+clean-mathverse.workspace = true
+
+[[bench]]
+name = "model_check"
+harness = false
+
+[[bench]]
+name = "hot_path"
+harness = false
+
+[[bench]]
+name = "arena_alloc"
+harness = false
+
+[[bench]]
+name = "flat_fingerprint_bench"
+harness = false
+
+[[test]]
+name = "parallel_state_count_parity"
+required-features = ["testing"]
+
+[[test]]
+name = "parallel_tlcget_level_context"
+required-features = ["testing"]
+
+[[test]]
+name = "liveness_disk_backend_parity"
+required-features = ["testing"]
+
+[[test]]
+name = "liveness_disk_bitmask_backend"
+required-features = ["testing"]
+
+[[test]]
+name = "liveness_disk_successor_backend"
+required-features = ["testing"]
+
+[[test]]
+name = "trust_cg_state_graph_parity"
+required-features = ["testing"]
+
+[[test]]
+name = "choose_soundness"
+required-features = ["testing"]
+
+[features]
+# Full verification surface ON by default (no gaps): `clean-cic` links the Clean CIC kernel +
+# clean-ck0 second checker so the kernel-checked `Certified` paths are live even in bare
+# `cargo test -p tla-check` runs (tla-cli already defaulted it; the clean crates are unconditional
+# dev-deps anyway, so this costs ~nothing); `ay` links SMT Init enumeration so the ay-gated config
+# is BUILT by default instead of silently rotting (it previously broke unnoticed because only
+# explicit `--features ay` builds compiled it). trust-cg native remains the default execution
+# engine (non-optional, always compiled in); interpreter is the runtime fallback. The old bytecode
+# JIT (TY_JIT) stays off by default (#4035 icache regression). Kani: `--no-default-features`.
+default = ["im", "bumpalo", "clean-cic", "ay"]
+im = ["dep:im", "tla-core/im", "tla-value/im"]  # Forward im to tla-core and tla-value (#1269)
+memory-stats = ["tla-value/memory-stats"]  # Forward to tla-value (#1269 Phase 4)
+ay = ["dep:tla-ay"]  # Enable ay-based SMT Init enumeration (Part of #251). `dep:` avoids an auto-generated implicit `tla-ay` feature.
+# Promote an SMT-Discharged inductive-safety certificate to the kernel-checkable
+# `Certified` tier: build a CIC proof term, type-check it with the Clean kernel, and
+# stamp `Certified` ONLY on kernel acceptance (fail-closed). Trust base for such a
+# verdict shrinks from the SMT solver to the small Clean kernel. Also pulls in
+# clean-ck0, the independent tiny second checker (Phase 1, kernel-checked-tla-plan).
+clean-cic = ["dep:clean-kernel", "dep:clean-ck0"]
+testing = []  # Expose test-only debug overrides (liveness backends, handle_state) for integration tests
+# Off-by-default experimental distributed-BFS subsystems (`distributed.rs` +
+# `check/distributed/`). No production entry point constructs them (only their own
+# `#[cfg(test)]` tests), so they are gated out of release builds. `cargo test` still
+# compiles them via the `test` cfg; this feature exists for explicit non-test opt-in.
+distributed-experimental = []
+
+[lints]
+workspace = true

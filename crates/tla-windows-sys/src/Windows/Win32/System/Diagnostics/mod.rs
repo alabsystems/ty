@@ -1,0 +1,16 @@
+// Copyright 2026 Andrew Yates
+// Author: Andrew Yates <andrewyates.name@gmail.com>
+// Licensed under the Apache License, Version 2.0
+
+#[cfg(feature = "Win32_System_Diagnostics_Ceip")]
+pub mod Ceip;
+#[cfg(feature = "Win32_System_Diagnostics_Debug")]
+pub mod Debug;
+#[cfg(feature = "Win32_System_Diagnostics_Etw")]
+pub mod Etw;
+#[cfg(feature = "Win32_System_Diagnostics_ProcessSnapshotting")]
+pub mod ProcessSnapshotting;
+#[cfg(feature = "Win32_System_Diagnostics_ToolHelp")]
+pub mod ToolHelp;
+#[cfg(feature = "Win32_System_Diagnostics_TraceLogging")]
+pub mod TraceLogging;

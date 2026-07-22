@@ -1,0 +1,38 @@
+[package]
+name = "tla-ay"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "TLA+ to ay SMT solver integration for constraint-based Init enumeration"
+readme.workspace = true
+repository.workspace = true
+
+[dependencies]
+# ay crates - workspace deps (see root Cargo.toml for pinned revision)
+ay-dpll.workspace = true
+ay-core.workspace = true
+ay-proof.workspace = true
+ay-allsat.workspace = true
+ay-chc.workspace = true
+
+# Shared AY engine (the ay-encode crate both ty and trust-mc consume)
+ay-encode.workspace = true
+
+# TY crates
+tla-core = { path = "../tla-core" }
+
+# Common
+thiserror.workspace = true
+tracing.workspace = true
+num-bigint.workspace = true
+num-traits.workspace = true
+num-integer.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+ntest = "0.9"
+proptest.workspace = true
+ay-frontend.workspace = true

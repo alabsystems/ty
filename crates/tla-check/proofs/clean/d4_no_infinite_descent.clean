@@ -1,0 +1,79 @@
+-- d4_no_infinite_descent: the LIVENESS verdict soundness core, authored in
+-- CLEAN's surface language and checked by CLEAN's CIC kernel (so it enters the
+-- clean kernel's trust base).
+--
+-- TY SOUNDNESS META-THEOREM (well-founded-measure liveness principle).
+-- TY's enumerator-free liveness verdict discharges progress by exhibiting a
+-- `Nat`-valued measure that STRICTLY DECREASES on every step of the run. The
+-- soundness meaning of that verdict is exactly: such a measure cannot decrease
+-- forever — there is NO infinite strictly-decreasing sequence of naturals. Once
+-- that holds, the measure reaches its floor (0 / a target) in FINITELY many
+-- steps, i.e. the run terminates / makes progress; that is what the verdict
+-- asserts.
+--
+-- STATEMENT PROVED (raw no-infinite-descent, the STRONGEST faithful form):
+--   d4_no_infinite_descent : (f : Nat -> Nat)
+--     -> ((n : Nat) -> Nat.lt (f (Nat.succ n)) (f n)) -> False
+-- i.e. there is no `f : Nat -> Nat` with `f (n+1) < f n` for every `n`. This
+-- is FULLY GENERAL over the sequence `f` (no bound assumed); it subsumes the
+-- weaker "bounded finite-descent" form (`(∀ n, f n ≤ k) -> …`), which is the
+-- special case where a bound is known.
+--
+-- The transition-system reading is `d4_wf_measure_liveness` below: for an
+-- ARBITRARY state type, an arbitrary run `s : Nat -> State`, and an arbitrary
+-- measure `mu : State -> Nat`, no run can have `mu` strictly decreasing at
+-- every step. That is the well-founded-measure liveness principle verbatim.
+--
+-- PROOF: well-founded induction on `Nat.lt` via the prelude's kernel-checked,
+-- sorry-free `Nat.accNatLt : (n : Nat) -> Acc Nat.lt n` and the primitive
+-- `Acc.rec`. No axioms beyond the foundational prelude; no `sorry`.
+
+-- `NoDescTo a`: no strictly-decreasing sequence can start (at index 0) from the
+-- value `a`. The predicate the Acc-induction carries.
+def NoDescTo (a : Nat) : Prop :=
+  (g : Nat -> Nat) ->
+  ((n : Nat) -> Nat.lt (g (Nat.succ n)) (g n)) ->
+  (@Eq Nat (g Nat.zero) a) ->
+  False
+
+-- Core lemma by well-founded induction (`Acc.rec` over accessibility of `a`).
+-- Step case: given a decreasing `g` with `g 0 = x`, the tail `g' n := g (n+1)`
+-- is again decreasing, its head `g' 0 = g 1` satisfies `g 1 < g 0 = x` (so it
+-- is an `Nat.lt`-predecessor of `x`), and the induction hypothesis at `g 1`
+-- rules the tail out — contradiction. The `g 1 < g 0` witness is transported
+-- to `g 1 < x` along `h0 : g 0 = x` with `Eq.subst`.
+theorem no_desc_acc (a : Nat) (acc : Acc Nat.lt a) : NoDescTo a :=
+  @Acc.rec Nat Nat.lt
+    (fun (x : Nat) (_ : Acc Nat.lt x) => NoDescTo x)
+    (fun (x : Nat)
+         (_h : (y : Nat) -> Nat.lt y x -> Acc Nat.lt y)
+         (ih : (y : Nat) -> Nat.lt y x -> NoDescTo y) =>
+       fun (g : Nat -> Nat)
+           (hg : (n : Nat) -> Nat.lt (g (Nat.succ n)) (g n))
+           (h0 : @Eq Nat (g Nat.zero) x) =>
+         ih (g (Nat.succ Nat.zero))
+            (@Eq.subst Nat
+               (fun (z : Nat) => Nat.lt (g (Nat.succ Nat.zero)) z)
+               (g Nat.zero) x h0
+               (hg Nat.zero))
+            (fun (n : Nat) => g (Nat.succ n))
+            (fun (n : Nat) => hg (Nat.succ n))
+            (@Eq.refl Nat (g (Nat.succ Nat.zero))))
+    a acc
+
+-- THE THEOREM: no infinite strictly-decreasing Nat sequence exists.
+-- Instantiate `no_desc_acc` at the accessible starting value `f 0` (accessible
+-- by `Nat.accNatLt`), with the sequence `f` itself and `Eq.refl : f 0 = f 0`.
+theorem d4_no_infinite_descent
+    (f : Nat -> Nat)
+    (hdec : (n : Nat) -> Nat.lt (f (Nat.succ n)) (f n)) : False :=
+  no_desc_acc (f Nat.zero) (Nat.accNatLt (f Nat.zero))
+    f hdec (@Eq.refl Nat (f Nat.zero))
+
+-- Liveness principle over an ARBITRARY transition system: no run `s` can carry
+-- a `Nat` measure `mu` that strictly decreases on every step. The measure
+-- sequence `fun n => mu (s n)` is exactly the `f` ruled out above.
+theorem d4_wf_measure_liveness
+    (State : Type) (mu : State -> Nat) (s : Nat -> State)
+    (hdec : (n : Nat) -> Nat.lt (mu (s (Nat.succ n))) (mu (s n))) : False :=
+  d4_no_infinite_descent (fun (n : Nat) => mu (s n)) hdec

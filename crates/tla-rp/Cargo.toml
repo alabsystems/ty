@@ -1,0 +1,17 @@
+[package]
+name = "tla-rp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Rp<T>: runtime-switchable atomic/non-atomic refcounted pointer (Arc drop-in) shared by tla-value and tla-im"
+readme.workspace = true
+
+# INTENTIONALLY dependency-free: tla-im (which tla-value and tla-core depend
+# on) must be able to depend on this crate without creating a cycle. Keep it
+# std-only.
+[dependencies]
+
+[lints]
+workspace = true

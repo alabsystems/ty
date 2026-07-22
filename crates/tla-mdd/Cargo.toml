@@ -1,0 +1,67 @@
+# Copyright 2026 Andrew Yates
+# Licensed under the Apache License, Version 2.0
+#
+# Multi-valued decision diagram (MDD) backend MVP for ty's Petri-net engine.
+#
+# Rationale: the existing `tla-dd` BDD lane is *large-final-BDD-bound* — it
+# bit-blasts each place into Boolean variables, so on counter / conserved /
+# high-bound nets the final reachable-set BDD blows up. An MDD with **one
+# level per PLACE** (k edges for the k domain values of that place, NOT
+# bit-blasted) is far more compact on exactly those nets, and is the
+# scalable-symbolic pillar ty needs for the StateSpace examination.
+#
+# FIRST INCREMENT (this crate): standalone node store + unique-table +
+# apply-cache + a tiny reachability/exact-count kernel for SMALL bounded P/T
+# nets. Correctness over performance. NOT wired into production verdicts:
+# this is a NEW engine, gated behind cross-checking against the `tla-dd` BDD
+# lane / explicit BFS as oracle until proven (fail-closed).
+#
+# Zero third-party runtime deps: own node store, std collections only. The
+# dev-only differential oracle is `tla-dd::bfs_reachable_set_count` (which is
+# itself the oracle the BDD lane cross-checks against), so the MDD count is
+# pinned to the SAME ground truth the production BDD lane uses.
+
+[package]
+name = "tla-mdd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Multi-valued decision-diagram backend MVP (per-place MDD reachable-state count) for ty"
+readme.workspace = true
+
+[dependencies]
+# Vendored arbitrary-precision integers (BigUint). The MDD reachable-set count
+# is exact-by-construction; the only ceiling was the `u128` count carrier
+# (≈3.4e38), which declined astronomically-large-but-finite reachable sets
+# (e.g. FMS ≈1e47, Philosophers/Kanban families up to ≈1e238) the MDD already
+# represents compactly. `count_markings_big` widens the count to `BigUint` so
+# those nets REPORT their exact |R| instead of declining on the representational
+# cap. SOUNDNESS-TRIVIAL: bignum is exact; the count VALUE is unchanged, only the
+# representable range widens. The `u64`/`u128` entry points are retained
+# (narrowing fail-closed) for the BDD cross-check and back-compat.
+tla-bignum = { path = "../tla-bignum" }
+# Single-source, resource-aware memory guarding: the interior-node and store-byte
+# caps derive from effective machine/confinement memory instead of fixed magic.
+tla-resource = { path = "../tla-resource" }
+
+[dev-dependencies]
+# Differential oracle. `tla-dd` exposes `bfs_reachable_set_count(&DdNetSpec)`
+# — the explicit-state BFS the BDD lane is itself validated against. The MDD
+# count is cross-checked against this directly so the new lane is pinned to
+# the production oracle, 0 disagreements required. proptest drives the random
+# net battery (workspace fork; no new third-party dep).
+tla-dd = { path = "../tla-dd" }
+proptest = { workspace = true }
+# Differential oracle for the symbolic MDD CTL evaluator (`symbolic_ctl`).
+# `tla-mc-core::CtlEngine` is the VERBATIM ground-truth non-totalized CTL
+# convention (A-family strictly as duals of E-family, deadlock maximal-path)
+# — the SAME oracle the BDD CTL lane (`tla_dd::symbolic_ctl`) is validated
+# against. The MDD evaluator is cross-checked against it directly, 0
+# disagreements required. No dependency cycle: `tla-mc-core` depends on
+# neither `tla-mdd` nor `tla-dd`.
+tla-mc-core = { path = "../tla-mc-core" }
+
+[lints]
+workspace = true

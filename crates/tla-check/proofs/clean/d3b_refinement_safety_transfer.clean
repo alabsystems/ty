@@ -1,0 +1,70 @@
+-- d3b_refinement_safety_transfer: the REFINEMENT verdict PAYOFF — property
+-- transfer along a step-simulation, authored in CLEAN's surface language and
+-- checked by CLEAN's CIC kernel (so it enters the clean kernel's trust base).
+--
+-- d3 (step_simulation) proves step-simulation => reachability inclusion:
+--   Reach C InitC StepC c  ->  Reach A InitA StepA (f c).
+-- That is necessary but not yet USEFUL: what a refinement verdict is FOR is to
+-- discharge a concrete safety property by proving it on the (simpler) abstract
+-- system. This file closes that loop — the composition of d3 with the safety
+-- inductive-invariant principle (tB / reach_least):
+--
+-- SOUNDNESS CLAIM (proved below, `refinement_safety_transfer`). Given a
+-- step-simulation `f : C -> A` (hInit + hSim, exactly as in d3) AND an abstract
+-- predicate `J : A -> Prop` that is an INDUCTIVE INVARIANT of the abstract
+-- system (contains the abstract initial states, closed under abstract steps),
+-- every C-reachable concrete state `c` satisfies `J` at its image:
+--     Reach C InitC StepC c  ->  J (f c).
+-- i.e. an abstract invariant pulls back along the refinement map to a concrete
+-- invariant. This is the property-transfer that justifies checking a property
+-- on the abstract model and concluding it for the concrete one.
+--
+-- PROOF. Direct induction on the concrete reachability derivation (`Reach.rec`,
+-- the SAME `Reach` as tB / e3 / d3), carrying `J (f s)` as the motive:
+--   base : InitC s --(hInit)--> InitA (f s) --(hJinit)--> J (f s).
+--   step : concrete StepC s t with IH `J (f s)`; (hSim) gives
+--            StepA (f s) (f t) \/ f s = f t, cased by Or.rec:
+--              inl (genuine abstract step): (hJstep) closes J from (f s) to (f t);
+--              inr (stutter f s = f t):     transport IH : J (f s) along the
+--                                           equality to J (f t) via Eq.subst.
+-- (Equivalently: d3 gives Reach A (f c), then reach_least on J closes it. The
+-- direct induction fuses the two so the file is self-contained — each .clean is
+-- checked in a fresh `with_prelude` env and cannot cite the other files.)
+--
+-- FULLY GENERAL: arbitrary state types C, A, arbitrary Init/Step relations, an
+-- arbitrary refinement map f, and an arbitrary abstract invariant J.
+
+-- The reachability predicate of a transition system (identical to tB / e3 / d3):
+inductive Reach (State : Type) (Init : State -> Prop) (Next : State -> State -> Prop) : State -> Prop where
+  | base : (s : State) -> Init s -> Reach State Init Next s
+  | step : (s : State) -> (t : State) -> Reach State Init Next s -> Next s t -> Reach State Init Next t
+
+theorem refinement_safety_transfer
+    (C : Type) (A : Type)
+    (InitC : C -> Prop) (InitA : A -> Prop)
+    (StepC : C -> C -> Prop) (StepA : A -> A -> Prop)
+    (f : C -> A)
+    -- step-simulation (as in d3):
+    (hInit : (c : C) -> InitC c -> InitA (f c))
+    (hSim : (c : C) -> (c' : C) -> StepC c c' -> Or (StepA (f c) (f c')) (@Eq A (f c) (f c')))
+    -- J is an inductive invariant of the ABSTRACT system:
+    (J : A -> Prop)
+    (hJinit : (a : A) -> InitA a -> J a)
+    (hJstep : (a : A) -> (a' : A) -> J a -> StepA a a' -> J a')
+    -- conclusion: every concrete-reachable state's image satisfies J
+    (c : C) (h : Reach C InitC StepC c) : J (f c) :=
+  @Reach.rec C InitC StepC
+    -- motive: the image of every reachable concrete state satisfies J
+    (fun s _hs => J (f s))
+    -- base: InitC s --(hInit)--> InitA (f s) --(hJinit)--> J (f s)
+    (fun s hi => hJinit (f s) (hInit s hi))
+    -- step: concrete StepC s t, IH `J (f s)`; case the simulation on (f s),(f t)
+    (fun s t _hr hn ih =>
+      @Or.rec (StepA (f s) (f t)) (@Eq A (f s) (f t))
+        (fun _ => J (f t))
+        -- inl: a genuine abstract step (f s) -> (f t); J is closed under StepA
+        (fun hstepA => hJstep (f s) (f t) ih hstepA)
+        -- inr: stutter f s = f t; transport IH : J (f s) along the equality
+        (fun heq => @Eq.subst A (fun z => J z) (f s) (f t) heq ih)
+        (hSim s t hn))
+    c h

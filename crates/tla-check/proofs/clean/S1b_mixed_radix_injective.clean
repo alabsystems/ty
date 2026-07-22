@@ -1,0 +1,366 @@
+-- S1b_mixed_radix_injective : MIXED-RADIX (per-column radix) pack INJECTIVITY —
+-- the multi-column generalization of S1's fixed-base `pack_injective`, authored
+-- in CLEAN's surface language and checked by CLEAN's CIC kernel (so it enters
+-- the clean kernel's trust base). This is the "never a false safe" critical
+-- property for TY's flat-primary storage: distinct in-range multi-column digit
+-- tuples must encode to DISTINCT codes.
+--
+-- S1 proves injectivity of the SINGLE-base encoder `baseValue b`. But TY's
+-- flat-primary storage packs a MULTI-COLUMN state where each column i has its
+-- OWN radix r_i (its domain size). The mixed-radix encoder is the lockstep
+-- Horner fold of a digit list `ds` against a radix list `rs`:
+--     mrEnc []          _            = 0
+--     mrEnc (r::rtl)    []           = 0
+--     mrEnc (r::rtl)    (d::dtl)     = d + r * mrEnc rtl dtl
+-- This is exactly L1b's `mixedRadix` with the (digit,radix) pairs split into two
+-- lockstep lists so the SHARED radix structure `rs` is explicit in the statement.
+--
+-- WHY the precondition matters (mixed-radix injectivity is FALSE without it):
+--   * different radix sequences collide, so the radices MUST match — here forced
+--     by sharing ONE radix list `rs` between both digit tuples;
+--   * a length mismatch collides too (rs=[2,3]: [1]->1 and [1,0]->1), so the
+--     digit tuple MUST be exactly as long as `rs`.
+-- Both are captured by ONE predicate `DigitsLt rs ds` — "ds is a well-formed
+-- digit vector for the radix vector rs": it holds iff `ds` has EXACTLY one digit
+-- per radix (structural/length match, cons/nil mismatches reduce to `False`) AND
+-- each digit d_i is below its radix r_i (`d_i < r_i`). No separate length
+-- hypothesis is needed: well-formedness subsumes it, faithfully.
+--
+-- THEOREM (`mixed_radix_injective`):
+--     (rs ds1 ds2 : List Nat)
+--     (h1 : DigitsLt rs ds1) (h2 : DigitsLt rs ds2)
+--     (hv : mrEnc rs ds1 = mrEnc rs ds2)
+--   ------------------------------------------------------------------
+--     ds1 = ds2
+-- i.e. two well-formed digit vectors for the SAME radix vector that pack to the
+-- SAME code are EQUAL — the mixed-radix encoder is injective on well-formed
+-- inputs, so flat storage never aliases two distinct multi-column states.
+--
+-- GENERALITY: FULL-GENERAL. Quantified over an ARBITRARY shared radix list `rs`
+-- (arbitrary length, arbitrary per-column radices) and arbitrary digit tuples;
+-- no fixed base, no fixed length, no constant restriction. The radix-match
+-- precondition is genuine (shared `rs`), and the digit-bound precondition is
+-- genuine (`DigitsLt` requires d_i < r_i) — neither is dropped and neither is
+-- unsatisfiable (rs=[], ds=[] satisfies the premises; rs=[2,3], ds=[1,2] gives a
+-- non-trivial witness), so the statement is NOT vacuous.
+--
+-- PROOF: structural induction on the shared radix list `rs` (the structure both
+-- `mrEnc` and `DigitsLt` recurse on), casing on both digit tuples via nested
+-- `@List.rec`. The nil/cons and cons/nil mismatches are killed by `DigitsLt`
+-- reducing to `False` (delta+iota) — `False.elim`. Each cons/cons step invokes
+-- the base-GENERAL crux `digit_cancel` at `b := r_i` to split the reduced head
+-- equality `d1 + r*V1 = d2 + r*V2` into equal head digits (`d1 = d2`) AND equal
+-- tail codes (`mrEnc rtl dtl1 = mrEnc rtl dtl2`); the tail-code equality feeds
+-- the IH on `rtl` to get `dtl1 = dtl2`, and `@List.cons` congruence (`congrArg`)
+-- reassembles `ds1 = ds2`. `digit_cancel` + its Nat helpers are COPIED verbatim
+-- from S1 (each file is checked in a fresh env and cannot cite siblings); they
+-- are proved from Nat first principles over `with_prelude` — no Mathlib, no
+-- axioms beyond clean's foundational ones.
+
+namespace MixedRadixInj
+
+-- ============================================================================
+-- Self-proved Nat helpers (COPIED from S1_pack_injective — a fresh-env check
+-- cannot cite a sibling file). Same trusted `with_prelude` primitives.
+-- ============================================================================
+
+-- `n <= k + n`, by induction on `n` (add recurses on its 2nd arg).
+theorem le_add_left (n k : Nat) : Nat.le n (Nat.add k n) :=
+  @Nat.rec
+    (fun m => Nat.le m (Nat.add k m))
+    (Nat.zero_le k)
+    (fun m ih => @Nat.succ_le_succ m (Nat.add k m) ih)
+    n
+
+-- Right-cancellation of addition:  a + c = b + c  ->  a = b.  Induct on `c`.
+-- (congrArg's @-explicit order is `@congrArg α β a₁ a₂ f h` — the function
+-- comes AFTER the two points.)
+theorem add_right_cancel (a b c : Nat)
+    (h : @Eq Nat (Nat.add a c) (Nat.add b c)) : @Eq Nat a b :=
+  @Nat.rec
+    (fun k => (@Eq Nat (Nat.add a k) (Nat.add b k)) -> (@Eq Nat a b))
+    (fun h0 => h0)
+    (fun m ih hs => ih (@congrArg Nat Nat (Nat.add a (Nat.succ m)) (Nat.add b (Nat.succ m)) Nat.pred hs))
+    c
+    h
+
+-- `d < b` and `b <= d` are jointly absurd.
+theorem lt_le_absurd (b d : Nat) (hlt : Nat.lt d b) (hle : Nat.le b d) : False :=
+  Nat.lt_irrefl d (@Nat.le_trans (Nat.succ d) b d hlt hle)
+
+-- If `d = W + b` then `b <= d`.
+theorem le_of_eq_add (b w d : Nat) (h : @Eq Nat d (Nat.add w b)) : Nat.le b d :=
+  @Eq.subst Nat (fun z => Nat.le b z) (Nat.add w b) d (@Eq.symm Nat d (Nat.add w b) h)
+    (le_add_left b w)
+
+-- `d < b` but `d = W + b` is absurd (the "carry overflows a digit" case).
+theorem absurd_lt_add (b w d : Nat) (hd : Nat.lt d b) (h : @Eq Nat d (Nat.add w b)) : False :=
+  lt_le_absurd b d hd (le_of_eq_add b w d h)
+
+-- ============================================================================
+-- CRUX (COPIED from S1): injectivity of the base-b place map (uniqueness of
+-- euclidean division).  Base-GENERAL — works for ANY base b.
+--   d1 < b -> d2 < b -> d1 + b*x = d2 + b*y  ->  d1 = d2  AND  x = y.
+-- Induction on x; the motive quantifies the other digit-pair + the b-part y.
+-- ============================================================================
+theorem digit_cancel (b x y d1 d2 : Nat)
+    (hd1 : Nat.lt d1 b) (hd2 : Nat.lt d2 b)
+    (h : @Eq Nat (Nat.add d1 (Nat.mul b x)) (Nat.add d2 (Nat.mul b y))) :
+    And (@Eq Nat d1 d2) (@Eq Nat x y) :=
+  @Nat.rec
+    (fun xx =>
+      (e1 : Nat) -> (e2 : Nat) -> (z : Nat) ->
+        Nat.lt e1 b -> Nat.lt e2 b ->
+        (@Eq Nat (Nat.add e1 (Nat.mul b xx)) (Nat.add e2 (Nat.mul b z))) ->
+        And (@Eq Nat e1 e2) (@Eq Nat xx z))
+    -- ── x = 0 ────────────────────────────────────────────────────────────
+    (fun e1 e2 z he1 he2 =>
+      @Nat.rec
+        (fun zz =>
+          (@Eq Nat (Nat.add e1 (Nat.mul b Nat.zero)) (Nat.add e2 (Nat.mul b zz))) ->
+          And (@Eq Nat e1 e2) (@Eq Nat Nat.zero zz))
+        (fun h0 =>
+          @And.intro (@Eq Nat e1 e2) (@Eq Nat Nat.zero Nat.zero)
+            h0 (@Eq.refl Nat Nat.zero))
+        (fun z' _ihz hs =>
+          @False.elim
+            (And (@Eq Nat e1 e2) (@Eq Nat Nat.zero (Nat.succ z')))
+            (absurd_lt_add b (Nat.add e2 (Nat.mul b z')) e1 he1
+              (@Eq.trans Nat
+                (Nat.add e1 (Nat.mul b Nat.zero))
+                (Nat.add e2 (Nat.mul b (Nat.succ z')))
+                (Nat.add (Nat.add e2 (Nat.mul b z')) b)
+                hs
+                (@Eq.symm Nat
+                  (Nat.add (Nat.add e2 (Nat.mul b z')) b)
+                  (Nat.add e2 (Nat.mul b (Nat.succ z')))
+                  (@Nat.add_assoc e2 (Nat.mul b z') b)))))
+        z)
+    -- ── x = succ x' ──────────────────────────────────────────────────────
+    (fun x' IH =>
+      fun e1 e2 z he1 he2 =>
+      @Nat.rec
+        (fun zz =>
+          (@Eq Nat (Nat.add e1 (Nat.mul b (Nat.succ x'))) (Nat.add e2 (Nat.mul b zz))) ->
+          And (@Eq Nat e1 e2) (@Eq Nat (Nat.succ x') zz))
+        (fun h0 =>
+          @False.elim
+            (And (@Eq Nat e1 e2) (@Eq Nat (Nat.succ x') Nat.zero))
+            (absurd_lt_add b (Nat.add e1 (Nat.mul b x')) e2 he2
+              (@Eq.trans Nat
+                (Nat.add e2 (Nat.mul b Nat.zero))
+                (Nat.add e1 (Nat.mul b (Nat.succ x')))
+                (Nat.add (Nat.add e1 (Nat.mul b x')) b)
+                (@Eq.symm Nat
+                  (Nat.add e1 (Nat.mul b (Nat.succ x')))
+                  (Nat.add e2 (Nat.mul b Nat.zero))
+                  h0)
+                (@Eq.symm Nat
+                  (Nat.add (Nat.add e1 (Nat.mul b x')) b)
+                  (Nat.add e1 (Nat.mul b (Nat.succ x')))
+                  (@Nat.add_assoc e1 (Nat.mul b x') b)))))
+        (fun z' _ihz hs =>
+          @And.intro (@Eq Nat e1 e2) (@Eq Nat (Nat.succ x') (Nat.succ z'))
+            (@And.left (@Eq Nat e1 e2) (@Eq Nat x' z')
+              (IH e1 e2 z' he1 he2
+                (add_right_cancel (Nat.add e1 (Nat.mul b x')) (Nat.add e2 (Nat.mul b z')) b
+                  (@Eq.trans Nat
+                    (Nat.add (Nat.add e1 (Nat.mul b x')) b)
+                    (Nat.add e2 (Nat.mul b (Nat.succ z')))
+                    (Nat.add (Nat.add e2 (Nat.mul b z')) b)
+                    (@Eq.trans Nat
+                      (Nat.add (Nat.add e1 (Nat.mul b x')) b)
+                      (Nat.add e1 (Nat.mul b (Nat.succ x')))
+                      (Nat.add e2 (Nat.mul b (Nat.succ z')))
+                      (@Nat.add_assoc e1 (Nat.mul b x') b)
+                      hs)
+                    (@Eq.symm Nat
+                      (Nat.add (Nat.add e2 (Nat.mul b z')) b)
+                      (Nat.add e2 (Nat.mul b (Nat.succ z')))
+                      (@Nat.add_assoc e2 (Nat.mul b z') b))))))
+            (@congrArg Nat Nat x' z' Nat.succ
+              (@And.right (@Eq Nat e1 e2) (@Eq Nat x' z')
+                (IH e1 e2 z' he1 he2
+                  (add_right_cancel (Nat.add e1 (Nat.mul b x')) (Nat.add e2 (Nat.mul b z')) b
+                    (@Eq.trans Nat
+                      (Nat.add (Nat.add e1 (Nat.mul b x')) b)
+                      (Nat.add e2 (Nat.mul b (Nat.succ z')))
+                      (Nat.add (Nat.add e2 (Nat.mul b z')) b)
+                      (@Eq.trans Nat
+                        (Nat.add (Nat.add e1 (Nat.mul b x')) b)
+                        (Nat.add e1 (Nat.mul b (Nat.succ x')))
+                        (Nat.add e2 (Nat.mul b (Nat.succ z')))
+                        (@Nat.add_assoc e1 (Nat.mul b x') b)
+                        hs)
+                      (@Eq.symm Nat
+                        (Nat.add (Nat.add e2 (Nat.mul b z')) b)
+                        (Nat.add e2 (Nat.mul b (Nat.succ z')))
+                        (@Nat.add_assoc e2 (Nat.mul b z') b))))))))
+        z)
+    x
+    d1 d2 y hd1 hd2 h
+
+-- ============================================================================
+-- The mixed-radix encoder (lockstep Horner fold of digits `ds` against the
+-- shared radix list `rs`). Nested `@List.rec`: outer on `rs` returning
+-- `List Nat -> Nat`, inner on `ds`.
+--   mrEnc []       _        = 0
+--   mrEnc (r::rtl) []       = 0
+--   mrEnc (r::rtl) (d::dtl) = d + r * mrEnc rtl dtl
+-- ============================================================================
+def mrEnc (rs : List Nat) : List Nat -> Nat :=
+  @List.rec Nat (fun _ => List Nat -> Nat)
+    (fun _ds => Nat.zero)
+    (fun (r : Nat) (_rtl : List Nat) (ih : List Nat -> Nat) =>
+      fun (ds : List Nat) =>
+        @List.rec Nat (fun _ => Nat)
+          Nat.zero
+          (fun (d : Nat) (dtl : List Nat) (_ihd : Nat) => Nat.add d (Nat.mul r (ih dtl)))
+          ds)
+    rs
+
+-- Well-formed-digit-vector predicate: `ds` is a valid digit tuple for radix
+-- vector `rs` iff it has EXACTLY one digit per radix (structural/length match)
+-- AND each digit is below its radix. Nested `@List.rec` into `Prop`:
+--   DigitsLt []       []        = True
+--   DigitsLt []       (d::dtl)  = False   -- too many digits
+--   DigitsLt (r::rtl) []        = False   -- too few digits
+--   DigitsLt (r::rtl) (d::dtl)  = (d < r) AND DigitsLt rtl dtl
+def DigitsLt (rs : List Nat) : List Nat -> Prop :=
+  @List.rec Nat (fun _ => List Nat -> Prop)
+    (fun (ds : List Nat) =>
+      @List.rec Nat (fun _ => Prop)
+        True
+        (fun (_d : Nat) (_dtl : List Nat) (_ihd : Prop) => False)
+        ds)
+    (fun (r : Nat) (_rtl : List Nat) (ih : List Nat -> Prop) =>
+      fun (ds : List Nat) =>
+        @List.rec Nat (fun _ => Prop)
+          False
+          (fun (d : Nat) (dtl : List Nat) (_ihd : Prop) => And (Nat.lt d r) (ih dtl))
+          ds)
+    rs
+
+-- ── Reduction sanity (all `rfl`): the defeq facts the injectivity proof uses. ──
+-- (`@List.cons Nat`/`@List.nil Nat` are written FULLY EXPLICIT: an implicit
+-- `List.cons` in an `@Eq.refl` reduction context trips a universe-inference
+-- failure in the current clean elaborator; the explicit form reduces cleanly.)
+theorem mrEnc_nil (ds : List Nat) : @Eq Nat (mrEnc (@List.nil Nat) ds) Nat.zero :=
+  @Eq.refl Nat Nat.zero
+theorem mrEnc_cons_nil (r : Nat) (rtl : List Nat) :
+    @Eq Nat (mrEnc (@List.cons Nat r rtl) (@List.nil Nat)) Nat.zero :=
+  @Eq.refl Nat Nat.zero
+theorem mrEnc_cons_cons (r d : Nat) (rtl dtl : List Nat) :
+    @Eq Nat (mrEnc (@List.cons Nat r rtl) (@List.cons Nat d dtl))
+      (Nat.add d (Nat.mul r (mrEnc rtl dtl))) :=
+  @Eq.refl Nat (Nat.add d (Nat.mul r (mrEnc rtl dtl)))
+theorem DigitsLt_cons_cons (r d : Nat) (rtl dtl : List Nat) :
+    @Eq Prop (DigitsLt (@List.cons Nat r rtl) (@List.cons Nat d dtl))
+      (And (Nat.lt d r) (DigitsLt rtl dtl)) :=
+  @Eq.refl Prop (And (Nat.lt d r) (DigitsLt rtl dtl))
+theorem DigitsLt_cons_nil (r : Nat) (rtl : List Nat) :
+    @Eq Prop (DigitsLt (@List.cons Nat r rtl) (@List.nil Nat)) False :=
+  @Eq.refl Prop False
+theorem DigitsLt_nil_cons (d : Nat) (dtl : List Nat) :
+    @Eq Prop (DigitsLt (@List.nil Nat) (@List.cons Nat d dtl)) False :=
+  @Eq.refl Prop False
+
+-- ============================================================================
+-- MIXED-RADIX INJECTIVITY (FULL-GENERAL): well-formed digit vectors for the
+-- SAME radix vector that pack to the SAME code are EQUAL.
+--   DigitsLt rs ds1 -> DigitsLt rs ds2 -> mrEnc rs ds1 = mrEnc rs ds2
+--     -> ds1 = ds2,   for every rs.
+-- Induction on `rs`; nested cases on ds1/ds2; mismatches killed by `DigitsLt`
+-- reducing to `False`; each cons/cons step closed by `digit_cancel` + the IH.
+-- ============================================================================
+theorem mixed_radix_injective (rs ds1 ds2 : List Nat)
+    (h1 : DigitsLt rs ds1) (h2 : DigitsLt rs ds2)
+    (hv : @Eq Nat (mrEnc rs ds1) (mrEnc rs ds2)) :
+    @Eq (List Nat) ds1 ds2 :=
+  @List.rec Nat
+    (fun rr =>
+      (xs : List Nat) -> (ys : List Nat) ->
+        DigitsLt rr xs -> DigitsLt rr ys ->
+        (@Eq Nat (mrEnc rr xs) (mrEnc rr ys)) ->
+        (@Eq (List Nat) xs ys))
+    -- ── rs = nil : DigitsLt nil forces both tuples to be nil ─────────────
+    (fun xs =>
+      @List.rec Nat
+        (fun xa =>
+          (ys : List Nat) ->
+            DigitsLt (@List.nil Nat) xa -> DigitsLt (@List.nil Nat) ys ->
+            (@Eq Nat (mrEnc (@List.nil Nat) xa) (mrEnc (@List.nil Nat) ys)) ->
+            (@Eq (List Nat) xa ys))
+        -- xa = nil
+        (fun ys =>
+          @List.rec Nat
+            (fun yb =>
+              DigitsLt (@List.nil Nat) (@List.nil Nat) -> DigitsLt (@List.nil Nat) yb ->
+              (@Eq Nat (mrEnc (@List.nil Nat) (@List.nil Nat)) (mrEnc (@List.nil Nat) yb)) ->
+              (@Eq (List Nat) (@List.nil Nat) yb))
+            (fun _hx _hy _hv2 => @Eq.refl (List Nat) (@List.nil Nat))
+            (fun yd ydtl _ihy =>
+              fun _hx hy _hv2 =>
+                @False.elim (@Eq (List Nat) (@List.nil Nat) (@List.cons Nat yd ydtl)) hy)
+            ys)
+        -- xa = cons xd xdtl : DigitsLt nil (cons ..) reduces to False
+        (fun xd xdtl _ihx =>
+          fun ys =>
+            fun hx _hy _hv2 =>
+              @False.elim (@Eq (List Nat) (@List.cons Nat xd xdtl) ys) hx)
+        xs)
+    -- ── rs = cons r rtl ─────────────────────────────────────────────────
+    (fun r rtl IH =>
+      fun xs =>
+        @List.rec Nat
+          (fun xa =>
+            (ys : List Nat) ->
+              DigitsLt (@List.cons Nat r rtl) xa -> DigitsLt (@List.cons Nat r rtl) ys ->
+              (@Eq Nat (mrEnc (@List.cons Nat r rtl) xa) (mrEnc (@List.cons Nat r rtl) ys)) ->
+              (@Eq (List Nat) xa ys))
+          -- xa = nil : DigitsLt (cons r rtl) nil reduces to False
+          (fun ys =>
+            fun hx _hy _hv2 =>
+              @False.elim (@Eq (List Nat) (@List.nil Nat) ys) hx)
+          -- xa = cons xd xdtl
+          (fun xd xdtl _ihx =>
+            fun ys =>
+              @List.rec Nat
+                (fun yb =>
+                  DigitsLt (@List.cons Nat r rtl) (@List.cons Nat xd xdtl) ->
+                  DigitsLt (@List.cons Nat r rtl) yb ->
+                  (@Eq Nat (mrEnc (@List.cons Nat r rtl) (@List.cons Nat xd xdtl))
+                    (mrEnc (@List.cons Nat r rtl) yb)) ->
+                  (@Eq (List Nat) (@List.cons Nat xd xdtl) yb))
+                -- yb = nil : DigitsLt (cons r rtl) nil reduces to False
+                (fun _hx hy _hv2 =>
+                  @False.elim (@Eq (List Nat) (@List.cons Nat xd xdtl) (@List.nil Nat)) hy)
+                -- yb = cons yd ydtl
+                (fun yd ydtl _ihy =>
+                  fun hx hy hvc =>
+                    @Eq.trans (List Nat)
+                      (@List.cons Nat xd xdtl)
+                      (@List.cons Nat yd xdtl)
+                      (@List.cons Nat yd ydtl)
+                      (@congrArg Nat (List Nat) xd yd (fun (z : Nat) => @List.cons Nat z xdtl)
+                        (@And.left (@Eq Nat xd yd) (@Eq Nat (mrEnc rtl xdtl) (mrEnc rtl ydtl))
+                          (digit_cancel r (mrEnc rtl xdtl) (mrEnc rtl ydtl) xd yd
+                            (@And.left (Nat.lt xd r) (DigitsLt rtl xdtl) hx)
+                            (@And.left (Nat.lt yd r) (DigitsLt rtl ydtl) hy)
+                            hvc)))
+                      (@congrArg (List Nat) (List Nat) xdtl ydtl
+                        (fun (z : List Nat) => @List.cons Nat yd z)
+                        (IH xdtl ydtl
+                          (@And.right (Nat.lt xd r) (DigitsLt rtl xdtl) hx)
+                          (@And.right (Nat.lt yd r) (DigitsLt rtl ydtl) hy)
+                          (@And.right (@Eq Nat xd yd) (@Eq Nat (mrEnc rtl xdtl) (mrEnc rtl ydtl))
+                            (digit_cancel r (mrEnc rtl xdtl) (mrEnc rtl ydtl) xd yd
+                              (@And.left (Nat.lt xd r) (DigitsLt rtl xdtl) hx)
+                              (@And.left (Nat.lt yd r) (DigitsLt rtl ydtl) hy)
+                              hvc)))))
+                ys)
+          xs)
+    rs
+    ds1 ds2 h1 h2 hv
+
+end MixedRadixInj

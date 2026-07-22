@@ -1,0 +1,44 @@
+[package]
+name = "tla-btor2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "BTOR2 format parser and IR for hardware model checking"
+readme.workspace = true
+
+[dependencies]
+# GPU bit-parallel falsification lane (`gpu_falsify`). Pure dlopen — no
+# build-time or link-time CUDA requirement; CUDA-less hosts decline at the
+# runtime probe and the word-level portfolio runs unchanged.
+tla-gpu = { path = "../tla-gpu" }
+rustc-hash = { workspace = true }
+thiserror = { workspace = true }
+tla-mc-core = { path = "../tla-mc-core" }
+tla-ay = { path = "../tla-ay" }
+tla-hw-evidence = { path = "../tla-hw-evidence" }
+ay-chc = { workspace = true }
+# Independent disjoint-trust SAFE certifier (`array_cert`): a pure-propositional
+# ay-sat leaf whose UNSAT proofs are re-checked by the separate ay-lrat-check
+# crate — a path that never enters ay-dpll's array theory.
+ay-sat = { workspace = true }
+ay-lrat-check = { workspace = true }
+tla-resource = { path = "../tla-resource" }
+
+[dev-dependencies]
+criterion = { workspace = true }
+# Needed for DetHashMap (test fixtures construct the deterministic-iteration
+# map type that ay-chc's `FxHashMap` alias resolves to).
+ay-core = { workspace = true }
+# The bit-level IC3/PDR reference lane for the array differential battery
+# (`array_battery`): oracle verdicts are cross-checked against
+# bitblast + check_aiger_sat on bit-blast-eligible tiny nets.
+tla-aiger = { path = "../tla-aiger" }
+
+[[bench]]
+name = "hwmcc_parse"
+harness = false
+
+[lints]
+workspace = true

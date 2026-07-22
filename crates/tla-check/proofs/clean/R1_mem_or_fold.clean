@@ -1,0 +1,66 @@
+-- R1: literal-set membership desugar.
+-- TY lowers `x ∈ {a, b}` (a finite literal set) to an Or-fold of Nat equality
+-- tests: `List.any [a, b] (fun v => Nat.beq x v)`. This meta-theorem proves that
+-- desugar SOUND for arity 2: the Boolean membership fold is `= true` iff the
+-- disjunction of the pointwise `Nat.beq` tests holds.
+--
+-- `memberOf` is exactly TY's desugar target (List.any over the literal list with
+-- the beq predicate). `List.any` reduces via `List.rec` so
+--   memberOf x [a,b]  ≡  Bool.or (Nat.beq x a) (Bool.or (Nat.beq x b) Bool.false)
+-- and R1_mem_or_fold is `orb2_true_iff` applied at (Nat.beq x a, Nat.beq x b),
+-- the kernel closing the gap by definitional unfolding of memberOf/List.any.
+
+def memberOf (x : Nat) (l : List Nat) : Bool :=
+  List.any l (fun v => Nat.beq x v)
+
+-- Forward direction: if the Or-fold is `true`, one of the two beq tests is `true`.
+-- Exhaustive Bool.rec case analysis on both operands; every leaf reduces so the
+-- disjunct is introduced by `Or.inl`/`Or.inr` with a reflexivity witness (or, in
+-- the all-false leaf, the hypothesis itself).
+theorem orb2_mp (p q : Bool) :
+    (Bool.or p (Bool.or q Bool.false) = Bool.true) → (p = Bool.true ∨ q = Bool.true) := by
+  cases p
+  case true =>
+    intro h
+    exact Or.inl rfl
+  case false =>
+    cases q
+    case true =>
+      intro h
+      exact Or.inr rfl
+    case false =>
+      intro h
+      exact Or.inl h
+
+-- Backward direction: if one of the two beq tests is `true`, the Or-fold is `true`.
+theorem orb2_mpr (p q : Bool) :
+    (p = Bool.true ∨ q = Bool.true) → (Bool.or p (Bool.or q Bool.false) = Bool.true) := by
+  cases p
+  case true =>
+    intro h
+    rfl
+  case false =>
+    cases q
+    case true =>
+      intro h
+      rfl
+    case false =>
+      intro h
+      cases h with
+      | inl hx => exact hx
+      | inr hx => exact hx
+
+-- Core Boolean lemma: the arity-2 Or-fold (with List.any's trailing `Bool.false`
+-- base case) is `= true` iff one of the two tests is `= true`.
+theorem orb2_true_iff (p q : Bool) :
+    (Bool.or p (Bool.or q Bool.false) = Bool.true) ↔ (p = Bool.true ∨ q = Bool.true) :=
+  Iff.intro (orb2_mp p q) (orb2_mpr p q)
+
+-- R1 (arity-2 literal-set membership desugar), the TY soundness claim.
+-- The `= true` / `= Bool.true` and `memberOf` / `Bool.or …` gaps are closed by
+-- the kernel's definitional equality (delta/iota/beta), so `orb2_true_iff`
+-- applied at the two beq tests inhabits exactly this membership iff.
+theorem R1_mem_or_fold (x a b : Nat) :
+    (memberOf x (List.cons a (List.cons b List.nil)) = true)
+      ↔ (Nat.beq x a = true ∨ Nat.beq x b = true) :=
+  orb2_true_iff (Nat.beq x a) (Nat.beq x b)

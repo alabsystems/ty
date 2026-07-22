@@ -1,0 +1,265 @@
+-- G1b_universe_count : EXACT multi-column universe count — the enumeration of
+-- ALL in-range multi-column tuples has length EXACTLY the product of the
+-- per-column radices. Authored in CLEAN's surface language and checked by
+-- CLEAN's CIC kernel (so it enters the clean kernel's trust base).
+--
+-- This COMPLETES G1 (per-column count): G1_column_cardinality proved the atomic
+-- fact `length (rangeList r) = r` (a radix-`r` column has exactly `r` values);
+-- this file lifts it to the FULL multi-column identity
+--
+--     theorem allTuples_length (rs : List Nat) :
+--         @Eq Nat (@List.length (List Nat) (allTuples rs)) (prod rs)
+--
+-- where `prod` is the radix product (prod [] = 1, prod (r::rs) = r * prod rs —
+-- the same definition as G1's ColCard.prod) and `allTuples rs` enumerates every
+-- tuple whose i-th digit ranges over the radix-r_i column values:
+--   allTuples []        = [[]]                                (one empty tuple)
+--   allTuples (r :: rs) = flatMap (fun d => map (cons d) (allTuples rs))
+--                                 (rangeList r)
+-- with the flatMap/map/append combinators (`blocks`/`consAll`/`app`) defined
+-- HERE via @List.rec, so every reduction is under this file's control (no
+-- reliance on prelude list combinators).
+--
+-- GENERALITY: FULL. Quantified over an ARBITRARY radix list `rs : List Nat` —
+-- arbitrary column count, arbitrary per-column radices (zero radices included:
+-- a 0-radix column empties the universe, and prod picks up the 0 factor).
+-- This is the EXACT count ("size = ∏ rᵢ") that TY's flat-primary storage
+-- sizing relies on — strictly stronger than the coverage BOUND (L1b: every
+-- in-range tuple packs BELOW ∏ rᵢ): the flat state space has exactly
+-- prod(rs) inhabitants, no slot unaccounted for and none duplicated by the
+-- enumerator.
+--
+-- PROOF SKELETON (all inductions oriented so the closing steps are
+-- definitional — Nat.add/Nat.mul recurse on their SECOND argument):
+--   length_consAll : length (consAll d ts) = length ts            (List.rec, congrArg succ)
+--   length_app     : length (app a b) = length b + length a       (List.rec on a;
+--                      nil case  `length b + 0 ≡ length b`  is rfl,
+--                      cons case `length b + succ k ≡ succ (length b + k)` closes
+--                      with congrArg succ — this orientation is WHY no 0+n lemma
+--                      is needed)
+--   length_blocks  : length (blocks ds ts) = length ts * length ds (List.rec on ds;
+--                      nil case  `P * 0 ≡ 0` is rfl, cons case
+--                      `P * succ k ≡ P*k + P` matches the length_app/length_consAll
+--                      chain endpoint definitionally — no (succ k)*m lemma needed)
+--   allTuples_length : List.rec on rs. Base: length [[]] ≡ 1 ≡ prod [] (rfl).
+--                      Cons: chain length_blocks → congrArg(length_rangeList) →
+--                      congrArg(IH) reaches `prod rtl * r`; a final Nat.mul_comm
+--                      flips it to `r * prod rtl ≡ prod (r :: rtl)`.
+-- The only prelude Nat lemma used is `Nat.mul_comm`; everything else is
+-- self-defined + definitional reduction + congrArg.
+--
+-- NOTE: `@List.cons`/`@List.nil`/`@List.length` are written FULLY EXPLICIT
+-- (`@List.cons Nat`, `@List.cons (List Nat)`, …). Implicit constructor forms in
+-- an `@Eq.refl` reduction context trigger a universe-inference failure in the
+-- current clean elaborator; the explicit forms reduce cleanly.
+
+namespace TupleCount
+
+-- ============================================================================
+-- Definitions (rangeList / prod copied from G1 verbatim — each file is checked
+-- in a fresh environment, so the copy is required; combinators are our own).
+-- ============================================================================
+
+-- The `r` distinct values a radix-`r` column can hold, as a length-`r` list
+-- (order irrelevant for counting): rangeList 0 = [], rangeList (k+1) = k :: rangeList k.
+def rangeList (r : Nat) : List Nat :=
+  @Nat.rec (fun _ => List Nat) (@List.nil Nat)
+    (fun (k : Nat) (ih : List Nat) => @List.cons Nat k ih) r
+
+-- Universe size of a multi-column state = product of the per-column radices.
+--   prod [] = 1,   prod (r :: rtl) = r * prod rtl.
+def prod (rs : List Nat) : Nat :=
+  @List.rec Nat (fun _ => Nat) (Nat.succ Nat.zero)
+    (fun (r : Nat) (_t : List Nat) (ih : Nat) => Nat.mul r ih) rs
+
+-- consAll d ts = map (List.cons d) ts : prefix every tuple in `ts` with digit `d`.
+--   consAll d []        = []
+--   consAll d (t :: tl) = (d :: t) :: consAll d tl
+def consAll (d : Nat) (ts : List (List Nat)) : List (List Nat) :=
+  @List.rec (List Nat) (fun _ => List (List Nat)) (@List.nil (List Nat))
+    (fun (t : List Nat) (_tl : List (List Nat)) (ih : List (List Nat)) =>
+      @List.cons (List Nat) (@List.cons Nat d t) ih) ts
+
+-- app a b = a ++ b, our own append combinator (recursion on the FIRST list).
+--   app [] b        = b
+--   app (t :: tl) b = t :: app tl b
+def app (a b : List (List Nat)) : List (List Nat) :=
+  @List.rec (List Nat) (fun _ => List (List Nat)) b
+    (fun (t : List Nat) (_tl : List (List Nat)) (ih : List (List Nat)) =>
+      @List.cons (List Nat) t ih) a
+
+-- blocks ds ts = flatMap (fun d => consAll d ts) ds : one block of tuples per
+-- digit d in ds, each block prefixing `ts` with d.
+--   blocks [] ts        = []
+--   blocks (d :: dtl) ts = app (consAll d ts) (blocks dtl ts)
+def blocks (ds : List Nat) (ts : List (List Nat)) : List (List Nat) :=
+  @List.rec Nat (fun _ => List (List Nat)) (@List.nil (List Nat))
+    (fun (d : Nat) (_dtl : List Nat) (ih : List (List Nat)) =>
+      app (consAll d ts) ih) ds
+
+-- The full multi-column enumeration: every tuple whose i-th digit ranges over
+-- the radix-r_i column values.
+--   allTuples []        = [[]]
+--   allTuples (r :: rtl) = blocks (rangeList r) (allTuples rtl)
+def allTuples (rs : List Nat) : List (List Nat) :=
+  @List.rec Nat (fun _ => List (List Nat))
+    (@List.cons (List Nat) (@List.nil Nat) (@List.nil (List Nat)))
+    (fun (r : Nat) (_rtl : List Nat) (ih : List (List Nat)) =>
+      blocks (rangeList r) ih) rs
+
+-- ============================================================================
+-- Reduction sanity (all `rfl`, fully-explicit List): the defeq facts the
+-- counting proof leans on.
+-- ============================================================================
+theorem allTuples_nil :
+    @Eq (List (List Nat)) (allTuples (@List.nil Nat))
+      (@List.cons (List Nat) (@List.nil Nat) (@List.nil (List Nat))) :=
+  @Eq.refl (List (List Nat)) (@List.cons (List Nat) (@List.nil Nat) (@List.nil (List Nat)))
+theorem allTuples_cons (r : Nat) (rtl : List Nat) :
+    @Eq (List (List Nat)) (allTuples (@List.cons Nat r rtl))
+      (blocks (rangeList r) (allTuples rtl)) :=
+  @Eq.refl (List (List Nat)) (blocks (rangeList r) (allTuples rtl))
+theorem blocks_cons (d : Nat) (dtl : List Nat) (ts : List (List Nat)) :
+    @Eq (List (List Nat)) (blocks (@List.cons Nat d dtl) ts)
+      (app (consAll d ts) (blocks dtl ts)) :=
+  @Eq.refl (List (List Nat)) (app (consAll d ts) (blocks dtl ts))
+-- `P * succ k` reduces to `P*k + P` (Nat.mul recurses on its 2nd arg): the pivot
+-- identity that lets length_blocks close its cons case definitionally.
+theorem mul_succ_reduces (P k : Nat) :
+    @Eq Nat (Nat.mul P (Nat.succ k)) (Nat.add (Nat.mul P k) P) :=
+  @Eq.refl Nat (Nat.add (Nat.mul P k) P)
+
+-- ============================================================================
+-- Length lemmas (each oriented so its induction closes definitionally).
+-- ============================================================================
+
+-- G1's per-column count, restated here (fresh environment): a radix-`r` column
+-- has exactly `r` values.
+theorem length_rangeList (r : Nat) :
+    @Eq Nat (@List.length Nat (rangeList r)) r :=
+  @Nat.rec
+    (fun n => @Eq Nat (@List.length Nat (rangeList n)) n)
+    (@Eq.refl Nat Nat.zero)
+    (fun (k : Nat) (ih : @Eq Nat (@List.length Nat (rangeList k)) k) =>
+      @congrArg Nat Nat (@List.length Nat (rangeList k)) k Nat.succ ih)
+    r
+
+-- Prefixing preserves count: length (consAll d ts) = length ts.
+theorem length_consAll (d : Nat) (ts : List (List Nat)) :
+    @Eq Nat (@List.length (List Nat) (consAll d ts)) (@List.length (List Nat) ts) :=
+  @List.rec (List Nat)
+    (fun l => @Eq Nat (@List.length (List Nat) (consAll d l)) (@List.length (List Nat) l))
+    (@Eq.refl Nat Nat.zero)
+    (fun (t : List Nat) (tl : List (List Nat))
+         (ih : @Eq Nat (@List.length (List Nat) (consAll d tl)) (@List.length (List Nat) tl)) =>
+      @congrArg Nat Nat
+        (@List.length (List Nat) (consAll d tl)) (@List.length (List Nat) tl)
+        Nat.succ ih)
+    ts
+
+-- Append adds counts: length (app a b) = length b + length a.
+-- ORIENTATION MATTERS: Nat.add recurses on its 2nd argument, so with `length a`
+-- in the 2nd slot the nil case (`length b + 0 ≡ length b`) and the cons step
+-- (`length b + succ k ≡ succ (length b + k)`) are both definitional.
+theorem length_app (a b : List (List Nat)) :
+    @Eq Nat (@List.length (List Nat) (app a b))
+      (Nat.add (@List.length (List Nat) b) (@List.length (List Nat) a)) :=
+  @List.rec (List Nat)
+    (fun l => @Eq Nat (@List.length (List Nat) (app l b))
+      (Nat.add (@List.length (List Nat) b) (@List.length (List Nat) l)))
+    (@Eq.refl Nat (@List.length (List Nat) b))
+    (fun (t : List Nat) (tl : List (List Nat))
+         (ih : @Eq Nat (@List.length (List Nat) (app tl b))
+           (Nat.add (@List.length (List Nat) b) (@List.length (List Nat) tl))) =>
+      @congrArg Nat Nat
+        (@List.length (List Nat) (app tl b))
+        (Nat.add (@List.length (List Nat) b) (@List.length (List Nat) tl))
+        Nat.succ ih)
+    a
+
+-- KEY COUNTING LEMMA: `length ds` blocks of `length ts` tuples each —
+--   length (blocks ds ts) = length ts * length ds.
+-- ORIENTATION MATTERS again: Nat.mul recurses on its 2nd argument, so with
+-- `length ds` in the 2nd slot the nil case (`P * 0 ≡ 0`) is rfl and the cons
+-- case's target `P * succ k ≡ P*k + P` is EXACTLY where the
+-- length_app → length_consAll → IH chain ends — no (succ k)*m lemma needed.
+theorem length_blocks (ds : List Nat) (ts : List (List Nat)) :
+    @Eq Nat (@List.length (List Nat) (blocks ds ts))
+      (Nat.mul (@List.length (List Nat) ts) (@List.length Nat ds)) :=
+  @List.rec Nat
+    (fun l => @Eq Nat (@List.length (List Nat) (blocks l ts))
+      (Nat.mul (@List.length (List Nat) ts) (@List.length Nat l)))
+    (@Eq.refl Nat Nat.zero)
+    (fun (d : Nat) (dtl : List Nat)
+         (ih : @Eq Nat (@List.length (List Nat) (blocks dtl ts))
+           (Nat.mul (@List.length (List Nat) ts) (@List.length Nat dtl))) =>
+      @Eq.trans Nat
+        (@List.length (List Nat) (app (consAll d ts) (blocks dtl ts)))
+        (Nat.add (@List.length (List Nat) (blocks dtl ts)) (@List.length (List Nat) ts))
+        (Nat.add (Nat.mul (@List.length (List Nat) ts) (@List.length Nat dtl))
+          (@List.length (List Nat) ts))
+        -- length (app (consAll d ts) (blocks dtl ts))
+        --   = length (blocks dtl ts) + length (consAll d ts)   [length_app]
+        --   = length (blocks dtl ts) + length ts               [length_consAll]
+        (@Eq.trans Nat
+          (@List.length (List Nat) (app (consAll d ts) (blocks dtl ts)))
+          (Nat.add (@List.length (List Nat) (blocks dtl ts))
+            (@List.length (List Nat) (consAll d ts)))
+          (Nat.add (@List.length (List Nat) (blocks dtl ts)) (@List.length (List Nat) ts))
+          (length_app (consAll d ts) (blocks dtl ts))
+          (@congrArg Nat Nat
+            (@List.length (List Nat) (consAll d ts)) (@List.length (List Nat) ts)
+            (fun (z : Nat) => Nat.add (@List.length (List Nat) (blocks dtl ts)) z)
+            (length_consAll d ts)))
+        --   = (length ts * length dtl) + length ts             [IH]
+        -- ≡ length ts * succ (length dtl)                      [rfl: mul_succ_reduces]
+        (@congrArg Nat Nat
+          (@List.length (List Nat) (blocks dtl ts))
+          (Nat.mul (@List.length (List Nat) ts) (@List.length Nat dtl))
+          (fun (z : Nat) => Nat.add z (@List.length (List Nat) ts))
+          ih))
+    ds
+
+-- ============================================================================
+-- MAIN THEOREM — EXACT MULTI-COLUMN UNIVERSE COUNT:
+--   length (allTuples rs) = prod rs,  for EVERY radix list rs.
+--   rs = []       : length [[]] ≡ 1 ≡ prod []                     (rfl).
+--   rs = r :: rtl : length (blocks (rangeList r) (allTuples rtl))
+--                     = length (allTuples rtl) * length (rangeList r)  [length_blocks]
+--                     = length (allTuples rtl) * r                     [length_rangeList]
+--                     = prod rtl * r                                   [IH]
+--                     = r * prod rtl  ≡  prod (r :: rtl)               [Nat.mul_comm].
+-- ============================================================================
+theorem allTuples_length (rs : List Nat) :
+    @Eq Nat (@List.length (List Nat) (allTuples rs)) (prod rs) :=
+  @List.rec Nat
+    (fun l => @Eq Nat (@List.length (List Nat) (allTuples l)) (prod l))
+    (@Eq.refl Nat (Nat.succ Nat.zero))
+    (fun (r : Nat) (rtl : List Nat)
+         (ih : @Eq Nat (@List.length (List Nat) (allTuples rtl)) (prod rtl)) =>
+      @Eq.trans Nat
+        (@List.length (List Nat) (blocks (rangeList r) (allTuples rtl)))
+        (Nat.mul (prod rtl) r)
+        (Nat.mul r (prod rtl))
+        (@Eq.trans Nat
+          (@List.length (List Nat) (blocks (rangeList r) (allTuples rtl)))
+          (Nat.mul (@List.length (List Nat) (allTuples rtl)) r)
+          (Nat.mul (prod rtl) r)
+          (@Eq.trans Nat
+            (@List.length (List Nat) (blocks (rangeList r) (allTuples rtl)))
+            (Nat.mul (@List.length (List Nat) (allTuples rtl))
+              (@List.length Nat (rangeList r)))
+            (Nat.mul (@List.length (List Nat) (allTuples rtl)) r)
+            (length_blocks (rangeList r) (allTuples rtl))
+            (@congrArg Nat Nat
+              (@List.length Nat (rangeList r)) r
+              (fun (z : Nat) => Nat.mul (@List.length (List Nat) (allTuples rtl)) z)
+              (length_rangeList r)))
+          (@congrArg Nat Nat
+            (@List.length (List Nat) (allTuples rtl)) (prod rtl)
+            (fun (z : Nat) => Nat.mul z r)
+            ih))
+        (Nat.mul_comm (prod rtl) r))
+    rs
+
+end TupleCount

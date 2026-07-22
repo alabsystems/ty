@@ -1,0 +1,132 @@
+-- L1b_mixed_radix_coverage : MULTI-COLUMN domain-bound COVERAGE — the mixed-
+-- radix generalization of L1, authored in CLEAN's surface language and checked
+-- by CLEAN's CIC kernel (so it enters the clean kernel's trust base).
+--
+-- L1 (baseValue_lt_pow) proves the coverage bound for a SINGLE base `b`:
+-- a bounded n-digit tuple packs into [0, b^n). But TY's flat-primary storage
+-- packs a MULTI-COLUMN state, where each column i has its OWN radix r_i (its
+-- domain size). The encoder is the mixed-radix Horner fold
+--     mixedRadix [(d0,r0),(d1,r1),…] = d0 + r0*(d1 + r1*(d2 + …))
+-- and the state-space size is the PRODUCT of the per-column radices
+--     radProduct [(_,r0),(_,r1),…] = r0 * r1 * … * 1.
+--
+-- COVERAGE soundness claim (proved below, `mixed_radix_coverage`): if every
+-- column's digit is below its radix (AllDigitLt: d_i < r_i for all i), then
+--     mixedRadix l  <  radProduct l.
+-- i.e. every in-range multi-column tuple packs into the half-open window
+-- [0, ∏ r_i) — the flat storage of size ∏ r_i COVERS exactly the encoded
+-- states. This is the multi-column version of L1's single-base [0, b^n) bound,
+-- and it is the coverage half of TY's flat-storage soundness (S1 / positional
+-- injectivity is the other half; the mixed-radix injective analog is future).
+--
+-- GENERALITY: FULL. Quantified over an arbitrary list of (digit, radix) pairs
+-- `l : List (Prod Nat Nat)` of arbitrary length and arbitrary per-column radices,
+-- by structural List induction (@List.rec) with an implication motive threading
+-- the digit-bound hypothesis. No fixed radix, no length restriction.
+--
+-- PROOF (cons (d,r)::tl, with V := mixedRadix tl, P := radProduct tl):
+--   goal :  d + r*V  <  r*P            (defeq to the reduced cons goal)
+--   IH   :  V < P    i.e. succ V <= P
+--   hd   :  d < r
+--   r*V + d  <  r*V + r          [add_lt_add_left on d<r]         -- strict
+--            =  r*(succ V)       [Nat.mul reduces on 2nd arg]     -- rfl
+--          <=  r*P               [mul_le_mul_left on succ V <= P] -- IH
+--   then transport LHS  r*V + d  ~>  d + r*V  by add_comm.
+-- (Simpler than L1: radProduct's cons is DEFINED r*P with r on the LEFT, so it
+-- matches mul_le_mul_left's output directly — no mul_comm transport needed.)
+-- Nat facts used are the SAME trusted with_prelude lemmas L1 uses;
+-- lt_of_lt_of_le does NOT resolve in `with_prelude` and is hand-proved below
+-- (Nat.lt a b is DEFINITIONALLY Nat.le (succ a) b, so le_trans closes it).
+
+namespace L1bMixed
+
+-- Per-column mixed-radix encoder: l is a list of (digit, radix) pairs.
+--   mixedRadix []            = 0
+--   mixedRadix ((d,r) :: tl) = d + r * mixedRadix tl
+def mixedRadix (l : List (Prod Nat Nat)) : Nat :=
+  @List.rec (Prod Nat Nat) (fun _ => Nat) Nat.zero
+    (fun (p : Prod Nat Nat) (_tl : List (Prod Nat Nat)) (ih : Nat) =>
+      Nat.add (@Prod.fst Nat Nat p) (Nat.mul (@Prod.snd Nat Nat p) ih)) l
+
+-- State-space size = product of the per-column radices.
+--   radProduct []            = 1
+--   radProduct ((_,r) :: tl) = r * radProduct tl
+def radProduct (l : List (Prod Nat Nat)) : Nat :=
+  @List.rec (Prod Nat Nat) (fun _ => Nat) (Nat.succ Nat.zero)
+    (fun (p : Prod Nat Nat) (_tl : List (Prod Nat Nat)) (ih : Nat) =>
+      Nat.mul (@Prod.snd Nat Nat p) ih) l
+
+-- Column-bound predicate: every column's digit is below its radix.
+--   AllDigitLt []            = True
+--   AllDigitLt ((d,r) :: tl) = (d < r) AND AllDigitLt tl
+def AllDigitLt (l : List (Prod Nat Nat)) : Prop :=
+  @List.rec (Prod Nat Nat) (fun _ => Prop) True
+    (fun (p : Prod Nat Nat) (_tl : List (Prod Nat Nat)) (ih : Prop) =>
+      And (Nat.lt (@Prod.fst Nat Nat p) (@Prod.snd Nat Nat p)) ih) l
+
+-- Reduction sanity (all `rfl`): the defeq facts the coverage proof leans on.
+-- (`@List.cons`/`@List.nil` are written FULLY EXPLICIT: an implicit `List.cons`
+-- in an `@Eq.refl` reduction context trips a universe-inference failure in the
+-- current clean elaborator; the explicit form reduces cleanly.)
+theorem mixedRadix_nil : @Eq Nat (mixedRadix (@List.nil (Prod Nat Nat))) Nat.zero :=
+  @Eq.refl Nat Nat.zero
+theorem radProduct_nil : @Eq Nat (radProduct (@List.nil (Prod Nat Nat))) (Nat.succ Nat.zero) :=
+  @Eq.refl Nat (Nat.succ Nat.zero)
+theorem mixedRadix_cons (p : Prod Nat Nat) (tl : List (Prod Nat Nat)) :
+    @Eq Nat (mixedRadix (@List.cons (Prod Nat Nat) p tl))
+      (Nat.add (@Prod.fst Nat Nat p) (Nat.mul (@Prod.snd Nat Nat p) (mixedRadix tl))) :=
+  @Eq.refl Nat (Nat.add (@Prod.fst Nat Nat p) (Nat.mul (@Prod.snd Nat Nat p) (mixedRadix tl)))
+theorem radProduct_cons (p : Prod Nat Nat) (tl : List (Prod Nat Nat)) :
+    @Eq Nat (radProduct (@List.cons (Prod Nat Nat) p tl))
+      (Nat.mul (@Prod.snd Nat Nat p) (radProduct tl)) :=
+  @Eq.refl Nat (Nat.mul (@Prod.snd Nat Nat p) (radProduct tl))
+-- `r * succ V` reduces to `r*V + r` (Nat.mul recurses on its 2nd arg): the pivot
+-- identity linking the strict-step bound to the mul-monotone one.
+theorem mul_succ_reduces (r V : Nat) :
+    @Eq Nat (Nat.mul r (Nat.succ V)) (Nat.add (Nat.mul r V) r) :=
+  @Eq.refl Nat (Nat.add (Nat.mul r V) r)
+
+-- `Nat.lt_of_lt_of_le` does not RESOLVE in `with_prelude` (`Nat.lt` is a def,
+-- so the dotted name is misparsed as dot notation on a type-valued expression).
+-- Hand-proved: `Nat.lt a b` is DEFINITIONALLY `Nat.le (Nat.succ a) b`, so the
+-- trusted `Nat.le_trans` closes it outright.
+theorem lt_of_lt_of_le (a b c : Nat) (h1 : Nat.lt a b) (h2 : Nat.le b c) :
+    Nat.lt a c :=
+  @Nat.le_trans (Nat.succ a) b c h1 h2
+
+-- ============================================================================
+-- COVERAGE: in-range multi-column tuples pack into [0, ∏ r_i).
+--   AllDigitLt l  ->  mixedRadix l  <  radProduct l,  for every l.
+-- ============================================================================
+theorem mixed_radix_coverage (l : List (Prod Nat Nat)) (hall : AllDigitLt l) :
+    Nat.lt (mixedRadix l) (radProduct l) :=
+  @List.rec (Prod Nat Nat)
+    (fun ll => AllDigitLt ll -> Nat.lt (mixedRadix ll) (radProduct ll))
+    -- nil : goal reduces to  0 < 1  =  Nat.le 1 1.
+    (fun _hnil =>
+      @Nat.succ_le_succ Nat.zero Nat.zero (Nat.zero_le Nat.zero))
+    -- cons p tl :  goal  (fst p) + (snd p)*V  <  (snd p) * P
+    (fun p tl ih =>
+      fun hcons =>
+        @Eq.subst Nat
+          (fun z => Nat.lt z (Nat.mul (@Prod.snd Nat Nat p) (radProduct tl)))
+          (Nat.add (Nat.mul (@Prod.snd Nat Nat p) (mixedRadix tl)) (@Prod.fst Nat Nat p))
+          (Nat.add (@Prod.fst Nat Nat p) (Nat.mul (@Prod.snd Nat Nat p) (mixedRadix tl)))
+          (Nat.add_comm (Nat.mul (@Prod.snd Nat Nat p) (mixedRadix tl)) (@Prod.fst Nat Nat p))
+          (lt_of_lt_of_le
+            (Nat.add (Nat.mul (@Prod.snd Nat Nat p) (mixedRadix tl)) (@Prod.fst Nat Nat p))
+            (Nat.mul (@Prod.snd Nat Nat p) (Nat.succ (mixedRadix tl)))
+            (Nat.mul (@Prod.snd Nat Nat p) (radProduct tl))
+            -- strict:  r*V + d  <  r*V + r  =defeq  r*(succ V)
+            (@Nat.add_lt_add_left (@Prod.fst Nat Nat p) (@Prod.snd Nat Nat p)
+              (@And.left (Nat.lt (@Prod.fst Nat Nat p) (@Prod.snd Nat Nat p)) (AllDigitLt tl) hcons)
+              (Nat.mul (@Prod.snd Nat Nat p) (mixedRadix tl)))
+            -- monotone:  r*(succ V)  <=  r*P   from  succ V <= P  (ih)
+            (@Nat.mul_le_mul_left
+              (Nat.succ (mixedRadix tl))
+              (radProduct tl)
+              (@Prod.snd Nat Nat p)
+              (ih (@And.right (Nat.lt (@Prod.fst Nat Nat p) (@Prod.snd Nat Nat p)) (AllDigitLt tl) hcons)))))
+    l hall
+
+end L1bMixed

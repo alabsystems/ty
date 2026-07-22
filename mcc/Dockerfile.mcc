@@ -1,0 +1,147 @@
+# syntax=docker/dockerfile:1.7
+
+ARG AY_REV=0adeaab4d66b1414a95ab5cee4ec64078c9dbd97
+ARG CLEAN_REV=659a6eeb15b29f7d739ecca852a77483fcfd88ea
+ARG CLEAN_FALLBACK_REV=659a6eeb15b29f7d739ecca852a77483fcfd88ea
+ARG TRUST_IR_REV=9de13453d69f84f24556bd75636bf020206f33c9
+ARG TRUST_CG_REV=7005df3c00a3e1b4042cc49a6608feb1aaa1bfec
+
+FROM rust:trixie AS ay-build
+
+ARG AY_REV
+ARG CARGO_BUILD_JOBS=1
+WORKDIR /ay
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git libgmp-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN --mount=type=secret,id=github_token,required=false \
+    printf '%s\n' '#!/bin/sh' \
+        'case "$1" in' \
+        '*Username*) printf "%s\n" x-access-token ;;' \
+        '*Password*) cat /run/secrets/github_token 2>/dev/null || true ;;' \
+        '*) printf "\n" ;;' \
+        'esac' > /tmp/git-askpass \
+    && chmod 0700 /tmp/git-askpass \
+    && printf '%s\n' "$AY_REV" | grep -Eq '^[0-9a-f]{40}$' \
+    && test "$AY_REV" = "0adeaab4d66b1414a95ab5cee4ec64078c9dbd97" \
+    && GIT_ASKPASS=/tmp/git-askpass GIT_TERMINAL_PROMPT=0 git clone https://github.com/alabsystems/ay.git /ay \
+    && git checkout --detach "${AY_REV}" \
+    && test "$(git rev-parse HEAD)" = "${AY_REV}" \
+    && sed -i 's/features = \["force-cross"\]/features = ["force-cross", "use-system-libs"]/' Cargo.toml \
+    && grep -F 'features = ["force-cross", "use-system-libs"]' Cargo.toml
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/ay/target \
+    RUSTC_WRAPPER= CARGO_BUILD_RUSTC_WRAPPER= CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" CARGO_NET_GIT_FETCH_WITH_CLI=true cargo build --release --locked -p ay --bin ay --features cli \
+    && install -Dm755 target/release/ay /out/ay \
+    && /out/ay --version
+
+FROM rust:trixie AS build
+
+ARG AY_REV
+ARG CLEAN_REV
+ARG CLEAN_FALLBACK_REV
+ARG TRUST_IR_REV
+ARG TRUST_CG_REV
+ARG TY_MCC_BUILD_GIT_HEAD
+ARG CARGO_BUILD_JOBS=1
+WORKDIR /src
+COPY . .
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git libgmp-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/target \
+    --mount=type=secret,id=github_token,required=false \
+    printf '%s\n' '#!/bin/sh' \
+        'case "$1" in' \
+        '*Username*) printf "%s\n" x-access-token ;;' \
+        '*Password*) cat /run/secrets/github_token 2>/dev/null || true ;;' \
+        '*) printf "\n" ;;' \
+        'esac' > /tmp/git-askpass \
+    && chmod 0700 /tmp/git-askpass \
+    && printf '%s\n' "$AY_REV" | grep -Eq '^[0-9a-f]{40}$' \
+    && printf '%s\n' "$CLEAN_REV" | grep -Eq '^[0-9a-f]{40}$' \
+    && printf '%s\n' "$CLEAN_FALLBACK_REV" | grep -Eq '^[0-9a-f]{40}$' \
+    && printf '%s\n' "$TRUST_IR_REV" | grep -Eq '^[0-9a-f]{40}$' \
+    && printf '%s\n' "$TRUST_CG_REV" | grep -Eq '^[0-9a-f]{40}$' \
+    && test "$CLEAN_REV" = "659a6eeb15b29f7d739ecca852a77483fcfd88ea" \
+    && test "$CLEAN_FALLBACK_REV" = "659a6eeb15b29f7d739ecca852a77483fcfd88ea" \
+    && test "$AY_REV" = "0adeaab4d66b1414a95ab5cee4ec64078c9dbd97" \
+    && test "$TRUST_IR_REV" = "9de13453d69f84f24556bd75636bf020206f33c9" \
+    && test "$TRUST_CG_REV" = "7005df3c00a3e1b4042cc49a6608feb1aaa1bfec" \
+    && grep -F "rev = \"$AY_REV\"" Cargo.toml \
+    && grep -F "rev = \"$CLEAN_FALLBACK_REV\"" Cargo.toml \
+    && grep -F "rev = \"$TRUST_IR_REV\"" Cargo.toml \
+    && grep -F "rev = \"$TRUST_CG_REV\"" Cargo.toml \
+    && grep -F "git+https://github.com/alabsystems/ay.git?rev=$AY_REV#$AY_REV" Cargo.lock \
+    && grep -F "git+https://github.com/alabsystems/trust-ir.git?rev=$TRUST_IR_REV#$TRUST_IR_REV" Cargo.lock \
+    && grep -F "git+https://github.com/alabsystems/trust-cg.git?rev=$TRUST_CG_REV#$TRUST_CG_REV" Cargo.lock \
+    && ! grep -E '^source = "git\+.*alabsystems/ay(\.git)?[?#"]' Cargo.lock | grep -Fxv "source = \"git+https://github.com/alabsystems/ay.git?rev=$AY_REV#$AY_REV\"" \
+    && ! grep -E '^source = "git\+.*alabsystems/trust-ir(\.git)?[?#"]' Cargo.lock | grep -Fxv "source = \"git+https://github.com/alabsystems/trust-ir.git?rev=$TRUST_IR_REV#$TRUST_IR_REV\"" \
+    && ! grep -E '^source = "git\+.*alabsystems/trust-cg(\.git)?[?#"]' Cargo.lock | grep -Fxv "source = \"git+https://github.com/alabsystems/trust-cg.git?rev=$TRUST_CG_REV#$TRUST_CG_REV\"" \
+    && ! grep -E '^source = "git\+.*alabsystems/clean(\.git)?[?#"]' Cargo.lock \
+    && mcc/first_party_lock_preflight.sh Cargo.lock "$AY_REV" "$TRUST_IR_REV" "$TRUST_CG_REV" \
+    && GIT_ASKPASS=/tmp/git-askpass GIT_TERMINAL_PROMPT=0 git clone https://github.com/alabsystems/ay.git /ay \
+    && git -C /ay checkout --detach "${AY_REV}" \
+    && test "$(git -C /ay rev-parse HEAD)" = "${AY_REV}" \
+    && GIT_ASKPASS=/tmp/git-askpass GIT_TERMINAL_PROMPT=0 git clone https://github.com/alabsystems/clean.git /clean \
+    && git -C /clean checkout --detach "${CLEAN_REV}" \
+    && test "$(git -C /clean rev-parse HEAD)" = "${CLEAN_REV}" \
+    && GIT_ASKPASS=/tmp/git-askpass GIT_TERMINAL_PROMPT=0 git clone https://github.com/alabsystems/trust-ir.git /trust-ir \
+    && git -C /trust-ir checkout --detach "${TRUST_IR_REV}" \
+    && test "$(git -C /trust-ir rev-parse HEAD)" = "${TRUST_IR_REV}" \
+    && GIT_ASKPASS=/tmp/git-askpass GIT_TERMINAL_PROMPT=0 git clone https://github.com/alabsystems/trust-cg.git /trust-cg \
+    && git -C /trust-cg checkout --detach "${TRUST_CG_REV}" \
+    && test "$(git -C /trust-cg rev-parse HEAD)" = "${TRUST_CG_REV}" \
+    && if [ -n "${TY_MCC_BUILD_GIT_HEAD:-}" ]; then \
+           printf '%s\n' "$TY_MCC_BUILD_GIT_HEAD" | grep -Eq '^[0-9a-f]{40}$' \
+           && export TY_MCC_BUILD_GIT_HEAD; \
+       else \
+           unset TY_MCC_BUILD_GIT_HEAD; \
+       fi \
+    && RUSTC_WRAPPER= CARGO_BUILD_RUSTC_WRAPPER= CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" CARGO_NET_GIT_FETCH_WITH_CLI=true cargo build --profile agent --locked -p tla-petri --bin ty-mcc --bin ty-mcc-ay-pin-validate --bin ty-mcc-backend-evidence-validate --features mcc-system-gmp,trust-cg-petri-native,dd-backend \
+    && target/agent/ty-mcc-ay-pin-validate --repo-root /src \
+    && install -Dm755 target/agent/ty-mcc /out/ty-mcc \
+    && install -Dm755 target/agent/ty-mcc-backend-evidence-validate /out/ty-mcc-backend-evidence-validate
+
+FROM debian:trixie-slim
+
+ARG AY_REV
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates coreutils libgmp10 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --home-dir /home/mcc --shell /bin/bash mcc \
+    && mkdir -p /home/mcc/BenchKit
+
+COPY --from=ay-build /out/ay /usr/local/bin/ay
+COPY --from=build /out/ty-mcc /usr/local/bin/ty-mcc
+COPY --from=build /out/ty-mcc-backend-evidence-validate /usr/local/bin/ty-mcc-backend-evidence-validate
+COPY mcc/BenchKit_head.sh /home/mcc/BenchKit/BenchKit_head.sh
+
+RUN /usr/local/bin/ay --version \
+    && chmod 0755 /home/mcc/BenchKit/BenchKit_head.sh \
+    && ln -s /home/mcc/BenchKit/BenchKit_head.sh /home/mcc/BenchKit_head.sh \
+    && mkdir -p /home/mcc/execution /home/mcc/storage \
+    && chown -R mcc:mcc /home/mcc
+
+USER mcc
+WORKDIR /home/mcc/execution
+
+ENV TY_MCC_STORAGE_DIR=/home/mcc/storage
+ENV TY_MCC_REQUIRE_BACKEND_EVIDENCE=1
+ENV TY_MCC_PACKAGED_AY_REV=${AY_REV}
+ENV TY_MCC_BACKEND_EVIDENCE_REQUIRED_CHECKS="mcc_ay_symbolic_execution native_jit_fail_closed_gate trust_ir_transport_identity trust_cg_native_admission ay_solve_decision_profile hardware_proof_replay_boundary hardware_replay_decision trust_cg_compile_artifact_cache_telemetry trust_cg_host_jit_pgo_provenance trust_cg_call_packet_contract_descriptor portfolio_route ay_solver_capability_descriptor ay_symbolic_execution_contract_manifest trust_ir_native_evidence_artifact_resolution trust_ir_native_semantic_bridge_proof_identity petri_trust_mc_model_acceptance"
+ENV BK_BIN_PATH=/usr/local/bin
+ENV AY_PATH=/usr/local/bin/ay
+ENV TY_MCC_ENABLE_BMC_DEPTH1_CHUNKING=1
+ENV TY_MCC_BMC_DEPTH1_CHUNK_SIZE=4
+
+ENTRYPOINT ["/home/mcc/BenchKit/BenchKit_head.sh"]

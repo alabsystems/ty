@@ -1,0 +1,39 @@
+# Copyright 2026 Andrew Yates.
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Licensed under the Apache License, Version 2.0
+#
+# Template docker-compose for benchmark evaluation
+#
+# TEMPLATE USAGE:
+# 1. Copy to your project's benchmarks/ directory
+# 2. Update volume mounts and resource limits as needed
+# 3. Run: docker compose -f benchmarks/docker-compose.yaml up
+
+services:
+  eval:
+    build:
+      context: ..
+      dockerfile: benchmarks/Dockerfile
+    container_name: ${PROJECT_NAME:-project}-eval-${RUN_ID:-default}
+    volumes:
+      # Mount logs directory for output persistence
+      - ./logs:/home/evaluator/project/benchmarks/logs
+      # Mount results directory
+      - ./results:/home/evaluator/project/benchmarks/results
+      # Mount input data (read-only)
+      - ./data:/home/evaluator/project/benchmarks/data:ro
+    environment:
+      - RUN_ID=${RUN_ID:-default}
+      - TIMEOUT=${TIMEOUT:-300}
+      - MAX_WORKERS=${MAX_WORKERS:-4}
+    # Resource limits (adjust per project needs)
+    deploy:
+      resources:
+        limits:
+          cpus: '8'
+          memory: 16G
+        reservations:
+          cpus: '2'
+          memory: 4G
+    # Restart policy for long-running evaluations
+    restart: "no"

@@ -1,0 +1,63 @@
+-- G1_column_cardinality : per-column UNIVERSE-SIZE cardinality — a state column of
+-- radix `r` has EXACTLY `r` inhabitants. Authored in CLEAN's surface language and
+-- checked by CLEAN's CIC kernel (so it enters the clean kernel's trust base).
+--
+-- TY sizes a flat-primary state space as the PRODUCT of the per-column domain
+-- sizes (`prod rs = r0 * r1 * … * 1`). The atomic counting fact underneath that
+-- product is: the domain of a single column of radix `r` — the values
+-- {0, 1, …, r-1} — has cardinality exactly `r`. This file proves that atomic
+-- fact as a genuine `List.length` identity:
+--
+--     length (rangeList r) = r,   for every r,
+--
+-- where `rangeList r` enumerates the `r` distinct column values. The multi-column
+-- universe size is `prod` (the fold of these per-column counts), defined here so
+-- the framing is explicit; the EXACT full-product count identity
+-- `length (allTuples rs) = prod rs` additionally needs a `(succ k)*m = m + k*m`
+-- lemma (Nat.mul recurses on its 2nd argument, so left-successor mul is not
+-- definitional) and is near-duplicative of the domain-coverage bound — deferred.
+--
+-- NOTE: `@List.cons`/`@List.nil`/`@List.length` are written FULLY EXPLICIT
+-- (`@List.cons Nat`, …). Implicit `List.cons` in an `@Eq.refl` reduction context
+-- triggers a universe-inference failure in the current clean elaborator; the
+-- explicit form reduces cleanly.
+
+namespace ColCard
+
+-- The `r` distinct values a radix-`r` column can hold, as a length-`r` list
+-- (order irrelevant for counting): rangeList 0 = [], rangeList (k+1) = k :: rangeList k.
+def rangeList (r : Nat) : List Nat :=
+  @Nat.rec (fun _ => List Nat) (@List.nil Nat)
+    (fun (k : Nat) (ih : List Nat) => @List.cons Nat k ih) r
+
+-- Universe size of a multi-column state = product of the per-column radices.
+--   prod [] = 1,   prod (r :: rtl) = r * prod rtl.
+def prod (rs : List Nat) : Nat :=
+  @List.rec Nat (fun _ => Nat) (Nat.succ Nat.zero)
+    (fun (r : Nat) (_t : List Nat) (ih : Nat) => Nat.mul r ih) rs
+
+-- Reduction sanity (rfl, fully-explicit List): the length reductions the count uses.
+theorem length_nil : @Eq Nat (@List.length Nat (@List.nil Nat)) Nat.zero :=
+  @Eq.refl Nat Nat.zero
+theorem length_cons (a : Nat) (l : List Nat) :
+    @Eq Nat (@List.length Nat (@List.cons Nat a l)) (Nat.succ (@List.length Nat l)) :=
+  @Eq.refl Nat (Nat.succ (@List.length Nat l))
+
+-- ============================================================================
+-- PER-COLUMN CARDINALITY: a radix-`r` column has exactly `r` values.
+--   length (rangeList r) = r,  by induction on r.
+--   r = 0     : length [] = 0.
+--   r = k+1   : length (k :: rangeList k) ≡ succ (length (rangeList k)) = succ k  (IH via congrArg).
+-- ============================================================================
+theorem length_rangeList (r : Nat) :
+    @Eq Nat (@List.length Nat (rangeList r)) r :=
+  @Nat.rec
+    (fun n => @Eq Nat (@List.length Nat (rangeList n)) n)
+    (@Eq.refl Nat Nat.zero)
+    (fun (k : Nat) (ih : @Eq Nat (@List.length Nat (rangeList k)) k) =>
+      -- congrArg.{1,1} : {α β}{a₁ a₂ : α}(f : α → β)(h : a₁ = a₂) → f a₁ = f a₂
+      -- so the @-explicit order is α β a₁ a₂ f h:
+      @congrArg Nat Nat (@List.length Nat (rangeList k)) k Nat.succ ih)
+    r
+
+end ColCard

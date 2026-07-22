@@ -1,0 +1,32 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$comment": "Andrew Yates <andrewyates.name@gmail.com>",
+  "description": "Schema for eval results. Claim validation requires passed/total metrics.",
+  "type": "object",
+  "required": ["metrics"],
+  "properties": {
+    "metrics": {
+      "type": "object",
+      "description": "Numeric metrics. For claim validation, must include passed and total.",
+      "properties": {
+        "passed": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Count of passing items. Required for claim validation."
+        },
+        "total": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Total items evaluated. Required for claim validation."
+        }
+      },
+      "additionalProperties": {
+        "type": "number"
+      }
+    },
+    "items": {
+      "type": "array",
+      "description": "Optional per-item results."
+    }
+  }
+}

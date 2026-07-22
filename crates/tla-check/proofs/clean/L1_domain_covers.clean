@@ -1,0 +1,133 @@
+-- L1_domain_covers : AST-direct domain-bound COVERAGE (the L1 residual).
+--
+-- TY encodes a bounded-digit state tuple as a single base-b word via the
+-- positional-pack encoder
+--     baseValue b (d :: ds) = d + b * baseValue b ds,   baseValue b [] = 0
+-- (the SAME `foldr (fun d acc => d + b*acc) 0` as S1_pack_injective.clean).
+--
+-- The COMPLETENESS-DOMAIN soundness claim ("the finite product domain COVERS
+-- the encoded states") is the coverage bound:
+--
+--     for a digit list `l` whose every element is < b (AllLt b l),
+--         baseValue b l  <  b ^ (List.length l).
+--
+-- i.e. every bounded n-digit tuple packs into the half-open window [0, b^n).
+-- Together with S1's injectivity (distinct tuples -> distinct words) this is
+-- exactly "the finite product |domain| = b^n both COVERS and is TIGHT for the
+-- encoded state set": the pack is an injection of the bounded-digit tuples
+-- INTO Fin (b^n). This file proves the coverage half.
+--
+-- GENERALITY: FULL. Quantified over an arbitrary base `b : Nat` and an
+-- arbitrary-length digit list `l : List Nat`, by structural List induction
+-- (@List.rec). No length restriction, no fixed b. The `b >= 1` premise (`hb`)
+-- is stated to match the "for b >= 1" framing but is NOT consumed by the proof
+-- (the AllLt premise already forces b >= 1 on any nonempty list, and the empty
+-- list gives 0 < b^0 = 1 outright), so the bound in fact holds for every b.
+--
+-- PROOF SKELETON (cons step, with V := baseValue b ds, P := b ^ length ds):
+--   goal   :  d + b*V  <  P * b            (defeq to the reduced cons goal)
+--   IH     :  V < P                          (i.e. succ V <= P)
+--   hd     :  d < b
+--   d + b*V  <  b*V + b            [add_lt_add_left on d<b]          -- strict
+--            =  b*(succ V)         [Nat.mul reduces on 2nd arg]      -- rfl
+--          <=  b*P                 [mul_le_mul_left on succ V <= P]  -- IH
+--            =  P*b                [Nat.mul_comm]                    -- eq
+--   then transport the LHS  b*V + d  ~>  d + b*V  by Nat.add_comm.
+-- The Nat facts used (add_lt_add_left, mul_le_mul_left, mul_comm, add_comm,
+-- succ_le_succ, zero_le, le_trans) are trusted `with_prelude` lemmas;
+-- lt_of_lt_of_le does NOT resolve in `with_prelude` and is hand-proved below
+-- (Nat.lt a b is DEFINITIONALLY Nat.le (succ a) b, so le_trans closes it).
+
+namespace L1Cover
+
+-- The positional-pack encoder (identical to S1_pack_injective.clean).
+--   baseValue b l = foldr (fun d acc => d + b*acc) 0 l
+def baseValue (b : Nat) (l : List Nat) : Nat :=
+  @List.foldr Nat Nat (fun (d : Nat) (acc : Nat) => Nat.add d (Nat.mul b acc)) Nat.zero l
+
+-- Bounded-digit predicate: every digit of `l` is `< b`.
+--   AllLt b []        = True
+--   AllLt b (d :: ds) = (d < b) AND AllLt b ds
+def AllLt (b : Nat) (l : List Nat) : Prop :=
+  @List.rec Nat (fun _ => Prop) True
+    (fun (hd : Nat) (_tl : List Nat) (ih : Prop) => And (Nat.lt hd b) ih) l
+
+-- Reduction sanity (all `rfl`): the exact defeq facts the coverage proof leans
+-- on for its base and step cases.  `Nat.pow` is a structural def
+--   Nat.pow m n := Nat.rec 1 (fun _ ih => Nat.mul ih m) n
+-- so it reduces by iota; these witness that.
+theorem pow_zero_one (b : Nat) :
+    @Eq Nat (Nat.pow b Nat.zero) (Nat.succ Nat.zero) :=
+  @Eq.refl Nat (Nat.succ Nat.zero)
+theorem pow_succ_eq (b n : Nat) :
+    @Eq Nat (Nat.pow b (Nat.succ n)) (Nat.mul (Nat.pow b n) b) :=
+  @Eq.refl Nat (Nat.mul (Nat.pow b n) b)
+theorem baseValue_nil (b : Nat) : @Eq Nat (baseValue b List.nil) Nat.zero :=
+  @Eq.refl Nat Nat.zero
+-- (`@List.cons Nat` is written FULLY EXPLICIT: an implicit `List.cons` in an
+-- `@Eq.refl` reduction context trips a universe-inference failure in the
+-- current clean elaborator; the explicit form reduces cleanly.)
+theorem baseValue_cons (b d : Nat) (ds : List Nat) :
+    @Eq Nat (baseValue b (@List.cons Nat d ds)) (Nat.add d (Nat.mul b (baseValue b ds))) :=
+  @Eq.refl Nat (Nat.add d (Nat.mul b (baseValue b ds)))
+-- `b * succ V` reduces to `b*V + b` (Nat.mul recurses on its 2nd arg): the
+-- pivot identity connecting the strict-step upper bound to the mul-monotone one.
+theorem mul_succ_reduces (b V : Nat) :
+    @Eq Nat (Nat.mul b (Nat.succ V)) (Nat.add (Nat.mul b V) b) :=
+  @Eq.refl Nat (Nat.add (Nat.mul b V) b)
+
+-- `Nat.lt_of_lt_of_le` does not RESOLVE in `with_prelude` (`Nat.lt` is a def,
+-- so the dotted name is misparsed as dot notation on a type-valued expression).
+-- Hand-proved: `Nat.lt a b` is DEFINITIONALLY `Nat.le (Nat.succ a) b`, so the
+-- trusted `Nat.le_trans` closes it outright.
+theorem lt_of_lt_of_le (a b c : Nat) (h1 : Nat.lt a b) (h2 : Nat.le b c) :
+    Nat.lt a c :=
+  @Nat.le_trans (Nat.succ a) b c h1 h2
+
+-- ============================================================================
+-- COVERAGE: bounded-digit tuples pack into [0, b^n).
+--   AllLt b l  ->  baseValue b l  <  b ^ (length l),  for all b and all l.
+-- Structural induction on `l` via @List.rec with an implication motive (so the
+-- digit-bound hypothesis is threaded through the recursion, no generalization
+-- needed).  Base: 0 < b^0 = 1.  Step: the four-link chain documented above.
+-- ============================================================================
+theorem baseValue_lt_pow (b : Nat) (l : List Nat)
+    (hb : Nat.le (Nat.succ Nat.zero) b)
+    (hall : AllLt b l) :
+    Nat.lt (baseValue b l) (Nat.pow b (List.length l)) :=
+  @List.rec Nat
+    (fun ll =>
+      AllLt b ll -> Nat.lt (baseValue b ll) (Nat.pow b (List.length ll)))
+    -- l = nil : goal reduces to  Nat.lt 0 (b^0) = Nat.lt 0 1 = Nat.le 1 1.
+    (fun _hnil =>
+      @Nat.succ_le_succ Nat.zero Nat.zero (Nat.zero_le Nat.zero))
+    -- l = cons d ds
+    (fun d ds ih =>
+      fun hcons =>
+        -- transport (b*V + d < P*b) along b*V + d = d + b*V (add_comm),
+        -- yielding the reduced cons goal  d + b*V < P*b.
+        @Eq.subst Nat
+          (fun z => Nat.lt z (Nat.mul (Nat.pow b (List.length ds)) b))
+          (Nat.add (Nat.mul b (baseValue b ds)) d)
+          (Nat.add d (Nat.mul b (baseValue b ds)))
+          (Nat.add_comm (Nat.mul b (baseValue b ds)) d)
+          (lt_of_lt_of_le
+            (Nat.add (Nat.mul b (baseValue b ds)) d)
+            (Nat.mul b (Nat.succ (baseValue b ds)))
+            (Nat.mul (Nat.pow b (List.length ds)) b)
+            (@Nat.add_lt_add_left d b
+              (@And.left (Nat.lt d b) (AllLt b ds) hcons)
+              (Nat.mul b (baseValue b ds)))
+            (@Eq.subst Nat
+              (fun z => Nat.le (Nat.mul b (Nat.succ (baseValue b ds))) z)
+              (Nat.mul b (Nat.pow b (List.length ds)))
+              (Nat.mul (Nat.pow b (List.length ds)) b)
+              (Nat.mul_comm b (Nat.pow b (List.length ds)))
+              (@Nat.mul_le_mul_left
+                (Nat.succ (baseValue b ds))
+                (Nat.pow b (List.length ds))
+                b
+                (ih (@And.right (Nat.lt d b) (AllLt b ds) hcons))))))
+    l hall
+
+end L1Cover

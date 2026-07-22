@@ -1,0 +1,39 @@
+-- TY safety soundness meta-theorem, authored in CLEAN's surface language and
+-- checked by CLEAN's CIC kernel (so it enters the clean kernel's trust base).
+--
+-- THE inductive-invariant safety principle: the meaning of every TY safety verdict.
+-- `Reach State Init Next` is the reachability predicate of a transition system —
+-- the set of states reachable from an `Init` state by the `Next` relation, defined
+-- inductively:
+--     base : every initial state is reachable;
+--     step : a `Next`-successor of a reachable state is reachable.
+--
+-- `reach_least` proves `Reach State Init Next` is the LEAST `Next`-closed predicate
+-- containing `Init`: for ANY predicate `R : State -> Prop` that
+--   (hinit) holds on every initial state, and
+--   (hstep) is preserved by every `Next` step,
+-- every reachable state satisfies `R`. `R` is exactly an INDUCTIVE INVARIANT, so this
+-- is: any reachable state satisfies any inductive invariant — the soundness of TY's
+-- safety checking (a safety verdict discharges hinit + hstep for R = the safety
+-- property, and this theorem concludes the property on all reachable states).
+--
+-- The proof is `@Reach.rec` — induction on the reachability derivation. The `step`
+-- minor receives the induction hypothesis `ih : R s` for the reachable predecessor
+-- and closes the goal `R t` with `hstep`. Fully general: quantified over an arbitrary
+-- state space `State : Type`, arbitrary `Init`, arbitrary `Next`, and arbitrary `R`.
+
+inductive Reach (State : Type) (Init : State -> Prop) (Next : State -> State -> Prop) : State -> Prop where
+  | base : (s : State) -> Init s -> Reach State Init Next s
+  | step : (s : State) -> (t : State) -> Reach State Init Next s -> Next s t -> Reach State Init Next t
+
+theorem reach_least
+    (State : Type) (Init : State -> Prop) (Next : State -> State -> Prop)
+    (R : State -> Prop)
+    (hinit : (s : State) -> Init s -> R s)
+    (hstep : (s : State) -> (t : State) -> R s -> Next s t -> R t)
+    (s : State) (h : Reach State Init Next s) : R s :=
+  @Reach.rec State Init Next
+    (fun s h => R s)
+    (fun s hi => hinit s hi)
+    (fun s t hr hn ih => hstep s t ih hn)
+    s h

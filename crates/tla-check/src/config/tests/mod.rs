@@ -1,0 +1,17 @@
+// Copyright 2026 Andrew Yates
+// Author: Andrew Yates <andrewyates.name@gmail.com>
+// Licensed under the Apache License, Version 2.0
+
+//! Config tests — split from monolithic tests.rs (1,112 lines)
+//!
+//! Split into 6 themed files — Part of #2779
+
+use super::types::ConfigValidationIssue;
+use super::*;
+
+mod basics;
+mod directive_boundaries;
+mod directives;
+mod init_mode;
+mod validation;
+mod view_terminal;

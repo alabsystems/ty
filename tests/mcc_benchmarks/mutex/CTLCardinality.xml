@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<!-- CTLCardinality properties for Mutex model.
+     Property 00: AG(tokens-count(idle0) <= 1) - TRUE
+     Property 01: EF(tokens-count(cs0) >= 1) - TRUE
+-->
+<property-set xmlns="http://mcc.lip6.fr/">
+  <property>
+    <id>Mutex-CTLCardinality-00</id>
+    <formula>
+      <all-paths>
+        <globally>
+          <integer-le>
+            <tokens-count><place>idle0</place></tokens-count>
+            <integer-constant>1</integer-constant>
+          </integer-le>
+        </globally>
+      </all-paths>
+    </formula>
+  </property>
+  <property>
+    <id>Mutex-CTLCardinality-01</id>
+    <formula>
+      <exists-path>
+        <finally>
+          <integer-le>
+            <integer-constant>1</integer-constant>
+            <tokens-count><place>cs0</place></tokens-count>
+          </integer-le>
+        </finally>
+      </exists-path>
+    </formula>
+  </property>
+</property-set>

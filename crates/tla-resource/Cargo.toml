@@ -1,0 +1,15 @@
+[package]
+name = "tla-resource"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Single-source, resource-aware memory guarding: platform footprint/free probes, a derived three-valued MemoryBudget, and a time-gated adaptive MemoryProbe shared by every ty engine"
+readme.workspace = true
+
+[dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

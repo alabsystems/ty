@@ -1,0 +1,29 @@
+-- K2_ite_disjunctive : IF-update disjunctive-expansion soundness (the AST-direct eqIte arm).
+--
+-- For c : Bool and a b v : Nat, an IF-update `v = (if c then a else b)` is EQUIVALENT (↔) to the
+-- disjunction `(c = true ∧ v = a) ∨ (c = false ∧ v = b)`.
+--
+-- Proof strategy (Bool.rec case-split on c, exactly as the lane specifies): in each branch the
+-- sugar `if c then a else b` reduces definitionally — `if true … = a`, `if false … = b` — by iota
+-- reduction through instDecidableEqBool / Bool.decEq / Decidable.casesOn. The two directions are
+-- proved as the lemmas K2_ite_disjunctive_mp / _mpr and then combined into the full ↔ by Iff.intro.
+--   * forward (_mp): pick the matching disjunct; the residual value equation `v = a` / `v = b` is
+--     discharged against `h : v = (if …)` via the kernel's defeq check (the `?_` hole + `exact h`).
+--   * backward (_mpr): case-split the disjunction; return the value equation, and refute the
+--     impossible `false = true` / `true = false` disjunct with Bool.noConfusion.
+
+theorem K2_ite_disjunctive_mp (c : Bool) (a b v : Nat) :
+    (v = (if c then a else b)) → ((c = true ∧ v = a) ∨ (c = false ∧ v = b)) := by
+  cases c with
+  | false => intro h; refine Or.inr (And.intro (@Eq.refl Bool Bool.false) ?_); exact h
+  | true => intro h; refine Or.inl (And.intro (@Eq.refl Bool Bool.true) ?_); exact h
+
+theorem K2_ite_disjunctive_mpr (c : Bool) (a b v : Nat) :
+    ((c = true ∧ v = a) ∨ (c = false ∧ v = b)) → (v = (if c then a else b)) := by
+  cases c with
+  | false => intro h; cases h with | inl hl => exact Bool.noConfusion (And.left hl) | inr hr => exact And.right hr
+  | true => intro h; cases h with | inl hl => exact And.right hl | inr hr => exact Bool.noConfusion (And.left hr)
+
+theorem K2_ite_disjunctive (c : Bool) (a b v : Nat) :
+    (v = (if c then a else b)) ↔ ((c = true ∧ v = a) ∨ (c = false ∧ v = b)) :=
+  Iff.intro (K2_ite_disjunctive_mp c a b v) (K2_ite_disjunctive_mpr c a b v)

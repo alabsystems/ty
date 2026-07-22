@@ -1,0 +1,20 @@
+// Copyright 2026 Andrew Yates
+// Author: Andrew Yates <andrewyates.name@gmail.com>
+// Licensed under the Apache License, Version 2.0
+
+//! TCP utility types.
+
+pub(crate) mod listener;
+
+cfg_not_wasip1! {
+    pub(crate) mod socket;
+}
+
+mod split;
+pub use split::{ReadHalf, WriteHalf};
+
+mod split_owned;
+pub use split_owned::{OwnedReadHalf, OwnedWriteHalf, ReuniteError};
+
+pub(crate) mod stream;
+pub(crate) use stream::TcpStream;

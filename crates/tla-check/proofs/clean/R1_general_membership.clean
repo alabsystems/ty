@@ -1,0 +1,157 @@
+-- R1_general_membership: finite-set membership desugar soundness, GENERAL length.
+--
+-- TY lowers `x ∈ {a0, a1, …, a_{n-1}}` (a finite literal set of Nats) to a Boolean
+-- Or-fold of pointwise equality tests: `List.any [a0,…,a_{n-1}] (fun v => Nat.beq x v)`.
+-- Round 1 (R1_mem_or_fold) proved this desugar SOUND only at arity 2. This file closes
+-- that wall: it proves the desugar sound for an ARBITRARY-LENGTH literal list — the full
+-- finite-set-membership desugar soundness.
+--
+-- `memberOf x l := List.any l (fun v => Nat.beq x v)` is EXACTLY TY's desugar target.
+-- In clean's prelude `List.any` is
+--     List.any l p  =  @List.rec α (fun _ => Bool) Bool.false (fun hd _ ih => Bool.or (p hd) ih) l
+-- so `memberOf` reduces (definitionally, via List.rec ι) as
+--     memberOf x []        ≡ Bool.false
+--     memberOf x (a :: t)  ≡ Bool.or (Nat.beq x a) (memberOf x t)
+-- (the two `memberOf_nil` / `memberOf_cons` `rfl` sanity theorems below witness this).
+--
+-- `listExistsBeq x l` is the intended MEANING of the fold: the finite disjunction
+-- "some element of `l` passes the `Nat.beq x ·` test", built by the same List.rec:
+--     listExistsBeq x []        =  False
+--     listExistsBeq x (a :: t)  =  (Nat.beq x a = true) ∨ listExistsBeq x t.
+--
+-- MAIN THEOREM (R1_general_membership): for every x and every list l,
+--     memberOf x l = true   ↔   listExistsBeq x l.
+-- FULLY GENERAL in the list length (and in x). Proof: List induction (`@List.rec`) with
+-- the round-1 Boolean `orb` lemmas closing each cons step. This lifts R1 from arity-2 to
+-- the general finite-set membership desugar — its round-1 wall is closed.
+
+-- ── TY's desugar target ────────────────────────────────────────────────────────────
+def memberOf (x : Nat) (l : List Nat) : Bool :=
+  List.any l (fun v => Nat.beq x v)
+
+-- ── the intended meaning: recursive Or-fold of the pointwise beq tests ─────────────
+--   listExistsBeq x []       = False
+--   listExistsBeq x (a :: t) = (Nat.beq x a = true) ∨ listExistsBeq x t
+def listExistsBeq (x : Nat) (l : List Nat) : Prop :=
+  @List.rec Nat (fun _ => Prop) False
+    (fun (a : Nat) (_t : List Nat) (ih : Prop) => Or (@Eq Bool (Nat.beq x a) Bool.true) ih) l
+
+-- ── reduction sanity (all `rfl`): memberOf really is the beq Or-fold ───────────────
+theorem memberOf_nil (x : Nat) :
+    @Eq Bool (memberOf x List.nil) Bool.false :=
+  @Eq.refl Bool Bool.false
+theorem memberOf_cons (x hd : Nat) (tl : List Nat) :
+    @Eq Bool (memberOf x (@List.cons Nat hd tl)) (Bool.or (Nat.beq x hd) (memberOf x tl)) :=
+  @Eq.refl Bool (Bool.or (Nat.beq x hd) (memberOf x tl))
+
+-- ============================================================================
+-- Round-1 Boolean `orb` lemmas, in the plain arity-2 form `Bool.or p q`.
+-- In clean's prelude `Bool.or a b = Bool.rec (fun _ => Bool) b Bool.true a`, i.e.
+-- `Bool.or` recurses on its FIRST argument:
+--     Bool.or Bool.true  q ≡ Bool.true      Bool.or Bool.false q ≡ q.
+-- ============================================================================
+
+-- Forward: if the Or is `true`, one of the two operands is `true`.
+theorem orb_mp (p q : Bool) :
+    (Bool.or p q = Bool.true) → (p = Bool.true ∨ q = Bool.true) := by
+  cases p
+  case true =>
+    intro h
+    exact Or.inl rfl
+  case false =>
+    intro h
+    exact Or.inr h
+
+-- Backward: if one operand is `true`, the Or is `true`.
+theorem orb_mpr (p q : Bool) :
+    (p = Bool.true ∨ q = Bool.true) → (Bool.or p q = Bool.true) := by
+  cases p
+  case true =>
+    intro h
+    rfl
+  case false =>
+    cases q
+    case true =>
+      intro h
+      rfl
+    case false =>
+      intro h
+      cases h with
+      | inl hx => exact hx
+      | inr hx => exact hx
+
+-- The plain 2-argument orb iff: `Bool.or p q = true ↔ p = true ∨ q = true`.
+theorem orb_true_iff (p q : Bool) :
+    (Bool.or p q = Bool.true) ↔ (p = Bool.true ∨ q = Bool.true) :=
+  Iff.intro (orb_mp p q) (orb_mpr p q)
+
+-- ============================================================================
+-- Small Prop plumbing (proved from first principles over the prelude).
+-- ============================================================================
+
+-- `Bool.false = Bool.true` is absurd (kills the nil-case forward direction).
+-- Same discriminator trick as S1's `zero_ne_succ`: transport `True` along the
+-- equation into `False` through a `Bool.rec` that is `True` at false, `False` at true.
+theorem false_ne_true (h : @Eq Bool Bool.false Bool.true) : False :=
+  @Eq.subst Bool
+    (fun b => @Bool.rec (fun _ => Prop) True False b)
+    Bool.false Bool.true h True.intro
+
+-- Transitivity of `↔`.
+theorem iff_trans (a b c : Prop) (h1 : a ↔ b) (h2 : b ↔ c) : a ↔ c :=
+  Iff.intro
+    (fun ha => @Iff.mp b c h2 (@Iff.mp a b h1 ha))
+    (fun hc => @Iff.mpr a b h1 (@Iff.mpr b c h2 hc))
+
+-- Congruence of `Or` in its RIGHT argument: `q1 ↔ q2 → (p ∨ q1) ↔ (p ∨ q2)`.
+theorem or_congr_right (p q1 q2 : Prop) (h : q1 ↔ q2) :
+    (Or p q1) ↔ (Or p q2) :=
+  Iff.intro
+    (fun hor =>
+      @Or.rec p q1 (fun _ => Or p q2)
+        (fun hp => @Or.inl p q2 hp)
+        (fun hq => @Or.inr p q2 (@Iff.mp q1 q2 h hq))
+        hor)
+    (fun hor =>
+      @Or.rec p q2 (fun _ => Or p q1)
+        (fun hp => @Or.inl p q1 hp)
+        (fun hq => @Or.inr p q1 (@Iff.mpr q1 q2 h hq))
+        hor)
+
+-- ── nil base case: `memberOf x [] = true ↔ listExistsBeq x []`, i.e. `false = true ↔ False`.
+theorem mem_nil_iff (x : Nat) :
+    (@Eq Bool (memberOf x List.nil) Bool.true) ↔ (listExistsBeq x List.nil) :=
+  Iff.intro
+    (fun h => false_ne_true h)
+    (fun h => @False.elim (@Eq Bool (memberOf x List.nil) Bool.true) h)
+
+-- ============================================================================
+-- MAIN THEOREM (full general R1): finite-set membership desugar soundness for
+-- ARBITRARY-LENGTH literal lists.  Induction on `l` via `@List.rec`:
+--   nil : `mem_nil_iff`.
+--   cons hd tl (ih : memberOf x tl = true ↔ listExistsBeq x tl):
+--     memberOf x (hd::tl) = true
+--       ≡ Bool.or (Nat.beq x hd) (memberOf x tl) = true          (memberOf reduction)
+--       ↔ (Nat.beq x hd = true) ∨ (memberOf x tl = true)         (orb_true_iff)
+--       ↔ (Nat.beq x hd = true) ∨ listExistsBeq x tl             (or_congr_right + ih)
+--       ≡ listExistsBeq x (hd::tl).                              (listExistsBeq reduction)
+-- The `≡` gaps are closed by the kernel's definitional equality (delta/beta/iota).
+-- ============================================================================
+theorem R1_general_membership (x : Nat) (l : List Nat) :
+    (@Eq Bool (memberOf x l) Bool.true) ↔ (listExistsBeq x l) :=
+  @List.rec Nat
+    (fun ll => (@Eq Bool (memberOf x ll) Bool.true) ↔ (listExistsBeq x ll))
+    (mem_nil_iff x)
+    (fun (hd : Nat) (tl : List Nat)
+         (ih : (@Eq Bool (memberOf x tl) Bool.true) ↔ (listExistsBeq x tl)) =>
+      iff_trans
+        (@Eq Bool (memberOf x (@List.cons Nat hd tl)) Bool.true)
+        (Or (@Eq Bool (Nat.beq x hd) Bool.true) (@Eq Bool (memberOf x tl) Bool.true))
+        (listExistsBeq x (@List.cons Nat hd tl))
+        (orb_true_iff (Nat.beq x hd) (memberOf x tl))
+        (or_congr_right
+          (@Eq Bool (Nat.beq x hd) Bool.true)
+          (@Eq Bool (memberOf x tl) Bool.true)
+          (listExistsBeq x tl)
+          ih))
+    l

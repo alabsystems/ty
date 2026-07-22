@@ -1,0 +1,18 @@
+{
+  "model": "AirplaneLD-PT-0010",
+  "ReachabilityCardinality": {
+    "AirplaneLD-PT-0010-ReachabilityCardinality-2025-00": "FALSE",
+    "AirplaneLD-PT-0010-ReachabilityCardinality-2025-01": "TRUE",
+    "AirplaneLD-PT-0010-ReachabilityCardinality-2025-02": "TRUE",
+    "AirplaneLD-PT-0010-ReachabilityCardinality-2025-03": "TRUE",
+    "AirplaneLD-PT-0010-ReachabilityCardinality-2025-04": "FALSE",
+    "AirplaneLD-PT-0010-ReachabilityCardinality-2025-05": "TRUE",
+    "AirplaneLD-PT-0010-ReachabilityCardinality-2025-06": "FALSE",
+    "AirplaneLD-PT-0010-ReachabilityCardinality-2025-08": "FALSE",
+    "AirplaneLD-PT-0010-ReachabilityCardinality-2025-09": "TRUE",
+    "AirplaneLD-PT-0010-ReachabilityCardinality-2025-10": "TRUE",
+    "AirplaneLD-PT-0010-ReachabilityCardinality-2025-12": "TRUE",
+    "AirplaneLD-PT-0010-ReachabilityCardinality-2025-13": "FALSE",
+    "AirplaneLD-PT-0010-ReachabilityCardinality-2025-14": "FALSE"
+  }
+}

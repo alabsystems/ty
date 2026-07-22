@@ -1,0 +1,23 @@
+[package]
+name = "tla-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "TY GPU engine: CUDA driver-API/nvrtc runtime + device-resident BFS for flat-primary state spaces"
+readme.workspace = true
+
+[dependencies]
+# Runtime dynamic loading of libcuda / libnvrtc — no build-time CUDA dependency.
+# On machines without CUDA the engine probes as Unavailable and TY falls back
+# to the CPU path (fail-closed, verdict-neutral).
+libloading = "0.8"
+thiserror.workspace = true
+tla-resource = { path = "../tla-resource" }
+# The trust-ir -> CUDA C emitter consumes the same lowered per-action IR the
+# CPU JIT compiles, so the GPU tier inherits the native tier's semantics.
+trust-ir.workspace = true
+
+[lints]
+workspace = true

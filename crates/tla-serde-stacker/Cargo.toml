@@ -1,0 +1,48 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Licensed under the Apache License, Version 2.0
+
+[package]
+# Keep the upstream crate name so `[patch.crates-io]` can redirect the dep
+# graph through this fork without a `package =` rename at every consumer
+# site (the tla-serde-json pattern). The ty workspace family name is
+# `tla-serde-stacker`; the directory carries that identity while the package
+# name stays `serde_stacker`.
+name = "serde_stacker"
+version = "0.1.14"
+authors = [
+    "Andrew Yates <andrewyates.name@gmail.com>",
+    "David Tolnay <dtolnay@gmail.com>",
+]
+edition = "2021"
+rust-version = "1.67"
+description = "TY fork of serde_stacker 0.1.14 (MIT OR Apache-2.0): serde adapter that avoids stack overflow by dynamically growing the stack. Fork fixes the Serializer side to actually grow on seq/tuple/map/struct element recursion (upstream only grows on the newtype/some paths, so serializing a deeply nested tuple-variant tree — e.g. a `clean_kernel::Expr` App spine — overflowed), and links the in-workspace `tla-stack` stacker fork."
+documentation = "https://docs.rs/serde_stacker"
+keywords = ["serde", "serialization"]
+categories = ["encoding"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/alabsystems/ty"
+
+# Fork of dtolnay/serde-stacker at v0.1.14.
+# Upstream: https://github.com/dtolnay/serde-stacker
+# Original license: MIT OR Apache-2.0 (preserved in LICENSE-APACHE + LICENSE-MIT).
+#
+# DELTA from upstream (the reason this fork exists — see
+# `cleancic::expr_to_bytes`'s stack discipline):
+#   * `ser.rs`: the per-element/per-field `Serialize` wrapper now calls
+#     `stacker::maybe_grow` exactly like the deserializer's `Visitor` methods
+#     do. Upstream only grows through `SerializeSized` (serialize_some /
+#     newtype paths), so recursion through seq/tuple/map/struct elements —
+#     the shape of every externally-tagged tuple-variant tree — never grew
+#     and overflowed at depth (observed on a ~10K-deep `ExprKind::App` chain).
+#   * `stacker` resolves to the in-workspace `tla-stack` fork (same 0.1.24
+#     code, already the workspace-wide stacker) rather than a second registry
+#     instance.
+
+[lib]
+name = "serde_stacker"
+path = "src/lib.rs"
+
+[dependencies]
+serde_core = { version = "1.0.220", default-features = false, features = ["alloc"] }
+stacker = { path = "../tla-stack", package = "tla-stack" }

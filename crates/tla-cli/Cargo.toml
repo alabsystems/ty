@@ -1,0 +1,122 @@
+[package]
+name = "tla-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "TY command line interface"
+readme.workspace = true
+
+[features]
+default = ["mimalloc", "ay", "clean-cic"]  # Full certifying-verification surface ON by default: `ay` links the SMT/BMC/PDR + AIGER/BTOR2 hardware frontends and SMT Init enumeration; `clean-cic` links the Clean CIC kernel so `ty certify`/`refine`/`tcb-census` reach their LIVE (kernel-checked) verdict path instead of bailing. trust-cg native remains the default execution engine (non-optional, via tla-check); interpreter is the runtime fallback. The old bytecode JIT (TY_JIT) stays off by default (#4035 icache regression). Lean builds: `--no-default-features --features mimalloc`.
+ay = ["tla-check/ay", "dep:tla-btor2", "dep:tla-aiger", "dep:tla-zenon", "dep:tla-cert"]
+# Kernel-checkable `Certified` tier (Clean CIC kernel in the loop) — forwards to tla-check's
+# `clean-cic`. Enables the LIVE explicit-state fixpoint Certified verdict in `ty certify`.
+clean-cic = ["tla-check/clean-cic"]
+memory-stats = ["tla-check/memory-stats"]
+dhat-heap = ["dep:dhat"]
+mimalloc = ["dep:mimalloc"]
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+clap_complete = { workspace = true }
+chrono = { version = "0.4" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+regex = "1"
+toml = { workspace = true }
+libc = "0.2"
+sha2 = "0.10"
+tokio = { workspace = true }
+tla-core = { path = "../tla-core" }
+tla-tir = { path = "../tla-tir" }
+tla-check = { path = "../tla-check" }
+# GPU engine: CUDA driver-API/nvrtc runtime + trust-ir -> CUDA C emitter for
+# `ty check --gpu`. Loads libcuda/libnvrtc at runtime; no build-time CUDA dep.
+tla-gpu = { path = "../tla-gpu" }
+# Unified backend / engine-selection layer. Stage 1 routes `ty check`'s --backend
+# resolution through it (byte-identical). Design: docs/ty-unified-backend-architecture-2026-06-05.md
+tla-backend = { path = "../tla-backend" }
+tla-value = { path = "../tla-value" }
+tla-codegen = { path = "../tla-codegen" }
+tla-lsp = { path = "../tla-lsp" }
+tla-petri = { path = "../tla-petri" }
+tla-concurrent = { path = "../tla-concurrent" }
+rustc-hash = { workspace = true }
+tla-aiger = { path = "../tla-aiger", optional = true }
+tla-btor2 = { path = "../tla-btor2", optional = true }
+# First-order tableau prover + independent certificate checker — the additive,
+# fail-closed second-provenance leg for `ty prove` (see src/zenon_leg.rs).
+tla-zenon = { path = "../tla-zenon", optional = true }
+tla-cert = { path = "../tla-cert", optional = true }
+# trust-codegen on-disk compilation cache (design doc §7). The `ty cache` subcommand
+# wraps `tla_trust_cg::artifact_cache` so users can inspect and clear cached
+# artifacts at `~/.cache/ty/compiled/`.
+tla-trust-cg = { path = "../tla-trust-cg" }
+notify = { workspace = true }
+tempfile = { workspace = true }
+dhat = { version = "0.3", optional = true }
+mimalloc = { version = "0.1", default-features = false, optional = true }
+
+[dev-dependencies]
+ntest = "0.9"
+num-bigint = { workspace = true }
+
+[[bin]]
+name = "tla"
+path = "src/bin/tla.rs"
+
+[[bin]]
+name = "ty"
+path = "src/main.rs"
+
+# Rust port of `scripts/dhat_summary.py`. Summarizes a dhat heap profile
+# (`dhat-heap.json`) by allocation family and hot stack for reports and
+# issue comments.
+[[bin]]
+name = "ty-dhat-summary"
+path = "src/bin/ty-dhat-summary.rs"
+
+# Rust port of `scripts/gh_issue_list_rest.py`. REST-based `gh issue list`
+# fallback for GraphQL quota exhaustion, with a small subset of search
+# syntax (repo:, label:, state:, is:) and title substring filtering.
+[[bin]]
+name = "ty-gh-issue-list-rest"
+path = "src/bin/ty-gh-issue-list-rest.rs"
+
+# Rust port of `scripts/validate_coffecan_codegen_poc.py`. Validates the
+# CoffeeCan codegen/AOT path against the TY interpreter and TLC by
+# staging a temporary wrapper module, generating Rust state-machine code,
+# and comparing distinct-state counts to the closed-form expected total.
+[[bin]]
+name = "ty-validate-coffecan-codegen-poc"
+path = "src/bin/ty-validate-coffecan-codegen-poc.rs"
+
+# Rust port of `scripts/profile_spec.py` / `scripts/profile_spec_workflow.py`
+# / `scripts/profile_sample_capture.py` / `scripts/perf_harness.py`. Builds
+# a deterministic ty binary into a per-role target dir, runs `ty check`
+# against one spec from the baseline catalog, optionally attaches macOS
+# `sample` for a bounded window, and writes a structured `summary.json`
+# alongside captured stdout/stderr.
+[[bin]]
+name = "ty-profile-spec"
+path = "src/bin/ty-profile-spec.rs"
+
+# Rust port of `crates/tla-zerocopy/ci/validate_auto_approvers.py`. Validates
+# PR changes against the tla-zerocopy auto-approver rules. Keeps the
+# zerocopy fork's pre-push hook Python-free.
+[[bin]]
+name = "ty-zerocopy-validate-auto-approvers"
+path = "src/bin/ty-zerocopy-validate-auto-approvers.rs"
+
+# Rust port of `crates/tla-walkdir/compare/walk.py`. Mirrors the trivial
+# os.walk benchmark loop so the tla-walkdir README's comparison example
+# stays free of Python.
+[[bin]]
+name = "ty-walk"
+path = "src/bin/ty-walk.rs"
+
+[lints]
+workspace = true

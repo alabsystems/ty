@@ -1,0 +1,37 @@
+[package]
+name = "tla-ir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "TY bytecode to trust-ir lowering backend"
+readme.workspace = true
+
+[dependencies]
+trust-ir = { workspace = true, features = ["binary", "fmt", "serde"] }
+trust-ir-build.workspace = true
+tla-tir = { path = "../tla-tir" }
+# tla-jit-abi — leaf crate with the stable JIT/AOT ABI types shared by
+# tla-ir, tla-check, and tla-trust-cg. Part of #4265.
+tla-jit-abi.workspace = true
+tla-value = { path = "../tla-value" }
+# tla-core — needed for `intern_name` so that `LoadConst` of a string constant
+# pool entry can be lowered to the same `NameId` that trust-codegen and serialized
+# state buffer use for strings. Part of #4280.
+tla-core = { path = "../tla-core" }
+# num-traits — needed for `BigInt::to_i64` so `LoadConst` of `Value::Interval`
+# can statically materialize small integer intervals into a trust-ir aggregate
+# (Gap A of #4280).
+num-traits = { workspace = true }
+
+# Error handling
+thiserror.workspace = true
+
+[dev-dependencies]
+# num-bigint — test construction of `Value::Interval` in trust-ir lowering tests
+# (Gap A of #4280).
+num-bigint = { workspace = true }
+
+[lints]
+workspace = true

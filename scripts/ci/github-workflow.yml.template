@@ -1,0 +1,60 @@
+# CI workflow TEMPLATE for the ty (TLA+ / Trust-TY) toolchain.
+#
+# This file is a TEMPLATE, not a live workflow: pushing files under
+# `.github/workflows/` requires a token with `workflow` scope, which the
+# project's current PAT lacks. To activate CI, a maintainer with workflow
+# scope copies this to `.github/workflows/ci.yml`:
+#
+#     mkdir -p .github/workflows
+#     cp scripts/ci/github-workflow.yml.template .github/workflows/ci.yml
+#     git add .github/workflows/ci.yml && git commit && git push
+#
+# The workflow itself is intentionally thin: all the gate logic lives in the
+# committed, locally-runnable `scripts/ci/run_gates.sh`, so CI and a developer's
+# pre-push check run the EXACT same gates (no drift between "what CI does" and
+# "what I can run"). Keeping the trigger trivial is deliberate.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref to save minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gates:
+    name: build + gates + tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # Match CLAUDE.md's memory-tight posture so CI mirrors local runs.
+      CARGO_BUILD_JOBS: "2"
+      RUST_TEST_THREADS: "2"
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install stable --profile minimal
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # Single source of truth: the same aggregate gate runner a developer runs.
+      # `--full` also runs the test suite (tla-petri single-process to avoid the
+      # concurrent-explorer OOM; the rest under the pinned thread budget).
+      - name: Run gates
+        run: scripts/ci/run_gates.sh --full

@@ -1,0 +1,96 @@
+-- M1_setmask_soundness : SETMASK (bitmask) encoder soundness — TY encodes a
+-- finite set of small naturals as a single Nat bitmask (bit i set iff i is in
+-- the set). This file establishes that encoder's soundness IN CLEAN's kernel,
+-- by MODELLING the set as its membership predicate `mem m i := Nat.testBit m i`
+-- and composing clean's kernel-checked, AXIOM-FREE bitwise theory.
+--
+-- HONEST PROVENANCE: the hard bit-vector facts — `Nat.testBit_or`,
+-- `Nat.testBit_and`, and the extensionality `Nat.eq_of_testBit_eq`
+-- ((forall i, testBit m i = testBit n i) -> m = n) — are proved in CLEAN's
+-- prelude (strong recursion over `div2`), NOT here. This file's contribution is
+-- the SetMask-encoder soundness statements: modelling membership as `testBit`
+-- and showing the encoder is an injective, empty-preserving, union/intersection
+-- homomorphism from sets to bitmasks — the soundness TY's SetMask verdicts rely
+-- on. `union_comm` / `inter_comm` are genuine COMPOSED proofs (extensionality +
+-- the homomorphism lemma + Bool commutativity), not lemma re-exports. Everything
+-- is foundational-axioms-only (`Nat.shiftRight` — the one admitted bitwise axiom
+-- in clean — is deliberately NOT used).
+--
+-- TY soundness reading: a set S over {0,1,…} is encoded as the mask `m` with
+-- `mem m i = (i in S)`. Then `mask_injective` is "distinct sets pack to distinct
+-- masks" (the never-a-false-safe property for set-valued state), and `mem_union`
+-- / `mem_inter` are "∪ is lor, ∩ is land" (the set-op homomorphism the SetMask
+-- transition encoding uses), with `mem_empty` = "∅ is mask 0".
+
+namespace SetMaskSound
+
+-- A bitmask `m : Nat` represents the set { i | testBit m i = true }; membership
+-- of element `i` is exactly bit `i` of the mask.
+def mem (m i : Nat) : Bool := Nat.testBit m i
+
+-- EMPTY: the mask `0` encodes the empty set (no element is a member).
+theorem mem_empty (i : Nat) : @Eq Bool (mem Nat.zero i) Bool.false :=
+  Nat.testBit_zero_eq_false i
+
+-- UNION = lor: `i` is a member of `a ∪ b` iff it is a member of `a` OR of `b`,
+-- at every element. (The set-union homomorphism: encode(S∪T) = lor (enc S)(enc T).)
+theorem mem_union (a b i : Nat) :
+    @Eq Bool (mem (Nat.lor a b) i) (Bool.or (mem a i) (mem b i)) :=
+  Nat.testBit_or a b i
+
+-- INTERSECTION = land: member of `a ∩ b` iff member of `a` AND of `b`.
+theorem mem_inter (a b i : Nat) :
+    @Eq Bool (mem (Nat.land a b) i) (Bool.and (mem a i) (mem b i)) :=
+  Nat.testBit_and a b i
+
+-- INJECTIVITY (never a false safe for set-valued state): two masks with the same
+-- membership at EVERY element are the same mask — so distinct sets encode to
+-- distinct masks. This is clean's bit-extensionality applied to the mem model.
+theorem mask_injective (a b : Nat)
+    (h : (i : Nat) -> @Eq Bool (mem a i) (mem b i)) : @Eq Nat a b :=
+  @Nat.eq_of_testBit_eq a b h
+
+-- ── COMPOSED soundness (genuine proofs, not lemma re-exports) ──────────────────
+
+-- Union is COMMUTATIVE as a mask operation: `lor a b = lor b a`. Proved by
+-- bit-extensionality: at each bit, `testBit (lor a b) i = or (ta) (tb)` (union
+-- homomorphism), `= or (tb) (ta)` (Bool.or_comm), `= testBit (lor b a) i` (union
+-- homomorphism, reversed). So the encoder respects set-union commutativity.
+theorem union_comm (a b : Nat) : @Eq Nat (Nat.lor a b) (Nat.lor b a) :=
+  @Nat.eq_of_testBit_eq (Nat.lor a b) (Nat.lor b a)
+    (fun (i : Nat) =>
+      @Eq.trans Bool
+        (Nat.testBit (Nat.lor a b) i)
+        (Bool.or (Nat.testBit a i) (Nat.testBit b i))
+        (Nat.testBit (Nat.lor b a) i)
+        (Nat.testBit_or a b i)
+        (@Eq.trans Bool
+          (Bool.or (Nat.testBit a i) (Nat.testBit b i))
+          (Bool.or (Nat.testBit b i) (Nat.testBit a i))
+          (Nat.testBit (Nat.lor b a) i)
+          (Bool.or_comm (Nat.testBit a i) (Nat.testBit b i))
+          (@Eq.symm Bool
+            (Nat.testBit (Nat.lor b a) i)
+            (Bool.or (Nat.testBit b i) (Nat.testBit a i))
+            (Nat.testBit_or b a i))))
+
+-- Intersection is COMMUTATIVE as a mask operation: `land a b = land b a`.
+theorem inter_comm (a b : Nat) : @Eq Nat (Nat.land a b) (Nat.land b a) :=
+  @Nat.eq_of_testBit_eq (Nat.land a b) (Nat.land b a)
+    (fun (i : Nat) =>
+      @Eq.trans Bool
+        (Nat.testBit (Nat.land a b) i)
+        (Bool.and (Nat.testBit a i) (Nat.testBit b i))
+        (Nat.testBit (Nat.land b a) i)
+        (Nat.testBit_and a b i)
+        (@Eq.trans Bool
+          (Bool.and (Nat.testBit a i) (Nat.testBit b i))
+          (Bool.and (Nat.testBit b i) (Nat.testBit a i))
+          (Nat.testBit (Nat.land b a) i)
+          (Bool.and_comm (Nat.testBit a i) (Nat.testBit b i))
+          (@Eq.symm Bool
+            (Nat.testBit (Nat.land b a) i)
+            (Bool.and (Nat.testBit b i) (Nat.testBit a i))
+            (Nat.testBit_and b a i))))
+
+end SetMaskSound

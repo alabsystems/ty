@@ -1,0 +1,70 @@
+# Cargo configuration for TY builds
+
+[target.x86_64-unknown-linux-gnu]
+# Use LLD for faster linking on Linux x86_64
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+[target.aarch64-unknown-linux-gnu]
+# Use LLD for faster linking on Linux aarch64.
+# `-C target-cpu=native` tunes codegen for the local CPU (this is a build==run
+# dev/benchmark host). Its key effect for TY: INLINE LSE atomics (`ldadd`/`cas`)
+# instead of the default aarch64 outline-atomics runtime calls
+# (`__aarch64_ldadd8_*`). Arc refcount churn on set/function-heavy specs spends a
+# measurable fraction of runtime in those calls; inlining removes the call
+# overhead (~3-7% on atomic-heavy specs; using the CPU's real atomics, which
+# TLC's JVM JIT already does — a fairness parity, not a novel feature). For
+# DISTRIBUTION to unknown aarch64 hosts, pin a portable baseline instead, e.g.
+# `-C target-feature=+lse` (ARMv8.1+) rather than `native`.
+rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "target-cpu=native"]
+
+[target.aarch64-apple-darwin]
+# Add Homebrew library path for Z3 linking on Apple Silicon
+rustflags = ["-C", "link-arg=-L/opt/homebrew/lib"]
+
+[target.x86_64-apple-darwin]
+# Add Homebrew library path for Z3 linking on Intel Mac
+rustflags = ["-C", "link-arg=-L/usr/local/lib"]
+
+[build]
+# Cap parallel rustc instances per cargo build. Default (num_cpus) spawns 10+
+# concurrent compiler processes, each using 1-3GB for large crates like
+# tla-check (242k LOC). With ThinLTO + codegen-units=4, each rustc process
+# uses ~1.5GB peak (down from 5GB with full LTO). 4 jobs × 1.5GB = ~6GB
+# during compilation, safe even with 2-3 concurrent builds on 128GB.
+# Previous: jobs=8 × 5GB peak = 40GB per build → OOM with concurrent builds.
+jobs = 4
+
+# ============================================================================
+# Environment Variables
+# ============================================================================
+# Test Configuration - CRITICAL for concurrent builds/test runs
+# When multiple `cargo test` invocations run simultaneously, unlimited
+# parallelism can exhaust system memory (each test can spawn heavy processes).
+#
+# Platform-specific Z3 paths:
+#   macOS (Homebrew Apple Silicon): /opt/homebrew/include/z3.h, /opt/homebrew/lib
+#   macOS (Homebrew Intel): /usr/local/include/z3.h, /usr/local/lib
+#   Linux: /usr/include/z3.h, /usr/lib
+[env]
+# Disable incremental compilation to prevent rustc file-lock deadlocks when
+# multiple build slots share the same target/ directory (#1417).
+# Incremental compilation uses filesystem locks in target/debug/incremental/
+# that cause concurrent rustc processes to deadlock at 0% CPU indefinitely.
+# Under frequent concurrent builds, cache invalidation is frequent enough that
+# incremental provides minimal benefit anyway.
+CARGO_INCREMENTAL = "0"
+# Limit test parallelism to 4 threads (down from default of num_cpus)
+# This prevents memory exhaustion when multiple test runs execute concurrently
+RUST_TEST_THREADS = "4"
+# Limit proptest cases - the property_tests.rs file has ~60k test executions
+# at full case counts. Reduce to 50 for regular runs. Use full counts via:
+#   PROPTEST_CASES=1000 cargo test
+PROPTEST_CASES = "50"
+# Larger stack for test threads. The `tla` / `ty` binaries have a clap CLI
+# parser with hundreds of subcommands; `Cli::try_parse_from` builds a deeply
+# nested type that exhausts the default 2 MiB worker-thread stack. 16 MiB
+# safely accommodates the parser plus headroom for any test logic.
+RUST_MIN_STACK = "16777216"
+# Z3 configuration for Apple Silicon
+Z3_SYS_Z3_HEADER = "/opt/homebrew/include/z3.h"
+LIBRARY_PATH = "/opt/homebrew/lib"

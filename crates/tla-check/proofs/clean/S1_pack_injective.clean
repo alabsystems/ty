@@ -1,0 +1,290 @@
+-- S1_pack_injective: positional-pack (base-b) encoder injectivity — the B1
+-- false-cert path. The value of a digit list is
+--   baseValue b (d :: ds) = d + b * baseValue b ds,   baseValue b [] = 0
+-- (a foldr). The soundness claim is: bounded, equal-length digit lists with the
+-- SAME baseValue are EQUAL (the encoder is injective, so no two distinct digit
+-- vectors collide on one packed word).
+--
+-- CRUX ("Nat div/mod reasoning"): `digit_cancel` — for d1,d2 < b,
+--   d1 + b*x = d2 + b*y  ->  d1 = d2  AND  x = y
+-- i.e. the base-b place map (d, x) |-> d + b*x is injective on {d < b} x Nat.
+-- This is uniqueness of euclidean division; proved here in FULL generality by
+-- induction on x, using only self-proved Nat facts over `with_prelude`.
+
+namespace PackInj
+
+-- ============================================================================
+-- Self-proved Nat helpers (none are assumed from `with_prelude` beyond the
+-- primitives the sibling nat_div_e2e / nat_mod_lt_e2e proofs already use).
+-- ============================================================================
+
+-- `n <= k + n`, by induction on `n` (add recurses on its 2nd arg).
+theorem le_add_left (n k : Nat) : Nat.le n (Nat.add k n) :=
+  @Nat.rec
+    (fun m => Nat.le m (Nat.add k m))
+    (Nat.zero_le k)
+    (fun m ih => @Nat.succ_le_succ m (Nat.add k m) ih)
+    n
+
+-- Right-cancellation of addition:  a + c = b + c  ->  a = b.  Induct on `c`.
+-- (congrArg's @-explicit order is `@congrArg α β a₁ a₂ f h` — the function
+-- comes AFTER the two points.)
+theorem add_right_cancel (a b c : Nat)
+    (h : @Eq Nat (Nat.add a c) (Nat.add b c)) : @Eq Nat a b :=
+  @Nat.rec
+    (fun k => (@Eq Nat (Nat.add a k) (Nat.add b k)) -> (@Eq Nat a b))
+    (fun h0 => h0)
+    (fun m ih hs => ih (@congrArg Nat Nat (Nat.add a (Nat.succ m)) (Nat.add b (Nat.succ m)) Nat.pred hs))
+    c
+    h
+
+-- `d < b` and `b <= d` are jointly absurd.
+theorem lt_le_absurd (b d : Nat) (hlt : Nat.lt d b) (hle : Nat.le b d) : False :=
+  Nat.lt_irrefl d (@Nat.le_trans (Nat.succ d) b d hlt hle)
+
+-- If `d = W + b` then `b <= d`.
+theorem le_of_eq_add (b w d : Nat) (h : @Eq Nat d (Nat.add w b)) : Nat.le b d :=
+  @Eq.subst Nat (fun z => Nat.le b z) (Nat.add w b) d (@Eq.symm Nat d (Nat.add w b) h)
+    (le_add_left b w)
+
+-- `d < b` but `d = W + b` is absurd (the "carry overflows a digit" case).
+theorem absurd_lt_add (b w d : Nat) (hd : Nat.lt d b) (h : @Eq Nat d (Nat.add w b)) : False :=
+  lt_le_absurd b d hd (le_of_eq_add b w d h)
+
+-- `0 = succ m` is absurd (used to kill length-mismatch cases).
+theorem zero_ne_succ (m : Nat) (h : @Eq Nat Nat.zero (Nat.succ m)) : False :=
+  @Eq.subst Nat
+    (fun k => @Nat.rec (fun _ => Prop) True (fun _ _ => False) k)
+    Nat.zero (Nat.succ m) h True.intro
+
+-- ============================================================================
+-- CRUX: injectivity of the base-b place map (uniqueness of euclidean division).
+-- ============================================================================
+--   d1 < b -> d2 < b -> d1 + b*x = d2 + b*y  ->  d1 = d2  AND  x = y.
+-- Induction on x (motive quantifies the other digit-pair + the b-part y):
+--   x = 0:  d1 = d2 + b*y.  y = 0 gives d1 = d2 (done); y = succ y' gives
+--           d1 = (d2 + b*y') + b >= b, contradicting d1 < b.
+--   x = succ x': d1 + b*x' + b = d2 + b*y.  y = 0 gives d2 >= b (absurd);
+--           y = succ y' cancels the trailing `+ b`, then the IH closes it.
+theorem digit_cancel (b x y d1 d2 : Nat)
+    (hd1 : Nat.lt d1 b) (hd2 : Nat.lt d2 b)
+    (h : @Eq Nat (Nat.add d1 (Nat.mul b x)) (Nat.add d2 (Nat.mul b y))) :
+    And (@Eq Nat d1 d2) (@Eq Nat x y) :=
+  @Nat.rec
+    (fun xx =>
+      (e1 : Nat) -> (e2 : Nat) -> (z : Nat) ->
+        Nat.lt e1 b -> Nat.lt e2 b ->
+        (@Eq Nat (Nat.add e1 (Nat.mul b xx)) (Nat.add e2 (Nat.mul b z))) ->
+        And (@Eq Nat e1 e2) (@Eq Nat xx z))
+    -- ── x = 0 ────────────────────────────────────────────────────────────
+    (fun e1 e2 z he1 he2 =>
+      @Nat.rec
+        (fun zz =>
+          (@Eq Nat (Nat.add e1 (Nat.mul b Nat.zero)) (Nat.add e2 (Nat.mul b zz))) ->
+          And (@Eq Nat e1 e2) (@Eq Nat Nat.zero zz))
+        (fun h0 =>
+          @And.intro (@Eq Nat e1 e2) (@Eq Nat Nat.zero Nat.zero)
+            h0 (@Eq.refl Nat Nat.zero))
+        (fun z' _ihz hs =>
+          @False.elim
+            (And (@Eq Nat e1 e2) (@Eq Nat Nat.zero (Nat.succ z')))
+            (absurd_lt_add b (Nat.add e2 (Nat.mul b z')) e1 he1
+              (@Eq.trans Nat
+                (Nat.add e1 (Nat.mul b Nat.zero))
+                (Nat.add e2 (Nat.mul b (Nat.succ z')))
+                (Nat.add (Nat.add e2 (Nat.mul b z')) b)
+                hs
+                (@Eq.symm Nat
+                  (Nat.add (Nat.add e2 (Nat.mul b z')) b)
+                  (Nat.add e2 (Nat.mul b (Nat.succ z')))
+                  (@Nat.add_assoc e2 (Nat.mul b z') b)))))
+        z)
+    -- ── x = succ x' ──────────────────────────────────────────────────────
+    (fun x' IH =>
+      fun e1 e2 z he1 he2 =>
+      @Nat.rec
+        (fun zz =>
+          (@Eq Nat (Nat.add e1 (Nat.mul b (Nat.succ x'))) (Nat.add e2 (Nat.mul b zz))) ->
+          And (@Eq Nat e1 e2) (@Eq Nat (Nat.succ x') zz))
+        (fun h0 =>
+          @False.elim
+            (And (@Eq Nat e1 e2) (@Eq Nat (Nat.succ x') Nat.zero))
+            (absurd_lt_add b (Nat.add e1 (Nat.mul b x')) e2 he2
+              (@Eq.trans Nat
+                (Nat.add e2 (Nat.mul b Nat.zero))
+                (Nat.add e1 (Nat.mul b (Nat.succ x')))
+                (Nat.add (Nat.add e1 (Nat.mul b x')) b)
+                (@Eq.symm Nat
+                  (Nat.add e1 (Nat.mul b (Nat.succ x')))
+                  (Nat.add e2 (Nat.mul b Nat.zero))
+                  h0)
+                (@Eq.symm Nat
+                  (Nat.add (Nat.add e1 (Nat.mul b x')) b)
+                  (Nat.add e1 (Nat.mul b (Nat.succ x')))
+                  (@Nat.add_assoc e1 (Nat.mul b x') b)))))
+        (fun z' _ihz hs =>
+          @And.intro (@Eq Nat e1 e2) (@Eq Nat (Nat.succ x') (Nat.succ z'))
+            (@And.left (@Eq Nat e1 e2) (@Eq Nat x' z')
+              (IH e1 e2 z' he1 he2
+                (add_right_cancel (Nat.add e1 (Nat.mul b x')) (Nat.add e2 (Nat.mul b z')) b
+                  (@Eq.trans Nat
+                    (Nat.add (Nat.add e1 (Nat.mul b x')) b)
+                    (Nat.add e2 (Nat.mul b (Nat.succ z')))
+                    (Nat.add (Nat.add e2 (Nat.mul b z')) b)
+                    (@Eq.trans Nat
+                      (Nat.add (Nat.add e1 (Nat.mul b x')) b)
+                      (Nat.add e1 (Nat.mul b (Nat.succ x')))
+                      (Nat.add e2 (Nat.mul b (Nat.succ z')))
+                      (@Nat.add_assoc e1 (Nat.mul b x') b)
+                      hs)
+                    (@Eq.symm Nat
+                      (Nat.add (Nat.add e2 (Nat.mul b z')) b)
+                      (Nat.add e2 (Nat.mul b (Nat.succ z')))
+                      (@Nat.add_assoc e2 (Nat.mul b z') b))))))
+            (@congrArg Nat Nat x' z' Nat.succ
+              (@And.right (@Eq Nat e1 e2) (@Eq Nat x' z')
+                (IH e1 e2 z' he1 he2
+                  (add_right_cancel (Nat.add e1 (Nat.mul b x')) (Nat.add e2 (Nat.mul b z')) b
+                    (@Eq.trans Nat
+                      (Nat.add (Nat.add e1 (Nat.mul b x')) b)
+                      (Nat.add e2 (Nat.mul b (Nat.succ z')))
+                      (Nat.add (Nat.add e2 (Nat.mul b z')) b)
+                      (@Eq.trans Nat
+                        (Nat.add (Nat.add e1 (Nat.mul b x')) b)
+                        (Nat.add e1 (Nat.mul b (Nat.succ x')))
+                        (Nat.add e2 (Nat.mul b (Nat.succ z')))
+                        (@Nat.add_assoc e1 (Nat.mul b x') b)
+                        hs)
+                      (@Eq.symm Nat
+                        (Nat.add (Nat.add e2 (Nat.mul b z')) b)
+                        (Nat.add e2 (Nat.mul b (Nat.succ z')))
+                        (@Nat.add_assoc e2 (Nat.mul b z') b))))))))
+        z)
+    x
+    d1 d2 y hd1 hd2 h
+
+-- ============================================================================
+-- The encoder itself: baseValue b l = foldr (fun d acc => d + b*acc) 0 l.
+-- ============================================================================
+def baseValue (b : Nat) (l : List Nat) : Nat :=
+  @List.foldr Nat Nat (fun (d : Nat) (acc : Nat) => Nat.add d (Nat.mul b acc)) Nat.zero l
+
+-- Reduction sanity (all `rfl`): the encoder computes the base-b place value.
+-- (`@List.cons Nat`/`@List.nil Nat` are written FULLY EXPLICIT: an implicit
+-- `List.cons` in an `@Eq.refl` reduction context trips a universe-inference
+-- failure in the current clean elaborator; the explicit form reduces cleanly.)
+theorem baseValue_nil (b : Nat) : @Eq Nat (baseValue b (@List.nil Nat)) Nat.zero :=
+  @Eq.refl Nat Nat.zero
+theorem baseValue_cons (b d : Nat) (ds : List Nat) :
+    @Eq Nat (baseValue b (@List.cons Nat d ds)) (Nat.add d (Nat.mul b (baseValue b ds))) :=
+  @Eq.refl Nat (Nat.add d (Nat.mul b (baseValue b ds)))
+
+-- Bounded-digit predicate: every digit of `l` is `< b`.
+--   AllLt b []        = True
+--   AllLt b (d :: ds) = (d < b) AND AllLt b ds
+def AllLt (b : Nat) (l : List Nat) : Prop :=
+  @List.rec Nat (fun _ => Prop) True
+    (fun (hd : Nat) (_tl : List Nat) (ih : Prop) => And (Nat.lt hd b) ih) l
+
+-- ============================================================================
+-- Faithful injectivity instance: LENGTH 2, general in b.  Bounded digits with
+-- equal baseValue force equal lists — the encoder cannot alias a 2-digit word.
+-- ============================================================================
+theorem pack_injective_len2 (b d0 d1 e0 e1 : Nat)
+    (hd0 : Nat.lt d0 b) (hd1 : Nat.lt d1 b)
+    (he0 : Nat.lt e0 b) (he1 : Nat.lt e1 b)
+    (hval : @Eq Nat
+      (baseValue b (@List.cons Nat d0 (@List.cons Nat d1 (@List.nil Nat))))
+      (baseValue b (@List.cons Nat e0 (@List.cons Nat e1 (@List.nil Nat))))) :
+    @Eq (List Nat)
+      (@List.cons Nat d0 (@List.cons Nat d1 (@List.nil Nat)))
+      (@List.cons Nat e0 (@List.cons Nat e1 (@List.nil Nat))) :=
+  @Eq.trans (List Nat)
+    (@List.cons Nat d0 (@List.cons Nat d1 (@List.nil Nat)))
+    (@List.cons Nat e0 (@List.cons Nat d1 (@List.nil Nat)))
+    (@List.cons Nat e0 (@List.cons Nat e1 (@List.nil Nat)))
+    (@congrArg Nat (List Nat) d0 e0
+      (fun (z : Nat) => @List.cons Nat z (@List.cons Nat d1 (@List.nil Nat)))
+      (@And.left (@Eq Nat d0 e0) (@Eq Nat d1 e1)
+        (digit_cancel b d1 e1 d0 e0 hd0 he0 hval)))
+    (@congrArg Nat (List Nat) d1 e1
+      (fun (z : Nat) => @List.cons Nat e0 (@List.cons Nat z (@List.nil Nat)))
+      (@And.right (@Eq Nat d0 e0) (@Eq Nat d1 e1)
+        (digit_cancel b d1 e1 d0 e0 hd0 he0 hval)))
+
+-- ============================================================================
+-- FULL general injectivity: bounded, equal-length digit lists with equal
+-- baseValue are equal.  Induction on `xs`, casing on `ys`; the length premise
+-- kills the nil/cons mismatches, and `digit_cancel` closes each cons/cons step
+-- (head digits equal + tail baseValues equal), feeding the IH on the tails.
+-- ============================================================================
+theorem pack_injective (b : Nat) (xs ys : List Nat)
+    (hx : AllLt b xs) (hy : AllLt b ys)
+    (hlen : @Eq Nat (@List.length Nat xs) (@List.length Nat ys))
+    (hval : @Eq Nat (baseValue b xs) (baseValue b ys)) :
+    @Eq (List Nat) xs ys :=
+  @List.rec Nat
+    (fun l =>
+      (ms : List Nat) ->
+        AllLt b l -> AllLt b ms ->
+        (@Eq Nat (@List.length Nat l) (@List.length Nat ms)) ->
+        (@Eq Nat (baseValue b l) (baseValue b ms)) ->
+        (@Eq (List Nat) l ms))
+    -- xs = nil
+    (fun ms =>
+      @List.rec Nat
+        (fun mm =>
+          AllLt b (@List.nil Nat) -> AllLt b mm ->
+          (@Eq Nat (@List.length Nat (@List.nil Nat)) (@List.length Nat mm)) ->
+          (@Eq Nat (baseValue b (@List.nil Nat)) (baseValue b mm)) ->
+          (@Eq (List Nat) (@List.nil Nat) mm))
+        (fun _hxn _hyn _hln _hvn => @Eq.refl (List Nat) (@List.nil Nat))
+        (fun d2 ds2 _ih =>
+          fun _hxn _hyn hln _hvn =>
+          @False.elim (@Eq (List Nat) (@List.nil Nat) (@List.cons Nat d2 ds2))
+            (zero_ne_succ (@List.length Nat ds2) hln))
+        ms)
+    -- xs = cons d1 ds1
+    (fun d1 ds1 IH =>
+      fun ms =>
+      @List.rec Nat
+        (fun mm =>
+          AllLt b (@List.cons Nat d1 ds1) -> AllLt b mm ->
+          (@Eq Nat (@List.length Nat (@List.cons Nat d1 ds1)) (@List.length Nat mm)) ->
+          (@Eq Nat (baseValue b (@List.cons Nat d1 ds1)) (baseValue b mm)) ->
+          (@Eq (List Nat) (@List.cons Nat d1 ds1) mm))
+        (fun _hx _hyn hln _hvn =>
+          @False.elim (@Eq (List Nat) (@List.cons Nat d1 ds1) (@List.nil Nat))
+            (zero_ne_succ (@List.length Nat ds1)
+              (@Eq.symm Nat
+                (@List.length Nat (@List.cons Nat d1 ds1))
+                (@List.length Nat (@List.nil Nat)) hln)))
+        (fun d2 ds2 _ih =>
+          fun hx hy hln hvn =>
+          @Eq.trans (List Nat)
+            (@List.cons Nat d1 ds1)
+            (@List.cons Nat d2 ds1)
+            (@List.cons Nat d2 ds2)
+            (@congrArg Nat (List Nat) d1 d2 (fun (z : Nat) => @List.cons Nat z ds1)
+              (@And.left (@Eq Nat d1 d2) (@Eq Nat (baseValue b ds1) (baseValue b ds2))
+                (digit_cancel b (baseValue b ds1) (baseValue b ds2) d1 d2
+                  (@And.left (Nat.lt d1 b) (AllLt b ds1) hx)
+                  (@And.left (Nat.lt d2 b) (AllLt b ds2) hy)
+                  hvn)))
+            (@congrArg (List Nat) (List Nat) ds1 ds2 (fun (z : List Nat) => @List.cons Nat d2 z)
+              (IH ds2
+                (@And.right (Nat.lt d1 b) (AllLt b ds1) hx)
+                (@And.right (Nat.lt d2 b) (AllLt b ds2) hy)
+                (@congrArg Nat Nat
+                  (@List.length Nat (@List.cons Nat d1 ds1))
+                  (@List.length Nat (@List.cons Nat d2 ds2)) Nat.pred hln)
+                (@And.right (@Eq Nat d1 d2) (@Eq Nat (baseValue b ds1) (baseValue b ds2))
+                  (digit_cancel b (baseValue b ds1) (baseValue b ds2) d1 d2
+                    (@And.left (Nat.lt d1 b) (AllLt b ds1) hx)
+                    (@And.left (Nat.lt d2 b) (AllLt b ds2) hy)
+                    hvn)))))
+        ms)
+    xs
+    ys hx hy hlen hval
+
+end PackInj

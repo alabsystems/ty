@@ -1,0 +1,21 @@
+[package]
+name = "tla-backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Unified backend / engine-selection layer for TY (leaf crate)"
+readme.workspace = true
+
+[dependencies]
+# Leaf crate. Depends ONLY on tla-mc-core for the shared capability vocabulary
+# (BackendDomain/BackendKind/ProblemKind/UnsupportedReason/...). It depends on
+# neither tla-check nor tla-cli, so it introduces no workspace cycle and can be
+# consumed by both. serde + tla-jit-abi are added in later migration stages when
+# evidence export (CapabilityReport) and the Petri/hardware spine land.
+# Design of record: docs/ty-unified-backend-architecture-2026-06-05.md
+tla-mc-core = { path = "../tla-mc-core" }
+
+[lints]
+workspace = true

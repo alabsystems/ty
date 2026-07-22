@@ -1,0 +1,27 @@
+-- e4_stuttering_closure: soundness of TLA's [Next]_v stutter steps.
+--
+-- TY claim: adding stutter (no-op) steps to a next-state relation preserves an
+-- inductive invariant. Formally, if a state predicate R is closed under Next
+--   (forall s t, R s -> Next s t -> R t),
+-- then R is also closed under the stuttering relation
+--   NextOrStutter s t := (Next s t \/ s = t).
+--
+-- Proof by Or-elimination on the disjunction:
+--   inl (Next s t) : apply the closure hypothesis directly;
+--   inr (s = t)    : transport the witness R s to R t along the equality
+--                    (Eq.subst with motive R).
+--
+-- Fully general: State : Type is abstract, R : State -> Prop, Next : State ->
+-- State -> Prop are abstract. No arithmetic; the clean CIC kernel checks the
+-- proof term.
+theorem e4_stuttering_closure
+    (State : Type)
+    (R : State -> Prop)
+    (Next : State -> State -> Prop)
+    (hclosed : forall s t : State, R s -> Next s t -> R t)
+    : forall s t : State, R s -> Or (Next s t) (s = t) -> R t :=
+  fun s t hR hstep =>
+    @Or.rec (Next s t) (s = t) (fun _ => R t)
+      (fun hnext => hclosed s t hR hnext)
+      (fun heq => @Eq.subst State R s t heq hR)
+      hstep

@@ -1,0 +1,70 @@
+-- d3_step_simulation: REFINEMENT verdict soundness — the meaning of every TY
+-- refinement (step-simulation) verdict, authored in CLEAN's surface language and
+-- checked by CLEAN's CIC kernel (so it enters the clean kernel's trust base).
+--
+-- SETTING. Two transition systems over abstract state types:
+--   concrete  C : Type   with initial predicate InitC : C -> Prop
+--                        and step relation      StepC : C -> C -> Prop
+--   abstract  A : Type   with initial predicate InitA : A -> Prop
+--                        and step relation      StepA : A -> A -> Prop
+-- and a state mapping (refinement map) f : C -> A.
+--
+-- `f` is a STEP-SIMULATION when
+--   (hInit)  every concrete initial state maps to an abstract initial state:
+--              forall c, InitC c -> InitA (f c)
+--   (hSim)   every concrete step maps to an abstract step OR a stutter:
+--              forall c c', StepC c c' -> (StepA (f c) (f c') \/ f c = f c')
+-- This is exactly what a TY refinement verdict discharges (a stuttering
+-- refinement, TLA-style: each concrete transition is matched by an abstract
+-- transition or leaves the abstract image fixed).
+--
+-- SOUNDNESS CLAIM (proved below, `d3_step_simulation`). Under (hInit) + (hSim),
+-- the image of every C-reachable state is A-reachable:
+--     Reach C InitC StepC c  ->  Reach A InitA StepA (f c).
+-- i.e. step-simulation => behaviour/reachability inclusion — refinement soundness.
+-- With `reach_least` (tB) this yields the property-transfer corollary: any
+-- abstract invariant pulls back along f to a concrete invariant.
+--
+-- PROOF. Induction on the reachability derivation `Reach.rec` (the SAME `Reach`
+-- inductive as tB / e3):
+--   base : c is InitC; (hInit) gives InitA (f c); Reach.base yields Reach (f c).
+--   step : concrete step StepC s t with IH `Reach (f s)`; (hSim) gives
+--            StepA (f s) (f t) \/ f s = f t, cased by Or.rec:
+--              inl (a genuine abstract step): Reach.step (f s) (f t) IH hstepA;
+--              inr (a stutter f s = f t):     transport IH : Reach (f s) along the
+--                                             equality to Reach (f t) via Eq.subst.
+--
+-- FULLY GENERAL: quantified over arbitrary state types C, A, arbitrary
+-- InitC/InitA, arbitrary StepC/StepA, and an arbitrary map f : C -> A. No
+-- arithmetic; the clean CIC kernel checks the proof term.
+
+-- The reachability predicate of a transition system (identical to tB / e3):
+--   base : every initial state is reachable;
+--   step : a Next-successor of a reachable state is reachable.
+inductive Reach (State : Type) (Init : State -> Prop) (Next : State -> State -> Prop) : State -> Prop where
+  | base : (s : State) -> Init s -> Reach State Init Next s
+  | step : (s : State) -> (t : State) -> Reach State Init Next s -> Next s t -> Reach State Init Next t
+
+theorem d3_step_simulation
+    (C : Type) (A : Type)
+    (InitC : C -> Prop) (InitA : A -> Prop)
+    (StepC : C -> C -> Prop) (StepA : A -> A -> Prop)
+    (f : C -> A)
+    (hInit : (c : C) -> InitC c -> InitA (f c))
+    (hSim : (c : C) -> (c' : C) -> StepC c c' -> Or (StepA (f c) (f c')) (@Eq A (f c) (f c')))
+    (c : C) (h : Reach C InitC StepC c) : Reach A InitA StepA (f c) :=
+  @Reach.rec C InitC StepC
+    -- motive: the image of every reachable concrete state is abstractly reachable
+    (fun s hs => Reach A InitA StepA (f s))
+    -- base: InitC s --(hInit)--> InitA (f s) --Reach.base--> Reach A InitA StepA (f s)
+    (fun s hi => @Reach.base A InitA StepA (f s) (hInit s hi))
+    -- step: concrete StepC s t, IH `Reach A InitA StepA (f s)`; case the simulation
+    (fun s t hr hn ih =>
+      @Or.rec (StepA (f s) (f t)) (@Eq A (f s) (f t))
+        (fun _ => Reach A InitA StepA (f t))
+        -- inl: a genuine abstract step (f s) -> (f t)
+        (fun hstepA => @Reach.step A InitA StepA (f s) (f t) ih hstepA)
+        -- inr: stutter f s = f t; transport IH : Reach (f s) along the equality
+        (fun heq => @Eq.subst A (fun z => Reach A InitA StepA z) (f s) (f t) heq ih)
+        (hSim s t hn))
+    c h

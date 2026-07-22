@@ -1,0 +1,2597 @@
+{
+  "build": {
+    "ay": true,
+    "clean_cic": true,
+    "lane_note": "certify lanes: ay SMT-synthesis + explicit-state kernel fixpoint (all tiers reachable)"
+  },
+  "corpus": {
+    "pin": "05c7256f153cd18e40e27eaa6dd4e60f4fcba15b",
+    "root": "~/tlaplus-examples",
+    "tag": "corpus-v1-05c7256"
+  },
+  "decline_census": {
+    "choose": 48,
+    "constants": 134,
+    "functions": 103,
+    "instance": 35,
+    "no-invariant": 25,
+    "quantifiers": 96,
+    "sequences": 107,
+    "sets": 83
+  },
+  "params": {
+    "filter": null,
+    "jobs": 6,
+    "timeout_secs": 45
+  },
+  "rows": [
+    {
+      "blocking_features": [
+        "constants"
+      ],
+      "detail": null,
+      "elapsed_ms": 45012,
+      "outcome": "timeout",
+      "pairing": "same-stem",
+      "spec": "Bakery-Boulangerie/MCBakery.cfg",
+      "tla": "Bakery-Boulangerie/MCBakery.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "quantifiers"
+      ],
+      "detail": null,
+      "elapsed_ms": 27,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "Bakery-Boulangerie/MCBoulanger.cfg",
+      "tla": "Bakery-Boulangerie/MCBoulanger.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "no-invariant"
+      ],
+      "detail": null,
+      "elapsed_ms": 4,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_1/MC.cfg",
+      "tla": "CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_1/MC.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "no-invariant"
+      ],
+      "detail": null,
+      "elapsed_ms": 5,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_2/MC.cfg",
+      "tla": "CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_2/MC.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "no-invariant"
+      ],
+      "detail": null,
+      "elapsed_ms": 4,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_3/MC.cfg",
+      "tla": "CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_3/MC.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 8,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "Chameneos/Chameneos.cfg",
+      "tla": "Chameneos/Chameneos.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "instance"
+      ],
+      "detail": null,
+      "elapsed_ms": 0,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "CheckpointCoordination/MCCheckpointCoordination.cfg",
+      "tla": "CheckpointCoordination/MCCheckpointCoordination.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 18,
+      "outcome": "declined",
+      "pairing": "cfg-names",
+      "spec": "CheckpointCoordination/MCCheckpointCoordinationFailure.cfg",
+      "tla": "CheckpointCoordination/CheckpointCoordination.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 3,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "CigaretteSmokers/CigaretteSmokers.cfg",
+      "tla": "CigaretteSmokers/CigaretteSmokers.tla"
+    },
+    {
+      "blocking_features": [
+        "constants"
+      ],
+      "detail": null,
+      "elapsed_ms": 45007,
+      "outcome": "timeout",
+      "pairing": "cfg-names",
+      "spec": "CoffeeCan/CoffeeCan1000Beans.cfg",
+      "tla": "CoffeeCan/CoffeeCan.tla"
+    },
+    {
+      "blocking_features": [
+        "constants"
+      ],
+      "detail": null,
+      "elapsed_ms": 2997,
+      "outcome": "kernel-certified (enumerator-assisted fixpoint)",
+      "pairing": "cfg-names",
+      "spec": "CoffeeCan/CoffeeCan100Beans.cfg",
+      "tla": "CoffeeCan/CoffeeCan.tla"
+    },
+    {
+      "blocking_features": [
+        "constants"
+      ],
+      "detail": null,
+      "elapsed_ms": 45006,
+      "outcome": "timeout",
+      "pairing": "cfg-names",
+      "spec": "CoffeeCan/CoffeeCan3000Beans.cfg",
+      "tla": "CoffeeCan/CoffeeCan.tla"
+    },
+    {
+      "blocking_features": [
+        "sequences"
+      ],
+      "detail": null,
+      "elapsed_ms": 246,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "DieHard/DieHard.cfg",
+      "tla": "DieHard/DieHard.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "functions"
+      ],
+      "detail": null,
+      "elapsed_ms": 174,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "DieHard/MCDieHarder.cfg",
+      "tla": "DieHard/MCDieHarder.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets"
+      ],
+      "detail": null,
+      "elapsed_ms": 10,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "DiningPhilosophers/DiningPhilosophers.cfg",
+      "tla": "DiningPhilosophers/DiningPhilosophers.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "instance",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 8,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "Disruptor/Disruptor_MPMC.cfg",
+      "tla": "Disruptor/Disruptor_MPMC.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "instance",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 9,
+      "outcome": "declined",
+      "pairing": "cfg-names+stem-prefix",
+      "spec": "Disruptor/Disruptor_MPMC_liveliness.cfg",
+      "tla": "Disruptor/Disruptor_MPMC.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "instance",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 5,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "Disruptor/Disruptor_SPMC.cfg",
+      "tla": "Disruptor/Disruptor_SPMC.tla"
+    },
+    {
+      "blocking_features": [
+        "sequences",
+        "quantifiers",
+        "functions"
+      ],
+      "detail": null,
+      "elapsed_ms": 1358,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "EinsteinRiddle/Einstein.cfg",
+      "tla": "EinsteinRiddle/Einstein.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "quantifiers",
+        "functions"
+      ],
+      "detail": null,
+      "elapsed_ms": 4,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "FiniteMonotonic/MCCRDT.cfg",
+      "tla": "FiniteMonotonic/MCCRDT.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "functions",
+        "sets"
+      ],
+      "detail": null,
+      "elapsed_ms": 4,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "FiniteMonotonic/MCDistributedReplicatedLog.cfg",
+      "tla": "FiniteMonotonic/MCDistributedReplicatedLog.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions"
+      ],
+      "detail": null,
+      "elapsed_ms": 10,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "FiniteMonotonic/MCReplicatedLog.cfg",
+      "tla": "FiniteMonotonic/MCReplicatedLog.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "functions",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 340,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "GameOfLife/GameOfLife.cfg",
+      "tla": "GameOfLife/GameOfLife.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 13,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "Huang/Huang.cfg",
+      "tla": "Huang/Huang.tla"
+    },
+    {
+      "blocking_features": [
+        "constants"
+      ],
+      "detail": null,
+      "elapsed_ms": 10,
+      "outcome": "declined",
+      "pairing": "stem-prefix",
+      "spec": "KeyValueStore/MCKVSSafetyLarge.cfg",
+      "tla": "KeyValueStore/MCKVS.tla"
+    },
+    {
+      "blocking_features": [
+        "constants"
+      ],
+      "detail": null,
+      "elapsed_ms": 8,
+      "outcome": "declined",
+      "pairing": "stem-prefix",
+      "spec": "KeyValueStore/MCKVSSafetyMedium.cfg",
+      "tla": "KeyValueStore/MCKVS.tla"
+    },
+    {
+      "blocking_features": [
+        "constants"
+      ],
+      "detail": null,
+      "elapsed_ms": 8,
+      "outcome": "declined",
+      "pairing": "stem-prefix",
+      "spec": "KeyValueStore/MCKVSSafetySmall.cfg",
+      "tla": "KeyValueStore/MCKVS.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "quantifiers"
+      ],
+      "detail": null,
+      "elapsed_ms": 0,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "KeyValueStore/MCKVsnap.cfg",
+      "tla": "KeyValueStore/MCKVsnap.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "no-invariant"
+      ],
+      "detail": null,
+      "elapsed_ms": 3,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "KnuthYao/SimKnuthYao.cfg",
+      "tla": "KnuthYao/SimKnuthYao.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "functions",
+        "sets"
+      ],
+      "detail": null,
+      "elapsed_ms": 13,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "LearnProofs/MCFindHighest.cfg",
+      "tla": "LearnProofs/MCFindHighest.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets"
+      ],
+      "detail": null,
+      "elapsed_ms": 9,
+      "outcome": "declined",
+      "pairing": "cfg-names",
+      "spec": "LeastCircularSubstring/MCLeastCircularSubstringMedium.cfg",
+      "tla": "LeastCircularSubstring/LeastCircularSubstring.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets"
+      ],
+      "detail": null,
+      "elapsed_ms": 7,
+      "outcome": "declined",
+      "pairing": "cfg-names",
+      "spec": "LeastCircularSubstring/MCLeastCircularSubstringSmall.cfg",
+      "tla": "LeastCircularSubstring/LeastCircularSubstring.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "functions",
+        "sets"
+      ],
+      "detail": null,
+      "elapsed_ms": 12904,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "LoopInvariance/MCBinarySearch.cfg",
+      "tla": "LoopInvariance/MCBinarySearch.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "functions",
+        "sets"
+      ],
+      "detail": null,
+      "elapsed_ms": 36,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "LoopInvariance/MCQuicksort.cfg",
+      "tla": "LoopInvariance/MCQuicksort.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "functions",
+        "sets",
+        "instance"
+      ],
+      "detail": null,
+      "elapsed_ms": 0,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "Majority/MCMajority.cfg",
+      "tla": "Majority/MCMajority.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "quantifiers",
+        "functions",
+        "sets",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 0,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "MisraReachability/MCParReach.cfg",
+      "tla": "MisraReachability/MCParReach.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "quantifiers",
+        "functions",
+        "sets",
+        "no-invariant"
+      ],
+      "detail": null,
+      "elapsed_ms": 0,
+      "outcome": "declined",
+      "pairing": "stem-prefix",
+      "spec": "MisraReachability/MCReachabilityTestAllGraphs.cfg",
+      "tla": "MisraReachability/MCReachabilityTest.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "quantifiers",
+        "functions",
+        "sets",
+        "no-invariant"
+      ],
+      "detail": null,
+      "elapsed_ms": 0,
+      "outcome": "declined",
+      "pairing": "stem-prefix",
+      "spec": "MisraReachability/MCReachabilityTestRandomGraphs.cfg",
+      "tla": "MisraReachability/MCReachabilityTest.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "quantifiers",
+        "functions",
+        "sets",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 689,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "MisraReachability/MCReachable.cfg",
+      "tla": "MisraReachability/MCReachable.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "quantifiers",
+        "functions",
+        "sets"
+      ],
+      "detail": null,
+      "elapsed_ms": 47,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "MissionariesAndCannibals/MissionariesAndCannibals.cfg",
+      "tla": "MissionariesAndCannibals/MissionariesAndCannibals.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 11775,
+      "outcome": "kernel-certified (enumerator-free fixpoint)",
+      "pairing": "cfg-names",
+      "spec": "Moving_Cat_Puzzle/CatEvenBoxes.cfg",
+      "tla": "Moving_Cat_Puzzle/Cat.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 3041,
+      "outcome": "kernel-certified (enumerator-free fixpoint)",
+      "pairing": "cfg-names",
+      "spec": "Moving_Cat_Puzzle/CatOddBoxes.cfg",
+      "tla": "Moving_Cat_Puzzle/Cat.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 19,
+      "outcome": "declined",
+      "pairing": "cfg-names",
+      "spec": "MultiCarElevator/ElevatorLivenessLarge.cfg",
+      "tla": "MultiCarElevator/Elevator.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 14,
+      "outcome": "declined",
+      "pairing": "cfg-names",
+      "spec": "MultiCarElevator/ElevatorLivenessMedium.cfg",
+      "tla": "MultiCarElevator/Elevator.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 973,
+      "outcome": "declined",
+      "pairing": "cfg-names",
+      "spec": "MultiCarElevator/ElevatorSafetyLarge.cfg",
+      "tla": "MultiCarElevator/Elevator.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 56,
+      "outcome": "declined",
+      "pairing": "cfg-names",
+      "spec": "MultiCarElevator/ElevatorSafetyMedium.cfg",
+      "tla": "MultiCarElevator/Elevator.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 17,
+      "outcome": "declined",
+      "pairing": "cfg-names",
+      "spec": "MultiCarElevator/ElevatorSafetySmall.cfg",
+      "tla": "MultiCarElevator/Elevator.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 19,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "MultiPaxos-SMR/MultiPaxos_MC.cfg",
+      "tla": "MultiPaxos-SMR/MultiPaxos_MC.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 19,
+      "outcome": "declined",
+      "pairing": "cfg-names",
+      "spec": "MultiPaxos-SMR/MultiPaxos_MC_small.cfg",
+      "tla": "MultiPaxos-SMR/MultiPaxos.tla"
+    },
+    {
+      "blocking_features": [
+        "constants"
+      ],
+      "detail": null,
+      "elapsed_ms": 4,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "N-Queens/Queens.toolbox/FourQueens/MC.cfg",
+      "tla": "N-Queens/Queens.toolbox/FourQueens/MC.tla"
+    },
+    {
+      "blocking_features": [
+        "constants"
+      ],
+      "detail": null,
+      "elapsed_ms": 4,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "N-Queens/QueensPluscal.toolbox/FourQueens/MC.cfg",
+      "tla": "N-Queens/QueensPluscal.toolbox/FourQueens/MC.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "instance",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 4,
+      "outcome": "declined",
+      "pairing": "cfg-names+stem-prefix",
+      "spec": "NanoBlockchain/MCNanoLarge.cfg",
+      "tla": "NanoBlockchain/MCNano.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "instance",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 4,
+      "outcome": "declined",
+      "pairing": "cfg-names+stem-prefix",
+      "spec": "NanoBlockchain/MCNanoMedium.cfg",
+      "tla": "NanoBlockchain/MCNano.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "instance",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 4,
+      "outcome": "declined",
+      "pairing": "cfg-names+stem-prefix",
+      "spec": "NanoBlockchain/MCNanoSmall.cfg",
+      "tla": "NanoBlockchain/MCNano.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sets"
+      ],
+      "detail": null,
+      "elapsed_ms": 3,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "Paxos/MCConsensus.cfg",
+      "tla": "Paxos/MCConsensus.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets"
+      ],
+      "detail": null,
+      "elapsed_ms": 1,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "Paxos/MCPaxos.cfg",
+      "tla": "Paxos/MCPaxos.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "sets"
+      ],
+      "detail": null,
+      "elapsed_ms": 0,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "Paxos/MCVoting.cfg",
+      "tla": "Paxos/MCVoting.tla"
+    },
+    {
+      "blocking_features": [
+        "constants"
+      ],
+      "detail": null,
+      "elapsed_ms": 13,
+      "outcome": "kernel-certified (enumerator-assisted fixpoint)",
+      "pairing": "same-stem",
+      "spec": "PaxosHowToWinATuringAward/MCConsensus.cfg",
+      "tla": "PaxosHowToWinATuringAward/MCConsensus.tla"
+    },
+    {
+      "blocking_features": [
+        "constants"
+      ],
+      "detail": null,
+      "elapsed_ms": 3,
+      "outcome": "declined",
+      "pairing": "stem-prefix",
+      "spec": "PaxosHowToWinATuringAward/MCPaxosSmall.cfg",
+      "tla": "PaxosHowToWinATuringAward/MCPaxos.tla"
+    },
+    {
+      "blocking_features": [
+        "constants"
+      ],
+      "detail": null,
+      "elapsed_ms": 2,
+      "outcome": "declined",
+      "pairing": "stem-prefix",
+      "spec": "PaxosHowToWinATuringAward/MCPaxosTiny.cfg",
+      "tla": "PaxosHowToWinATuringAward/MCPaxos.tla"
+    },
+    {
+      "blocking_features": [
+        "constants"
+      ],
+      "detail": null,
+      "elapsed_ms": 0,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "PaxosHowToWinATuringAward/MCVoting.cfg",
+      "tla": "PaxosHowToWinATuringAward/MCVoting.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 27,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "Prisoners/Prisoners.cfg",
+      "tla": "Prisoners/Prisoners.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 12,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "Prisoners_Single_Switch/Prisoner.cfg",
+      "tla": "Prisoners_Single_Switch/Prisoner.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 23,
+      "outcome": "declined",
+      "pairing": "cfg-names",
+      "spec": "Prisoners_Single_Switch/PrisonerLightUnknown.cfg",
+      "tla": "Prisoners_Single_Switch/Prisoner.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 7,
+      "outcome": "declined",
+      "pairing": "cfg-names",
+      "spec": "Prisoners_Single_Switch/PrisonerSolo.cfg",
+      "tla": "Prisoners_Single_Switch/Prisoner.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 7,
+      "outcome": "declined",
+      "pairing": "cfg-names",
+      "spec": "Prisoners_Single_Switch/PrisonerSoloLightUnknown.cfg",
+      "tla": "Prisoners_Single_Switch/Prisoner.tla"
+    },
+    {
+      "blocking_features": [
+        "constants"
+      ],
+      "detail": null,
+      "elapsed_ms": 3,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "ReadersWriters/MC.cfg",
+      "tla": "ReadersWriters/MC.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "functions"
+      ],
+      "detail": null,
+      "elapsed_ms": 81,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "SDP_Verification/SDP_Attack_New_Solution_Spec/MC.cfg",
+      "tla": "SDP_Verification/SDP_Attack_New_Solution_Spec/MC.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "functions"
+      ],
+      "detail": null,
+      "elapsed_ms": 81,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "SDP_Verification/SDP_Attack_Spec/MC.cfg",
+      "tla": "SDP_Verification/SDP_Attack_Spec/MC.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets"
+      ],
+      "detail": null,
+      "elapsed_ms": 13,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "SimplifiedFastPaxos/FastPaxos.cfg",
+      "tla": "SimplifiedFastPaxos/FastPaxos.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 45008,
+      "outcome": "timeout",
+      "pairing": "same-stem",
+      "spec": "SimplifiedFastPaxos/Paxos.cfg",
+      "tla": "SimplifiedFastPaxos/Paxos.tla"
+    },
+    {
+      "blocking_features": [
+        "constants"
+      ],
+      "detail": null,
+      "elapsed_ms": 12270,
+      "outcome": "kernel-certified (enumerator-assisted fixpoint)",
+      "pairing": "same-stem",
+      "spec": "SingleLaneBridge/MC.cfg",
+      "tla": "SingleLaneBridge/MC.tla"
+    },
+    {
+      "blocking_features": [
+        "sequences",
+        "quantifiers",
+        "sets",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 4,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "SlidingPuzzles/SlidingPuzzles.cfg",
+      "tla": "SlidingPuzzles/SlidingPuzzles.tla"
+    },
+    {
+      "blocking_features": [
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 8,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "SlidingPuzzles/SlidingPuzzles_anim.cfg",
+      "tla": "SlidingPuzzles/SlidingPuzzles_anim.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 14,
+      "outcome": "declined",
+      "pairing": "cfg-names",
+      "spec": "SlushProtocol/SlushLarge.cfg",
+      "tla": "SlushProtocol/Slush.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 14,
+      "outcome": "declined",
+      "pairing": "cfg-names",
+      "spec": "SlushProtocol/SlushMedium.cfg",
+      "tla": "SlushProtocol/Slush.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 13,
+      "outcome": "declined",
+      "pairing": "cfg-names",
+      "spec": "SlushProtocol/SlushSmall.cfg",
+      "tla": "SlushProtocol/Slush.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets"
+      ],
+      "detail": null,
+      "elapsed_ms": 593,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "SpanningTree/SpanTree.cfg",
+      "tla": "SpanningTree/SpanTree.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets"
+      ],
+      "detail": null,
+      "elapsed_ms": 22354,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "SpanningTree/SpanTreeRandom.cfg",
+      "tla": "SpanningTree/SpanTreeRandom.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets"
+      ],
+      "detail": null,
+      "elapsed_ms": 8,
+      "outcome": "declined",
+      "pairing": "cfg-names+stem-prefix",
+      "spec": "SpanningTree/SpanTreeTest4Nodes.cfg",
+      "tla": "SpanningTree/SpanTreeTest.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets"
+      ],
+      "detail": null,
+      "elapsed_ms": 33,
+      "outcome": "declined",
+      "pairing": "cfg-names+stem-prefix",
+      "spec": "SpanningTree/SpanTreeTest5Nodes.cfg",
+      "tla": "SpanningTree/SpanTreeTest.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers"
+      ],
+      "detail": null,
+      "elapsed_ms": 8,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "SpecifyingSystems/AdvancedExamples/MCInnerSequential.cfg",
+      "tla": "SpecifyingSystems/AdvancedExamples/MCInnerSequential.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 1,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "SpecifyingSystems/AdvancedExamples/MCInnerSerial.cfg",
+      "tla": "SpecifyingSystems/AdvancedExamples/MCInnerSerial.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences"
+      ],
+      "detail": null,
+      "elapsed_ms": 249,
+      "outcome": "kernel-certified (enumerator-free fixpoint)",
+      "pairing": "same-stem",
+      "spec": "SpecifyingSystems/AsynchronousInterface/AsynchInterface.cfg",
+      "tla": "SpecifyingSystems/AsynchronousInterface/AsynchInterface.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "quantifiers"
+      ],
+      "detail": null,
+      "elapsed_ms": 484,
+      "outcome": "kernel-certified (enumerator-free closure; Init enumerated)",
+      "pairing": "same-stem",
+      "spec": "SpecifyingSystems/AsynchronousInterface/Channel.cfg",
+      "tla": "SpecifyingSystems/AsynchronousInterface/Channel.tla"
+    },
+    {
+      "blocking_features": [
+        "sequences",
+        "functions",
+        "no-invariant"
+      ],
+      "detail": null,
+      "elapsed_ms": 4,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "SpecifyingSystems/AsynchronousInterface/PrintValues.cfg",
+      "tla": "SpecifyingSystems/AsynchronousInterface/PrintValues.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 2,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "SpecifyingSystems/CachingMemory/MCInternalMemory.cfg",
+      "tla": "SpecifyingSystems/CachingMemory/MCInternalMemory.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 1,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "SpecifyingSystems/CachingMemory/MCWriteThroughCache.cfg",
+      "tla": "SpecifyingSystems/CachingMemory/MCWriteThroughCache.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences"
+      ],
+      "detail": null,
+      "elapsed_ms": 0,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "SpecifyingSystems/FIFO/MCInnerFIFO.cfg",
+      "tla": "SpecifyingSystems/FIFO/MCInnerFIFO.tla"
+    },
+    {
+      "blocking_features": [],
+      "detail": null,
+      "elapsed_ms": 416,
+      "outcome": "kernel-certified (enumerator-free fixpoint)",
+      "pairing": "same-stem",
+      "spec": "SpecifyingSystems/HourClock/HourClock.cfg",
+      "tla": "SpecifyingSystems/HourClock/HourClock.tla"
+    },
+    {
+      "blocking_features": [
+        "no-invariant"
+      ],
+      "detail": null,
+      "elapsed_ms": 3,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "SpecifyingSystems/HourClock/HourClock2.cfg",
+      "tla": "SpecifyingSystems/HourClock/HourClock2.tla"
+    },
+    {
+      "blocking_features": [
+        "sequences",
+        "quantifiers",
+        "no-invariant"
+      ],
+      "detail": null,
+      "elapsed_ms": 3,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "SpecifyingSystems/Liveness/LiveHourClock.cfg",
+      "tla": "SpecifyingSystems/Liveness/LiveHourClock.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "choose",
+        "no-invariant"
+      ],
+      "detail": null,
+      "elapsed_ms": 0,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "SpecifyingSystems/Liveness/MCLiveInternalMemory.cfg",
+      "tla": "SpecifyingSystems/Liveness/MCLiveInternalMemory.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "choose",
+        "no-invariant"
+      ],
+      "detail": null,
+      "elapsed_ms": 2,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "SpecifyingSystems/Liveness/MCLiveWriteThroughCache.cfg",
+      "tla": "SpecifyingSystems/Liveness/MCLiveWriteThroughCache.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "no-invariant"
+      ],
+      "detail": null,
+      "elapsed_ms": 2,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "SpecifyingSystems/RealTime/MCRealTimeHourClock.cfg",
+      "tla": "SpecifyingSystems/RealTime/MCRealTimeHourClock.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "quantifiers",
+        "sets",
+        "no-invariant"
+      ],
+      "detail": null,
+      "elapsed_ms": 1,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "SpecifyingSystems/SimpleMath/SimpleMath.cfg",
+      "tla": "SpecifyingSystems/SimpleMath/SimpleMath.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers"
+      ],
+      "detail": null,
+      "elapsed_ms": 1202,
+      "outcome": "kernel-certified (enumerator-free fixpoint)",
+      "pairing": "same-stem",
+      "spec": "SpecifyingSystems/TLC/ABCorrectness.cfg",
+      "tla": "SpecifyingSystems/TLC/ABCorrectness.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "instance"
+      ],
+      "detail": null,
+      "elapsed_ms": 1,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "SpecifyingSystems/TLC/MCAlternatingBit.cfg",
+      "tla": "SpecifyingSystems/TLC/MCAlternatingBit.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "no-invariant"
+      ],
+      "detail": null,
+      "elapsed_ms": 2,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "Stones/Stones.cfg",
+      "tla": "Stones/Stones.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "functions",
+        "instance",
+        "no-invariant"
+      ],
+      "detail": null,
+      "elapsed_ms": 2,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "TLC/TestGraphs.cfg",
+      "tla": "TLC/TestGraphs.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions"
+      ],
+      "detail": null,
+      "elapsed_ms": 1960,
+      "outcome": "kernel-certified (enumerator-assisted fixpoint)",
+      "pairing": "same-stem",
+      "spec": "TeachingConcurrency/Simple.cfg",
+      "tla": "TeachingConcurrency/Simple.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets"
+      ],
+      "detail": null,
+      "elapsed_ms": 45014,
+      "outcome": "timeout",
+      "pairing": "same-stem",
+      "spec": "TeachingConcurrency/SimpleRegular.cfg",
+      "tla": "TeachingConcurrency/SimpleRegular.tla"
+    },
+    {
+      "blocking_features": [
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "choose",
+        "no-invariant"
+      ],
+      "detail": null,
+      "elapsed_ms": 10,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "TransitiveClosure/TransitiveClosure.cfg",
+      "tla": "TransitiveClosure/TransitiveClosure.tla"
+    },
+    {
+      "blocking_features": [
+        "instance"
+      ],
+      "detail": null,
+      "elapsed_ms": 0,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "TwoPhase/MCTwoPhase.cfg",
+      "tla": "TwoPhase/MCTwoPhase.tla"
+    },
+    {
+      "blocking_features": [
+        "instance"
+      ],
+      "detail": null,
+      "elapsed_ms": 5,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "YoYo/MCYoYoNoPruning.cfg",
+      "tla": "YoYo/MCYoYoNoPruning.tla"
+    },
+    {
+      "blocking_features": [
+        "instance"
+      ],
+      "detail": null,
+      "elapsed_ms": 7,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "YoYo/MCYoYoPruning.cfg",
+      "tla": "YoYo/MCYoYoPruning.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 1613,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "YoYo/YoYoAllGraphs.cfg",
+      "tla": "YoYo/YoYoAllGraphs.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions"
+      ],
+      "detail": null,
+      "elapsed_ms": 45014,
+      "outcome": "timeout",
+      "pairing": "same-stem",
+      "spec": "aba-asyn-byz/aba_asyn_byz.cfg",
+      "tla": "aba-asyn-byz/aba_asyn_byz.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "no-invariant"
+      ],
+      "detail": null,
+      "elapsed_ms": 1,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "acp/ACP_NB_TLC.cfg",
+      "tla": "acp/ACP_NB_TLC.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "no-invariant"
+      ],
+      "detail": null,
+      "elapsed_ms": 4,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "acp/ACP_NB_WRONG_TLC.cfg",
+      "tla": "acp/ACP_NB_WRONG_TLC.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "no-invariant"
+      ],
+      "detail": null,
+      "elapsed_ms": 0,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "acp/ACP_SB_TLC.cfg",
+      "tla": "acp/ACP_SB_TLC.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "instance"
+      ],
+      "detail": null,
+      "elapsed_ms": 9,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "allocator/AllocatorImplementation.cfg",
+      "tla": "allocator/AllocatorImplementation.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "instance",
+        "no-invariant"
+      ],
+      "detail": null,
+      "elapsed_ms": 0,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "allocator/AllocatorRefinement.cfg",
+      "tla": "allocator/AllocatorRefinement.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets"
+      ],
+      "detail": null,
+      "elapsed_ms": 1867,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "allocator/SchedulingAllocator.cfg",
+      "tla": "allocator/SchedulingAllocator.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets"
+      ],
+      "detail": null,
+      "elapsed_ms": 626,
+      "outcome": "kernel-certified (enumerator-assisted fixpoint)",
+      "pairing": "same-stem",
+      "spec": "allocator/SimpleAllocator.cfg",
+      "tla": "allocator/SimpleAllocator.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions"
+      ],
+      "detail": null,
+      "elapsed_ms": 5090,
+      "outcome": "kernel-certified (enumerator-free fixpoint)",
+      "pairing": "same-stem",
+      "spec": "barriers/Barrier.cfg",
+      "tla": "barriers/Barrier.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "instance"
+      ],
+      "detail": null,
+      "elapsed_ms": 45037,
+      "outcome": "timeout",
+      "pairing": "same-stem",
+      "spec": "barriers/Barriers.cfg",
+      "tla": "barriers/Barriers.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets"
+      ],
+      "detail": null,
+      "elapsed_ms": 73,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "bcastByz/bcastByz.cfg",
+      "tla": "bcastByz/bcastByz.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets"
+      ],
+      "detail": null,
+      "elapsed_ms": 110,
+      "outcome": "declined",
+      "pairing": "cfg-names",
+      "spec": "bcastByz/bcastByzNoBcast.cfg",
+      "tla": "bcastByz/bcastByz.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets"
+      ],
+      "detail": null,
+      "elapsed_ms": 14,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "bcastFolklore/bcastFolklore.cfg",
+      "tla": "bcastFolklore/bcastFolklore.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets"
+      ],
+      "detail": null,
+      "elapsed_ms": 11,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "bosco/bosco.cfg",
+      "tla": "bosco/bosco.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "instance"
+      ],
+      "detail": null,
+      "elapsed_ms": 16,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "braf/BufferedRandomAccessFile.cfg",
+      "tla": "braf/BufferedRandomAccessFile.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "instance",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 45013,
+      "outcome": "timeout",
+      "pairing": "same-stem",
+      "spec": "btree/btree.cfg",
+      "tla": "btree/btree.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets"
+      ],
+      "detail": null,
+      "elapsed_ms": 11,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "btree/kvstore.cfg",
+      "tla": "btree/kvstore.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "instance"
+      ],
+      "detail": null,
+      "elapsed_ms": 30397,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "byihive/VoucherCancel.cfg",
+      "tla": "byihive/VoucherCancel.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "instance"
+      ],
+      "detail": null,
+      "elapsed_ms": 31788,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "byihive/VoucherIssue.cfg",
+      "tla": "byihive/VoucherIssue.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions"
+      ],
+      "detail": null,
+      "elapsed_ms": 20398,
+      "outcome": "kernel-certified (enumerator-free fixpoint)",
+      "pairing": "same-stem",
+      "spec": "byihive/VoucherLifeCycle.cfg",
+      "tla": "byihive/VoucherLifeCycle.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "instance"
+      ],
+      "detail": null,
+      "elapsed_ms": 38134,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "byihive/VoucherRedeem.cfg",
+      "tla": "byihive/VoucherRedeem.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "instance"
+      ],
+      "detail": null,
+      "elapsed_ms": 25004,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "byihive/VoucherTransfer.cfg",
+      "tla": "byihive/VoucherTransfer.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "instance",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 134,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "byzpaxos/BPConProof.cfg",
+      "tla": "byzpaxos/BPConProof.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "sets"
+      ],
+      "detail": null,
+      "elapsed_ms": 29,
+      "outcome": "kernel-certified (enumerator-assisted fixpoint)",
+      "pairing": "same-stem",
+      "spec": "byzpaxos/Consensus.cfg",
+      "tla": "byzpaxos/Consensus.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "instance",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 20,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "byzpaxos/PConProof.cfg",
+      "tla": "byzpaxos/PConProof.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "instance",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 77,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "byzpaxos/VoteProof.cfg",
+      "tla": "byzpaxos/VoteProof.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 32,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "c1cs/c1cs.cfg",
+      "tla": "c1cs/c1cs.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions"
+      ],
+      "detail": null,
+      "elapsed_ms": 12,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "cf1s-folklore/cf1s_folklore.cfg",
+      "tla": "cf1s-folklore/cf1s_folklore.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "functions",
+        "instance"
+      ],
+      "detail": null,
+      "elapsed_ms": 4,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "chang_roberts/MCChangRoberts.cfg",
+      "tla": "chang_roberts/MCChangRoberts.tla"
+    },
+    {
+      "blocking_features": [
+        "sequences",
+        "functions",
+        "sets",
+        "instance",
+        "no-invariant"
+      ],
+      "detail": null,
+      "elapsed_ms": 2,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "dag-consensus/BlockDagTest.cfg",
+      "tla": "dag-consensus/BlockDagTest.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "instance"
+      ],
+      "detail": null,
+      "elapsed_ms": 4,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "dag-consensus/TLCSailfish1.cfg",
+      "tla": "dag-consensus/TLCSailfish1.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "sets",
+        "instance"
+      ],
+      "detail": null,
+      "elapsed_ms": 7,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "dag-consensus/TLCSailfish2.cfg",
+      "tla": "dag-consensus/TLCSailfish2.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "instance"
+      ],
+      "detail": null,
+      "elapsed_ms": 13,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "detector_chan96/EnvironmentController.cfg",
+      "tla": "detector_chan96/EnvironmentController.tla"
+    },
+    {
+      "blocking_features": [
+        "constants"
+      ],
+      "detail": null,
+      "elapsed_ms": 30,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "dijkstra-mutex/DijkstraMutex.toolbox/LSpec-model/MC.cfg",
+      "tla": "dijkstra-mutex/DijkstraMutex.toolbox/LSpec-model/MC.tla"
+    },
+    {
+      "blocking_features": [
+        "constants"
+      ],
+      "detail": null,
+      "elapsed_ms": 106,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "dijkstra-mutex/DijkstraMutex.toolbox/Safety-4-processors/MC.cfg",
+      "tla": "dijkstra-mutex/DijkstraMutex.toolbox/Safety-4-processors/MC.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sets"
+      ],
+      "detail": null,
+      "elapsed_ms": 13,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "diskpaxos/MC_HDiskSynod.cfg",
+      "tla": "diskpaxos/MC_HDiskSynod.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "functions",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 10,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "echo/MCEcho.cfg",
+      "tla": "echo/MCEcho.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences"
+      ],
+      "detail": null,
+      "elapsed_ms": 6029,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "ewd426/SimTokenRing.cfg",
+      "tla": "ewd426/SimTokenRing.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions"
+      ],
+      "detail": null,
+      "elapsed_ms": 38155,
+      "outcome": "kernel-certified (enumerator-assisted fixpoint)",
+      "pairing": "same-stem",
+      "spec": "ewd426/TokenRing.cfg",
+      "tla": "ewd426/TokenRing.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "functions",
+        "sets"
+      ],
+      "detail": null,
+      "elapsed_ms": 16,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "ewd687a/EWD687a_anim.cfg",
+      "tla": "ewd687a/EWD687a_anim.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers"
+      ],
+      "detail": null,
+      "elapsed_ms": 0,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "ewd687a/MCEWD687a.cfg",
+      "tla": "ewd687a/MCEWD687a.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "instance"
+      ],
+      "detail": null,
+      "elapsed_ms": 590,
+      "outcome": "kernel-certified (enumerator-assisted fixpoint)",
+      "pairing": "same-stem",
+      "spec": "ewd840/EWD840.cfg",
+      "tla": "ewd840/EWD840.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions"
+      ],
+      "detail": null,
+      "elapsed_ms": 9,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "ewd840/EWD840_anim.cfg",
+      "tla": "ewd840/EWD840_anim.tla"
+    },
+    {
+      "blocking_features": [
+        "constants"
+      ],
+      "detail": null,
+      "elapsed_ms": 0,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "ewd840/EWD840_json.cfg",
+      "tla": "ewd840/EWD840_json.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions"
+      ],
+      "detail": null,
+      "elapsed_ms": 473,
+      "outcome": "kernel-certified (enumerator-assisted fixpoint)",
+      "pairing": "same-stem",
+      "spec": "ewd840/SyncTerminationDetection.cfg",
+      "tla": "ewd840/SyncTerminationDetection.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions"
+      ],
+      "detail": null,
+      "elapsed_ms": 45011,
+      "outcome": "timeout",
+      "pairing": "same-stem",
+      "spec": "ewd998/AsyncTerminationDetection.cfg",
+      "tla": "ewd998/AsyncTerminationDetection.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "instance"
+      ],
+      "detail": null,
+      "elapsed_ms": 80,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "ewd998/EWD998.cfg",
+      "tla": "ewd998/EWD998.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "instance",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 18,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "ewd998/EWD998Chan.cfg",
+      "tla": "ewd998/EWD998Chan.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "instance",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 12,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "ewd998/EWD998ChanID.cfg",
+      "tla": "ewd998/EWD998ChanID.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "functions"
+      ],
+      "detail": null,
+      "elapsed_ms": 1,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "ewd998/EWD998ChanID_export.cfg",
+      "tla": "ewd998/EWD998ChanID_export.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "functions",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 1,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "ewd998/EWD998ChanID_shiviz.cfg",
+      "tla": "ewd998/EWD998ChanID_shiviz.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "no-invariant"
+      ],
+      "detail": null,
+      "elapsed_ms": 3,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "ewd998/EWD998ChanTrace.cfg",
+      "tla": "ewd998/EWD998ChanTrace.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "instance",
+        "choose",
+        "no-invariant"
+      ],
+      "detail": null,
+      "elapsed_ms": 6,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "ewd998/EWD998PCal.cfg",
+      "tla": "ewd998/EWD998PCal.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "instance"
+      ],
+      "detail": null,
+      "elapsed_ms": 37,
+      "outcome": "declined",
+      "pairing": "cfg-names+stem-prefix",
+      "spec": "ewd998/EWD998Small.cfg",
+      "tla": "ewd998/EWD998.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "functions",
+        "sets",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 1,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "ewd998/SmokeEWD998.cfg",
+      "tla": "ewd998/SmokeEWD998.tla"
+    },
+    {
+      "blocking_features": [
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "no-invariant"
+      ],
+      "detail": null,
+      "elapsed_ms": 1,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "ewd998/SmokeEWD998_SC.cfg",
+      "tla": "ewd998/SmokeEWD998_SC.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers"
+      ],
+      "detail": null,
+      "elapsed_ms": 89,
+      "outcome": "kernel-certified (enumerator-assisted fixpoint)",
+      "pairing": "same-stem",
+      "spec": "glowingRaccoon/clean.cfg",
+      "tla": "glowingRaccoon/clean.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "instance"
+      ],
+      "detail": null,
+      "elapsed_ms": 1361,
+      "outcome": "kernel-certified (enumerator-assisted fixpoint)",
+      "pairing": "same-stem",
+      "spec": "glowingRaccoon/product.cfg",
+      "tla": "glowingRaccoon/product.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "instance"
+      ],
+      "detail": null,
+      "elapsed_ms": 193,
+      "outcome": "kernel-certified (enumerator-assisted fixpoint)",
+      "pairing": "same-stem",
+      "spec": "glowingRaccoon/stages.cfg",
+      "tla": "glowingRaccoon/stages.tla"
+    },
+    {
+      "blocking_features": [
+        "constants"
+      ],
+      "detail": null,
+      "elapsed_ms": 24,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "lamport_mutex/MCLamportMutex.cfg",
+      "tla": "lamport_mutex/MCLamportMutex.tla"
+    },
+    {
+      "blocking_features": [
+        "sequences",
+        "quantifiers",
+        "functions"
+      ],
+      "detail": null,
+      "elapsed_ms": 1473,
+      "outcome": "kernel-certified (enumerator-free fixpoint)",
+      "pairing": "same-stem",
+      "spec": "locks_auxiliary_vars/Lock.cfg",
+      "tla": "locks_auxiliary_vars/Lock.tla"
+    },
+    {
+      "blocking_features": [
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "instance"
+      ],
+      "detail": null,
+      "elapsed_ms": 27,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "locks_auxiliary_vars/LockHS.cfg",
+      "tla": "locks_auxiliary_vars/LockHS.tla"
+    },
+    {
+      "blocking_features": [
+        "sequences",
+        "quantifiers",
+        "functions",
+        "instance"
+      ],
+      "detail": null,
+      "elapsed_ms": 17230,
+      "outcome": "kernel-certified (enumerator-free fixpoint)",
+      "pairing": "same-stem",
+      "spec": "locks_auxiliary_vars/Peterson.cfg",
+      "tla": "locks_auxiliary_vars/Peterson.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets"
+      ],
+      "detail": null,
+      "elapsed_ms": 14,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "nbacc_ray97/nbacc_ray97.cfg",
+      "tla": "nbacc_ray97/nbacc_ray97.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions"
+      ],
+      "detail": null,
+      "elapsed_ms": 17777,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "nbacg_guer01/nbacg_guer01.cfg",
+      "tla": "nbacg_guer01/nbacg_guer01.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences"
+      ],
+      "detail": null,
+      "elapsed_ms": 16,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "spanning/MC_spanning.cfg",
+      "tla": "spanning/MC_spanning.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "no-invariant"
+      ],
+      "detail": null,
+      "elapsed_ms": 1,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "sums_even/MC_sums_even.cfg",
+      "tla": "sums_even/MC_sums_even.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions"
+      ],
+      "detail": null,
+      "elapsed_ms": 16,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "tcp/MCtcp.cfg",
+      "tla": "tcp/MCtcp.tla"
+    },
+    {
+      "blocking_features": [
+        "constants"
+      ],
+      "detail": null,
+      "elapsed_ms": 1,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "tower_of_hanoi/Hanoi.toolbox/Model_1/MC.cfg",
+      "tla": "tower_of_hanoi/Hanoi.toolbox/Model_1/MC.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "functions"
+      ],
+      "detail": null,
+      "elapsed_ms": 2,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "tower_of_hanoi/Hanoi_anim.cfg",
+      "tla": "tower_of_hanoi/Hanoi_anim.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets"
+      ],
+      "detail": null,
+      "elapsed_ms": 10,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "transaction_commit/2PCwithBTM.cfg",
+      "tla": "transaction_commit/2PCwithBTM.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "instance",
+        "choose"
+      ],
+      "detail": null,
+      "elapsed_ms": 12,
+      "outcome": "declined",
+      "pairing": "same-stem",
+      "spec": "transaction_commit/PaxosCommit.cfg",
+      "tla": "transaction_commit/PaxosCommit.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "quantifiers",
+        "functions"
+      ],
+      "detail": null,
+      "elapsed_ms": 4006,
+      "outcome": "kernel-certified (enumerator-free fixpoint)",
+      "pairing": "same-stem",
+      "spec": "transaction_commit/TCommit.cfg",
+      "tla": "transaction_commit/TCommit.tla"
+    },
+    {
+      "blocking_features": [
+        "constants",
+        "sequences",
+        "quantifiers",
+        "functions",
+        "sets",
+        "instance"
+      ],
+      "detail": null,
+      "elapsed_ms": 466,
+      "outcome": "kernel-certified (enumerator-assisted fixpoint)",
+      "pairing": "same-stem",
+      "spec": "transaction_commit/TwoPhase.cfg",
+      "tla": "transaction_commit/TwoPhase.tla"
+    }
+  ],
+  "schema": "ty.corpus-sweep/v1",
+  "summary": {
+    "buckets_sum_to_total": true,
+    "declined": 148,
+    "error": 0,
+    "kernel_certified_any": 24,
+    "kernel_enumerator_assisted": 13,
+    "kernel_enumerator_free": 10,
+    "kernel_enumerator_free_closure": 1,
+    "kernel_unbounded_parametric": 0,
+    "not_attempted": 0,
+    "smt_certified": 0,
+    "timeout": 9,
+    "total_cfgs": 181,
+    "unpaired": 0
+  }
+}

@@ -1,0 +1,195 @@
+// Copyright 2026 Andrew Yates
+// Author: Andrew Yates <andrewyates.name@gmail.com>
+// Licensed under the Apache License, Version 2.0
+
+//! Supported MCC examination kinds and string conversions.
+
+use crate::error::PnmlError;
+use crate::reduction::ReductionMode;
+
+/// The Model Checking Contest examination categories this engine answers.
+///
+/// Each variant corresponds to one MCC examination name (round-tripped by
+/// [`from_name`](Examination::from_name) / [`as_str`](Examination::as_str)).
+/// Variants split into *property* examinations, which read a formula file from
+/// the model directory (see [`needs_property_xml`](Examination::needs_property_xml)),
+/// and *non-property* examinations, which examine the whole state space or a
+/// structural property. The enum is `#[non_exhaustive]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Examination {
+    /// Does the net have a reachable deadlock (a marking with no enabled
+    /// transition)?
+    ReachabilityDeadlock,
+    /// A batch of place-cardinality reachability queries (does some marking
+    /// satisfy a comparison over token counts?), read from the property XML.
+    ReachabilityCardinality,
+    /// A batch of transition-fireability reachability queries (is some
+    /// transition fireable in a reachable marking?), read from the property XML.
+    ReachabilityFireability,
+    /// A batch of CTL formulas over place cardinalities, read from the property
+    /// XML.
+    CTLCardinality,
+    /// A batch of CTL formulas over transition fireabilities, read from the
+    /// property XML.
+    CTLFireability,
+    /// A batch of LTL formulas over place cardinalities, read from the property
+    /// XML.
+    LTLCardinality,
+    /// A batch of LTL formulas over transition fireabilities, read from the
+    /// property XML.
+    LTLFireability,
+    /// Count the reachable markings (and edges) of the net.
+    StateSpace,
+    /// Is the net 1-safe (every reachable marking has at most one token in
+    /// every place)?
+    OneSafe,
+    /// Is every transition quasi-live (fireable in at least one reachable
+    /// marking)?
+    QuasiLiveness,
+    /// Does the net have a stable marking (a reachable marking from which the
+    /// marking of every place is constant on every infinite run)?
+    StableMarking,
+    /// The maximum number of tokens each place can hold over all reachable
+    /// markings (per-place upper bounds).
+    UpperBounds,
+    /// Is every transition live (fireable from every reachable marking)?
+    Liveness,
+}
+
+impl Examination {
+    /// All 13 MCC examination kinds, in canonical order.
+    pub const ALL: [Examination; 13] = [
+        Self::ReachabilityDeadlock,
+        Self::ReachabilityCardinality,
+        Self::ReachabilityFireability,
+        Self::CTLCardinality,
+        Self::CTLFireability,
+        Self::LTLCardinality,
+        Self::LTLFireability,
+        Self::StateSpace,
+        Self::UpperBounds,
+        Self::OneSafe,
+        Self::QuasiLiveness,
+        Self::StableMarking,
+        Self::Liveness,
+    ];
+
+    /// Parses an MCC examination name into its [`Examination`] variant.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PnmlError::UnknownExamination`] if `name` is not one of the
+    /// recognized MCC examination names.
+    pub fn from_name(name: &str) -> Result<Self, PnmlError> {
+        match name {
+            "ReachabilityDeadlock" => Ok(Self::ReachabilityDeadlock),
+            "ReachabilityCardinality" => Ok(Self::ReachabilityCardinality),
+            "ReachabilityFireability" => Ok(Self::ReachabilityFireability),
+            "CTLCardinality" => Ok(Self::CTLCardinality),
+            "CTLFireability" => Ok(Self::CTLFireability),
+            "LTLCardinality" => Ok(Self::LTLCardinality),
+            "LTLFireability" => Ok(Self::LTLFireability),
+            "StateSpace" => Ok(Self::StateSpace),
+            "OneSafe" => Ok(Self::OneSafe),
+            "QuasiLiveness" => Ok(Self::QuasiLiveness),
+            "StableMarking" => Ok(Self::StableMarking),
+            "UpperBounds" => Ok(Self::UpperBounds),
+            "Liveness" => Ok(Self::Liveness),
+            _ => Err(PnmlError::UnknownExamination(name.into())),
+        }
+    }
+
+    /// Returns the MCC examination name string.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReachabilityDeadlock => "ReachabilityDeadlock",
+            Self::ReachabilityCardinality => "ReachabilityCardinality",
+            Self::ReachabilityFireability => "ReachabilityFireability",
+            Self::CTLCardinality => "CTLCardinality",
+            Self::CTLFireability => "CTLFireability",
+            Self::LTLCardinality => "LTLCardinality",
+            Self::LTLFireability => "LTLFireability",
+            Self::StateSpace => "StateSpace",
+            Self::OneSafe => "OneSafe",
+            Self::QuasiLiveness => "QuasiLiveness",
+            Self::StableMarking => "StableMarking",
+            Self::UpperBounds => "UpperBounds",
+            Self::Liveness => "Liveness",
+        }
+    }
+
+    /// Returns true if this examination requires property XML files from
+    /// the model directory (e.g., UpperBounds.xml, ReachabilityCardinality.xml).
+    #[must_use]
+    pub fn needs_property_xml(self) -> bool {
+        self.property_xml_name().is_ok()
+    }
+
+    /// Returns the MCC property XML stem for property examinations,
+    /// or an error for non-property examinations (e.g., StateSpace, OneSafe).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PnmlError::ExaminationDoesNotUsePropertyXml`] for the
+    /// non-property examinations, which take no formula file.
+    pub fn property_xml_name(self) -> Result<&'static str, PnmlError> {
+        match self {
+            Self::UpperBounds => Ok("UpperBounds"),
+            Self::ReachabilityCardinality => Ok("ReachabilityCardinality"),
+            Self::ReachabilityFireability => Ok("ReachabilityFireability"),
+            Self::CTLCardinality => Ok("CTLCardinality"),
+            Self::CTLFireability => Ok("CTLFireability"),
+            Self::LTLCardinality => Ok("LTLCardinality"),
+            Self::LTLFireability => Ok("LTLFireability"),
+            _ => Err(PnmlError::ExaminationDoesNotUsePropertyXml {
+                examination: self.as_str().to_string(),
+            }),
+        }
+    }
+
+    /// Returns the query-aware structural reduction mode for this examination.
+    ///
+    /// Different temporal logics tolerate different structural reduction rules.
+    /// This follows Tapaal's approach: reachability allows all rules, CTL/LTL
+    /// progressively restrict which rules are applied.
+    ///
+    /// # Reduction safety by examination type
+    ///
+    /// - **Reachability** examinations: all rules safe (only markings matter)
+    /// - **CTL** examinations: next-free CTL rules (no agglomeration)
+    /// - **LTL** examinations: stutter-insensitive rules (LTL without X)
+    /// - **Non-property** examinations (StateSpace, OneSafe, etc.): reachability
+    ///   mode since they examine the full state space or structural properties
+    #[must_use]
+    pub(crate) fn reduction_mode(self) -> ReductionMode {
+        match self {
+            // Reachability examinations: all reductions are sound.
+            Self::ReachabilityDeadlock
+            | Self::ReachabilityCardinality
+            | Self::ReachabilityFireability => ReductionMode::Reachability,
+
+            // CTL examinations: formulas may contain EX/AX. Use next-free CTL
+            // as the conservative default — callers that detect absence of
+            // next-step operators can upgrade to the more permissive mode.
+            Self::CTLCardinality | Self::CTLFireability => ReductionMode::NextFreeCTL,
+
+            // LTL examinations: assume stutter-insensitive (no X operator).
+            // Callers that detect X in the formula should downgrade to
+            // StutterSensitiveLTL.
+            Self::LTLCardinality | Self::LTLFireability => ReductionMode::StutterInsensitiveLTL,
+
+            // Non-property examinations: state space / structural analysis.
+            // UpperBounds needs exact markings (reachability-equivalent).
+            // OneSafe has its own dedicated semantics lane.
+            // QuasiLiveness/StableMarking/Liveness examine global properties.
+            Self::StateSpace
+            | Self::OneSafe
+            | Self::QuasiLiveness
+            | Self::StableMarking
+            | Self::UpperBounds
+            | Self::Liveness => ReductionMode::Reachability,
+        }
+    }
+}

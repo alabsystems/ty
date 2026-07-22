@@ -1,0 +1,68 @@
+[package]
+name = "tla-trust-cg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "TY trust-codegen compilation backend: trust-ir -> native code via trust-codegen"
+readme.workspace = true
+
+[dependencies]
+trust-ir = { workspace = true, features = ["binary", "fmt", "serde"] }
+trust-ir-build.workspace = true
+tla-ir = { path = "../tla-ir" }
+tla-tir = { path = "../tla-tir" }
+
+# tla-jit-abi — leaf crate holding the stable ABI types (JitCallOut,
+# JitStatus, JitRuntimeErrorKind, JitRuntimeError + function-pointer
+# aliases). `runtime_abi::abi` re-exports from this crate so the three types
+# have a single source of truth. Part of #4265 (Stage 2b of epic #4251).
+tla-jit-abi.workspace = true
+
+# Runtime ABI: ABI types, flat state, compound layout, fingerprint, atomic fp
+# set, and liveness predicate descriptors for the trust-codegen native path.
+tla-core = { path = "../tla-core" }
+tla-value = { path = "../tla-value" }
+
+# trust-codegen native compilation pipeline (zero C deps, optional)
+trust-cg-codegen = { workspace = true, optional = true }
+trust-cg-ir = { workspace = true, optional = true }
+trust-cg-lower = { workspace = true, optional = true }
+trust-cg-opt = { workspace = true, optional = true }
+
+# trust-cg-jit-matrix provides `executable_buffer_cache` — the persistent
+# on-disk ExecutableBuffer cache (serialize/decode/publish + fail-closed
+# cross-process disk I/O) consumed by the native batch JIT path so compiled
+# shards survive a process boundary.
+trust-cg-jit-matrix = { workspace = true, optional = true }
+
+# Error handling
+thiserror.workspace = true
+serde_json.workspace = true
+
+# Support for the absorbed runtime ABI modules.
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+num-bigint.workspace = true
+num-traits.workspace = true
+
+# Compilation cache + PGO (design doc §7)
+sha2 = "0.10"
+
+# Dynamic loading of cached .dylib/.so artifacts (native feature only)
+libloading = { version = "0.8", optional = true }
+
+[features]
+# Enable trust-codegen native compilation pipeline (JIT, zero C deps).
+# Gated because trust-codegen pulls in tracing-subscriber which conflicts with tla-log.
+# `native` also enables the on-disk compilation cache's dynamic-library loader.
+native = ["trust-cg-codegen", "trust-cg-ir", "trust-cg-lower", "trust-cg-opt", "trust-cg-jit-matrix", "dep:libloading"]
+
+[dev-dependencies]
+ntest = "0.9"
+tempfile = { workspace = true }
+tla-dialect = { path = "../tla-dialect" }
+ay-dpll = { workspace = true }
+
+[lints]
+workspace = true

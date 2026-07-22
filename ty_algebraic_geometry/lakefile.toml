@@ -1,0 +1,45 @@
+name = "ty_algebraic_geometry"
+defaultTargets = ["TyAlgebraicGeometry", "QuotientGraph", "SymmetricLTL", "MemoryHomotopy", "PetriCounting", "PetriSemantics", "PetriRedundant", "PetriRuleRConcrete", "PetriFiberCount", "PetriAgglom", "PetriEdges", "PetriStateMachineComplete", "PetriReadArcRedundant"]
+
+[[lean_lib]]
+name = "PetriCounting"
+
+[[lean_lib]]
+name = "PetriSemantics"
+
+[[lean_lib]]
+name = "PetriRedundant"
+
+[[lean_lib]]
+name = "PetriRuleRConcrete"
+
+[[lean_lib]]
+name = "PetriFiberCount"
+
+[[lean_lib]]
+name = "PetriAgglom"
+
+[[lean_lib]]
+name = "PetriEdges"
+
+[[lean_lib]]
+name = "PetriStateMachineComplete"
+
+[[lean_lib]]
+name = "PetriReadArcRedundant"
+
+[[lean_lib]]
+name = "TyAlgebraicGeometry"
+
+[[lean_lib]]
+name = "QuotientGraph"
+
+[[lean_lib]]
+name = "SymmetricLTL"
+
+[[lean_lib]]
+name = "MemoryHomotopy"
+
+[[require]]
+name = "mathlib"
+git = "https://github.com/leanprover-community/mathlib4"

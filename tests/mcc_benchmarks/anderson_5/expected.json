@@ -1,0 +1,15 @@
+{
+  "model": "Anderson-PT-05",
+  "ReachabilityCardinality": {
+    "Anderson-PT-05-ReachabilityCardinality-2025-00": "FALSE",
+    "Anderson-PT-05-ReachabilityCardinality-2025-02": "TRUE",
+    "Anderson-PT-05-ReachabilityCardinality-2025-05": "FALSE",
+    "Anderson-PT-05-ReachabilityCardinality-2025-06": "TRUE",
+    "Anderson-PT-05-ReachabilityCardinality-2025-07": "TRUE",
+    "Anderson-PT-05-ReachabilityCardinality-2025-09": "FALSE",
+    "Anderson-PT-05-ReachabilityCardinality-2025-12": "FALSE",
+    "Anderson-PT-05-ReachabilityCardinality-2025-13": "TRUE",
+    "Anderson-PT-05-ReachabilityCardinality-2025-14": "FALSE",
+    "Anderson-PT-05-ReachabilityCardinality-2025-15": "FALSE"
+  }
+}

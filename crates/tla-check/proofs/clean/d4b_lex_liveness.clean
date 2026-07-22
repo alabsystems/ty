@@ -1,0 +1,136 @@
+-- d4b_lex_liveness : LEXICOGRAPHIC well-founded liveness — the multi-measure
+-- generalization of d4, authored in CLEAN's surface language and checked by
+-- CLEAN's CIC kernel (so it enters the clean kernel's trust base).
+--
+-- d4 proves no `f : Nat -> Nat` strictly decreases forever (single Nat measure).
+-- TY's liveness verdicts often need a LEXICOGRAPHIC measure — a pair (m1, m2)
+-- where every step either strictly decreases m1, OR keeps m1 and strictly
+-- decreases m2. The soundness meaning is: such a lexicographic measure cannot
+-- decrease forever, so the run makes progress / terminates.
+--
+-- lexLt q p := (fst q < fst p)  OR  (fst q = fst p AND snd q < snd p)
+--   "q is strictly lexicographically below p".
+--
+-- STATEMENT PROVED (`no_infinite_lex_descent`): there is NO
+--   f : Nat -> Prod Nat Nat  with  (forall n, lexLt (f (n+1)) (f n)).
+-- i.e. no run whose (Nat,Nat) lexicographic measure strictly lex-decreases at
+-- every step. FULLY GENERAL over the pair sequence `f`.
+--
+-- PROOF: the lexicographic order on `Prod Nat Nat` is well-founded
+-- (`lexAcc : (p : Prod Nat Nat) -> Acc lexLt p`), proved by NESTED `Acc.rec` on
+-- the two Nat components (outer on fst via `Nat.accNatLt`, inner on snd) — the
+-- standard lexicographic-well-foundedness construction, with `Prod.rec` used to
+-- destructure predecessors so no structure-eta is required. Then the SAME
+-- Acc-descent argument as d4 (`no_lex_desc_acc`, an `Acc.rec` mirroring d4's
+-- `no_desc_acc`) rules out any infinite lex-descending sequence. No axioms
+-- beyond the foundational prelude (`Acc`, `Acc.rec`, `Acc.intro`, `Nat.accNatLt`,
+-- `Prod.rec`); no `sorry`.
+
+namespace LexLive
+
+-- Strict lexicographic order on Nat-pairs.
+def lexLt (q p : Prod Nat Nat) : Prop :=
+  Or (Nat.lt (@Prod.fst Nat Nat q) (@Prod.fst Nat Nat p))
+     (And (@Eq Nat (@Prod.fst Nat Nat q) (@Prod.fst Nat Nat p))
+          (Nat.lt (@Prod.snd Nat Nat q) (@Prod.snd Nat Nat p)))
+
+-- Reduction sanity (`rfl`): on literal pairs, lexLt is exactly the disjunction
+-- "fst strictly drops, OR fst ties and snd strictly drops". (`@Prod.mk Nat Nat`
+-- is written FULLY EXPLICIT — an implicit `Prod.mk` in an `@Eq.refl` reduction
+-- context trips a universe-inference failure in the current clean elaborator.)
+theorem lexLt_mk (qa qb pa pb : Nat) :
+    @Eq Prop (lexLt (@Prod.mk Nat Nat qa qb) (@Prod.mk Nat Nat pa pb))
+      (Or (Nat.lt qa pa) (And (@Eq Nat qa pa) (Nat.lt qb pb))) :=
+  @Eq.refl Prop (Or (Nat.lt qa pa) (And (@Eq Nat qa pa) (Nat.lt qb pb)))
+
+-- ============================================================================
+-- WELL-FOUNDEDNESS of lexLt: every pair is accessible.
+-- Nested Acc.rec: outer on the accessibility of the first component `a`
+-- (via Nat.accNatLt), inner on the accessibility of the second component `b`.
+-- A predecessor (qa,qb) of (x,yb) is either qa<x (use the OUTER IH at qa, with
+-- qb accessible by Nat.accNatLt) or qa=x AND qb<yb (use the INNER IH at qb,
+-- transported along qa=x). `Prod.rec` destructures the predecessor so we never
+-- need `Prod.mk (fst q) (snd q) = q` (structure eta).
+-- ============================================================================
+theorem lexAccAux (a : Nat) (acca : Acc Nat.lt a) :
+    (b : Nat) -> Acc Nat.lt b -> Acc lexLt (Prod.mk a b) :=
+  @Acc.rec Nat Nat.lt
+    (fun (x : Nat) (_ : Acc Nat.lt x) => (b : Nat) -> Acc Nat.lt b -> Acc lexLt (Prod.mk x b))
+    (fun (x : Nat)
+         (_hx : (y : Nat) -> Nat.lt y x -> Acc Nat.lt y)
+         (ih_x : (y : Nat) -> Nat.lt y x -> (b : Nat) -> Acc Nat.lt b -> Acc lexLt (Prod.mk y b)) =>
+       fun (b : Nat) (accb : Acc Nat.lt b) =>
+         @Acc.rec Nat Nat.lt
+           (fun (yy : Nat) (_ : Acc Nat.lt yy) => Acc lexLt (Prod.mk x yy))
+           (fun (yb : Nat)
+                (_hy : (z : Nat) -> Nat.lt z yb -> Acc Nat.lt z)
+                (ih_y : (z : Nat) -> Nat.lt z yb -> Acc lexLt (Prod.mk x z)) =>
+              @Acc.intro (Prod Nat Nat) lexLt (Prod.mk x yb)
+                (fun (q : Prod Nat Nat) =>
+                  @Prod.rec Nat Nat
+                    (fun (qq : Prod Nat Nat) => lexLt qq (Prod.mk x yb) -> Acc lexLt qq)
+                    (fun (qa : Nat) (qb : Nat) =>
+                      fun (hq : lexLt (Prod.mk qa qb) (Prod.mk x yb)) =>
+                        @Or.rec (Nat.lt qa x) (And (@Eq Nat qa x) (Nat.lt qb yb))
+                          (fun _ => Acc lexLt (Prod.mk qa qb))
+                          -- qa < x : outer IH at qa, qb accessible on its own
+                          (fun h1 => ih_x qa h1 qb (Nat.accNatLt qb))
+                          -- qa = x AND qb < yb : inner IH at qb, transported along qa = x
+                          (fun h2 =>
+                            @Eq.subst Nat
+                              (fun z => Acc lexLt (Prod.mk z qb))
+                              x qa
+                              (@Eq.symm Nat qa x (@And.left (@Eq Nat qa x) (Nat.lt qb yb) h2))
+                              (ih_y qb (@And.right (@Eq Nat qa x) (Nat.lt qb yb) h2)))
+                          hq)
+                    q))
+           b accb)
+    a acca
+
+-- Every Nat-pair is accessible (destructure via Prod.rec, seed both components
+-- with Nat.accNatLt).
+theorem lexAcc (p : Prod Nat Nat) : Acc lexLt p :=
+  @Prod.rec Nat Nat (fun (pp : Prod Nat Nat) => Acc lexLt pp)
+    (fun (a : Nat) (b : Nat) => lexAccAux a (Nat.accNatLt a) b (Nat.accNatLt b))
+    p
+
+-- ============================================================================
+-- No infinite lex-descending sequence from an accessible pair (mirrors d4's
+-- `no_desc_acc`, with Prod Nat Nat / lexLt in place of Nat / Nat.lt).
+-- ============================================================================
+def NoLexDescTo (p : Prod Nat Nat) : Prop :=
+  (g : Nat -> Prod Nat Nat) ->
+  ((n : Nat) -> lexLt (g (Nat.succ n)) (g n)) ->
+  (@Eq (Prod Nat Nat) (g Nat.zero) p) ->
+  False
+
+theorem no_lex_desc_acc (p : Prod Nat Nat) (acc : Acc lexLt p) : NoLexDescTo p :=
+  @Acc.rec (Prod Nat Nat) lexLt
+    (fun (x : Prod Nat Nat) (_ : Acc lexLt x) => NoLexDescTo x)
+    (fun (x : Prod Nat Nat)
+         (_h : (y : Prod Nat Nat) -> lexLt y x -> Acc lexLt y)
+         (ih : (y : Prod Nat Nat) -> lexLt y x -> NoLexDescTo y) =>
+       fun (g : Nat -> Prod Nat Nat)
+           (hg : (n : Nat) -> lexLt (g (Nat.succ n)) (g n))
+           (h0 : @Eq (Prod Nat Nat) (g Nat.zero) x) =>
+         ih (g (Nat.succ Nat.zero))
+            (@Eq.subst (Prod Nat Nat)
+               (fun (z : Prod Nat Nat) => lexLt (g (Nat.succ Nat.zero)) z)
+               (g Nat.zero) x h0
+               (hg Nat.zero))
+            (fun (n : Nat) => g (Nat.succ n))
+            (fun (n : Nat) => hg (Nat.succ n))
+            (@Eq.refl (Prod Nat Nat) (g (Nat.succ Nat.zero))))
+    p acc
+
+-- ============================================================================
+-- THE THEOREM: no run's (Nat,Nat) lexicographic measure strictly lex-decreases
+-- forever. Instantiate `no_lex_desc_acc` at `f 0` (accessible by `lexAcc`).
+-- ============================================================================
+theorem no_infinite_lex_descent
+    (f : Nat -> Prod Nat Nat)
+    (hdec : (n : Nat) -> lexLt (f (Nat.succ n)) (f n)) : False :=
+  no_lex_desc_acc (f Nat.zero) (lexAcc (f Nat.zero))
+    f hdec (@Eq.refl (Prod Nat Nat) (f Nat.zero))
+
+end LexLive

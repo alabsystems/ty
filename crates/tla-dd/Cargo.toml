@@ -1,0 +1,33 @@
+# Decision-Diagram spec infrastructure for ty's Petri-net engine.
+#
+# Rationale: DD-backed reachability is the single biggest algorithmic gap
+# vs ITS-Tools / tedd on bounded, highly-concurrent nets.
+#
+# This crate is the oxidd-free half of the DD lane: the DdNetSpec builder,
+# the predicate/query DSL, BDD variable ordering, the explicit-state BFS
+# reachable-set oracle, and the SymbolicGba types the native `tla-bdd` engine
+# consumes. The former OxiDD-based BDD reachability engine that lived here has
+# been deleted; `oxidd` is no longer a dependency. Wired into `tla-petri`
+# behind the `dd-backend` feature (ON by default at HEAD).
+
+[package]
+name = "tla-dd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Decision-diagram backend MVP (OxiDD BDD reachability) for ty"
+readme.workspace = true
+
+[dependencies]
+# Native, oxidd-free spec infrastructure only — the DdNetSpec builder, predicate
+# lowering, variable ordering, BFS reachable-set oracle, and the SymbolicGba
+# types consumed by the native tla-bdd LTL lane. The oxidd BDD engine that once
+# lived here (DdReachability + dispatch_* + symbolic_ctl/ltl evaluators) has been
+# deleted; oxidd (and its transitive oxidd-core via the vendored reorder fork) is
+# no longer a dependency of this crate.
+thiserror.workspace = true
+
+[lints]
+workspace = true

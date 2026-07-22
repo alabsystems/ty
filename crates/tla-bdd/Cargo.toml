@@ -1,0 +1,41 @@
+# Copyright 2026 Andrew Yates
+# Licensed under the Apache License, Version 2.0
+#
+# tla-bdd — TY's own native Reduced Ordered Binary Decision Diagram engine, the
+# from-scratch replacement for the external `oxidd` stack (`oxidd-core`,
+# `oxidd-rules-bdd`, `oxidd-manager-index`, `oxidd-cache`). Zero third-party
+# runtime deps: own node store, unique table (canonicity), and ITE computed
+# cache — std collections only.
+#
+# FIRST INCREMENT (this crate): the canonical ROBDD core — node store +
+# unique table + reduced `mk` + recursive `ite` (and/or/not/xor derived) + exact
+# model count + node count, with a property battery. Correctness first. The
+# oxidd-API surface `tla-dd` consumes (manager handles, fused ∃, var reordering,
+# GC) is layered on in subsequent increments until `tla-dd` can swap oxidd →
+# tla-bdd and the external stack is dropped.
+[package]
+name = "tla-bdd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Native zero-dep Reduced Ordered BDD engine for ty (replacement for the external oxidd stack)"
+readme.workspace = true
+
+[dependencies]
+# Single-source, resource-aware memory guarding (adaptive node/byte budgets +
+# collective free-memory floor). A FIRST-PARTY workspace crate — the "zero
+# third-party runtime deps" design point above targets the external oxidd DD
+# stack, not the shared in-tree memory-budget layer that every ty engine uses.
+tla-resource = { path = "../tla-resource" }
+
+[dev-dependencies]
+# Random-net differential battery: the native engine's StateSpace metrics +
+# reachability verdicts are cross-checked against an in-test explicit BFS over
+# arbitrary small bounded nets (the validation gate before routing tla-dd onto
+# this engine). Workspace fork; no new third-party dep.
+proptest = { workspace = true }
+
+[lints]
+workspace = true

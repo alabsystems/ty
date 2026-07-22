@@ -1,0 +1,3 @@
+-- Pipeline sanity: a trivial reflexivity theorem that the clean kernel accepts.
+-- Confirms the ty→clean-elab→clean-kernel path is live before real soundness proofs land.
+theorem ty_clean_pipeline_ok (a : Nat) : @Eq Nat a a := @Eq.refl Nat a

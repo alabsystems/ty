@@ -1,0 +1,296 @@
+# PNML Petri net tools for MCC (Model Checking Contest) competition entry
+#
+# Parses PNML XML (Place/Transition nets), explores state spaces via BFS,
+# and produces MCC-format FORMULA output for competition examinations.
+
+[package]
+name = "tla-petri"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Petri net model checking frontend and MCC engine for ty"
+readme.workspace = true
+
+[features]
+# Native compiled Petri successor execution is the DEFAULT backend for MCC runs.
+# It JIT-compiles the per-state successor kernel (amortized via the
+# ~/.cache/ty/jit-buf disk cache) and is installed automatically for exact
+# parallel exploration. Soundness floor: the runtime adopts native output only
+# when `native_clean` holds (status Ok, no overflow, full successor count) and
+# otherwise falls through to the exact scalar interpreter. ALL builds (release
+# included) additionally run an always-on sampled shadow verification inside
+# `PetriNetSystem::successors` (full native==interpreter byte parity on the
+# first 1024 native states, then every 4096th), a per-state enabled-set
+# membership bitmask cross-check, and fail-closed token-range guards; any
+# proven divergence quarantines the kernel and the run completes exactly on
+# the interpreter.
+# The production MCC container (mcc/Dockerfile.mcc) already builds with this
+# feature; defaulting it here aligns local/CI builds with production.
+#
+# `dd-backend` is now also a default: the Decision-Diagram lane is the
+# primary engine for StateSpace + UpperBounds (the ~62k-pt symbolic pool
+# explicit BFS cannot win, since it requires representing the entire
+# reachable set). The production container already builds it; defaulting it
+# here keeps local/CI in lockstep. Soundness floor is unchanged: the DD spec
+# gate over-approximates each place's reachable range via a sound LP bound
+# (so the BDD reachable set is EXACT), every DD result is validated against
+# that gate / the LP cap, and on ANY decline (precondition failure, wall-
+# clock budget, OOM, non-convergence) the explicit/structural engine runs
+# unchanged. A wall-clock deadline inside the DD worker (see
+# `tla_dd::set_thread_deadline`) keeps the symbolic fixpoint inside its
+# budget so it never starves the BFS fallback.
+default = ["trust-cg-petri-native", "dd-backend", "gpu"]
+mcc-system-gmp = ["dep:gmp-mpfr-sys", "gmp-mpfr-sys/use-system-libs"]
+# Native compiled Petri successor backend. Pulls trust-ir's typed native
+# transport bundle + the tla-trust-cg native JIT. Remains fail-closed: a net is
+# only run on native after install-time semantic/parity/validation receipts pass
+# and per-call `native_clean` holds, else the scalar interpreter runs unchanged.
+trust-cg-petri-native = ["dep:trust-ir", "dep:tla-trust-cg", "tla-trust-cg/native"]
+# Decision-Diagram backend (ON by default at HEAD via the `default` set above).
+# When enabled, StateSpace and
+# UpperBounds try a BDD-based forward reachability fixpoint (via the
+# `tla-dd` crate, which wraps OxiDD) on small bounded nets before falling
+# back to explicit BFS. Soundness floor is preserved: on any DD
+# failure/timeout/precondition violation the explicit engine runs
+# unchanged.
+dd-backend = ["dep:tla-dd", "dep:tla-mdd", "dep:tla-bdd"]
+# GPU StateSpace lane: device-resident explicit BFS via the shared `tla-gpu`
+# CUDA engine (dlopen-based — no build-time or link-time CUDA requirement, so
+# it is safe as a DEFAULT everywhere; hosts without a usable driver decline at
+# the runtime probe). Fail-closed like every sibling lane: any probe,
+# emission, or engine error falls through to the CPU explicit BFS unchanged.
+# Kill-switch: `TY_MCC_DISABLE_GPU_STATESPACE` (diagnostic, not semantic).
+gpu = ["dep:tla-gpu", "dep:trust-ir"]
+
+[dependencies]
+tla-mc-core = { path = "../tla-mc-core" }
+# Single-source resource-aware memory guarding (platform probes + derived
+# budget + adaptive probe) — replaces the crate-local scattered guards.
+tla-resource = { path = "../tla-resource" }
+# Vendored arbitrary-precision integers (BigUint). The StateSpace count pipe
+# (|R| and edges) now carries `BigUint` end-to-end so a structurally-computable
+# count BEYOND u128 (disconnected-component product, multinomial orbit-sum, or
+# MDD-compact reachable set — e.g. FMS ≈1e47, Kanban/Philosophers ≈1e238) is
+# REPORTED at full decimal precision instead of declining on the u128 cap. The
+# MCC oracle parses arbitrary precision (tedd up to ≈1e614). SOUNDNESS-TRIVIAL:
+# the count VALUE is unchanged; only the representable range widens.
+tla-bignum = { path = "../tla-bignum" }
+tla-jit-abi = { path = "../tla-jit-abi" }
+tla-aiger = { path = "../tla-aiger" }
+tla-ay = { path = "../tla-ay" }
+tla-trust-cg = { path = "../tla-trust-cg", optional = true }
+# Decision-Diagram backend (ON by default at HEAD — gated by `dd-backend`,
+# which is in the `default` feature set above).
+tla-dd = { path = "../tla-dd", optional = true }
+# MDD lane (per-place multi-valued DD). Same `dd-backend` gate as `tla-dd`.
+# StateSpace tries this AFTER the BDD lane and BEFORE BFS, behind a
+# cross-validated soundness gate (adopt only on BDD-match or BDD-decline +
+# MDD-exact). See `examination_non_property::state_space`.
+tla-mdd = { path = "../tla-mdd", optional = true }
+# Native ROBDD engine (the from-scratch oxidd replacement). Same `dd-backend`
+# gate; bridged from the SAME `DdNetSpec` the BDD/MDD lanes use, so its verdicts
+# are directly cross-validatable against the BFS oracle on the way to routing
+# tla-dd off oxidd.
+tla-bdd = { path = "../tla-bdd", optional = true }
+# GPU StateSpace lane (`gpu` feature): shared CUDA BFS engine. Pure dlopen —
+# builds and runs on hosts with no CUDA toolkit; the runtime probe declines.
+tla-gpu = { path = "../tla-gpu", optional = true }
+trust-ir = { workspace = true, optional = true }
+ay-dpll = { workspace = true }
+thiserror.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+minilp = { workspace = true }
+roxmltree = { workspace = true }
+rustc-hash = { workspace = true }
+rayon = { workspace = true }
+dashmap = { workspace = true }
+rand = { workspace = true }
+parking_lot = { workspace = true }
+ay-chc = { workspace = true }
+memmap2 = "0.9"
+# Platform-specific process RSS query for the explorer's memory-pressure guard
+# (see `memory::current_rss_bytes`). Mirrors tla-check's existing usage; the
+# workspace pins the vendored `crates/tla-libc`, so no new dependency surface.
+libc = "0.2"
+gmp-mpfr-sys = { version = "1.7", default-features = false, optional = true }
+# Used by ty-mcc-ay-pin-validate (workspace `Cargo.toml`/`Cargo.lock` parsing)
+# and by ty-mcc-evidence-generate (`Cargo.lock` source-url parsing). Pulls in
+# the workspace-pinned toml crate so no new dependency surface is introduced.
+toml = { workspace = true }
+# Used by ty-validate-codegen (rustc compile-check tempfile) and
+# ty-validate-codegen-state-counts (per-spec work directory). Already
+# pulled in as a dev-dependency below; promoting to a runtime dep
+# introduces no new third-party deps because `tempfile` is the workspace
+# fork at `crates/tla-tempfile`.
+tempfile.workspace = true
+
+[dev-dependencies]
+# Property-based differential gate for the structural-reduction catalog
+# (`src/reduction/tests/reduction_differential_proptest.rs`). Routes through the
+# workspace `proptest` fork (`crates/tla-proptest`) so no new third-party
+# dependency surface is introduced.
+proptest = { workspace = true }
+
+[[bin]]
+name = "ty-mcc"
+path = "src/bin/ty-mcc.rs"
+
+[[bin]]
+name = "ty-mccctl"
+path = "src/bin/ty-mccctl.rs"
+
+[[bin]]
+name = "pnml-simplify-report"
+path = "src/bin/pnml-simplify-report.rs"
+
+[[bin]]
+name = "ty-mcc-validate"
+path = "src/bin/ty-mcc-validate.rs"
+
+# Cross-repo Cargo dep drift guard (proof-grade replacement for
+# scripts/cargo_dep_drift_guard.sh). Walks `cargo metadata` for each
+# sibling workspace under ~/root/ and enforces that every shared
+# package (trust-ir/trust-codegen/ay family) resolves to the same (source, version)
+# pair across every repo.
+[[bin]]
+name = "ty-mcc-drift-guard"
+path = "src/bin/ty-mcc-drift-guard.rs"
+
+# Versioned MCC corpus manager. Resolves and extracts the official MCC inputs
+# into a per-version cache so measurement harnesses never depend on ad-hoc
+# snapshots that may have drifted from the competition tarballs. See
+# `crates/tla-petri/src/bin/ty-corpus.rs` for the full rationale and CLI.
+[[bin]]
+name = "ty-corpus"
+path = "src/bin/ty-corpus.rs"
+
+# MCC 2025 history harness. Reads the MCC 2025 archive, parses each tool's
+# stdout per the MCC protocol, and produces normalized score/blocker/comparison
+# reports. Routes every MCC keyword through `tla_petri::mcc_keywords` and every
+# examination name through `tla_petri::examination::Examination`.
+[[bin]]
+name = "ty-mcc-history"
+path = "src/bin/ty-mcc-history.rs"
+
+# Direct MCC sweep harness. Runs the local ty-mcc / ty binary across MCC
+# benchmark cases, compares stdout against either MCC's raw-result-analysis.csv
+# consensus column or per-model expected.json fixtures, and writes
+# TSV/JSON/Markdown evidence. Routes every MCC keyword through
+# `tla_petri::mcc_keywords` and every examination name through
+# `tla_petri::examination::Examination` so there is no cross-language drift
+# possibility for the qualification-1 keyword bug.
+[[bin]]
+name = "ty-mcc-sweep"
+path = "src/bin/ty-mcc-sweep.rs"
+
+# ay pin validator. Validates that `mcc/Dockerfile.mcc` ARG AY_REV matches
+# every `ay*` rev pinned in workspace `Cargo.toml` and locked in `Cargo.lock`.
+[[bin]]
+name = "ty-mcc-ay-pin-validate"
+path = "src/bin/ty-mcc-ay-pin-validate.rs"
+
+# Deterministic backend-evidence JSONL sidecar generator consumed by the MCC
+# replay-smoke harness and the backend-evidence validator.
+[[bin]]
+name = "ty-mcc-evidence-generate"
+path = "src/bin/ty-mcc-evidence-generate.rs"
+
+# TLC↔TY state-graph differential. Rust port of
+# scripts/compare_tlc_ty.py. Loads a TLC DOT artefact and a TY
+# successor-debug transcript, then checks state-set + transition parity
+# with provenance enforcement. Uses `tla_petri::tlc_dot` so the DOT
+# parser is shared with the system-health gate.
+[[bin]]
+name = "ty-tlc-compare"
+path = "src/bin/ty-tlc-compare.rs"
+
+# Baseline spec-list selector. Rust port of
+# scripts/select_diagnose_specs.py. Reads
+# tests/tlc_comparison/spec_baseline.json and filters specs for
+# bounded `ty diagnose --spec-list` sweeps.
+[[bin]]
+name = "ty-diagnose-spec-select"
+path = "src/bin/ty-diagnose-spec-select.rs"
+
+# Liveness verdict parity matrix runbook generator. Rust port of
+# scripts/liveness_verdict_matrix.py — emits the matrix dry-run /
+# runbook output and reuses `tla_petri::liveness_verdict` for verdict
+# classification and trace info parsing (formerly
+# scripts/liveness_verdict_lib.py).
+[[bin]]
+name = "ty-liveness-matrix"
+path = "src/bin/ty-liveness-matrix.rs"
+
+# Single-line verdict classifier consumed by scripts/test_all_liveness.sh
+# in place of the inline `from liveness_verdict_lib import …` Python
+# heredoc. Emits `<status>|<states>` for one transcript.
+[[bin]]
+name = "ty-liveness-classify"
+path = "src/bin/ty-liveness-classify.rs"
+
+# Backend capability evidence sidecar canary. Reads one or more JSONL evidence
+# sidecars and verifies that the required gating rows are present and
+# well-formed. Routes MCC keyword references through `tla_petri::mcc_keywords`
+# and every examination name through `tla_petri::examination::Examination` so
+# there is no cross-language drift possibility for the qualification-1 keyword
+# bug.
+[[bin]]
+name = "ty-mcc-backend-evidence-validate"
+path = "src/bin/ty-mcc-backend-evidence-validate.rs"
+
+# MCC backend-evidence sidecar smoke harness. Single Rust entry point
+# providing both the per-case BenchKit wrapper (`wrapper` subcommand /
+# positional compatibility mode) and the competition sidecar smoke matrix
+# (`competition` subcommand). Routes every MCC keyword through
+# `tla_petri::mcc_keywords` and every examination name through
+# `tla_petri::examination::Examination`.
+[[bin]]
+name = "ty-mcc-smoke"
+path = "src/bin/ty-mcc-smoke.rs"
+
+# TLC baseline collector — Rust port of `scripts/collect_tlc_baseline/`.
+# Single compiler-enforced interface for baseline collection: runs TLC
+# against every spec in `tests/tlc_comparison/spec_catalog.py`, parses
+# stdout/stderr, classifies the verdict, and emits or refreshes
+# `tests/tlc_comparison/spec_baseline.json` (schema v3) with full
+# provenance and a JCS digest of the specs map. Replaces
+# `scripts/collect_tlc_baseline/*.py` and the standalone
+# `scripts/json_jcs.py` JCS helper.
+[[bin]]
+name = "ty-tlc-baseline"
+path = "src/bin/ty-tlc-baseline.rs"
+
+# Rust port of `scripts/validate_codegen.py`. Runs `ty codegen` (AST and
+# optionally TIR path) on every spec in `tests/tlc_comparison/spec_baseline.json`,
+# captures per-spec results plus an optional `rustc` compile check,
+# classifies errors, and writes a Markdown coverage report. Replaces the
+# Python harness so codegen-coverage has a compiler-enforced entry point.
+[[bin]]
+name = "ty-validate-codegen"
+path = "src/bin/ty-validate-codegen.rs"
+
+# Rust port of `scripts/validate_codegen_state_counts.py`. End-to-end
+# validation that the generated Rust model checker explores the same
+# number of distinct states as the TLC baseline.
+[[bin]]
+name = "ty-validate-codegen-state-counts"
+path = "src/bin/ty-validate-codegen-state-counts.rs"
+
+# MCC backend-capability JSONL summarizer. Aggregates selected/rejected lanes,
+# native-JIT gates, trust-ir/trust-codegen/AY typed evidence rows, and proof/replay
+# boundary rows. Shares the `tla_petri::mcc_evidence_jsonl` reader with the
+# validator binary so the same JSONL sidecars are read identically across
+# summarize and
+# validate paths.
+[[bin]]
+name = "ty-mcc-summarize-evidence"
+path = "src/bin/ty-mcc-summarize-evidence.rs"
+
+[lints]
+workspace = true

@@ -1,0 +1,39 @@
+[package]
+name = "tla-aiger"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "AIGER format parser and CHC translation for bit-level hardware model checking"
+readme.workspace = true
+
+[dependencies]
+rustc-hash = { workspace = true }
+thiserror = { workspace = true }
+tla-mc-core = { path = "../tla-mc-core" }
+tla-ay = { path = "../tla-ay" }
+# GPU bit-parallel random-simulation falsification lane (`bmc/gpu_random_sim`).
+# Pure dlopen — no build-time or link-time CUDA requirement; hosts without a
+# usable driver decline at the runtime probe and the scalar walker runs
+# unchanged.
+tla-gpu = { path = "../tla-gpu" }
+# BDD symbolic reachability lane (`bdd_reach`): the workspace's general ROBDD
+# engine (GC + sifting + cooperative abort) computing the exact reachable set —
+# full unbounded Safe proofs and minimal-depth bad witnesses for the portfolio.
+tla-bdd = { path = "../tla-bdd" }
+tla-hw-evidence = { path = "../tla-hw-evidence" }
+ay-chc = { workspace = true }
+ay-sat = { workspace = true, features = ["unsafe-bcp"] }
+
+[features]
+# Gate for the HWMCC /unsafe/ soundness canary suite (tests/unsafe_canary_smoke.rs).
+# Runs ~7 small /unsafe/ benchmarks (SAT-oracle per R22 audit #4311) with tight
+# per-benchmark timeouts. Off by default because it depends on local HWMCC
+# benchmark files at ~/hwmcc/benchmarks/bitlevel/safety/.
+#
+# Enable with: cargo test -p tla-aiger --features hwmcc_canary unsafe_canary
+hwmcc_canary = []
+
+[lints]
+workspace = true

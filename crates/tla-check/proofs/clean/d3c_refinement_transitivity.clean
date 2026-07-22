@@ -1,0 +1,73 @@
+-- d3c_refinement_transitivity: refinements COMPOSE — the transitivity of the
+-- REFINEMENT verdict, authored in CLEAN's surface language and checked by
+-- CLEAN's CIC kernel (so it enters the clean kernel's trust base).
+--
+-- d3 proves a single step-simulation `f : C -> A` gives reachability inclusion
+-- C -> A. A refinement chain `C ~f~> A ~g~> B` should compose: if `f` refines C
+-- into A and `g` refines A into B, then `g . f` refines C into B. This file
+-- proves that composition sound at the reachability level.
+--
+-- SOUNDNESS CLAIM (proved below, `refinement_transitivity`). Given step-
+-- simulations `f : C -> A` (hInitF + hSimF) and `g : A -> B` (hInitG + hSimG),
+-- every C-reachable state maps under `g . f` to a B-reachable state:
+--     Reach C InitC StepC c  ->  Reach B InitB StepB (g (f c)).
+-- So a two-stage refinement transfers reachability (and hence, with reach_least
+-- / safety-transfer, any B-invariant) all the way back to C.
+--
+-- PROOF. Induction on the concrete reachability derivation (`Reach.rec`, the
+-- SAME `Reach` as tB / e3 / d3 / d3b), carrying `Reach B InitB StepB (g (f s))`:
+--   base : InitC s --(hInitF)--> InitA (f s) --(hInitG)--> InitB (g (f s))
+--          --Reach.base--> Reach B (g (f s)).
+--   step : concrete StepC s t with IH `Reach B (g (f s))`; (hSimF) gives
+--            StepA (f s) (f t) \/ f s = f t:
+--            * inl (abstract A-step): (hSimG) on that A-step gives
+--                StepB (g (f s)) (g (f t)) \/ g (f s) = g (f t):
+--                - inl: Reach.step closes Reach B to (g (f t));
+--                - inr: transport IH along g (f s) = g (f t) via Eq.subst.
+--            * inr (f-stutter f s = f t): transport IH along f s = f t with the
+--                COMPOSED motive `fun a => Reach B ... (g a)` (so g (f s) becomes
+--                g (f t) automatically) via Eq.subst.
+--
+-- FULLY GENERAL: arbitrary state types C, A, B, arbitrary Init/Step relations,
+-- and arbitrary refinement maps f, g.
+
+-- The reachability predicate of a transition system (identical to tB / e3 / d3):
+inductive Reach (State : Type) (Init : State -> Prop) (Next : State -> State -> Prop) : State -> Prop where
+  | base : (s : State) -> Init s -> Reach State Init Next s
+  | step : (s : State) -> (t : State) -> Reach State Init Next s -> Next s t -> Reach State Init Next t
+
+theorem refinement_transitivity
+    (C : Type) (A : Type) (B : Type)
+    (InitC : C -> Prop) (InitA : A -> Prop) (InitB : B -> Prop)
+    (StepC : C -> C -> Prop) (StepA : A -> A -> Prop) (StepB : B -> B -> Prop)
+    (f : C -> A) (g : A -> B)
+    -- f is a step-simulation C -> A:
+    (hInitF : (c : C) -> InitC c -> InitA (f c))
+    (hSimF : (c : C) -> (c' : C) -> StepC c c' -> Or (StepA (f c) (f c')) (@Eq A (f c) (f c')))
+    -- g is a step-simulation A -> B:
+    (hInitG : (a : A) -> InitA a -> InitB (g a))
+    (hSimG : (a : A) -> (a' : A) -> StepA a a' -> Or (StepB (g a) (g a')) (@Eq B (g a) (g a')))
+    -- conclusion: g . f transfers reachability C -> B
+    (c : C) (h : Reach C InitC StepC c) : Reach B InitB StepB (g (f c)) :=
+  @Reach.rec C InitC StepC
+    (fun s _hs => Reach B InitB StepB (g (f s)))
+    -- base: InitC s -> InitA (f s) -> InitB (g (f s)) -> Reach B (g (f s))
+    (fun s hi => @Reach.base B InitB StepB (g (f s)) (hInitG (f s) (hInitF s hi)))
+    -- step: StepC s t, IH `Reach B (g (f s))`; case the f-simulation
+    (fun s t _hr hn ih =>
+      @Or.rec (StepA (f s) (f t)) (@Eq A (f s) (f t))
+        (fun _ => Reach B InitB StepB (g (f t)))
+        -- inl: genuine A-step (f s) -> (f t); now case the g-simulation on it
+        (fun hstepA =>
+          @Or.rec (StepB (g (f s)) (g (f t))) (@Eq B (g (f s)) (g (f t)))
+            (fun _ => Reach B InitB StepB (g (f t)))
+            -- inl: genuine B-step (g (f s)) -> (g (f t))
+            (fun hstepB => @Reach.step B InitB StepB (g (f s)) (g (f t)) ih hstepB)
+            -- inr: g-stutter g (f s) = g (f t); transport IH along it
+            (fun heqg => @Eq.subst B (fun z => Reach B InitB StepB z) (g (f s)) (g (f t)) heqg ih)
+            (hSimG (f s) (f t) hstepA))
+        -- inr: f-stutter f s = f t; transport IH along it with the COMPOSED motive
+        (fun heqf =>
+          @Eq.subst A (fun a => Reach B InitB StepB (g a)) (f s) (f t) heqf ih)
+        (hSimF s t hn))
+    c h

@@ -1,0 +1,17 @@
+# .gitleaks.toml
+# Gitleaks secret scanning configuration
+# See: https://github.com/gitleaks/gitleaks
+#
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Licensed under the Apache License, Version 2.0
+#
+# Publication policy: no allowlists — the publication engine's gitleaks
+# guard forbids suppression in this config. Findings must be fixed at the
+# source.
+
+title = "ty gitleaks config"
+
+[extend]
+# Use default gitleaks rules
+useDefault = true
