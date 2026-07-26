@@ -3,9 +3,9 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::*;
-use tla_value::Rp;
 use std::sync::Arc;
 use tla_core::name_intern::intern_name;
+use tla_value::Rp;
 
 #[cfg_attr(test, ntest::timeout(10000))]
 #[test]

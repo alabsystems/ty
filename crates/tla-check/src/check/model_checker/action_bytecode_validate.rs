@@ -380,6 +380,13 @@ fn validate_register_reuse_reads(
             read(child)?;
             read(parent)?;
         }
+        Opcode::EdgeFilter {
+            first, arg, domain, ..
+        } => {
+            read(first)?;
+            read(arg)?;
+            read(domain)?;
+        }
         Opcode::FuncApply { func, arg, .. } => {
             read(func)?;
             read(arg)?;
@@ -840,6 +847,11 @@ fn validate_entry_shape(
             Opcode::RoundStepEq { .. } => {
                 return Err(format!(
                     "VM-only RoundStepEq remains in action entry at pc {pc}"
+                ));
+            }
+            Opcode::EdgeFilter { .. } => {
+                return Err(format!(
+                    "VM-only EdgeFilter remains in action entry at pc {pc}"
                 ));
             }
             Opcode::SetPrimeMode { .. } => {
@@ -1752,6 +1764,11 @@ fn validate_helper_shape(func_idx: u16, func: &BytecodeFunction) -> Result<(), S
             Opcode::RoundStepEq { .. } => {
                 return Err(format!(
                     "reachable callee {func_idx} contains VM-only RoundStepEq at pc {pc}"
+                ));
+            }
+            Opcode::EdgeFilter { .. } => {
+                return Err(format!(
+                    "reachable callee {func_idx} contains VM-only EdgeFilter at pc {pc}"
                 ));
             }
             Opcode::StoreVar { .. } => {

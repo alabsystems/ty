@@ -8,7 +8,6 @@
 //! and set-op tests to reduce merge pressure on the live throughput lane.
 
 use super::super::super::*;
-use crate::rp::Rp;
 
 #[cfg_attr(test, ntest::timeout(10000))]
 #[test]
@@ -47,6 +46,7 @@ fn test_3285_value_type_sizes_baseline() {
     let seq_set_value_size = size_of::<crate::value::SeqSetValue>();
     let union_value_size = size_of::<crate::value::UnionValue>();
     let func_value_size = size_of::<crate::value::FuncValue>();
+    let func_domain_size = size_of::<crate::value::FuncDomain>();
     let int_interval_func_size = size_of::<crate::value::IntIntervalFunc>();
     let seq_value_size = size_of::<crate::value::SeqValue>();
 
@@ -65,6 +65,7 @@ fn test_3285_value_type_sizes_baseline() {
     println!("SeqSetValue:      {} bytes", seq_set_value_size);
     println!("UnionValue:       {} bytes", union_value_size);
     println!("FuncValue:        {} bytes", func_value_size);
+    println!("FuncDomain:       {} bytes", func_domain_size);
     println!("IntIntervalFunc:  {} bytes", int_interval_func_size);
     println!("SeqValue:         {} bytes", seq_value_size);
 
@@ -128,15 +129,18 @@ fn test_3285_value_type_sizes_baseline() {
         union_value_size, 8,
         "UnionValue size changed from pre-#3445 width-driver audit baseline"
     );
-    // Split-array FuncValue (Part of #3337, #3371): domain: Arc<[Value]> (16) +
-    // values: Arc<Vec<Value>> (8) + overrides: Option<Box<Vec<...>>> (8) +
-    // additive_fp: AtomicU64 (8) + tlc_normalized: OnceLock<Arc<[usize]>> (24) = 64,
-    // plus dense: DenseTag (1 byte, padded to +8) = 72 for the O(1)
-    // dense-domain apply classification (fast-func).
-    // Overrides field added in #3371 (lazy EXCEPT overlay).
+    // Split-array FuncValue with a shared domain descriptor: domain:
+    // Arc<FuncDomain> (8) + values: Arc<Vec<Value>> (8) + overrides:
+    // Option<Box<Vec<...>>> (8) + additive_fp: AtomicU64 (8) = 32.
+    // Domain keys (16-byte Arc slice), TLC-order cache (24-byte OnceLock), and
+    // dense tag (1 byte plus padding) live once in the 48-byte FuncDomain.
     assert_eq!(
-        func_value_size, 72,
-        "FuncValue size changed from dense-apply (fast-func) baseline"
+        func_value_size, 32,
+        "FuncValue size changed from shared-domain-descriptor baseline"
+    );
+    assert_eq!(
+        func_domain_size, 48,
+        "FuncDomain size changed from shared-domain-descriptor baseline"
     );
     assert_eq!(
         int_interval_func_size, 32,

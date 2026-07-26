@@ -10,13 +10,13 @@
 
 use super::IntIntervalFunc;
 use crate::dedup_fingerprint::additive_int_entry_hash;
+use crate::rp::Rp as Arc;
 use crate::value::functions::FP_UNSET;
 use crate::value::{
     intern_int_func_array, try_get_interned_modified, Value, MAX_INTERN_INT_FUNC_SIZE,
 };
 use num_traits::ToPrimitive;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use crate::rp::Rp as Arc;
 impl IntIntervalFunc {
     /// Check whether an EXCEPT operation would actually change the function.
     /// Returns `false` for out-of-domain keys and same-value updates.

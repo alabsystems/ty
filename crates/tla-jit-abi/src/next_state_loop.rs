@@ -13,30 +13,28 @@
 //! `state_out`, an action that should yield *N* successors at runtime — e.g.
 //! `\E k \in 1 .. natMin(primer, template) : x' = f(k)` where the domain
 //! bound is a *runtime* quantity — cannot be compiled. The only way to get
-//! multiple successors today is multiple compile-time action *entries*
+//! Historically, the only way to get
+//! multiple successors was multiple compile-time action *entries*
 //! (compile-time unrolling), which requires the domain's values to be known
-//! at compile time. When the domain is a runtime range, the whole action
-//! falls back to the tree-walking interpreter.
+//! at compile time.
 //!
-//! This module defines the **scaffold ABI** that lets a single compiled
+//! This module defines the ABI that lets a single compiled
 //! action emit *N* successors at runtime by pushing each one into a
 //! caller-owned arena via [`NextStateLoopSink`]. It mirrors the existing
 //! multi-successor [`crate::FlatBfsStepOutput`] flat layout: successors are
 //! packed back-to-back as `[s0_slot0, s0_slot1, ..., s1_slot0, ...]` in a
 //! single i64 buffer, `state_len` slots per successor.
 //!
-//! # Status: scaffold only (not yet wired to live codegen)
+//! # Status
 //!
-//! The trust-codegen backend does **not** yet emit code against this ABI. The
-//! BFS dispatch path that *selects* the runtime-domain inner-existential case
-//! currently routes it to the interpreter (fail-closed) rather than executing
-//! anything against a partially-built ABI. Shipping a too-small or wrong
-//! successor set would silently drop or fabricate states — the worst possible
-//! bug in a model checker — so until the codegen + soundness proof land, the
-//! selection path returns "not yet supported" and the interpreter handles the
-//! action. See [`NextStateLoopSupport`].
+//! Trust-codegen emits this ABI for direct runtime integer ranges and, behind
+//! its proof gate, proven-closed record-set carriers. Other runtime-domain
+//! shapes remain fail-closed on the interpreter. Shipping a too-small or wrong
+//! successor set would silently drop or fabricate states, so support is
+//! intentionally classified per exact lowering shape. See
+//! [`NextStateLoopSupport`].
 //!
-//! # Soundness contract (for the eventual codegen)
+//! # Soundness contract
 //!
 //! A compiled `NextStateLoopFn` MUST, for the runtime domain it iterates:
 //! 1. Re-seed each candidate successor from `state_in` (preserve UNCHANGED
@@ -161,12 +159,10 @@ pub type NextStateLoopFn = unsafe extern "C" fn(
 
 /// Whether the multi-successor native path can execute a given action yet.
 ///
-/// The scaffold always reports [`NextStateLoopSupport::NotYetSupported`]: the
-/// runtime-domain inner-existential is *recognized* and routed here, but
-/// trust-codegen does not yet emit a sound `NextStateLoopFn`, so the action
-/// falls back to the interpreter. This enum is the single, explicit
-/// fail-closed gate — flipping the recognized case to `Supported` is the
-/// remaining work for full native multi-successor execution.
+/// Direct runtime integer ranges and proof-backed record-set carriers report
+/// [`NextStateLoopSupport::Supported`] when their corresponding sound lowering
+/// is available. Recognized shapes outside those narrow kernels report
+/// [`NextStateLoopSupport::NotYetSupported`] and remain on the interpreter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NextStateLoopSupport {
     /// The action shape was recognized as a runtime-domain multi-successor

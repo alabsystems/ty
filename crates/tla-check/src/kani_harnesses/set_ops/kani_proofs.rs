@@ -3,11 +3,11 @@
 // Licensed under the Apache License, Version 2.0
 
 use crate::kani_harnesses::kani_generators::*;
-use tla_value::Rp;
 use crate::value::Value;
 use num_bigint::BigInt;
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use tla_value::Rp;
 
 // P9: Set Operations
 

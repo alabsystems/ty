@@ -7,11 +7,11 @@
 //!
 //! Part of #3412: extracted from `parallel_intern.rs` (lines 127-362).
 
+use crate::rp::Rp as Arc;
 use rustc_hash::FxHashMap;
 use std::cell::Cell;
 use std::sync::atomic::Ordering;
 use std::sync::{MutexGuard, OnceLock};
-use crate::rp::Rp as Arc;
 
 use super::super::{intern_tables, strings, Value};
 use super::state::{
@@ -282,7 +282,7 @@ pub enum SharedValueCacheMode {
 ///
 /// # Usage
 ///
-/// ```ignore
+/// ```text
 /// let _run_guard = ParallelValueInternRunGuard::new(SharedValueCacheMode::Readonly);
 /// // spawn workers with WorkerInternGuard...
 /// // guard drop unfreezes interners and disables read-only cache mode

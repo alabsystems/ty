@@ -6,7 +6,6 @@ use super::{
     apply_binary_op, check_arity, eval, eval_iter_set, eval_iter_set_tlc_normalized, EvalCtx,
     EvalError, EvalResult, Expr, OperatorRef, SortedSet, Span, Spanned, Value,
 };
-use std::sync::Arc;
 use tla_value::Rp;
 // SequencesExt module operators — basic operations and sequence-level folds
 

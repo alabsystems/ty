@@ -254,6 +254,13 @@ impl<'a, 'mc, S: BfsStorage, Q: BfsFrontier<Entry = S::QueueEntry>> BfsTransport
         // Set the TLC level on the eval context for this iteration.
         self.checker.ctx.set_tlc_level(current_level);
 
+        // Standalone-router AUTO pilot. This common sequential dispatcher is
+        // visited exactly once per expanded parent, before either the diff or
+        // full-state consumer selects its successor engine. The delayed pilot
+        // only counts parents; guard rate, parity, and timings are measured
+        // together after it requests the guarded per-action route.
+        self.checker.maybe_advance_router_pilot();
+
         // Part of #3083: update TLCGet("stats") runtime stats from BFS state.
         // Without this, BFS mode always falls through to hardcoded zeros in
         // builtin_tlc_get.rs. The plumbing via set_tlc_runtime_stats already

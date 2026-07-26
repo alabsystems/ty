@@ -6842,7 +6842,6 @@ mod tests {
 
     #[cfg(feature = "trust-cg-petri-native")]
     #[test]
-    #[ignore = "pre-existing upstream trust-ir/ay evidence-descriptor drift; asserts stale descriptor strings, unrelated to native successor parity (verified). Re-enable after evidence-descriptor re-sync."]
     fn capability_jsonl_preserves_petri_produced_native_bundle_rows() {
         let report = build_petri_mcc_capability_report(
             &tiny_net(),
@@ -6865,7 +6864,10 @@ mod tests {
         assert!(transport_row.contains("bundle_validated=true"));
         assert!(transport_row.contains("producer=trust_ir"));
         assert!(transport_row.contains("input=trust_ir_module"));
-        assert!(transport_row.contains("schema=trust_ir.native.transport_identity.v1"));
+        assert!(transport_row.contains(&format!(
+            "schema={}",
+            trust_ir::NATIVE_TRANSPORT_IDENTITY_SCHEMA
+        )));
         assert!(transport_row.contains("module_digest=sha256:"));
         assert!(transport_row.contains("bundle_digest=sha256:"));
         assert!(transport_row.contains("target_abi_digest=sha256:"));
@@ -6885,9 +6887,9 @@ mod tests {
             .expect("MCC JSONL should preserve produced bundle admission evidence");
         assert!(admission_row.contains("source=NativeInstallGateAdmissionSummary"));
         assert!(admission_row
-            .contains("schema=trust_cg.phase6.native_install_gate.admission_summary.v1"));
-        assert!(admission_row.contains("source_package=trust_cg-codegen"));
-        assert!(admission_row.contains("package=trust_cg-codegen"));
+            .contains("schema=trust-cg.phase6.native_install_gate.admission_summary.v1"));
+        assert!(admission_row.contains("source_package=trust-cg-codegen"));
+        assert!(admission_row.contains("package=trust-cg-codegen"));
         assert!(admission_row.contains("consumer=mcc"));
         assert!(admission_row.contains("consumer_mode=petri_successor"));
         assert!(admission_row.contains("kind=petri_native_successor"));
@@ -6907,42 +6909,16 @@ mod tests {
         assert!(admission_row.contains("bundle_validated=true"));
         assert!(admission_row.contains("trust_ir_transport_identity_available=true"));
         assert!(admission_row.contains("trust_ir_bundle_consumed=true"));
-        let legacy_missing_native_evidence =
-            admission_row.contains("rejection_code=missing_native_evidence_bundle");
-        let missing_install_gate_packet =
-            admission_row.contains("rejection_code=missing_native_install_gate_packet");
-        let accepted_validation_only = admission_row.contains("disposition=accepted")
-            && admission_row.contains("status_code=accepted");
-        assert!(
-            legacy_missing_native_evidence || missing_install_gate_packet || accepted_validation_only,
-            "produced bundle admission should either preserve a fail-closed blocker or the validation-only accepted handoff: {admission_row}"
-        );
-        if legacy_missing_native_evidence {
-            assert!(admission_row.contains("reason_code=missing_native_evidence_bundle"));
-            assert!(admission_row.contains("trust_ir_consumption_status=missing_native_evidence"));
-            assert!(admission_row.contains("trust_ir_consumption_entries=0"));
-            assert!(admission_row.contains("consumed_certificates=0"));
-            assert!(admission_row.contains("artifact_count=0"));
-        } else if missing_install_gate_packet {
-            assert!(admission_row.contains("reason_code=missing_native_install_gate_packet"));
-            assert!(admission_row.contains("disposition=rejected"));
-            assert!(admission_row.contains("status_code=rejected"));
-            assert!(admission_row.contains("production_selected=false"));
-            assert!(admission_row.contains("fail_closed=true"));
-            assert!(admission_row.contains("trust_ir_consumption_status=available"));
-            assert!(admission_row.contains("trust_ir_consumption_entries=1"));
-            // The Petri native producer now attaches a semantic-evidence bundle with
-            // four artifacts (one per shared-primitive contract requirement plus the
-            // native-execution artifact). Matches the `artifact_count=4` already
-            // tracked by `native_successor_capability_report_is_validation_disabled_by_default`.
-            assert!(admission_row.contains("artifact_count=4"));
-        } else {
-            assert!(accepted_validation_only);
-            assert!(!admission_row.contains("rejection_code="));
-            assert!(admission_row.contains("trust_ir_consumption_status=available"));
-            assert!(admission_row.contains("trust_ir_consumption_entries=1"));
-            assert!(admission_row.contains("artifact_count=4"));
-        }
+        assert!(admission_row.contains("rejection_code=missing_native_install_gate_packet"));
+        assert!(admission_row.contains("reason_code=missing_native_install_gate_packet"));
+        assert!(admission_row.contains("disposition=rejected"));
+        assert!(admission_row.contains("status_code=rejected"));
+        assert!(admission_row.contains("trust_ir_consumption_status=available"));
+        assert!(admission_row.contains("trust_ir_consumption_entries=1"));
+        assert!(admission_row.contains("consumed_certificates=0"));
+        // The Petri native producer attaches one artifact per shared-primitive
+        // contract requirement plus the native-execution artifact.
+        assert!(admission_row.contains("artifact_count=4"));
         assert!(admission_row.contains("actions_ty_native_activate=false"));
         assert!(admission_row.contains("useful_native_delta=0"));
         assert!(admission_row.contains("packet_hash="));
@@ -6987,7 +6963,6 @@ mod tests {
 
     #[cfg(feature = "trust-cg-petri-native")]
     #[test]
-    #[ignore = "pre-existing upstream trust-ir/ay evidence-descriptor drift; asserts stale descriptor strings, unrelated to native successor parity (verified). Re-enable after evidence-descriptor re-sync."]
     fn capability_jsonl_preserves_native_transport_identity_availability_rows() {
         let net = tiny_net();
         let bundle = native_verification_bundle_fixture();
@@ -7007,7 +6982,10 @@ mod tests {
         assert!(transport_row.contains("cargo_dependency=true"));
         assert!(transport_row.contains("api=NativeVerificationBundle::transport_identity"));
         assert!(transport_row.contains("bundle_source=external_supplied"));
-        assert!(transport_row.contains("schema=trust_ir.native.transport_identity.v1"));
+        assert!(transport_row.contains(&format!(
+            "schema={}",
+            trust_ir::NATIVE_TRANSPORT_IDENTITY_SCHEMA
+        )));
         assert!(transport_row.contains("module_digest="));
         assert!(transport_row.contains("bundle_digest="));
         assert!(transport_row.contains("target_abi_digest="));
@@ -7026,9 +7004,9 @@ mod tests {
             .expect("MCC JSONL should preserve external bundle admission blocker evidence");
         assert!(admission_row.contains("source=NativeInstallGateAdmissionSummary"));
         assert!(admission_row
-            .contains("schema=trust_cg.phase6.native_install_gate.admission_summary.v1"));
-        assert!(admission_row.contains("source_package=trust_cg-codegen"));
-        assert!(admission_row.contains("package=trust_cg-codegen"));
+            .contains("schema=trust-cg.phase6.native_install_gate.admission_summary.v1"));
+        assert!(admission_row.contains("source_package=trust-cg-codegen"));
+        assert!(admission_row.contains("package=trust-cg-codegen"));
         assert!(admission_row.contains("consumer=mcc"));
         assert!(admission_row.contains("consumer_mode=petri_successor"));
         assert!(admission_row.contains("kind=petri_native_successor"));

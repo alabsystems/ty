@@ -190,6 +190,12 @@ impl ModelChecker<'_> {
         params: &BfsStepParams<'_>,
         prof: &mut BfsProfile,
     ) -> Option<BfsIterOutcome> {
+        // A prior splitter validation failure makes whole-Next authoritative
+        // for the rest of the run. Fall through to the full-state interpreter
+        // before any Value-VM/JIT/native route can arm.
+        if self.por.parity_failed {
+            return None;
+        }
         // Hybrid per-action dispatch (item 4 M0): classify + build the flat-view
         // projection once. The flagship compound specs (Disruptor, btree) reach
         // the checker only through this diff path, so classification (G4) is
@@ -311,6 +317,7 @@ impl ModelChecker<'_> {
             }
         };
         prof.accum_succ_gen(prof_t0);
+        self.record_raw_successors_generated(diff_result.raw_successor_count);
         let diffs = diff_result.successors;
 
         #[cfg(debug_assertions)]

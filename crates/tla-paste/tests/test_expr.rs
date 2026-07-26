@@ -213,15 +213,7 @@ mod test_x86_feature_literal {
         };
     }
 
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-    macro_rules! my_is_x86_feature_detected {
-        ($feat:literal) => {
-            #[ignore]
-            #[test]
-            fn test() {}
-        };
-    }
-
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     my_is_x86_feature_detected!("mmx");
 }
 

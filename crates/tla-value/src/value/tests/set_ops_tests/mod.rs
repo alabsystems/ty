@@ -6,7 +6,6 @@
 //! Part of #1649: zero-test modules need direct coverage.
 
 use super::super::*;
-use crate::rp::Rp as Arc;
 mod big_union;
 mod lazy_binary_ops;
 mod seqset;

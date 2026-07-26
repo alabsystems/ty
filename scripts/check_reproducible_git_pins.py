@@ -142,10 +142,12 @@ def _check_lock(root: Path, pin: GitPin, lock: Mapping[str, Any]) -> list[str]:
             f"Cargo.lock: {pin.name} source must be {pin.lock_source!r}, found {source!r}"
         )
 
-    metadata = lock.get("metadata")
-    checksum_key = f"checksum {pin.name} {pin.version} ({pin.lock_source_base})"
-    if not isinstance(metadata, Mapping) or metadata.get(checksum_key) != "<none>":
-        errors.append(f"Cargo.lock: missing exact metadata key {checksum_key!r}")
+    # Modern Cargo lockfiles bind Git dependencies directly in `source` as
+    # `?rev=<selector>#<resolved>`. Legacy lockfiles also carried a
+    # `[metadata]` checksum key with the value `<none>`, but current Cargo
+    # removes that redundant record and rejects a hand-restored copy under
+    # `--locked`. The exact source equality above is the authoritative,
+    # Cargo-maintained immutable binding.
     return errors
 
 

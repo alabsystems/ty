@@ -2,7 +2,6 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
-use std::sync::Arc;
 use tla_value::Rp;
 
 use super::{

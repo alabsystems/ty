@@ -37,9 +37,9 @@
 //! function untouched. Callers treat `None` as "keep the original bytecode".
 
 use super::chunk::ConstantPool;
-use tla_value::Rp;
 use super::opcode::{Opcode, Register};
 use super::BytecodeFunction;
+use tla_value::Rp;
 use tla_value::Value;
 
 /// Maximum callee size (in opcodes) eligible for inlining.
@@ -155,6 +155,14 @@ fn for_each_source_register(op: &Opcode, mut f: impl FnMut(Register)) {
         Opcode::RoundStepEq { child, parent, .. } => {
             f(child);
             f(parent);
+        }
+
+        Opcode::EdgeFilter {
+            first, arg, domain, ..
+        } => {
+            f(first);
+            f(arg);
+            f(domain);
         }
 
         Opcode::AddInt { r1, r2, .. }
@@ -969,6 +977,7 @@ fn shift_registers(op: &Opcode, shift: u16) -> Option<Opcode> {
         | Opcode::Unchanged { .. }
         | Opcode::SetPrimeMode { .. }
         | Opcode::RoundStepEq { .. }
+        | Opcode::EdgeFilter { .. }
         | Opcode::Halt
         | Opcode::Call { .. }
         | Opcode::ValueApply { .. }
@@ -1287,7 +1296,8 @@ fn callee_inline_eligible(callee: &BytecodeFunction) -> Option<Register> {
             | Opcode::StoreVar { .. }
             | Opcode::Unchanged { .. }
             | Opcode::SetPrimeMode { .. }
-            | Opcode::RoundStepEq { .. } => return None,
+            | Opcode::RoundStepEq { .. }
+            | Opcode::EdgeFilter { .. } => return None,
             _ => {}
         }
         if let Some(off) = jump_offset(op) {
@@ -2217,6 +2227,7 @@ mod tests {
         use std::sync::Arc;
         use tla_core::ast::Expr;
         use tla_core::Spanned;
+        use tla_value::Rp;
 
         // Sub-function: identity-ish bool check `arg0 = 1`.
         let mut sub = BytecodeFunction::new("<lambda>".to_string(), 1);

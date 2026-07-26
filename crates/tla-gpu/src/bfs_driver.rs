@@ -227,6 +227,12 @@ pub fn probe() -> Result<GpuInfo, GpuError> {
     })
 }
 
+/// Make device 0's primary context current on this thread. Required before
+/// any context-scoped driver call (`cuMemGetInfo`, allocations, launches).
+pub(crate) fn activate_device_context(api: &CudaApi) -> Result<(), GpuError> {
+    activate_context(api)
+}
+
 fn activate_context(api: &CudaApi) -> Result<(), GpuError> {
     let mut dev = 0;
     check(
@@ -335,6 +341,65 @@ unsafe fn read_u64(buf: &DeviceBuffer) -> u64 {
 
 unsafe fn write_u64(buf: &DeviceBuffer, v: u64) {
     unsafe { std::ptr::write_volatile(buf.ptr as *mut u64, v) }
+}
+
+/// Projected total device+managed footprint of [`run_bfs`] for this
+/// spec+config, in bytes — the same arithmetic as the allocation block in
+/// [`run_bfs`] (keep the two in lockstep).
+///
+/// Lets the grow-and-retry caller decline a doomed configuration up front
+/// instead of asking the driver for an allocation that cannot fit anywhere:
+/// on 2026-07-21 the retry ladder escalated to a single 96 GiB arena request
+/// (table_bits 29, frontier 512Mi, trace doubling, 96-byte rows) because
+/// nothing projected the footprint before retrying, and on unified-memory
+/// hardware that request consumed the host. The projection is advisory —
+/// [`DeviceBuffer`](crate::cuda) re-checks the budget atomically at
+/// allocation time.
+pub fn projected_device_bytes(spec: &GpuBfsSpec, config: &GpuBfsConfig) -> Result<u64, GpuError> {
+    let trace = config.trace_on_violation;
+    let table_slots = checked_power_of_two_u64("BFS fingerprint table slots", config.table_bits)?;
+    let table_slots_usize = checked_allocation_usize("BFS fingerprint table slots", table_slots)?;
+    let table_bytes =
+        checked_allocation_bytes("BFS fingerprint table bytes", &[table_slots_usize, 8])?;
+    let row_bytes = checked_allocation_bytes("BFS state row bytes", &[spec.slots, 8])?;
+    let arena_rows = if trace {
+        config
+            .frontier_cap_rows
+            .checked_mul(2)
+            .ok_or(GpuError::AllocationOverflow("BFS trace arena rows"))?
+    } else {
+        config.frontier_cap_rows
+    };
+    let arena_rows_usize = checked_allocation_usize("BFS arena rows", arena_rows)?;
+    let arena_bytes = checked_allocation_bytes("BFS arena bytes", &[arena_rows_usize, row_bytes])?;
+    let init_bytes =
+        checked_allocation_bytes("BFS initial-state bytes", &[spec.init_rows.len(), 8])?;
+    let parent_bytes = if trace {
+        checked_allocation_bytes("BFS parent bytes", &[arena_rows_usize, 8])?
+    } else {
+        8
+    };
+    let slot_stats_bytes = checked_allocation_bytes("BFS slot-stat bytes", &[spec.slots, 8])?;
+    // Trace mode reuses `arena_a` monotonically; `arena_b` is only the tiny
+    // init-staging buffer.
+    let arena_b_bytes = if trace {
+        init_bytes.max(8)
+    } else {
+        arena_bytes
+    };
+
+    // fp_lo + fp_hi + arena_a + arena_b + parent + enabled_flags (one byte
+    // per arena row), plus the small managed buffers (nine u64 counters, two
+    // slot-stat arrays, one violation row).
+    let total: u128 = 2 * table_bytes as u128
+        + arena_bytes as u128
+        + arena_b_bytes as u128
+        + parent_bytes as u128
+        + arena_rows_usize as u128
+        + 9 * 8
+        + 2 * slot_stats_bytes as u128
+        + row_bytes as u128;
+    u64::try_from(total).map_err(|_| GpuError::AllocationOverflow("BFS projected footprint"))
 }
 
 /// Run an exhaustive device-resident BFS for the spec.
@@ -818,4 +883,57 @@ pub fn run_bfs(spec: &GpuBfsSpec, config: &GpuBfsConfig) -> Result<GpuBfsOutcome
         slot_maxima: slot_maxima_out,
         slot_minima: slot_minima_out,
     })
+}
+
+#[cfg(test)]
+mod projected_footprint_tests {
+    use super::*;
+
+    fn spec(slots: usize) -> GpuBfsSpec {
+        GpuBfsSpec {
+            slots,
+            action_count: 1,
+            actions_src: String::new(),
+            init_rows: vec![0; slots],
+            track_slot_stats: false,
+        }
+    }
+
+    #[test]
+    fn default_trace_config_projects_under_sixteen_gib() {
+        // The shipping defaults (table_bits 27, frontier 32Mi) with trace
+        // doubling and 12-slot (96-byte) rows must fit the 1/8-of-128-GiB
+        // per-process budget the CUDA layer enforces on this hardware.
+        let mut config = GpuBfsConfig::default();
+        config.trace_on_violation = true;
+        let bytes = projected_device_bytes(&spec(12), &config).unwrap();
+        assert!(
+            bytes < 16 << 30,
+            "default trace footprint {bytes} >= 16 GiB"
+        );
+    }
+
+    #[test]
+    fn incident_ladder_rung_four_projects_over_one_hundred_gib() {
+        // The 2026-07-21 configuration: two fingerprint-table doublings and
+        // one frontier x4 on top of the defaults. The projection must expose
+        // it as impossible on any current hardware rather than letting the
+        // retry ladder request it.
+        let mut config = GpuBfsConfig::default();
+        config.trace_on_violation = true;
+        config.table_bits = 29;
+        config.frontier_cap_rows = 512 << 20;
+        let bytes = projected_device_bytes(&spec(12), &config).unwrap();
+        assert!(
+            bytes > 100u64 << 30,
+            "incident rung projected only {bytes} bytes"
+        );
+    }
+
+    #[test]
+    fn projection_overflow_is_an_error_not_a_wrap() {
+        let mut config = GpuBfsConfig::default();
+        config.frontier_cap_rows = u64::MAX / 2;
+        assert!(projected_device_bytes(&spec(12), &config).is_err());
+    }
 }

@@ -149,9 +149,15 @@ pub(super) fn compute_record_additive_fp(rec: &crate::value::RecordValue) -> u64
 /// Part of #3246: Uses commutative wrapping addition of splitmix64-mixed element
 /// fingerprints. Must match the tla-value crate's compute_set_additive_fp exactly.
 pub(super) fn compute_set_additive_fp(set: &SortedSet) -> u64 {
+    // Normalize FIRST (as_slice), then read the normalized length — calling
+    // `len()` on an unnormalized set runs a redundant FxHashSet dedup-count
+    // pass (deep-hashing every element) ahead of the normalization the
+    // iteration forces anyway. Kept in lockstep with the tla-value twin
+    // (`tla_value::dedup_fingerprint::compute_set_additive_fp`).
+    let elems = set.as_slice();
     let mut fp = ADDITIVE_SET_SEED;
-    fp = fp.wrapping_add(splitmix64(set.len() as u64));
-    for elem in set.iter() {
+    fp = fp.wrapping_add(splitmix64(elems.len() as u64));
+    for elem in elems {
         fp = fp.wrapping_add(splitmix64(value_fingerprint(elem)));
     }
     fp

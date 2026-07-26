@@ -29,7 +29,10 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const CACHE_SCHEMA_VERSION: u32 = 1;
+// v2 adds authoritative raw initial/successor generation counts. Keep the
+// serde defaults below solely so a v1 file can be decoded far enough for the
+// version gate to discard it; v1 zeroes must never surface as measurements.
+const CACHE_SCHEMA_VERSION: u32 = 2;
 const SIGNATURE_FORMAT_VERSION: &[u8] = b"ty-check-cache-sig-v3\0";
 
 fn modified_ns(meta: &fs::Metadata) -> u128 {
@@ -150,6 +153,12 @@ pub struct CacheStats {
     pub states_found: u64,
     /// Number of initial states.
     pub initial_states: u64,
+    /// Initial states generated before state constraints and deduplication.
+    #[serde(default)]
+    pub raw_initial_states_generated: u64,
+    /// Successors generated before state/action constraints and reductions.
+    #[serde(default)]
+    pub raw_successors_generated: u64,
     /// Maximum BFS frontier (queue) depth reached.
     pub max_queue_depth: u64,
     /// Number of state transitions explored.

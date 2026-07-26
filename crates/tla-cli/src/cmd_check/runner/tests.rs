@@ -792,11 +792,8 @@ Next == A \/ B \/ C
     let spec_path = base_dir.join("StrictVacuityAuto.tla");
     let cfg_path = base_dir.join("StrictVacuityAuto.cfg");
     fs::write(&spec_path, spec).expect("write strict-vacuity spec");
-    fs::write(
-        &cfg_path,
-        "INIT Init\nNEXT Next\nCHECK_DEADLOCK FALSE\n",
-    )
-    .expect("write strict-vacuity cfg");
+    fs::write(&cfg_path, "INIT Init\nNEXT Next\nCHECK_DEADLOCK FALSE\n")
+        .expect("write strict-vacuity cfg");
 
     let (result, strategy) = run_once_with_workers_and_strict(
         &module,
@@ -821,10 +818,13 @@ Next == A \/ B \/ C
     assert!(strategy
         .as_deref()
         .is_some_and(|line| line.contains("strict-vacuity exhaustive action evidence")));
-    let dead_actions = stats.vacuity_warnings.iter().find_map(|warning| match warning {
-        tla_check::VacuityWarning::DeadActions(names) => Some(names.as_slice()),
-        _ => None,
-    });
+    let dead_actions = stats
+        .vacuity_warnings
+        .iter()
+        .find_map(|warning| match warning {
+            tla_check::VacuityWarning::DeadActions(names) => Some(names.as_slice()),
+            _ => None,
+        });
     assert_eq!(dead_actions, Some(["C".to_string()].as_slice()));
 
     let _ = fs::remove_dir_all(base_dir);

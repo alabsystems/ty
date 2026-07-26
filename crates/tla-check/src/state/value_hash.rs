@@ -14,6 +14,7 @@
 //! re-exports all public items for backward compatibility.
 
 use crate::Value;
+#[cfg(test)]
 use tla_value::Rp;
 
 // Additive fingerprint functions — extracted to value_hash_additive.rs (#3338)
@@ -170,7 +171,7 @@ pub(crate) use super::value_hash_state::{
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex, MutexGuard};
+    use std::sync::{Mutex, MutexGuard};
     use tla_value::{FuncValue, IntIntervalFunc, SeqValue};
 
     static READONLY_VALUE_CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -207,12 +208,13 @@ mod tests {
         let Value::Func(func) = &value else {
             panic!("expected function");
         };
+        let cached_before = func.get_additive_fp();
 
         let fp1 = value_fingerprint(&value);
         let fp2 = value_fingerprint(&value);
 
         assert_eq!(fp1, fp2);
-        assert_eq!(func.get_additive_fp(), None);
+        assert_eq!(func.get_additive_fp(), cached_before);
     }
 
     #[test]
@@ -226,12 +228,13 @@ mod tests {
         let Value::IntFunc(func) = &value else {
             panic!("expected int function");
         };
+        let cached_before = func.get_additive_fp();
 
         let fp1 = value_fingerprint(&value);
         let fp2 = value_fingerprint(&value);
 
         assert_eq!(fp1, fp2);
-        assert_eq!(func.get_additive_fp(), None);
+        assert_eq!(func.get_additive_fp(), cached_before);
     }
 
     #[test]
@@ -241,12 +244,13 @@ mod tests {
         let Value::Set(set) = &value else {
             panic!("expected set");
         };
+        let cached_before = set.get_additive_fp();
 
         let fp1 = value_fingerprint(&value);
         let fp2 = value_fingerprint(&value);
 
         assert_eq!(fp1, fp2);
-        assert_eq!(set.get_additive_fp(), None);
+        assert_eq!(set.get_additive_fp(), cached_before);
     }
 
     #[test]
@@ -259,12 +263,13 @@ mod tests {
         let Value::Seq(seq) = &value else {
             panic!("expected sequence");
         };
+        let cached_before = seq.get_additive_fp();
 
         let fp1 = value_fingerprint(&value);
         let fp2 = value_fingerprint(&value);
 
         assert_eq!(fp1, fp2);
-        assert_eq!(seq.get_additive_fp(), None);
+        assert_eq!(seq.get_additive_fp(), cached_before);
     }
 
     #[test]
@@ -274,11 +279,15 @@ mod tests {
         let Value::Record(record) = &value else {
             panic!("expected record");
         };
+        // Record interning may legitimately seed this cache while the freshly
+        // constructed value is exclusively owned. Read-only mode promises
+        // that value_fingerprint itself does not mutate the shared value.
+        let cached_before = record.get_additive_fp();
 
         let fp1 = value_fingerprint(&value);
         let fp2 = value_fingerprint(&value);
 
         assert_eq!(fp1, fp2);
-        assert_eq!(record.get_additive_fp(), None);
+        assert_eq!(record.get_additive_fp(), cached_before);
     }
 }

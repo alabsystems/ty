@@ -86,6 +86,20 @@ impl EvalCtx {
         self.stable.scope_ids.local_ops
     }
 
+    /// Whether the current local-operator scope requires per-frame Arc
+    /// identity. Normally this is the O(1) fact stored alongside the scope id;
+    /// an explicitly invalidated scope is resolved through the pointer memo.
+    #[inline]
+    pub(crate) fn local_ops_scope_recursive(&self) -> bool {
+        if self.stable.scope_ids.local_ops != crate::cache::scope_ids::INVALIDATED {
+            return self.stable.scope_ids.local_ops_recursive;
+        }
+        crate::cache::openv_memo::recursive_flag_memoized(
+            &self.stable.local_ops,
+            crate::cache::openv_memo::ScopeIdSite::EnterLet,
+        )
+    }
+
     /// Set `local_ops` together with an already-computed scope id, avoiding the
     /// `INVALIDATED` sentinel that forces every subsequent cache-key build to
     /// re-walk the (immutable) `local_ops` HAMT.

@@ -4,9 +4,9 @@
 
 //! RecordSetValue ([a: S, b: T, ...]) and RecordSetIterator.
 
-use std::sync::Arc;
 use super::super::*;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use tla_core::{intern_name, NameId};
 
 /// A lazy record set value representing [a: S, b: T, ...] without allocating all records.
@@ -45,12 +45,25 @@ impl RecordSetValue {
 
     /// Compute the field check order: ascending by domain cardinality, then alphabetical.
     /// Fields with unknown cardinality are placed last (treated as u64::MAX).
+    ///
+    /// Cardinality is read via `set_len_if_cheap` (O(1) `Set`/`Interval` only) —
+    /// NEVER the materializing `set_len`. A field domain that is itself a lazy
+    /// compound set (e.g. `block : Block` where `Block` is a `SetCup` of record
+    /// sets) would otherwise be fully materialized + dedup-hashed here on EVERY
+    /// `RecordSetValue::new`, which for a per-state-reconstructed `TypeOK` record
+    /// set (NanoBlockchain `SignedBlock`) dominated runtime. The check order is a
+    /// pure short-circuit-AND ordering heuristic (#3792): a compound field simply
+    /// sorts last (`u64::MAX`), which is exactly where an expensive-to-discriminate
+    /// field belongs. Membership results are order-independent, so this is sound.
     fn compute_check_order(fields: &BTreeMap<Arc<str>, Box<Value>>) -> Box<[Arc<str>]> {
         use num_traits::ToPrimitive;
         let mut ordered: Vec<(Arc<str>, u64)> = fields
             .iter()
             .map(|(name, set)| {
-                let card = set.set_len().and_then(|n| n.to_u64()).unwrap_or(u64::MAX);
+                let card = set
+                    .set_len_if_cheap()
+                    .and_then(|n| n.to_u64())
+                    .unwrap_or(u64::MAX);
                 (name.clone(), card)
             })
             .collect();

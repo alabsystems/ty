@@ -85,7 +85,7 @@ pub(crate) fn compute_local_ops_id(ops: &OpEnv) -> u64 {
 /// operator bodies but different bound variables, causing incorrect cache hits.
 /// Fall back to `Arc` pointer identity so each recursion frame gets a unique key.
 #[inline]
-fn local_ops_requires_arc_identity(ops: &OpEnv) -> bool {
+pub(crate) fn local_ops_requires_arc_identity(ops: &OpEnv) -> bool {
     ops.values().any(|def| def.is_recursive)
 }
 
@@ -113,16 +113,11 @@ pub(crate) fn compute_local_ops_scope_id(local_ops: &Arc<OpEnv>) -> u64 {
 /// [`EvalScopeIds::local_ops_recursive`] so the (single) `OpEnv` HAMT walk runs
 /// once per scope construction instead of once per cache-key build.
 #[inline]
+#[cfg(test)]
 pub(crate) fn local_ops_recursive_flag(local_ops: &Option<Arc<OpEnv>>) -> bool {
     local_ops
         .as_ref()
         .is_some_and(|ops| local_ops_requires_arc_identity(ops))
-}
-
-/// [`local_ops_recursive_flag`] for an already-unwrapped `Arc<OpEnv>`.
-#[inline]
-pub(crate) fn arc_local_ops_recursive(local_ops: &Arc<OpEnv>) -> bool {
-    local_ops_requires_arc_identity(local_ops)
 }
 
 /// Compute the scope id and the recursive flag for `local_ops` in a single HAMT
@@ -303,6 +298,7 @@ pub(crate) fn compute_instance_subs_id(subs: &[Substitution]) -> u64 {
 /// already know it pass it via [`resolve_local_ops_id_with_recursive`] to skip
 /// the walk entirely; this wrapper performs the walk only as a fallback.
 #[inline]
+#[cfg(test)]
 pub(crate) fn resolve_local_ops_id(scope_id: u64, local_ops: &Option<Arc<OpEnv>>) -> u64 {
     let requires_arc_identity = local_ops
         .as_ref()

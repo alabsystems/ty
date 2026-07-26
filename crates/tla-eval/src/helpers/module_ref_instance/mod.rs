@@ -14,7 +14,8 @@ mod instance_resolution;
 
 // Re-export public API — preserves all existing import paths.
 pub(crate) use binding_builders::{
-    build_lazy_subst_bindings, build_lazy_subst_bindings_with_local_ops,
+    build_lazy_subst_bindings, build_lazy_subst_bindings_memoized,
+    build_lazy_subst_bindings_with_local_ops,
 };
 pub use binding_builders::{expr_has_any_prime, expr_has_primed_param};
 pub(super) use instance_resolution::get_instance_info;
@@ -115,6 +116,39 @@ pub fn prepare_registered_named_module_ref_call(
     Ok((prepared.ctx, prepared.op_def))
 }
 
+/// Build the composed-substitutions + merged-local-ops scope entry for a
+/// named INSTANCE call. Pure structural computation: reads only the shared
+/// tables (`ctx.shared`, COW — identity guarded by the memo's pinned
+/// `shared_ptr` key) and the ambient `instance_substitutions` / `local_ops` /
+/// `let_def_overlay` — never state values. This determinism is the run-memo
+/// contract (see `module_ref_cache::RUN_SCOPE_MEMOS`), debug-verified by a
+/// full rebuild + structural comparison on every memo hit.
+fn build_named_scope_entry(ctx: &EvalCtx, instance_info: &InstanceInfo) -> ModuleRefScopeEntry {
+    let effective_substitutions = ctx.compute_effective_instance_substitutions(
+        &instance_info.module_name,
+        &instance_info.substitutions,
+    );
+
+    let mut instance_local_ops: OpEnv = ctx
+        .shared
+        .instance_ops
+        .get(&instance_info.module_name)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(parent_local_ops) = ctx.local_ops.as_ref() {
+        for (name, def) in parent_local_ops.iter() {
+            if !instance_local_ops.contains_key(name.as_str()) {
+                instance_local_ops.insert(name.clone(), def.clone());
+            }
+        }
+    }
+
+    ModuleRefScopeEntry {
+        effective_subs_arc: Arc::new(effective_substitutions),
+        local_ops_arc: Arc::new(instance_local_ops),
+    }
+}
+
 fn prepare_resolved_named_module_ref_call(
     ctx: &EvalCtx,
     instance_name: &str,
@@ -125,9 +159,10 @@ fn prepare_resolved_named_module_ref_call(
 ) -> EvalResult<PreparedNamedModuleRefCall> {
     // Fix #2364: Cache the composed substitutions and merged local_ops in
     // pre-wrapped Arcs so SUBST_CACHE keys remain stable across eval entries.
+    let instance_name_id = intern_name(instance_name);
     let scope_key = ModuleRefScopeKey {
         shared_id: ctx.shared.id,
-        instance_name_id: intern_name(instance_name),
+        instance_name_id,
         outer_subs_id: ctx
             .instance_substitutions
             .as_ref()
@@ -141,29 +176,104 @@ fn prepare_resolved_named_module_ref_call(
     let scope_entry = MODULE_REF_CACHES
         .with(|c| c.borrow().module_ref_scope.get(&scope_key).cloned())
         .unwrap_or_else(|| {
-            let effective_substitutions = ctx.compute_effective_instance_substitutions(
-                &instance_info.module_name,
-                &instance_info.substitutions,
-            );
-
-            let mut instance_local_ops: OpEnv = ctx
-                .shared
-                .instance_ops
-                .get(&instance_info.module_name)
-                .cloned()
-                .unwrap_or_default();
-            if let Some(parent_local_ops) = ctx.local_ops.as_ref() {
-                for (name, def) in parent_local_ops.iter() {
-                    if !instance_local_ops.contains_key(name.as_str()) {
-                        instance_local_ops.insert(name.clone(), def.clone());
+            // #3447/#4170 epoch policy: the per-state pointer-keyed cache above
+            // keeps its exact clear lifecycle; on a miss (boundary clears wipe
+            // it up to ~13×/state on VIEW-bearing specs like MCNano), consult
+            // the RUN-lifetime producer-identity memo before rebuilding.
+            let fps = super::module_ref_cache::run_scope_memo_ambient_ids(ctx);
+            if let Some((inst_subs_ptr, local_ops_ptr)) = fps {
+                let run_key = super::module_ref_cache::RunNamedScopeKey {
+                    shared_ptr: Arc::as_ptr(&ctx.shared) as usize,
+                    instance_name_id,
+                    inst_subs_ptr,
+                    local_ops_ptr,
+                };
+                if let Some(entry) = super::module_ref_cache::run_named_scope_memo_get(&run_key) {
+                    // Producer-determinism contract: same (shared, site,
+                    // ambient content) must rebuild to the same entry. Debug
+                    // builds verify by re-running the full build on every hit.
+                    #[cfg(debug_assertions)]
+                    {
+                        let rebuilt = build_named_scope_entry(ctx, instance_info);
+                        if *rebuilt.effective_subs_arc != *entry.effective_subs_arc
+                            || *rebuilt.local_ops_arc != *entry.local_ops_arc
+                        {
+                            let subs_names = |v: &[tla_core::ast::Substitution]| {
+                                v.iter()
+                                    .map(|s| s.from.node.clone())
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            };
+                            let mut diffs = String::new();
+                            for (name, def) in rebuilt.local_ops_arc.iter() {
+                                match entry.local_ops_arc.get(name.as_str()) {
+                                    None => {
+                                        diffs.push_str(&format!("[only-rebuilt {name}] "));
+                                    }
+                                    Some(memo_def) if **memo_def != **def => {
+                                        diffs.push_str(&format!(
+                                            "[differs {name}: span {:?}/{:?} rec {}/{} \
+                                             prime {}/{} scc {}/{} params {}/{} body_eq {}] ",
+                                            def.body.span,
+                                            memo_def.body.span,
+                                            def.is_recursive,
+                                            memo_def.is_recursive,
+                                            def.contains_prime,
+                                            memo_def.contains_prime,
+                                            def.self_call_count,
+                                            memo_def.self_call_count,
+                                            def.params.len(),
+                                            memo_def.params.len(),
+                                            def.body == memo_def.body,
+                                        ));
+                                    }
+                                    Some(_) => {}
+                                }
+                            }
+                            panic!(
+                                "run scope memo: producer-determinism contract violated \
+                                 for named INSTANCE `{instance_name}` (same key, different entry)\n\
+                                 subs_equal={} local_ops_equal={}\n\
+                                 rebuilt_subs=[{}]\nmemo_subs=[{}]\n\
+                                 rebuilt_ops_len={} memo_ops_len={}\n\
+                                 overlay_nonempty={} var_registry_len={} shared_ptr={:p}\n\
+                                 diffs: {diffs}",
+                                *rebuilt.effective_subs_arc == *entry.effective_subs_arc,
+                                *rebuilt.local_ops_arc == *entry.local_ops_arc,
+                                subs_names(&rebuilt.effective_subs_arc),
+                                subs_names(&entry.effective_subs_arc),
+                                rebuilt.local_ops_arc.len(),
+                                entry.local_ops_arc.len(),
+                                !ctx.let_def_overlay.is_empty(),
+                                ctx.var_registry().names().len(),
+                                Arc::as_ptr(&ctx.shared),
+                            );
+                        }
                     }
+                    crate::cache::subst_chain_memo::count_scope_memo_hit();
+                    MODULE_REF_CACHES.with(|c| {
+                        c.borrow_mut()
+                            .module_ref_scope
+                            .insert(scope_key, entry.clone())
+                    });
+                    return entry;
                 }
+                let entry = build_named_scope_entry(ctx, instance_info);
+                crate::cache::subst_chain_memo::count_scope_memo_build();
+                super::module_ref_cache::run_named_scope_memo_insert(
+                    run_key,
+                    entry.clone(),
+                    &ctx.shared,
+                );
+                MODULE_REF_CACHES.with(|c| {
+                    c.borrow_mut()
+                        .module_ref_scope
+                        .insert(scope_key, entry.clone())
+                });
+                return entry;
             }
-
-            let entry = ModuleRefScopeEntry {
-                effective_subs_arc: Arc::new(effective_substitutions),
-                local_ops_arc: Arc::new(instance_local_ops),
-            };
+            crate::cache::subst_chain_memo::count_scope_memo_bail();
+            let entry = build_named_scope_entry(ctx, instance_info);
             MODULE_REF_CACHES.with(|c| {
                 c.borrow_mut()
                     .module_ref_scope
@@ -213,11 +323,15 @@ fn prepare_resolved_named_module_ref_call(
     if has_effective_substitutions {
         new_ctx.stable_mut().eager_subst_bindings = Some(Arc::clone(&EMPTY_EAGER_SUBST));
         // SAFETY: every expression pointer belongs to effective_subs_arc,
-        // retained by new_ctx.instance_substitutions for the body lifetime.
-        new_ctx.bindings = binding_builders::build_lazy_subst_bindings_with_local_ops(
+        // retained by new_ctx.instance_substitutions for the body lifetime
+        // (and pinned by the subst-chain memo entry on top of that).
+        new_ctx.bindings = binding_builders::build_lazy_subst_bindings_memoized(
+            ctx,
             &ctx.bindings,
             ctx.local_ops.clone(),
             &scope_entry.effective_subs_arc,
+            crate::cache::subst_chain_memo::SITE_NAMED_MODULE_REF,
+            u64::from(intern_name(instance_name).0),
         );
         for (name_id, value) in saved_param_bindings.iter().rev() {
             new_ctx.bindings = new_ctx.bindings.cons_local(

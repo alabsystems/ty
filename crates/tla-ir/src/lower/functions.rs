@@ -1310,7 +1310,8 @@ impl<'cp> Ctx<'cp> {
                     block_idx,
                     val_reg,
                     &value_shape,
-                )? {
+                )?
+            {
                 replacement
             } else {
                 self.compact_value_source_for_reg(block_idx, val_reg, &value_shape)?
@@ -1826,7 +1827,8 @@ impl<'cp> Ctx<'cp> {
                     block_idx,
                     val_reg,
                     &value_shape,
-                )? {
+                )?
+            {
                 replacement
             } else {
                 self.compact_value_source_for_reg(block_idx, val_reg, &value_shape)?
@@ -2846,8 +2848,7 @@ impl<'cp> Ctx<'cp> {
         let Some(shapes) = self.tuple_element_shapes.get(&tuple_reg) else {
             return raw;
         };
-        let Some(super::AggregateShape::TaggedScalarUnion { universe, .. }) =
-            shapes.get(position)
+        let Some(super::AggregateShape::TaggedScalarUnion { universe, .. }) = shapes.get(position)
         else {
             return raw;
         };
@@ -4266,8 +4267,7 @@ impl<'cp> Ctx<'cp> {
             let func_shape_takes_int_key = matches!(
                 self.aggregate_shapes.get(&func_reg),
                 Some(
-                    super::AggregateShape::Function { .. }
-                        | super::AggregateShape::Sequence { .. }
+                    super::AggregateShape::Function { .. } | super::AggregateShape::Sequence { .. }
                 )
             );
             if !func_shape_takes_int_key {
@@ -5579,7 +5579,14 @@ impl<'cp> Ctx<'cp> {
                 self.tuple_function_domain_keys_for_explicit_function(func_reg, source_slot, len)?
             {
                 return self.lower_tuple_keyed_compact_func_except(
-                    block_idx, rd, func_reg, path_reg, val_reg, source_slot, len, value,
+                    block_idx,
+                    rd,
+                    func_reg,
+                    path_reg,
+                    val_reg,
+                    source_slot,
+                    len,
+                    value,
                     tuple_keys,
                 );
             }

@@ -253,6 +253,8 @@ fn clear_run_reset_impl() {
     // Entries pin the allocations they key on, so entries and pins drop
     // together; later calls rebuild fresh (value-identical scope ids).
     super::openv_memo::clear_openv_memos();
+    // Clear the INSTANCE-subst chain memo (same pin-and-drop contract).
+    super::subst_chain_memo::clear_subst_chain_memo();
     // Clear the primed-var-refs memo (pure static fn; memory reset only).
     tla_core::clear_primed_var_refs_memo();
     // Part of #3962: Single TLS access to clear all PerRun fields in SMALL_CACHES.
@@ -272,6 +274,10 @@ fn clear_run_reset_impl() {
         sc.thunk_taint_set.clear();
         // Part of #3962: fold + action caches consolidated from separate thread_locals.
         sc.fold_result_cache.clear();
+        // Linear/chain-recursive operator memo: PerRun, keyed by (def ptr, args) and
+        // only populated with proven state-independent results. Reused operator
+        // pointers in a later run must not alias stale entries.
+        sc.recursive_result_cache.clear();
         sc.action_ctx_cache.clear();
         // Raw-pointer-keyed PerRun cache: clear so a reused TIR body address in a
         // later run cannot alias a stale lambda body (same contract as
@@ -280,6 +286,11 @@ fn clear_run_reset_impl() {
     });
     // Fix #2364: Clear module reference scope caches for test isolation.
     crate::helpers::clear_module_ref_caches();
+    // #3447/#4170 epoch policy: the run-lifetime producer-identity scope memo
+    // is PerRun — cleared here (run/phase/test reset), NOT at eval-scope
+    // boundaries. Its keys are memo-PINNED pointer identities (no allocator
+    // ABA possible while pinned; see helpers::module_ref_cache).
+    crate::helpers::clear_module_ref_run_memos();
     // Clear operator/closure param-name caches so reused operator pointers or
     // deterministic closure ids cannot replay stale bindings across resets.
     crate::helpers::clear_param_name_caches();
@@ -289,6 +300,9 @@ fn clear_run_reset_impl() {
     // causes {<<>>} to silently replace {Func(empty)}, failing as_func() asserts.
     crate::value::clear_set_intern_table();
     crate::value::clear_int_func_intern_table();
+    // Record intern table keys entries by NameId (run-scoped) and pins
+    // canonical allocations — clear with the other value intern tables.
+    crate::value::clear_record_intern_table();
     crate::value::clear_tlc_norm_cache();
     super::quantifier_hoist::clear_quantifier_hoist_cache(); // Part of #3128
     super::const_set_cache::clear_const_set_cache(); // Constant set-producing subexpr cache

@@ -15,7 +15,7 @@ use super::subscript_action_pair::extract_subscript_action_pairs;
 pub(in crate::check::model_checker) use super::subscript_action_pair::SubscriptActionPair;
 use crate::check::model_checker::ModelChecker;
 use crate::liveness::AstToLive;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 impl<'a> ModelChecker<'a> {
     pub(in crate::check::model_checker) fn inline_fairness_active(&self) -> bool {
@@ -40,6 +40,7 @@ impl<'a> ModelChecker<'a> {
         };
 
         self.liveness_cache.cache_for_liveness
+            && !self.liveness_cache.regenerate_on_the_fly
             && mode_supports_inline
             && self.liveness_cache.fairness_max_tag > 0
             && (!self.liveness_cache.fairness_state_checks.is_empty()
@@ -56,6 +57,8 @@ impl<'a> ModelChecker<'a> {
         self.liveness_cache.action_provenance_tags.clear();
         self.liveness_cache.action_fast_path_provenance_tags.clear();
         self.liveness_cache.enabled_action_groups.clear();
+        self.liveness_cache.whole_next_enabled_tags.clear();
+        self.liveness_cache.whole_next_action_tags.clear();
         self.liveness_cache.enabled_provenance.clear();
         self.liveness_cache.subscript_action_pairs.clear();
         // Bitmask maps cleared below (per-tag inline_state/action_results removed).
@@ -223,11 +226,13 @@ impl<'a> ModelChecker<'a> {
         // (which clears the set) so they survive into evaluation. These leaves are
         // decided by scanning the complete BFS successor set for a subscript
         // change, avoiding a per-state from-scratch Next re-enumeration.
+        self.liveness_cache.whole_next_enabled_tags = whole_next_enabled.clone();
         crate::liveness::extend_whole_next_enabled_tags(whole_next_enabled);
         // Register whole-Next ActionPred tags (same lifecycle) so the inline
         // recorder sets `<<Next>>_vars`' ActionPred(Next) leaf directly to TRUE
         // per real successor instead of re-enumerating Next. No-op under the
         // TY_DISABLE_WHOLE_NEXT_ACTION_TAGS kill switch.
+        self.liveness_cache.whole_next_action_tags = whole_next_action_tags.clone();
         crate::liveness::extend_whole_next_action_tags(whole_next_action_tags);
 
         // Part of #3100: Extract subscript-action pairs for the LNAction-style
@@ -496,6 +501,33 @@ impl<'a> ModelChecker<'a> {
         self.liveness_cache.enabled_action_groups = enabled_groups;
         self.liveness_cache.enabled_provenance = enabled_provenance;
         self.liveness_cache.subscript_action_pairs = subscript_pairs;
+    }
+
+    /// Re-arm run-stable fairness metadata after a property-boundary TLS clear.
+    ///
+    /// Fairness is converted before every property, so its tags are stable
+    /// (`1..=fairness_max_tag`) for the whole model-checking run. The mid-BFS
+    /// regeneration trip intentionally releases the large result maps, but the
+    /// tiny semantic registries below remain valid and let the post-BFS exact
+    /// checker recover whole-Next successor/provenance fast paths.
+    pub(in crate::check::model_checker) fn rearm_inline_fairness_metadata(&self) {
+        let pairs: FxHashMap<u32, u32> = self
+            .liveness_cache
+            .enabled_action_groups
+            .iter()
+            .filter_map(|group| {
+                group
+                    .action_pred_tag
+                    .map(|action_tag| (group.enabled_tag, action_tag))
+            })
+            .collect();
+        crate::liveness::set_enabled_action_pred_pairs(pairs);
+        crate::liveness::extend_whole_next_enabled_tags(
+            self.liveness_cache.whole_next_enabled_tags.iter().copied(),
+        );
+        crate::liveness::extend_whole_next_action_tags(
+            self.liveness_cache.whole_next_action_tags.iter().copied(),
+        );
     }
 
     #[cfg(test)]

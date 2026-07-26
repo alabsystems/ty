@@ -91,6 +91,7 @@
 //! veto site, no `BfsFingerprintDomain` variant, no `run_helpers` change. The
 //! module is exercised by its oracle tests only.
 
+#[cfg(test)]
 use tla_value::Rp;
 
 use std::cmp::Ordering;
@@ -455,7 +456,9 @@ fn universe_dest_positions(universe: &[FlatScalarValue], perm: &NamePerm) -> Opt
     let mut seen = vec![false; universe.len()];
     for value in universe {
         let permuted = permute_flat_scalar(value, perm);
-        let d = universe.iter().position(|candidate| *candidate == permuted)?;
+        let d = universe
+            .iter()
+            .position(|candidate| *candidate == permuted)?;
         if seen[d] {
             return None;
         }
@@ -798,12 +801,11 @@ fn compile_var_kind(
                     SlotType::String => i,
                     SlotType::ModelValue => {
                         let permuted = perm.image_of(key);
-                        domain_keys
-                            .iter()
-                            .zip(domain_types.iter())
-                            .position(|(candidate, candidate_type)| {
+                        domain_keys.iter().zip(domain_types.iter()).position(
+                            |(candidate, candidate_type)| {
                                 *candidate_type == SlotType::ModelValue && **candidate == *permuted
-                            })?
+                            },
+                        )?
                     }
                     // String-keyed layouts only carry String/ModelValue keys.
                     SlotType::Int | SlotType::Bool => return None,
@@ -1150,12 +1152,7 @@ mod tests {
         let mut entries: Vec<(Value, Value)> = perm
             .entries()
             .iter()
-            .map(|(from, to)| {
-                (
-                    Value::ModelValue(from.into()),
-                    Value::ModelValue(to.into()),
-                )
-            })
+            .map(|(from, to)| (Value::ModelValue(from.into()), Value::ModelValue(to.into())))
             .collect();
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         FuncValue::from_sorted_entries(entries)
@@ -1392,7 +1389,11 @@ mod tests {
         let layout = Arc::new(StateLayout::new(
             &registry,
             vec![VarLayoutKind::StringKeyedArray {
-                domain_keys: vec![Arc::from("wp11p1"), Arc::from("wp11p2"), Arc::from("wp11p3")],
+                domain_keys: vec![
+                    Arc::from("wp11p1"),
+                    Arc::from("wp11p2"),
+                    Arc::from("wp11p3"),
+                ],
                 domain_types: vec![SlotType::ModelValue; 3],
                 value_types,
                 range_encoding: StringKeyedArrayRangeEncoding::ScalarSlots,
@@ -1640,8 +1641,11 @@ mod tests {
     #[test]
     fn decline_dynamic_and_placeholder_bitmask() {
         assert!(
-            FlatSymmetryCanonicalizer::compile(&single_var_layout(VarLayoutKind::Dynamic), &swap_ab())
-                .is_none(),
+            FlatSymmetryCanonicalizer::compile(
+                &single_var_layout(VarLayoutKind::Dynamic),
+                &swap_ab()
+            )
+            .is_none(),
             "Dynamic vars do not encode their value: decline"
         );
         assert!(
@@ -1791,8 +1795,7 @@ mod tests {
         let non_bijection = FuncValue::from_sorted_entries(vec![(mv("wp11a"), mv("wp11b"))]);
         assert!(FlatSymmetryCanonicalizer::compile(&layout, &[non_bijection]).is_none());
         // Non-model-value entries.
-        let ints =
-            FuncValue::from_sorted_entries(vec![(Value::SmallInt(1), Value::SmallInt(2))]);
+        let ints = FuncValue::from_sorted_entries(vec![(Value::SmallInt(1), Value::SmallInt(2))]);
         assert!(FlatSymmetryCanonicalizer::compile(&layout, &[ints]).is_none());
         // Empty / identity-only symmetry: nothing to exploit.
         assert!(FlatSymmetryCanonicalizer::compile(&layout, &[]).is_none());

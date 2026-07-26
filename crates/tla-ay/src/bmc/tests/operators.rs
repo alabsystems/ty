@@ -320,3 +320,60 @@ fn test_bmc_neg_operator() {
         _ => panic!("unexpected SolveResult variant"),
     }
 }
+
+/// String interning shares AY's Int carrier, but never TLA+'s value kind.
+/// The first intern id is deliberately used as the integer operand so this
+/// catches translation-before-kind-check aliasing in both orientations.
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_bmc_scalar_equality_rejects_string_int_carrier_alias() {
+    const FIRST_STRING_ID: i64 = -1_000_000_007;
+
+    for reverse in [false, true] {
+        let mut trans = BmcTranslator::new(0).unwrap();
+        let string = spanned(Expr::String("collision".to_string()));
+        let integer = spanned(Expr::Int(BigInt::from(FIRST_STRING_ID)));
+        let (left, right) = if reverse {
+            (integer, string)
+        } else {
+            (string, integer)
+        };
+        let equality = spanned(Expr::Eq(Box::new(left), Box::new(right)));
+        let term = trans.translate_init(&equality).unwrap();
+        trans.assert(term);
+        assert!(matches!(trans.check_sat(), SolveResult::Unsat(_)));
+    }
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_bmc_scalar_disequality_and_expression_kinds_are_exact() {
+    let mut trans = BmcTranslator::new(0).unwrap();
+    trans.declare_var("s", TlaSort::String).unwrap();
+
+    let neq = spanned(Expr::Neq(
+        Box::new(spanned(Expr::Ident(
+            "s".to_string(),
+            tla_core::name_intern::NameId::INVALID,
+        ))),
+        Box::new(spanned(Expr::Add(
+            Box::new(spanned(Expr::Int(BigInt::from(-1_000_000_007_i64)))),
+            Box::new(spanned(Expr::Int(BigInt::from(0)))),
+        ))),
+    ));
+    let term = trans.translate_init(&neq).unwrap();
+    trans.assert(term);
+    assert!(matches!(trans.check_sat(), SolveResult::Sat));
+
+    let mut trans = BmcTranslator::new(0).unwrap();
+    let bool_vs_int = spanned(Expr::Eq(
+        Box::new(spanned(Expr::And(
+            Box::new(spanned(Expr::Bool(true))),
+            Box::new(spanned(Expr::Bool(true))),
+        ))),
+        Box::new(spanned(Expr::Int(BigInt::from(1)))),
+    ));
+    let false_term = trans.translate_init(&bool_vs_int).unwrap();
+    trans.assert(false_term);
+    assert!(matches!(trans.check_sat(), SolveResult::Unsat(_)));
+}

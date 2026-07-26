@@ -189,7 +189,7 @@ impl ModelChecker<'_> {
         current_array: &ArrayState,
         scratch: &'a mut CompiledBfsStepScratch,
     ) -> Option<CompiledStepOutput<'a>> {
-        if self.jit_monolithic_disabled {
+        if self.por.parity_failed || self.jit_monolithic_disabled {
             return None;
         }
         let state_len = self.compiled_bfs_step.as_ref()?.state_len();
@@ -257,6 +257,10 @@ impl ModelChecker<'_> {
         params: &BfsStepParams<'_>,
         prof: &mut BfsProfile,
     ) -> BfsIterOutcome {
+        // A full-state run can reach this consumer before the diff path touches
+        // hybrid dispatch, so arm the standalone router before reading any
+        // per-action route-selection signal.
+        self.ensure_router_ready();
         let &BfsStepParams {
             registry: _registry,
             current_depth: _current_depth,
@@ -363,8 +367,7 @@ impl ModelChecker<'_> {
         // Monolithic JIT does not emit per-action attribution. Explicit
         // coverage (including strict track-only mode) stays on the split-action
         // dispatcher even after every action has promoted.
-        let jit_ready =
-            monolithic_jit_route_ready(has_coverage, self.jit_monolithic_ready());
+        let jit_ready = monolithic_jit_route_ready(has_coverage, self.jit_monolithic_ready());
 
         if jit_ready {
             // Part of #4030: Fused JIT dispatch path. Runs JIT actions inline
@@ -420,10 +423,12 @@ impl ModelChecker<'_> {
         // with >=1 hybrid-compiled action — the default streaming selection is
         // unchanged.
         let trust_cg_hybrid = self.trust_cg_hybrid_action_dispatch_ready();
+        let router = self.router_active();
 
         if !jit_ready
             && !jit_hybrid
             && !trust_cg_hybrid
+            && !router
             && !has_eval_implied_actions
             && !has_constraints
             && !has_por
@@ -500,6 +505,7 @@ impl ModelChecker<'_> {
                 }
             }
         };
+        self.record_raw_successors_generated(succ_result.raw_successor_count);
         let valid_successors = succ_result.successors;
         prof.accum_succ_gen(prof_t0);
 
@@ -1037,6 +1043,7 @@ impl ModelChecker<'_> {
                 // Action can't be JIT-compiled — fall back to interpreter for entire state.
                 // This shouldn't happen since jit_all_next_state_compiled is checked by caller,
                 // but handle gracefully.
+                self.rollback_raw_successors_generated(enabled_action_count);
                 return self.fallback_to_interpreter_path(iter_state, storage, queue, params, prof);
             }
 
@@ -1062,6 +1069,7 @@ impl ModelChecker<'_> {
                 let cache = match self.jit_next_state_cache.as_ref() {
                     Some(c) => c,
                     None => {
+                        self.rollback_raw_successors_generated(enabled_action_count);
                         return self.fallback_to_interpreter_path(
                             iter_state, storage, queue, params, prof,
                         );
@@ -1085,7 +1093,10 @@ impl ModelChecker<'_> {
                     // Action enabled — successor is in jit_action_out_scratch.
                     self.next_state_dispatch.jit_hit += 1;
                     had_raw = true;
-                    enabled_action_count += 1;
+                    enabled_action_count = enabled_action_count
+                        .checked_add(1)
+                        .expect("raw successor generation count overflowed usize");
+                    self.record_raw_successors_generated(1);
 
                     // --- Fingerprint directly from scratch buffer (no clone!) ---
                     // Part of #3987: When compiled xxh3 fingerprinting is active,
@@ -1396,6 +1407,7 @@ impl ModelChecker<'_> {
                     if action_idx < self.jit_disabled_actions.len() {
                         self.jit_disabled_actions[action_idx] = true;
                     }
+                    self.rollback_raw_successors_generated(enabled_action_count);
                     return self
                         .fallback_to_interpreter_path(iter_state, storage, queue, params, prof);
                 }
@@ -1409,6 +1421,7 @@ impl ModelChecker<'_> {
                     } else {
                         self.next_state_dispatch.jit_not_compiled += 1;
                     }
+                    self.rollback_raw_successors_generated(enabled_action_count);
                     return self
                         .fallback_to_interpreter_path(iter_state, storage, queue, params, prof);
                 }
@@ -1585,6 +1598,7 @@ impl ModelChecker<'_> {
                 return BfsIterOutcome::Terminate(self.bfs_error_return(iter_state, storage, e));
             }
         };
+        self.record_raw_successors_generated(succ_result.raw_successor_count);
         let flat_successors = succ_result.successors;
         let had_raw = succ_result.had_raw_successors;
         prof.accum_succ_gen(prof_t0);
@@ -1817,6 +1831,7 @@ impl ModelChecker<'_> {
 
         prof.count_successors(raw_successor_count);
         self.record_transitions(raw_successor_count);
+        self.record_raw_successors_generated(raw_successor_count);
 
         #[cfg(debug_assertions)]
         let mut debug_succ_data: Vec<(Fingerprint, ArrayState, Option<usize>)> = if need_detail_log
@@ -1953,6 +1968,7 @@ impl ModelChecker<'_> {
         let fp = iter_state.fp();
 
         let has_action_tags = flat_succs.iter().any(|(_, tag)| tag.is_some());
+        self.record_raw_successors_generated(flat_succs.len());
 
         #[cfg(debug_assertions)]
         let (state_tlc_fp, need_detail_log, debug_actions_this_state) = self
@@ -2249,6 +2265,10 @@ impl ModelChecker<'_> {
 
         prof.count_successors(succ_count);
         self.record_transitions(succ_count);
+        self.record_raw_successors_generated(
+            usize::try_from(output.generated_count())
+                .expect("compiled raw successor count does not fit usize"),
+        );
 
         self.ctx.set_tlc_level(succ_level);
 

@@ -35,6 +35,7 @@
 //! Part of #3794.
 
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
 use tla_value::Rp;
 
 use num_traits::ToPrimitive;
@@ -306,7 +307,7 @@ const INTERVAL_EXPANSION_LIMIT: usize = 10_000;
 
 /// Try to convert a TLA+ `Value` to a `BmcValue` for symbolic encoding.
 ///
-/// Supports scalar types (Bool, Int), interned types (String, ModelValue),
+/// Supports scalar types (Bool, Int, String),
 /// and compound types (Tuple, Seq, Record, Func, IntFunc, Set, Interval).
 ///
 /// Returns `None` for lazy/non-enumerable types (Subset, FuncSet, RecordSet,
@@ -325,54 +326,86 @@ pub(crate) fn value_to_bmc_value(value: &Value) -> Option<BmcValue> {
                 Some(BmcValue::BigInt((**n).clone()))
             }
         }
-        // String -> Int via TLC-compatible string token interning.
-        Value::String(s) => {
-            let token = tla_value::value::tlc_string_token(s);
-            Some(BmcValue::Int(i64::from(token)))
-        }
-        // ModelValue -> Int via model value registry index.
-        Value::ModelValue(name) => {
-            let idx = tla_value::value::lookup_model_value_index(name)?;
-            Some(BmcValue::Int(i64::from(idx)))
-        }
-        // Tuple -> Sequence (element-wise recursive conversion).
+        Value::String(s) => Some(BmcValue::String(s.to_string())),
+        // TlaSort has no ModelValue kind. Encoding its registry token as Int
+        // would let it alias a genuine TLA+ integer, so fail closed.
+        Value::ModelValue(_) => None,
+        // Tuple (element-wise recursive conversion).
         Value::Tuple(elems) => {
             let converted: Option<Vec<BmcValue>> = elems.iter().map(value_to_bmc_value).collect();
-            Some(BmcValue::Sequence(converted?))
+            Some(BmcValue::Tuple(converted?))
         }
         // Seq -> Sequence (element-wise recursive conversion).
         Value::Seq(seq) => {
             let converted: Option<Vec<BmcValue>> = seq.iter().map(value_to_bmc_value).collect();
             Some(BmcValue::Sequence(converted?))
         }
-        // Record -> Sequence (field values in sorted-field-name order).
-        // RecordValue entries are stored in canonical field order (field-name
-        // string, alphabetical), so values() yields them in that order.
+        // Record fields retain their names and canonical order.
         Value::Record(rec) => {
-            let converted: Option<Vec<BmcValue>> = rec.values().map(value_to_bmc_value).collect();
-            Some(BmcValue::Sequence(converted?))
+            let converted: Option<Vec<(String, BmcValue)>> = rec
+                .iter_str()
+                .map(|(name, value)| {
+                    value_to_bmc_value(value).map(|value| (name.to_string(), value))
+                })
+                .collect();
+            Some(BmcValue::Record(converted?))
         }
-        // Func -> Sequence (interleaved [key, val, key, val, ...]).
+        // BMC supports homogeneous Int-keyed and String-keyed finite
+        // functions. Empty general functions carry no recoverable key sort,
+        // and mixed/other key kinds cannot be represented soundly.
         Value::Func(func) => {
-            let mut elems = Vec::with_capacity(func.domain_len() * 2);
-            for (k, v) in func.iter() {
-                elems.push(value_to_bmc_value(k)?);
-                elems.push(value_to_bmc_value(v)?);
+            enum FunctionEntries {
+                Int(Vec<(i64, BmcValue)>),
+                String(Vec<(String, BmcValue)>),
             }
-            Some(BmcValue::Sequence(elems))
+
+            let mut converted: Option<FunctionEntries> = None;
+            for (key, value) in func.iter() {
+                let value = value_to_bmc_value(value)?;
+                match key {
+                    Value::SmallInt(key) => match &mut converted {
+                        None => converted = Some(FunctionEntries::Int(vec![(*key, value)])),
+                        Some(FunctionEntries::Int(entries)) => entries.push((*key, value)),
+                        Some(FunctionEntries::String(_)) => return None,
+                    },
+                    Value::Int(key) => {
+                        let key = key.to_i64()?;
+                        match &mut converted {
+                            None => converted = Some(FunctionEntries::Int(vec![(key, value)])),
+                            Some(FunctionEntries::Int(entries)) => entries.push((key, value)),
+                            Some(FunctionEntries::String(_)) => return None,
+                        }
+                    }
+                    Value::String(key) => match &mut converted {
+                        None => {
+                            converted =
+                                Some(FunctionEntries::String(vec![(key.to_string(), value)]))
+                        }
+                        Some(FunctionEntries::String(entries)) => {
+                            entries.push((key.to_string(), value));
+                        }
+                        Some(FunctionEntries::Int(_)) => return None,
+                    },
+                    _ => return None,
+                }
+            }
+            match converted? {
+                FunctionEntries::Int(entries) => Some(BmcValue::Function(entries)),
+                FunctionEntries::String(entries) => Some(BmcValue::StringFunction(entries)),
+            }
         }
-        // IntFunc -> Sequence (interleaved [key, val, key, val, ...]).
+        // IntFunc retains its contiguous integer keys.
         Value::IntFunc(func) => {
             let int_func: &tla_value::value::IntIntervalFunc = func;
             let min_key = int_func.min();
             let values = int_func.values();
-            let mut elems = Vec::with_capacity(values.len() * 2);
+            let mut entries = Vec::with_capacity(values.len());
             for (i, v) in values.iter().enumerate() {
-                let key = min_key + i as i64;
-                elems.push(BmcValue::Int(key));
-                elems.push(value_to_bmc_value(v)?);
+                let offset = i64::try_from(i).ok()?;
+                let key = min_key.checked_add(offset)?;
+                entries.push((key, value_to_bmc_value(v)?));
             }
-            Some(BmcValue::Sequence(elems))
+            Some(BmcValue::Function(entries))
         }
         // Set (finite, concrete) -> Set (element-wise recursive conversion).
         Value::Set(sorted_set) => {
@@ -385,11 +418,11 @@ pub(crate) fn value_to_bmc_value(value: &Value) -> Option<BmcValue> {
             let low = iv.low().to_i64()?;
             let high = iv.high().to_i64()?;
             let size = if high >= low {
-                (high - low + 1) as usize
+                i128::from(high) - i128::from(low) + 1
             } else {
                 0
             };
-            if size > INTERVAL_EXPANSION_LIMIT {
+            if size > INTERVAL_EXPANSION_LIMIT as i128 {
                 return None;
             }
             let elems: Vec<BmcValue> = (low..=high).map(BmcValue::Int).collect();
@@ -409,17 +442,33 @@ fn all_equal(vals: &[&BmcValue]) -> bool {
     vals.iter().all(|v| bmc_value_eq(v, first))
 }
 
-/// Structural equality for BmcValue (since it may not implement Eq).
+/// Semantic equality for the concrete BMC subset used by wavefront factoring.
 fn bmc_value_eq(a: &BmcValue, b: &BmcValue) -> bool {
     match (a, b) {
         (BmcValue::Bool(a), BmcValue::Bool(b)) => a == b,
         (BmcValue::Int(a), BmcValue::Int(b)) => a == b,
         (BmcValue::BigInt(a), BmcValue::BigInt(b)) => a == b,
-        (BmcValue::Set(a), BmcValue::Set(b)) => {
+        (BmcValue::Int(a), BmcValue::BigInt(b)) | (BmcValue::BigInt(b), BmcValue::Int(a)) => {
+            *b == num_bigint::BigInt::from(*a)
+        }
+        (BmcValue::String(a), BmcValue::String(b)) => a == b,
+        (BmcValue::Set(a), BmcValue::Set(b))
+        | (BmcValue::Sequence(a), BmcValue::Sequence(b))
+        | (BmcValue::Tuple(a), BmcValue::Tuple(b)) => {
             a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| bmc_value_eq(x, y))
         }
-        (BmcValue::Sequence(a), BmcValue::Sequence(b)) => {
-            a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| bmc_value_eq(x, y))
+        (BmcValue::Function(a), BmcValue::Function(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b)
+                    .all(|((ak, av), (bk, bv))| ak == bk && bmc_value_eq(av, bv))
+        }
+        (BmcValue::StringFunction(a), BmcValue::StringFunction(b))
+        | (BmcValue::Record(a), BmcValue::Record(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b)
+                    .all(|((ak, av), (bk, bv))| ak == bk && bmc_value_eq(av, bv))
         }
         _ => false,
     }
@@ -427,7 +476,6 @@ fn bmc_value_eq(a: &BmcValue, b: &BmcValue) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use super::*;
 
@@ -628,6 +676,31 @@ mod tests {
         assert!(!bmc_value_eq(&a, &c));
     }
 
+    #[test]
+    fn test_bmc_value_eq_covers_every_typed_variant() {
+        assert!(bmc_value_eq(&BmcValue::Int(7), &BmcValue::BigInt(7.into())));
+        assert!(bmc_value_eq(
+            &BmcValue::String("x".to_string()),
+            &BmcValue::String("x".to_string())
+        ));
+        assert!(bmc_value_eq(
+            &BmcValue::Tuple(vec![BmcValue::Bool(true)]),
+            &BmcValue::Tuple(vec![BmcValue::Bool(true)])
+        ));
+        assert!(bmc_value_eq(
+            &BmcValue::Function(vec![(1, BmcValue::String("v".to_string()))]),
+            &BmcValue::Function(vec![(1, BmcValue::String("v".to_string()))])
+        ));
+        assert!(bmc_value_eq(
+            &BmcValue::StringFunction(vec![("k".to_string(), BmcValue::Int(1))]),
+            &BmcValue::StringFunction(vec![("k".to_string(), BmcValue::BigInt(1.into()))])
+        ));
+        assert!(bmc_value_eq(
+            &BmcValue::Record(vec![("field".to_string(), BmcValue::Bool(false))]),
+            &BmcValue::Record(vec![("field".to_string(), BmcValue::Bool(false))])
+        ));
+    }
+
     // =========================================================================
     // value_to_bmc_value conversion tests
     // =========================================================================
@@ -668,15 +741,18 @@ mod tests {
     }
 
     #[test]
-    fn test_value_to_bmc_value_string_returns_int() {
-        // String values are interned to integer tokens.
+    fn test_value_to_bmc_value_string_preserves_string_kind() {
         let s = Value::String(Rp::from("hello"));
-        let result = value_to_bmc_value(&s);
-        assert!(result.is_some(), "strings should convert via interning");
-        match result.unwrap() {
-            BmcValue::Int(n) => assert!(n >= 0, "token should be non-negative"),
-            other => panic!("expected BmcValue::Int, got {other:?}"),
-        }
+        assert_eq!(
+            value_to_bmc_value(&s),
+            Some(BmcValue::String("hello".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_value_to_bmc_value_model_value_fails_closed() {
+        let model_value = Value::ModelValue(Rp::from("Node"));
+        assert_eq!(value_to_bmc_value(&model_value), None);
     }
 
     #[test]
@@ -692,16 +768,92 @@ mod tests {
     }
 
     #[test]
-    fn test_value_to_bmc_value_tuple_returns_sequence() {
+    fn test_value_to_bmc_value_tuple_preserves_tuple_kind() {
         let tuple = Value::Tuple(Rp::from(vec![Value::SmallInt(1), Value::Bool(true)]));
         let result = value_to_bmc_value(&tuple);
         assert_eq!(
             result,
-            Some(BmcValue::Sequence(vec![
+            Some(BmcValue::Tuple(vec![
                 BmcValue::Int(1),
                 BmcValue::Bool(true)
             ]))
         );
+    }
+
+    #[test]
+    fn test_value_to_bmc_value_preserves_record_fields() {
+        let record = Value::Record(tla_value::value::RecordValue::from_sorted_str_entries(
+            vec![
+                (
+                    std::sync::Arc::from("name"),
+                    Value::String(Rp::from("alice")),
+                ),
+                (std::sync::Arc::from("ready"), Value::Bool(true)),
+            ],
+        ));
+        assert_eq!(
+            value_to_bmc_value(&record),
+            Some(BmcValue::Record(vec![
+                ("name".to_string(), BmcValue::String("alice".to_string())),
+                ("ready".to_string(), BmcValue::Bool(true)),
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_value_to_bmc_value_preserves_function_key_kind() {
+        let int_function = Value::Func(Rp::new(tla_value::value::FuncValue::from_sorted_entries(
+            vec![
+                (Value::SmallInt(1), Value::Bool(true)),
+                (Value::SmallInt(2), Value::Bool(false)),
+            ],
+        )));
+        assert_eq!(
+            value_to_bmc_value(&int_function),
+            Some(BmcValue::Function(vec![
+                (1, BmcValue::Bool(true)),
+                (2, BmcValue::Bool(false)),
+            ]))
+        );
+
+        let string_function = Value::Func(Rp::new(
+            tla_value::value::FuncValue::from_sorted_entries(vec![
+                (Value::String(Rp::from("a")), Value::SmallInt(1)),
+                (Value::String(Rp::from("b")), Value::SmallInt(2)),
+            ]),
+        ));
+        assert_eq!(
+            value_to_bmc_value(&string_function),
+            Some(BmcValue::StringFunction(vec![
+                ("a".to_string(), BmcValue::Int(1)),
+                ("b".to_string(), BmcValue::Int(2)),
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_value_to_bmc_value_ambiguous_or_mixed_function_fails_closed() {
+        let empty = Value::Func(Rp::new(tla_value::value::FuncValue::from_sorted_entries(
+            Vec::new(),
+        )));
+        assert_eq!(value_to_bmc_value(&empty), None);
+
+        let mixed = Value::Func(Rp::new(tla_value::value::FuncValue::from_sorted_entries(
+            vec![
+                (Value::SmallInt(1), Value::Bool(true)),
+                (Value::String(Rp::from("a")), Value::Bool(false)),
+            ],
+        )));
+        assert_eq!(value_to_bmc_value(&mixed), None);
+    }
+
+    #[test]
+    fn test_value_to_bmc_value_extreme_interval_rejects_without_i64_overflow() {
+        let interval = Value::Interval(Rp::new(tla_value::value::IntervalValue::new(
+            i64::MIN.into(),
+            i64::MAX.into(),
+        )));
+        assert_eq!(value_to_bmc_value(&interval), None);
     }
 
     #[test]

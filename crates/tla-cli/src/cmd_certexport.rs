@@ -30,6 +30,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use tla_check::cert::AyObligationProof;
+use tla_check::{BmcScalarSymbol, BmcTranslator};
 
 /// The common shape across all three certificate kinds (safety / liveness /
 /// all-N) — they all carry `schema`, `var_sorts`, and `ay_proof_obligations`.
@@ -70,10 +71,8 @@ const TERM_KEYWORDS: &[&str] = &[
     "forall", "select", "store", "to_int", "to_real", "is_int",
 ];
 
-/// Collect the FREE symbols (variables + rigid constants) appearing in an Alethe
-/// assume `term` — i.e. alphabetic identifiers that are neither SMT word-operators
-/// nor numerals — so the reconstructed problem can declare them. This catches both
-/// step-indexed state vars (`x__0`) AND rigid constants (`N`, no step suffix).
+/// Collect the free variables and rigid constants appearing in an Alethe assume
+/// term so the reconstructed problem can declare their canonical BMC symbols.
 fn collect_free_symbols(text: &str, out: &mut BTreeSet<String>) {
     let bytes = text.as_bytes();
     let is_sym = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
@@ -141,13 +140,23 @@ pub(crate) fn split_alethe_for_carcara(
         if declared.contains(sym) {
             continue;
         }
-        // Strip a `__<digits>` step suffix to get the base name (for sort lookup);
-        // a rigid constant like `N` has no suffix and is its own base.
-        let base = match sym.rsplit_once("__") {
-            Some((b, rest)) if !b.is_empty() && rest.bytes().all(|c| c.is_ascii_digit()) => b,
-            _ => sym.as_str(),
+        // Decode the collision-free source name for sort lookup. Preserve the
+        // old `base__step` parser so already-issued certificates remain
+        // exportable after the naming migration.
+        let base = match BmcTranslator::parse_scalar_symbol(sym) {
+            Some(BmcScalarSymbol::State { name, .. }) | Some(BmcScalarSymbol::Rigid { name }) => {
+                name
+            }
+            None => match sym.rsplit_once("__") {
+                Some((base, step))
+                    if !base.is_empty() && step.bytes().all(|byte| byte.is_ascii_digit()) =>
+                {
+                    base.to_string()
+                }
+                _ => sym.clone(),
+            },
         };
-        var_decls.push(format!("(declare-fun {sym} () {})", sort_of(base)));
+        var_decls.push(format!("(declare-fun {sym} () {})", sort_of(&base)));
     }
 
     let mut problem = String::from("(set-logic QF_UFLIA)\n");
@@ -351,4 +360,35 @@ pub(crate) fn cmd_cert_export(cert_file: &Path, out_dir: &Path) -> Result<()> {
         bail!("no carcara-checkable obligations (all structural or empty Alethe)");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_alethe_recovers_bool_sorts_from_canonical_state_and_rigid_symbols() {
+        let state = BmcTranslator::state_step_symbol("x__0_step_7", 12);
+        let rigid = BmcTranslator::rigid_const_symbol("N__0");
+        let alethe = format!("(assume a0 (and {state} {rigid}))\n");
+        let (problem, _) = split_alethe_for_carcara(
+            &alethe,
+            &[
+                ("x__0_step_7".to_string(), "Bool".to_string()),
+                ("N__0".to_string(), "Bool".to_string()),
+            ],
+        );
+
+        assert!(problem.contains(&format!("(declare-fun {state} () Bool)")));
+        assert!(problem.contains(&format!("(declare-fun {rigid} () Bool)")));
+    }
+
+    #[test]
+    fn split_alethe_retains_legacy_step_symbol_sort_lookup() {
+        let (problem, _) = split_alethe_for_carcara(
+            "(assume a0 legacy__name__3)\n",
+            &[("legacy__name".to_string(), "Bool".to_string())],
+        );
+        assert!(problem.contains("(declare-fun legacy__name__3 () Bool)"));
+    }
 }

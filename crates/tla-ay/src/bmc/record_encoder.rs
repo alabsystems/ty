@@ -4,14 +4,12 @@
 
 //! Record and tuple encoding for BMC translator.
 //!
-//! Records are encoded as per-field SMT variables:
-//! - `[a |-> 1, b |-> TRUE]` → `r__f_a: Int, r__f_b: Bool`
-//! - `r.a` → direct field variable lookup (`r__f_a`)
-//! - `[r EXCEPT !.a = 2]` → copy all fields, override `r__f_a`
+//! Records are encoded as per-field SMT variables whose collision-free names
+//! come from [`BmcTranslator::record_field_symbol`]. Field access and `EXCEPT`
+//! operate directly on those carriers.
 //!
-//! Tuples are encoded as per-element SMT variables:
-//! - `<<1, TRUE, "x">>` → `t__e_1: Int, t__e_2: Bool, t__e_3: Int`
-//! - `t[2]` → direct element variable lookup (`t__e_2`)
+//! Tuples are encoded as per-element SMT variables whose collision-free names
+//! come from [`BmcTranslator::tuple_element_symbol`].
 //!
 //! Part of #3787: ay symbolic engine record and tuple encoding for BMC.
 
@@ -22,17 +20,18 @@ use tla_core::{dispatch_translate_bool, dispatch_translate_int, Spanned};
 use crate::error::{AYError, AYResult};
 use crate::TlaSort;
 
-use super::BmcTranslator;
+use super::{BmcCarrierKind, BmcTranslator};
 
 /// Information about a record variable across all BMC steps.
 ///
 /// Each record is encoded as a set of per-field SMT variables per step.
-/// The field sorts are stored in canonical name order.
+/// The field sorts are stored in declaration order. Operations that compare
+/// record shapes canonicalize by field name first.
 ///
 /// Part of #3787: Record encoding in BMC translator.
 #[derive(Debug)]
 pub(super) struct BmcRecordVarInfo {
-    /// Field sorts in canonical (alphabetical) name order.
+    /// Field sorts in declaration order.
     pub(super) field_sorts: Vec<(String, TlaSort)>,
     /// Per-field terms per step: field_terms[field_idx][step] = Term.
     pub(super) field_terms: Vec<Vec<Term>>,
@@ -52,15 +51,70 @@ pub(super) struct BmcTupleVarInfo {
     pub(super) element_terms: Vec<Vec<Term>>,
 }
 
+/// Canonicalize a record shape by field name, rejecting duplicate fields.
+fn canonical_record_shape(field_sorts: &[(String, TlaSort)]) -> Option<Vec<(String, TlaSort)>> {
+    let mut shape: Vec<(String, TlaSort)> = field_sorts
+        .iter()
+        .map(|(name, sort)| (name.clone(), sort.clone().canonicalized()))
+        .collect();
+    shape.sort_by(|left, right| left.0.cmp(&right.0));
+    (!shape.windows(2).any(|pair| pair[0].0 == pair[1].0)).then_some(shape)
+}
+
+/// Decide whether two record shapes are equal or definitely denote disjoint
+/// TLA+ values. Set element-sort metadata is not enough to prove inequality:
+/// for example, empty `Set(Int)` and empty `Set(String)` values are equal.
+fn record_shapes_equal_or_false(
+    left: &[(String, TlaSort)],
+    right: &[(String, TlaSort)],
+    context: &str,
+) -> AYResult<bool> {
+    let Some(left) = canonical_record_shape(left) else {
+        return Ok(false);
+    };
+    let Some(right) = canonical_record_shape(right) else {
+        return Ok(false);
+    };
+    if left.len() != right.len()
+        || left
+            .iter()
+            .zip(&right)
+            .any(|((left_name, _), (right_name, _))| left_name != right_name)
+    {
+        return Ok(false);
+    }
+    for ((field_name, left_sort), (_, right_sort)) in left.iter().zip(&right) {
+        if left_sort == right_sort {
+            continue;
+        }
+        if matches!(
+            (left_sort, right_sort),
+            (TlaSort::Set { .. }, TlaSort::Set { .. })
+        ) {
+            return Err(AYError::UnsupportedOp(format!(
+                "BMC cannot decide {context} for field '{field_name}' with differing set \
+                 element sorts {left_sort} and {right_sort}"
+            )));
+        }
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 impl BmcTranslator {
     // === Record variable declaration ===
 
     /// Declare a record state variable for all k+1 steps.
     ///
-    /// Each record field becomes an independent SMT variable per step:
-    /// - `{name}__f_{field}__{step}`: field-sort variable
+    /// Each record field becomes an independently and canonically named SMT
+    /// variable per step.
     ///
-    /// The field sorts must be scalar (Bool, Int, or String).
+    /// The field sorts must be scalar (Bool, Int, or String) or Set. Nested
+    /// records are rejected until every record operation has a recursive
+    /// encoding; accepting them with placeholder terms would leave equality,
+    /// `UNCHANGED`, and `EXCEPT` unconstrained at the nested field.
+    /// Re-declaration is idempotent only for a canonical-equivalent field
+    /// shape; field declaration order is ignored.
     ///
     /// Part of #3787: Record encoding in BMC translator.
     pub fn declare_record_var(
@@ -68,53 +122,74 @@ impl BmcTranslator {
         name: &str,
         field_sorts: Vec<(String, TlaSort)>,
     ) -> AYResult<()> {
-        if self.record_vars.contains_key(name) {
-            return Ok(()); // Already declared
-        }
-
+        // Validate the ENTIRE shape, including AY carrier conversion, before
+        // declaring a single solver symbol. Otherwise a late bad field could
+        // leave a partially registered SMT record behind after this method
+        // returns `Err`.
+        let mut field_names = std::collections::HashSet::with_capacity(field_sorts.len());
+        let mut ay_sorts = Vec::with_capacity(field_sorts.len());
         for (field_name, sort) in &field_sorts {
-            if !sort.is_scalar()
-                && !matches!(sort, TlaSort::Set { .. })
-                && !matches!(sort, TlaSort::Record { .. })
-            {
+            if !field_names.insert(field_name.as_str()) {
                 return Err(AYError::UnsupportedOp(format!(
-                    "BMC record field must be scalar or Set, got {sort} for field \
-                     '{field_name}' of record '{name}'"
+                    "BMC record '{name}' declares duplicate field '{field_name}'"
                 )));
             }
+            if !sort.is_scalar() && !matches!(sort, TlaSort::Set { .. }) {
+                return Err(AYError::UnsupportedOp(format!(
+                    "BMC record field must be scalar or Set (nested records require a \
+                     recursive encoding), got {sort} for field \
+                    '{field_name}' of record '{name}'"
+                )));
+            }
+            if matches!(
+                sort,
+                TlaSort::Set { element_sort }
+                    if (**element_sort).clone().canonicalized() == TlaSort::Bool
+            ) {
+                return Err(AYError::UnsupportedOp(format!(
+                    "BMC record field '{field_name}' of '{name}' cannot use Set(Bool): no Bool-index encoding is defined"
+                )));
+            }
+            ay_sorts.push(sort.to_ay()?);
+        }
+        self.ensure_declaration_carrier(name, BmcCarrierKind::Record)?;
+
+        // Re-declaration is idempotent only for the same logical record shape.
+        // Field order is not semantically significant in TLA+, so compare
+        // canonicalized shapes while retaining the original declaration order
+        // used to index `field_terms`.
+        let requested_shape = TlaSort::Record {
+            field_sorts: field_sorts.clone(),
+        }
+        .canonicalized();
+        if let Some(existing) = self.record_vars.get(name) {
+            let existing_shape = TlaSort::Record {
+                field_sorts: existing.field_sorts.clone(),
+            }
+            .canonicalized();
+            if existing_shape == requested_shape {
+                return Ok(());
+            }
+            return Err(AYError::TypeMismatch {
+                name: name.to_string(),
+                expected: existing_shape.to_string(),
+                actual: requested_shape.to_string(),
+            });
         }
 
         let mut all_field_terms = Vec::with_capacity(field_sorts.len());
 
-        for (field_name, sort) in &field_sorts {
-            match sort {
-                TlaSort::Record {
-                    field_sorts: sub_fields,
-                } => {
-                    // Recursively declare sub-record for all k+1 steps.
-                    // The sub-record is registered as "{name}__f_{field_name}" in
-                    // record_vars with its own per-step field terms.
-                    let sub_name = format!("{name}__f_{field_name}");
-                    self.declare_record_var(&sub_name, sub_fields.clone())?;
-                    // Store empty step_terms as placeholder — nested record access
-                    // goes through the sub-record's own entry in record_vars.
-                    let sentinel_terms = (0..=self.bound_k)
-                        .map(|_| self.solver.bool_const(true))
-                        .collect();
-                    all_field_terms.push(sentinel_terms);
-                }
-                _ => {
-                    // Scalar or Set: declare directly (Set maps to (Array Int Bool))
-                    let ay_sort = sort.to_ay()?;
-                    let mut step_terms = Vec::with_capacity(self.bound_k + 1);
-                    for step in 0..=self.bound_k {
-                        let var_name = format!("{name}__f_{field_name}__{step}");
-                        let term = self.solver.declare_const(&var_name, ay_sort.clone());
-                        step_terms.push(term);
-                    }
-                    all_field_terms.push(step_terms);
-                }
+        for ((field_name, _), ay_sort) in field_sorts.iter().zip(ay_sorts) {
+            // Scalar or Set: declare directly (Set maps to (Array Int Bool)).
+            // The validation pass above rejects every representation that lacks
+            // a complete per-step carrier before this loop mutates the solver.
+            let mut step_terms = Vec::with_capacity(self.bound_k + 1);
+            for step in 0..=self.bound_k {
+                let var_name = Self::record_field_symbol(name, field_name, step);
+                let term = self.solver.declare_const(&var_name, ay_sort.clone());
+                step_terms.push(term);
             }
+            all_field_terms.push(step_terms);
         }
 
         self.record_vars.insert(
@@ -131,17 +206,16 @@ impl BmcTranslator {
 
     /// Declare a tuple state variable for all k+1 steps.
     ///
-    /// Each tuple element becomes an independent SMT variable per step:
-    /// - `{name}__e_{index}__{step}`: element-sort variable (1-indexed)
+    /// Each tuple element becomes an independently and canonically named SMT
+    /// variable per step (with a 1-indexed element number).
     ///
     /// The element sorts must be scalar (Bool, Int, or String).
+    /// Re-declaration is idempotent only for the exact ordered element shape.
     ///
     /// Part of #3787: Tuple encoding in BMC translator.
     pub fn declare_tuple_var(&mut self, name: &str, element_sorts: Vec<TlaSort>) -> AYResult<()> {
-        if self.tuple_vars.contains_key(name) {
-            return Ok(()); // Already declared
-        }
-
+        // Validate and convert the entire shape before mutating the solver.
+        let mut ay_sorts = Vec::with_capacity(element_sorts.len());
         for (i, sort) in element_sorts.iter().enumerate() {
             if !sort.is_scalar() {
                 return Err(AYError::UnsupportedOp(format!(
@@ -150,15 +224,37 @@ impl BmcTranslator {
                     i + 1
                 )));
             }
+            ay_sorts.push(sort.to_ay()?);
+        }
+        self.ensure_declaration_carrier(name, BmcCarrierKind::Tuple)?;
+
+        // Tuple order is semantically significant. Re-declaration is
+        // idempotent only when every element sort at every index matches.
+        let requested_shape = TlaSort::Tuple {
+            element_sorts: element_sorts.clone(),
+        }
+        .canonicalized();
+        if let Some(existing) = self.tuple_vars.get(name) {
+            let existing_shape = TlaSort::Tuple {
+                element_sorts: existing.element_sorts.clone(),
+            }
+            .canonicalized();
+            if existing_shape == requested_shape {
+                return Ok(());
+            }
+            return Err(AYError::TypeMismatch {
+                name: name.to_string(),
+                expected: existing_shape.to_string(),
+                actual: requested_shape.to_string(),
+            });
         }
 
         let mut all_element_terms = Vec::with_capacity(element_sorts.len());
 
-        for (i, sort) in element_sorts.iter().enumerate() {
-            let ay_sort = sort.to_ay()?;
+        for (i, ay_sort) in ay_sorts.into_iter().enumerate() {
             let mut step_terms = Vec::with_capacity(self.bound_k + 1);
             for step in 0..=self.bound_k {
-                let var_name = format!("{name}__e_{}__{step}", i + 1);
+                let var_name = Self::tuple_element_symbol(name, i + 1, step);
                 let term = self.solver.declare_const(&var_name, ay_sort.clone());
                 step_terms.push(term);
             }
@@ -342,22 +438,16 @@ impl BmcTranslator {
         let mut conjuncts = Vec::with_capacity(fields.len());
 
         for (field_name, value) in fields {
-            let id = self.aux_var_counter;
-            self.aux_var_counter += 1;
-            let var_name = format!("__rec_f_{}_{id}", field_name.node);
+            let purpose = format!("record literal field {}", field_name.node);
 
             // Try translating as Int first, fall back to Bool
             if let Ok(val_term) = dispatch_translate_int(self, value) {
-                let fresh = self
-                    .solver
-                    .declare_const(&var_name, ay_dpll::api::Sort::Int);
+                let (_, fresh) = self.declare_internal_const(&purpose, ay_dpll::api::Sort::Int);
                 let eq = self.solver.try_eq(fresh, val_term)?;
                 conjuncts.push(eq);
             } else {
                 let val_term = dispatch_translate_bool(self, value)?;
-                let fresh = self
-                    .solver
-                    .declare_const(&var_name, ay_dpll::api::Sort::Bool);
+                let (_, fresh) = self.declare_internal_const(&purpose, ay_dpll::api::Sort::Bool);
                 // Bool equality: (fresh => val) /\ (val => fresh)
                 let fwd = self.solver.try_implies(fresh, val_term)?;
                 let bwd = self.solver.try_implies(val_term, fresh)?;
@@ -400,23 +490,67 @@ impl BmcTranslator {
         source: &(String, usize),
         specs: &[ExceptSpec],
     ) -> AYResult<Term> {
-        let info = self
+        let source_field_sorts = self
             .record_vars
             .get(&source.0)
-            .ok_or_else(|| AYError::UnknownVariable(format!("record {}", source.0)))?;
+            .ok_or_else(|| AYError::UnknownVariable(format!("record {}", source.0)))?
+            .field_sorts
+            .clone();
+        let target_field_sorts = self
+            .record_vars
+            .get(&target.0)
+            .ok_or_else(|| AYError::UnknownVariable(format!("record {}", target.0)))?
+            .field_sorts
+            .clone();
 
-        let field_names: Vec<String> = info.field_sorts.iter().map(|(n, _)| n.clone()).collect();
+        let field_names: Vec<String> = source_field_sorts
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
         let num_fields = field_names.len();
 
         // Collect all field overrides from EXCEPT specs
         let mut overrides: std::collections::HashMap<String, &Spanned<Expr>> =
             std::collections::HashMap::new();
         for spec in specs {
-            if spec.path.len() == 1 {
-                if let ExceptPathElement::Field(ref rfn) = spec.path[0] {
-                    overrides.insert(rfn.name.node.clone(), &spec.value);
+            match spec.path.as_slice() {
+                [ExceptPathElement::Field(field)] => {
+                    overrides.insert(field.name.node.clone(), &spec.value);
+                }
+                _ => {
+                    return Err(AYError::UnsupportedOp(
+                        "BMC record EXCEPT requires exactly one direct .field path element; \
+                         nested and dynamic paths require a recursive encoding"
+                            .to_string(),
+                    ));
                 }
             }
+        }
+
+        // Derive the result shape before translating any override. EXCEPT
+        // preserves the source DOMAIN but may change an overridden field's
+        // value kind. Thus `target.a:String = [source.a:Int EXCEPT !.a = "x"]`
+        // is supported, while a copied or overridden field that does not match
+        // the target is FALSE. Unknown direct fields remain the TLA+ no-op.
+        let mut result_field_sorts = Vec::with_capacity(source_field_sorts.len());
+        for (field_name, source_sort) in &source_field_sorts {
+            let result_sort = if let Some(value_expr) = overrides.get(field_name) {
+                self.value_expr_sort(value_expr).ok_or_else(|| {
+                    AYError::UnsupportedOp(format!(
+                        "BMC cannot determine the sort of record EXCEPT field '{field_name}'"
+                    ))
+                })?
+            } else {
+                source_sort.clone()
+            };
+            result_field_sorts.push((field_name.clone(), result_sort));
+        }
+        if !record_shapes_equal_or_false(
+            &target_field_sorts,
+            &result_field_sorts,
+            "record EXCEPT equality",
+        )? {
+            return Ok(self.solver.bool_const(false));
         }
 
         let mut conjuncts = Vec::with_capacity(num_fields);
@@ -426,21 +560,29 @@ impl BmcTranslator {
 
             if let Some(value_expr) = overrides.get(field_name) {
                 // Overridden field: target.field = value
-                let field_sort = self
-                    .record_vars
-                    .get(&source.0)
-                    .and_then(|info| {
-                        info.field_sorts
-                            .iter()
-                            .find(|(n, _)| n == field_name)
-                            .map(|(_, s)| s.clone())
-                    })
-                    .unwrap_or(TlaSort::Int);
+                let field_sort = target_field_sorts
+                    .iter()
+                    .find(|(candidate, _)| candidate == field_name)
+                    .map(|(_, sort)| sort)
+                    .ok_or_else(|| {
+                        AYError::UnsupportedOp(format!(
+                            "record EXCEPT target is missing field '{field_name}'"
+                        ))
+                    })?;
 
-                let val_term = if field_sort == TlaSort::Bool {
-                    dispatch_translate_bool(self, value_expr)?
-                } else {
-                    dispatch_translate_int(self, value_expr)?
+                let val_term = match field_sort {
+                    TlaSort::Bool => dispatch_translate_bool(self, value_expr)?,
+                    TlaSort::Int => dispatch_translate_int(self, value_expr)?,
+                    TlaSort::String if self.is_string_scalar(value_expr) => {
+                        self.string_scalar_term(value_expr)?
+                    }
+                    TlaSort::String => dispatch_translate_int(self, value_expr)?,
+                    compound => {
+                        return Err(AYError::UnsupportedOp(format!(
+                            "BMC record EXCEPT does not support field '{field_name}' with sort \
+                             {compound}"
+                        )))
+                    }
                 };
 
                 let eq = self.solver.try_eq(target_term, val_term)?;
@@ -476,22 +618,16 @@ impl BmcTranslator {
         let mut conjuncts = Vec::with_capacity(elements.len());
 
         for (i, elem) in elements.iter().enumerate() {
-            let id = self.aux_var_counter;
-            self.aux_var_counter += 1;
-            let var_name = format!("__tup_e_{}_{id}", i + 1);
+            let purpose = format!("tuple literal element {}", i + 1);
 
             // Try translating as Int first, fall back to Bool
             if let Ok(val_term) = dispatch_translate_int(self, elem) {
-                let fresh = self
-                    .solver
-                    .declare_const(&var_name, ay_dpll::api::Sort::Int);
+                let (_, fresh) = self.declare_internal_const(&purpose, ay_dpll::api::Sort::Int);
                 let eq = self.solver.try_eq(fresh, val_term)?;
                 conjuncts.push(eq);
             } else {
                 let val_term = dispatch_translate_bool(self, elem)?;
-                let fresh = self
-                    .solver
-                    .declare_const(&var_name, ay_dpll::api::Sort::Bool);
+                let (_, fresh) = self.declare_internal_const(&purpose, ay_dpll::api::Sort::Bool);
                 // Bool equality: (fresh => val) /\ (val => fresh)
                 let fwd = self.solver.try_implies(fresh, val_term)?;
                 let bwd = self.solver.try_implies(val_term, fresh)?;
@@ -697,34 +833,199 @@ impl BmcTranslator {
         Some(self.translate_record_literal_eq(&target, fields))
     }
 
+    /// Return the sort of a compound-literal component expression when it is
+    /// known without translating (and therefore without mutating the solver).
+    ///
+    /// Record equality must compare shapes before it emits any pointwise
+    /// constraints. In particular, `Int` and `String` share BMC's SMT `Int`
+    /// representation, so allowing their terms to reach `try_eq` would erase a
+    /// real TLA+ sort mismatch.
+    fn value_expr_sort(&self, expr: &Spanned<Expr>) -> Option<TlaSort> {
+        match &expr.node {
+            Expr::Bool(_) => Some(TlaSort::Bool),
+            Expr::Int(_) => Some(TlaSort::Int),
+            Expr::String(_) => Some(TlaSort::String),
+            Expr::Ident(name, _) | Expr::StateVar(name, ..) => {
+                if let Some(info) = self.vars.get(name) {
+                    return Some(info.sort.clone());
+                }
+                if let Some(info) = self.record_vars.get(name) {
+                    return Some(
+                        TlaSort::Record {
+                            field_sorts: info.field_sorts.clone(),
+                        }
+                        .canonicalized(),
+                    );
+                }
+                self.tuple_vars.get(name).map(|info| TlaSort::Tuple {
+                    element_sorts: info.element_sorts.clone(),
+                })
+            }
+            Expr::Prime(inner) => self.value_expr_sort(inner),
+            Expr::Label(label) => self.value_expr_sort(&label.body),
+            Expr::SubstIn(_, body) => self.value_expr_sort(body),
+            Expr::If(_, then_expr, else_expr) => {
+                let then_sort = self.value_expr_sort(then_expr)?.canonicalized();
+                let else_sort = self.value_expr_sort(else_expr)?.canonicalized();
+                (then_sort == else_sort).then_some(then_sort)
+            }
+            Expr::And(..)
+            | Expr::Or(..)
+            | Expr::Not(..)
+            | Expr::Implies(..)
+            | Expr::Equiv(..)
+            | Expr::Forall(..)
+            | Expr::Exists(..)
+            | Expr::In(..)
+            | Expr::NotIn(..)
+            | Expr::Subseteq(..)
+            | Expr::Eq(..)
+            | Expr::Neq(..)
+            | Expr::Lt(..)
+            | Expr::Leq(..)
+            | Expr::Gt(..)
+            | Expr::Geq(..)
+            | Expr::Always(..)
+            | Expr::Eventually(..)
+            | Expr::LeadsTo(..)
+            | Expr::WeakFair(..)
+            | Expr::StrongFair(..)
+            | Expr::Enabled(..) => Some(TlaSort::Bool),
+            Expr::Add(..)
+            | Expr::Sub(..)
+            | Expr::Mul(..)
+            | Expr::Div(..)
+            | Expr::IntDiv(..)
+            | Expr::Mod(..)
+            | Expr::Pow(..)
+            | Expr::Neg(..) => Some(TlaSort::Int),
+            Expr::Range(..) => Some(TlaSort::Set {
+                element_sort: Box::new(TlaSort::Int),
+            }),
+            Expr::RecordAccess(record, field) => {
+                let (name, _) = self.resolve_record_var(record).ok()?;
+                self.record_vars
+                    .get(&name)?
+                    .field_sorts
+                    .iter()
+                    .find(|(candidate, _)| candidate == &field.name.node)
+                    .map(|(_, sort)| sort.clone().canonicalized())
+            }
+            Expr::Record(fields) => {
+                let mut field_sorts = Vec::with_capacity(fields.len());
+                for (name, value) in fields {
+                    field_sorts.push((
+                        name.node.clone(),
+                        self.value_expr_sort(value)?.canonicalized(),
+                    ));
+                }
+                field_sorts.sort_by(|left, right| left.0.cmp(&right.0));
+                if field_sorts.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+                    return None;
+                }
+                Some(TlaSort::Record { field_sorts })
+            }
+            _ => None,
+        }
+    }
+
     /// Translate `target = [a |-> e1, b |-> e2]` as per-field equalities.
     fn translate_record_literal_eq(
         &mut self,
         target: &(String, usize),
         fields: &[(Spanned<String>, Spanned<Expr>)],
     ) -> AYResult<Term> {
-        let mut conjuncts = Vec::with_capacity(fields.len());
+        let target_field_sorts = self
+            .record_vars
+            .get(&target.0)
+            .ok_or_else(|| AYError::UnknownVariable(format!("record {}", target.0)))?
+            .field_sorts
+            .clone();
 
-        for (field_name, value_expr) in fields {
-            let target_term =
-                self.get_record_field_at_step(&target.0, &field_name.node, target.1)?;
+        // TLA+ record equality includes DOMAIN equality. Comparing only the
+        // fields mentioned by the literal is unsound under negation: for a
+        // target with fields {a, b}, translating `target = [a |-> 0]` as merely
+        // `target.a = 0` turns the false equality into a satisfiable one, and
+        // turns its negation into the stronger `target.a # 0`. Require the
+        // complete field-name set before building any pointwise constraints.
+        let mut target_names: Vec<&str> = target_field_sorts
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        let mut literal_names: Vec<&str> =
+            fields.iter().map(|(name, _)| name.node.as_str()).collect();
+        target_names.sort_unstable();
+        literal_names.sort_unstable();
+        let target_has_duplicate = target_names.windows(2).any(|pair| pair[0] == pair[1]);
+        let literal_has_duplicate = literal_names.windows(2).any(|pair| pair[0] == pair[1]);
+        if target_has_duplicate || literal_has_duplicate || target_names != literal_names {
+            return Ok(self.solver.bool_const(false));
+        }
 
-            // Determine field sort to choose Int or Bool translation
-            let field_sort = self
-                .record_vars
-                .get(&target.0)
-                .and_then(|info| {
-                    info.field_sorts
-                        .iter()
-                        .find(|(n, _)| n == &field_name.node)
-                        .map(|(_, s)| s.clone())
-                })
-                .unwrap_or(TlaSort::Int);
+        // Compare every statically known literal field sort before translating
+        // any value. This keeps unequal shapes equal to the Boolean constant
+        // FALSE in both operand orders, including under negation, and avoids
+        // leaking partial auxiliary constraints from an earlier field.
+        for (field_name, field_sort) in &target_field_sorts {
+            let value_expr = fields
+                .iter()
+                .find(|(literal_name, _)| literal_name.node == *field_name)
+                .map(|(_, value)| value)
+                .ok_or_else(|| {
+                    AYError::UnsupportedOp(format!(
+                        "record literal is missing field '{field_name}'"
+                    ))
+                })?;
+            let literal_sort = self.value_expr_sort(value_expr).ok_or_else(|| {
+                AYError::UnsupportedOp(format!(
+                    "BMC cannot determine the sort of record literal field '{field_name}'"
+                ))
+            })?;
+            let field_sort = field_sort.clone().canonicalized();
+            let literal_sort = literal_sort.canonicalized();
+            if field_sort != literal_sort {
+                if matches!(
+                    (&field_sort, &literal_sort),
+                    (TlaSort::Set { .. }, TlaSort::Set { .. })
+                ) {
+                    return Err(AYError::UnsupportedOp(format!(
+                        "BMC cannot decide record-literal equality for field '{field_name}' \
+                         with differing set element sorts {field_sort} and {literal_sort}"
+                    )));
+                }
+                return Ok(self.solver.bool_const(false));
+            }
+        }
 
-            let val_term = if field_sort == TlaSort::Bool {
-                dispatch_translate_bool(self, value_expr)?
-            } else {
-                dispatch_translate_int(self, value_expr)?
+        let mut conjuncts = Vec::with_capacity(target_field_sorts.len());
+
+        for (field_name, field_sort) in &target_field_sorts {
+            let value_expr = fields
+                .iter()
+                .find(|(literal_name, _)| literal_name.node == *field_name)
+                .map(|(_, value)| value)
+                // The exact-name-set check above makes this unreachable, but
+                // keep the translator fail-closed if that invariant changes.
+                .ok_or_else(|| {
+                    AYError::UnsupportedOp(format!(
+                        "record literal is missing field '{field_name}'"
+                    ))
+                })?;
+            let target_term = self.get_record_field_at_step(&target.0, field_name, target.1)?;
+
+            let val_term = match field_sort {
+                TlaSort::Bool => dispatch_translate_bool(self, value_expr)?,
+                TlaSort::Int => dispatch_translate_int(self, value_expr)?,
+                TlaSort::String if self.is_string_scalar(value_expr) => {
+                    self.string_scalar_term(value_expr)?
+                }
+                TlaSort::String => dispatch_translate_int(self, value_expr)?,
+                compound => {
+                    return Err(AYError::UnsupportedOp(format!(
+                        "BMC record-literal equality does not support field '{field_name}' \
+                         with sort {compound}"
+                    )))
+                }
             };
 
             let eq = self.solver.try_eq(target_term, val_term)?;
@@ -740,15 +1041,38 @@ impl BmcTranslator {
         lhs: &(String, usize),
         rhs: &(String, usize),
     ) -> AYResult<Term> {
-        let info = self
+        let lhs_field_sorts = self
             .record_vars
             .get(&lhs.0)
-            .ok_or_else(|| AYError::UnknownVariable(format!("record {}", lhs.0)))?;
+            .ok_or_else(|| AYError::UnknownVariable(format!("record {}", lhs.0)))?
+            .field_sorts
+            .clone();
+        let rhs_field_sorts = self
+            .record_vars
+            .get(&rhs.0)
+            .ok_or_else(|| AYError::UnknownVariable(format!("record {}", rhs.0)))?
+            .field_sorts
+            .clone();
 
-        let field_names: Vec<String> = info.field_sorts.iter().map(|(n, _)| n.clone()).collect();
-        let mut conjuncts = Vec::with_capacity(field_names.len());
+        // Equality is symmetric and includes the complete record DOMAIN. Sort
+        // each declaration by field name so declaration order is irrelevant,
+        // reject malformed duplicate names, and return the TLA value FALSE for
+        // any field-name or field-sort mismatch. Iterating only the lhs fields
+        // made `small = large` weaker while `large = small` errored.
+        if !record_shapes_equal_or_false(
+            &lhs_field_sorts,
+            &rhs_field_sorts,
+            "record-variable equality",
+        )? {
+            return Ok(self.solver.bool_const(false));
+        }
 
-        for field_name in &field_names {
+        let lhs_shape = canonical_record_shape(&lhs_field_sorts)
+            .ok_or_else(|| AYError::UnsupportedOp("duplicate record field shape".to_string()))?;
+
+        let mut conjuncts = Vec::with_capacity(lhs_shape.len());
+
+        for (field_name, _) in &lhs_shape {
             let l_term = self.get_record_field_at_step(&lhs.0, field_name, lhs.1)?;
             let r_term = self.get_record_field_at_step(&rhs.0, field_name, rhs.1)?;
             let eq = self.solver.try_eq(l_term, r_term)?;
@@ -821,23 +1145,52 @@ impl BmcTranslator {
         target: &(String, usize),
         elements: &[Spanned<Expr>],
     ) -> AYResult<Term> {
+        let target_element_sorts = self
+            .tuple_vars
+            .get(&target.0)
+            .ok_or_else(|| AYError::UnknownVariable(format!("tuple {}", target.0)))?
+            .element_sorts
+            .clone();
+
+        // Tuple equality includes exact arity and element value kinds. Validate
+        // the entire literal before translating an element so short literals
+        // cannot leave suffix elements unconstrained and Int/String cannot
+        // alias through their shared SMT Int carrier.
+        if target_element_sorts.len() != elements.len() {
+            return Ok(self.solver.bool_const(false));
+        }
+        for (index, (element_sort, element_expr)) in
+            target_element_sorts.iter().zip(elements).enumerate()
+        {
+            let literal_sort = self.value_expr_sort(element_expr).ok_or_else(|| {
+                AYError::UnsupportedOp(format!(
+                    "BMC cannot determine the sort of tuple literal element {}",
+                    index + 1
+                ))
+            })?;
+            if element_sort.clone().canonicalized() != literal_sort.canonicalized() {
+                return Ok(self.solver.bool_const(false));
+            }
+        }
+
         let mut conjuncts = Vec::with_capacity(elements.len());
 
-        for (i, elem) in elements.iter().enumerate() {
+        for (i, (elem, elem_sort)) in elements.iter().zip(&target_element_sorts).enumerate() {
             let index_1based = i + 1;
             let target_term = self.get_tuple_element_at_step(&target.0, index_1based, target.1)?;
 
-            // Determine element sort
-            let elem_sort = self
-                .tuple_vars
-                .get(&target.0)
-                .and_then(|info| info.element_sorts.get(i).cloned())
-                .unwrap_or(TlaSort::Int);
-
-            let val_term = if elem_sort == TlaSort::Bool {
-                dispatch_translate_bool(self, elem)?
-            } else {
-                dispatch_translate_int(self, elem)?
+            let val_term = match elem_sort {
+                TlaSort::Bool => dispatch_translate_bool(self, elem)?,
+                TlaSort::Int => dispatch_translate_int(self, elem)?,
+                TlaSort::String if self.is_string_scalar(elem) => self.string_scalar_term(elem)?,
+                TlaSort::String => dispatch_translate_int(self, elem)?,
+                compound => {
+                    return Err(AYError::UnsupportedOp(format!(
+                        "BMC tuple-literal equality does not support element {} with sort \
+                         {compound}",
+                        i + 1
+                    )))
+                }
             };
 
             let eq = self.solver.try_eq(target_term, val_term)?;
@@ -853,12 +1206,33 @@ impl BmcTranslator {
         lhs: &(String, usize),
         rhs: &(String, usize),
     ) -> AYResult<Term> {
-        let info = self
+        let lhs_element_sorts = self
             .tuple_vars
             .get(&lhs.0)
-            .ok_or_else(|| AYError::UnknownVariable(format!("tuple {}", lhs.0)))?;
+            .ok_or_else(|| AYError::UnknownVariable(format!("tuple {}", lhs.0)))?
+            .element_sorts
+            .iter()
+            .cloned()
+            .map(TlaSort::canonicalized)
+            .collect::<Vec<_>>();
+        let rhs_element_sorts = self
+            .tuple_vars
+            .get(&rhs.0)
+            .ok_or_else(|| AYError::UnknownVariable(format!("tuple {}", rhs.0)))?
+            .element_sorts
+            .iter()
+            .cloned()
+            .map(TlaSort::canonicalized)
+            .collect::<Vec<_>>();
 
-        let num_elems = info.element_sorts.len();
+        // Tuple equality is symmetric and exact in arity and per-index sorts.
+        // Comparing only the lhs prefix made short = long weaker while the
+        // reverse orientation errored, and Int/String could alias in SMT.
+        if lhs_element_sorts != rhs_element_sorts {
+            return Ok(self.solver.bool_const(false));
+        }
+
+        let num_elems = lhs_element_sorts.len();
         let mut conjuncts = Vec::with_capacity(num_elems);
 
         for i in 0..num_elems {
@@ -895,7 +1269,7 @@ impl BmcTranslator {
 /// bounded quantifier substitutes its variable (`t[i + 1]`, `t[i - 1]`, etc.).
 /// Returns `None` if the index is not a constant integer expression, so the
 /// caller falls back to its existing (non-constant) handling.
-fn const_fold_int_index(expr: &Spanned<Expr>) -> Option<i64> {
+pub(super) fn const_fold_int_index(expr: &Spanned<Expr>) -> Option<i64> {
     match &expr.node {
         Expr::Int(n) => i64::try_from(n).ok(),
         Expr::Neg(a) => const_fold_int_index(a)?.checked_neg(),

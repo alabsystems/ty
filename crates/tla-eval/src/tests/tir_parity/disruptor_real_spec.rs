@@ -5,12 +5,12 @@
 //! Real Disruptor_MPMC fixture loading and named-op reuse regressions.
 
 use super::*;
-use tla_value::Rp;
 use crate::cache::lifecycle::clear_for_test_reset;
 use crate::tir::TirProgram;
 use std::sync::Arc;
 use tla_core::ast::Unit;
 use tla_core::name_intern::intern_name;
+use tla_value::Rp;
 use tla_value::{FuncBuilder, IntIntervalFunc};
 
 const REAL_DISRUPTOR_MPMC_MODULE: &str = include_str!(concat!(

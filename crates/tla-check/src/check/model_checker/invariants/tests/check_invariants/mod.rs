@@ -5,12 +5,11 @@
 //! Tests for `check_invariants_array`: pass, fail, non-boolean, empty, first-fail.
 
 use super::*;
-use tla_value::Rp;
 use crate::resolve_spec_from_config_with_extends;
 use crate::EvalCheckError;
 use std::path::PathBuf;
-use std::sync::Arc;
 use tla_core::{compute_is_recursive, parse_to_syntax_tree, FileId, ModuleLoader};
+use tla_value::Rp;
 use tla_value::{FuncBuilder, IntIntervalFunc};
 
 mod basics;

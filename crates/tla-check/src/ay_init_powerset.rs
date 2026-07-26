@@ -29,8 +29,8 @@
 //! Part of #3826.
 
 use std::collections::BTreeSet;
-use tla_value::Rp;
 use std::sync::Arc;
+use tla_value::Rp;
 
 use tla_ay::translate::nested_powerset::{
     BaseElement, NestedPowersetConfig, MAX_NESTED_POWERSET_BASE,

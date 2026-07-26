@@ -473,12 +473,10 @@ fn runs(prepared: &PreparedSupremacy, spec: &str, mode: &str) -> Vec<Value> {
                 "workers": 1,
                 "artifact_dir": format!("artifacts/{spec}/{mode}-{run_index}"),
             });
-            if mode == "tlc" {
-                run["states_generated"] = json!(expected_generated + 1);
-                run["transitions"] = json!(expected_generated);
-            } else {
-                run["transitions"] = json!(expected_generated);
-            }
+            run["raw_initial_states_generated"] = json!(1);
+            run["raw_successors_generated"] = json!(expected_generated);
+            run["states_generated"] = json!(expected_generated + 1);
+            run["transitions"] = json!(expected_generated);
             if mode != "tlc" {
                 run["mode"] = json!(mode);
             }
@@ -594,7 +592,7 @@ fn summary(prepared: &PreparedSupremacy) -> Value {
                     "workers": 1,
                     "cache_dir": prepared.output_dir.join("trust_cg-artifact-cache").display().to_string(),
                     "artifact_cache_disabled_env": "1",
-                    "native_callout_compile_jobs": "27",
+                    "native_callout_compile_jobs": "1",
                 },
             },
         },
@@ -627,9 +625,11 @@ fn write_selftest_artifacts(prepared: &PreparedSupremacy, summary_path: &Path, s
                     .unwrap()
                     .join(run["artifact_dir"].as_str().unwrap());
                 fs::create_dir_all(&artifact_dir).unwrap();
+                fs::create_dir(artifact_dir.join(COMMAND_SCRATCH_DIR_NAME)).unwrap();
                 fs::write(
                     artifact_dir.join("command.json"),
-                    serde_json::to_string_pretty(&command_artifact(spec, mode, run)).unwrap()
+                    serde_json::to_string_pretty(&command_artifact(spec, mode, run, &artifact_dir))
+                        .unwrap()
                         + "\n",
                 )
                 .unwrap();
@@ -657,7 +657,7 @@ fn write_selftest_artifacts(prepared: &PreparedSupremacy, summary_path: &Path, s
     }
 }
 
-fn command_artifact(spec: &str, mode: &str, run: &Value) -> Value {
+fn command_artifact(spec: &str, mode: &str, run: &Value, artifact_dir: &Path) -> Value {
     let argv = if mode == "tlc" {
         let mut argv = vec!["java".to_string()];
         argv.extend(
@@ -697,8 +697,50 @@ fn command_artifact(spec: &str, mode: &str, run: &Value) -> Value {
             .to_string(),
         ]
     };
+    let artifact_dir = fs::canonicalize(artifact_dir).unwrap();
+    let scratch_dir = fs::canonicalize(artifact_dir.join(COMMAND_SCRATCH_DIR_NAME)).unwrap();
+    let scratch_text = scratch_dir.display().to_string();
+    let environment_confinement = COMMAND_SCOPED_ENV_KEYS
+        .iter()
+        .map(|key| ((*key).to_string(), json!(scratch_text.clone())))
+        .collect::<serde_json::Map<_, _>>();
+    let disk_evidence = json!({
+        "contract_schema": DISK_SCOPE_CONTRACT_SCHEMA,
+        "scope_root": artifact_dir.display().to_string(),
+        "scratch_root": scratch_text,
+        "scope": "command_artifact_and_scratch_tree",
+        "method": "recursive_filesystem_metadata_polling",
+        "peak_exact": false,
+        "sampling_execution": "inline_runner_poll_loop",
+        "sampling_can_perturb_elapsed": true,
+        "peak_allocated_bytes": 4096,
+        "peak_apparent_bytes": 1024,
+        "sampling_interval_ms": DISK_USAGE_SAMPLE_INTERVAL.as_millis() as u64,
+        "scan_budget_ms": DISK_USAGE_SCAN_BUDGET.as_millis() as u64,
+        "scan_entry_limit": DISK_USAGE_SCAN_ENTRY_LIMIT,
+        "total_scan_nanoseconds": 2000,
+        "max_scan_nanoseconds": 1000,
+        "samples_attempted": 2,
+        "samples_complete": 2,
+        "samples_partial": 0,
+        "peak_entries_observed": 2,
+        "initial_sample_complete": true,
+        "final_sample_complete": true,
+        "setup_complete": true,
+        "environment_confinement": environment_confinement,
+        "environment_confinement_complete": true,
+        "scope_identity_stable": true,
+        "ownership_verified": true,
+        "accounting_complete": true,
+        "polling_complete": true,
+        "process_tree_lifetime_complete": true,
+        "complete": true,
+        "strict_qualified": true,
+        "diagnostics": [],
+        "qualification_failures": [],
+    });
     json!({
-        "schema": "ty.supremacy.command.v1",
+        "schema": COMMAND_ARTIFACT_SCHEMA,
         "argv": argv,
         "cwd": "/tmp",
         "returncode": run["returncode"],
@@ -706,6 +748,11 @@ fn command_artifact(spec: &str, mode: &str, run: &Value) -> Value {
         "env_overrides": run.get("env_overrides").cloned().unwrap_or_else(|| json!({})),
         "timed_out": false,
         "peak_rss_bytes": null,
+        "resource_evidence": {
+            "strict_qualified": true,
+            "qualification_failures": [],
+            "disk": disk_evidence,
+        },
     })
 }
 
@@ -791,10 +838,7 @@ fn retired_python_benchmark_helpers_do_not_exist() {
 
 #[test]
 fn active_benchmark_docs_do_not_link_retired_python_helpers() {
-    for doc_path in [
-        "benchmarking.md",
-        "trust-cg-native-jit-launch-program.md",
-    ] {
+    for doc_path in ["benchmarking.md", "trust-cg-native-jit-launch-program.md"] {
         let doc = repo_text(doc_path);
         for retired_path in retired_python_benchmark_helper_paths() {
             assert!(
@@ -920,7 +964,7 @@ fn final_gate_rejects_missing_or_mismatched_launch_controls() {
     summary_with_mismatch["launch_controls"]["tlc"]["jvm_args"][0] =
         json!("-XX:ActiveProcessorCount=2");
     summary_with_mismatch["launch_controls"]["ty"]["trust_cg"]["native_callout_compile_jobs"] =
-        json!("1");
+        json!("27");
     summary_with_mismatch["launch_controls"]["ty"]["trust_cg"]["artifact_cache_disabled_env"] =
         json!("0");
     summary_with_mismatch["launch_controls"]["ty"]["trust_cg"]["cache_dir"] = json!("");
@@ -991,6 +1035,113 @@ fn final_gate_rejects_mutated_command_artifacts() {
         .errors
         .iter()
         .any(|error| error.contains("tlc run 1: command argv[13]")));
+}
+
+#[test]
+fn final_gate_fails_closed_for_missing_or_unqualified_command_disk_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let prepared = prepared(dir.path().join("out"));
+    let summary = summary(&prepared);
+
+    let verdict = evaluate_summary_after_artifact_edit(&summary, |summary_path, summary| {
+        let artifact_dir = summary_path.parent().unwrap().join(
+            summary["rows"][0]["interp"]["runs"][0]["artifact_dir"]
+                .as_str()
+                .unwrap(),
+        );
+        let command_path = artifact_dir.join("command.json");
+        let mut command: Value =
+            serde_json::from_str(&fs::read_to_string(&command_path).unwrap()).unwrap();
+        command["resource_evidence"]
+            .as_object_mut()
+            .unwrap()
+            .remove("disk");
+        fs::write(
+            command_path,
+            serde_json::to_string_pretty(&command).unwrap() + "\n",
+        )
+        .unwrap();
+    });
+    assert!(verdict
+        .errors
+        .iter()
+        .any(|error| error.contains("resource_evidence.disk missing or not an object")));
+
+    let verdict = evaluate_summary_after_artifact_edit(&summary, |summary_path, summary| {
+        let artifact_dir = summary_path.parent().unwrap().join(
+            summary["rows"][0]["trust_cg"]["runs"][0]["artifact_dir"]
+                .as_str()
+                .unwrap(),
+        );
+        let command_path = artifact_dir.join("command.json");
+        let mut command: Value =
+            serde_json::from_str(&fs::read_to_string(&command_path).unwrap()).unwrap();
+        command["resource_evidence"]["disk"]["strict_qualified"] = json!(false);
+        command["resource_evidence"]["disk"]["samples_partial"] = json!(1);
+        command["resource_evidence"]["disk"]["qualification_failures"] =
+            json!(["partial disk scan"]);
+        fs::write(
+            command_path,
+            serde_json::to_string_pretty(&command).unwrap() + "\n",
+        )
+        .unwrap();
+    });
+    for expected in [
+        "disk.strict_qualified was false",
+        "disk.samples_partial was 1",
+        "disk.qualification_failures contained 1 item",
+    ] {
+        assert!(
+            verdict.errors.iter().any(|error| error.contains(expected)),
+            "missing {expected:?} in {:?}",
+            verdict.errors
+        );
+    }
+}
+
+#[test]
+fn final_gate_binds_disk_scope_and_full_environment_confinement_to_artifact() {
+    let dir = tempfile::tempdir().unwrap();
+    let prepared = prepared(dir.path().join("out"));
+    let summary = summary(&prepared);
+
+    let verdict = evaluate_summary_after_artifact_edit(&summary, |summary_path, summary| {
+        let artifact_dir = summary_path.parent().unwrap().join(
+            summary["rows"][0]["tlc"]["runs"][0]["artifact_dir"]
+                .as_str()
+                .unwrap(),
+        );
+        let command_path = artifact_dir.join("command.json");
+        let mut command: Value =
+            serde_json::from_str(&fs::read_to_string(&command_path).unwrap()).unwrap();
+        command["resource_evidence"]["disk"]["scope_root"] = json!("/tmp/not-the-artifact");
+        command["resource_evidence"]["disk"]["scratch_root"] = json!("/tmp/not-the-scratch");
+        command["resource_evidence"]["disk"]["environment_confinement"]
+            .as_object_mut()
+            .unwrap()
+            .remove("TMPDIR");
+        command["resource_evidence"]["disk"]["environment_confinement"]["HOME"] =
+            json!("/tmp/outside");
+        fs::write(
+            command_path,
+            serde_json::to_string_pretty(&command).unwrap() + "\n",
+        )
+        .unwrap();
+    });
+
+    for expected in [
+        "disk.scope_root was",
+        "disk.scratch_root was",
+        "disk.environment_confinement keys were",
+        "disk.environment_confinement.HOME was",
+        "disk.environment_confinement.TMPDIR was missing",
+    ] {
+        assert!(
+            verdict.errors.iter().any(|error| error.contains(expected)),
+            "missing {expected:?} in {:?}",
+            verdict.errors
+        );
+    }
 }
 
 #[test]
@@ -1736,14 +1887,17 @@ fn final_gate_rejects_missing_advertised_wall_median() {
 }
 
 #[test]
-fn final_gate_does_not_treat_tlc_generated_states_as_ty_transitions() {
+fn final_gate_does_not_treat_legacy_transitions_as_raw_generated_evidence() {
     let dir = tempfile::tempdir().unwrap();
     let prepared = prepared(dir.path().join("out"));
     let mut summary = summary(&prepared);
     for row in summary["rows"].as_array_mut().unwrap() {
-        for run in row["tlc"]["runs"].as_array_mut().unwrap() {
-            run.as_object_mut().unwrap().remove("transitions");
-            run["states_generated"] = json!(99_999_999_u64);
+        let generated = expected_generated(&prepared, row["spec"].as_str().unwrap());
+        for run in row["interp"]["runs"].as_array_mut().unwrap() {
+            run.as_object_mut()
+                .unwrap()
+                .remove("raw_successors_generated");
+            run["transitions"] = json!(generated);
         }
     }
     let summary_path = dir.path().join("summary.json");
@@ -1752,7 +1906,11 @@ fn final_gate_does_not_treat_tlc_generated_states_as_ty_transitions() {
 
     let verdict = evaluate(&prepared, &summary_path).unwrap();
 
-    assert!(verdict.passed(), "{:?}", verdict.errors);
+    assert!(verdict.errors.iter().any(|error| {
+        error.contains(
+            "interp run 1: raw_successors_generated was missing, expected a non-negative integer",
+        )
+    }));
 }
 
 #[test]
@@ -1778,7 +1936,7 @@ fn final_gate_accepts_native_fused_flat_frontier_admission_when_flat_primary_fal
 }
 
 #[test]
-fn final_gate_allows_state_constrained_native_generated_counter_semantics() {
+fn final_gate_ignores_legacy_state_constraint_transition_counter_when_raw_counts_match() {
     let dir = tempfile::tempdir().unwrap();
     let prepared = prepared(dir.path().join("out"));
     let mut summary = summary(&prepared);
@@ -1803,7 +1961,7 @@ fn final_gate_allows_state_constrained_native_generated_counter_semantics() {
 }
 
 #[test]
-fn final_gate_rejects_spec_name_only_generated_count_waiver_without_telemetry() {
+fn final_gate_rejects_raw_generated_count_drift_regardless_of_spec_name() {
     let dir = tempfile::tempdir().unwrap();
     let prepared = prepared(dir.path().join("out"));
     let expected_generated = expected_generated(&prepared, "EWD998Small");
@@ -1817,6 +1975,8 @@ fn final_gate_rejects_spec_name_only_generated_count_waiver_without_telemetry() 
         .unwrap();
     for run in ewd["trust_cg"]["runs"].as_array_mut().unwrap() {
         run["transitions"] = json!(mismatched_generated);
+        run["raw_successors_generated"] = json!(mismatched_generated);
+        run["states_generated"] = json!(mismatched_generated + 1);
         run["trust_cg_telemetry"]["transitions"] = json!(mismatched_generated);
         run["trust_cg_telemetry"]["compiled_bfs_successors_generated"] =
             json!(mismatched_generated);
@@ -1831,18 +1991,16 @@ fn final_gate_rejects_spec_name_only_generated_count_waiver_without_telemetry() 
 
     assert!(verdict.errors.iter().any(|error| {
             error.contains(&format!(
-                "EWD998Small: trust-cg run 1: transitions was {mismatched_generated}, expected {expected_generated}"
+                "EWD998Small: trust-cg run 1: raw_successors_generated was {mismatched_generated}, expected {expected_generated}"
             ))
         }));
     assert!(verdict.errors.iter().any(|error| {
-        error.contains(&format!(
-            "EWD998Small: generated-state parity failed at run 1: interp={expected_generated}"
-        ))
+        error.contains("EWD998Small: raw generated-state parity failed at run 1:")
     }));
 }
 
 #[test]
-fn final_gate_rejects_state_constraint_waiver_without_compiled_constraint_evidence() {
+fn final_gate_does_not_waive_raw_count_drift_for_state_constraint_telemetry() {
     let dir = tempfile::tempdir().unwrap();
     let prepared = prepared(dir.path().join("out"));
     let expected_generated = expected_generated(&prepared, "EWD998Small");
@@ -1856,6 +2014,8 @@ fn final_gate_rejects_state_constraint_waiver_without_compiled_constraint_eviden
         .unwrap();
     for run in ewd["trust_cg"]["runs"].as_array_mut().unwrap() {
         run["transitions"] = json!(mismatched_generated);
+        run["raw_successors_generated"] = json!(mismatched_generated);
+        run["states_generated"] = json!(mismatched_generated + 1);
         let telemetry = run["trust_cg_telemetry"].as_object_mut().unwrap();
         telemetry.insert("transitions".to_string(), json!(mismatched_generated));
         telemetry.insert(
@@ -1880,21 +2040,12 @@ fn final_gate_rejects_state_constraint_waiver_without_compiled_constraint_eviden
     let verdict = evaluate(&prepared, &summary_path).unwrap();
 
     assert!(verdict.errors.iter().any(|error| {
-        error.contains(
-            "state-constrained generated-count waiver requires active native fused state constraints",
-        ) && error.contains(
-            "trust_cg_state_constraints_compiled did not match native state constraint count",
-        )
-    }));
-    assert!(verdict.errors.iter().any(|error| {
         error.contains(&format!(
-            "EWD998Small: trust-cg run 1: transitions was {mismatched_generated}, expected {expected_generated}"
+            "EWD998Small: trust-cg run 1: raw_successors_generated was {mismatched_generated}, expected {expected_generated}"
         ))
     }));
     assert!(verdict.errors.iter().any(|error| {
-        error.contains(&format!(
-            "EWD998Small: generated-state parity failed at run 1: interp={expected_generated}"
-        ))
+        error.contains("EWD998Small: raw generated-state parity failed at run 1:")
     }));
 }
 
@@ -1905,7 +2056,8 @@ fn final_gate_rejects_worker_state_and_generated_drift() {
     let mut summary = summary(&prepared);
     summary["rows"][0]["tlc"]["runs"][0]["workers"] = json!(2);
     summary["rows"][0]["parity_trust_cg_vs_tlc"] = json!(false);
-    summary["rows"][0]["interp"]["runs"][1]["transitions"] = json!(42);
+    summary["rows"][0]["interp"]["runs"][1]["raw_successors_generated"] = json!(42);
+    summary["rows"][0]["interp"]["runs"][1]["states_generated"] = json!(43);
     let summary_path = dir.path().join("summary.json");
     fs::write(&summary_path, serde_json::to_string(&summary).unwrap()).unwrap();
     write_selftest_artifacts(&prepared, &summary_path, &summary);
@@ -1923,7 +2075,7 @@ fn final_gate_rejects_worker_state_and_generated_drift() {
     assert!(verdict
         .errors
         .iter()
-        .any(|error| { error.contains("interp run 2: transitions was 42") }));
+        .any(|error| { error.contains("interp run 2: raw_successors_generated was 42") }));
 }
 
 #[test]

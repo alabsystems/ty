@@ -10,7 +10,6 @@
 //! Extracted from `eval_let.rs` for file size compliance (#3474).
 
 use super::eval_let_func_domain;
-use tla_value::Rp;
 use super::zero_arg_cache::eval_zero_arg_let_body;
 use crate::error::{EvalError, EvalResult};
 use crate::eval;
@@ -19,6 +18,7 @@ use crate::EvalCtx;
 use std::sync::Arc;
 use tla_core::ast::{Expr, OperatorDef};
 use tla_core::{expr_mentions_name_v, get_primed_var_refs_spanned_v, Span, Spanned};
+use tla_value::Rp;
 
 use super::build_lazy_func_from_ctx;
 

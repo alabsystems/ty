@@ -9,6 +9,7 @@ mod builtins;
 mod call;
 mod compound_values;
 mod const_fold;
+mod edge_filter;
 mod eq_fusion;
 mod lambda_closure;
 mod projection_hoist;
@@ -18,7 +19,6 @@ mod scalar_ops;
 mod state_and_loops;
 
 use super::execute::{ActionVmOutcome, BytecodeVm, VmError};
-use std::sync::Arc;
 use tla_core::intern_name;
 use tla_tir::bytecode::{BytecodeChunk, BytecodeFunction, ConstantPool, Opcode};
 use tla_value::{SortedSet, Value};

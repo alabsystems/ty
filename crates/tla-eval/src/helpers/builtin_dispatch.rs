@@ -17,10 +17,9 @@ use super::super::{
     EvalResult,
 };
 use crate::value::{boolean_set, FuncValue, Value};
-use tla_value::Rp;
-use std::sync::Arc;
 use tla_core::ast::{Expr, OperatorDef};
 use tla_core::{FileId, Span, Spanned};
+use tla_value::Rp;
 
 /// Builtins from Json/IOUtils/Community modules where the TLA module body is often
 /// only a placeholder (e.g., `CHOOSE v : TRUE` / `TRUE`) and TLC uses a Java override.

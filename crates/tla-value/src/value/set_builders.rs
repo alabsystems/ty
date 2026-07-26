@@ -4,9 +4,8 @@
 
 use super::{IntervalValue, SortedSet, Value};
 use crate::error::{EvalError, EvalResult};
-use num_bigint::BigInt;
-use crate::rp::Rp as Arc;
 use crate::rp::Rp;
+use num_bigint::BigInt;
 // === Utility functions ===
 
 /// Create a range set {a..b} (inclusive) as a lazy interval

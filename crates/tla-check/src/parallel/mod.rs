@@ -54,7 +54,7 @@ mod shared;
 // `pub(crate)` matches shared.rs item visibility and suppresses unused-import
 // warnings for items consumed only by children via `super::`.
 pub(crate) use shared::{
-    accum_ns, check_and_warn_capacity, check_state_constraints_array,
+    accum_ns, check_and_warn_capacity, check_state_constraints_array, checked_atomic_add_usize,
     emit_parallel_profile_worker_stats, parallel_preserve_value_fps, parallel_profiling,
     timing_enabled, timing_start, trace_value_for_fp, use_handle_state, use_shared_queue,
     FxBuildHasher, FxDashMap, ParentLog, SuccessorWitnessDashMap, WorkerResult, WorkerStats,
@@ -112,6 +112,10 @@ pub struct ParallelChecker {
     max_depth: Arc<AtomicUsize>,
     /// Total transitions counter (atomic for thread safety)
     total_transitions: Arc<AtomicUsize>,
+    /// Raw initial states generated before constraints/deduplication.
+    total_raw_initial_states_generated: Arc<AtomicUsize>,
+    /// Total raw successors generated before constraints/reductions.
+    total_raw_successors_generated: Arc<AtomicUsize>,
     /// Variable names
     vars: Vec<Arc<str>>,
     /// Operator definitions

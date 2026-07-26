@@ -42,10 +42,10 @@
 //! trace, Liveness descent, Symmetry quotient, and native-lane relation-inclusion certificates.
 
 use clean_kernel::expr::BinderInfo;
-use tla_value::Rp;
 use clean_kernel::{Declaration, Environment, Expr, Name, TypeChecker};
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
+use tla_value::Rp;
 
 /// The kernel prelude environment — `Environment::with_prelude()` built ONCE per process and
 /// shared READ-ONLY. `with_prelude` is deterministic and this cache is initialized by calling
@@ -664,17 +664,26 @@ fn equality_transitivity_term() -> Expr {
     let z = || Expr::bvar(2);
     let h1 = Expr::bvar(1); // h1 : Eq S x z
     let h2 = Expr::bvar(0); // h2 : Eq S xp x
+
     // Eq.trans S xp x z h2 h1 : Eq S xp z   (xp=x, x=z ⊢ xp=z)
-    let body =
-        Expr::apps(Expr::const_str_levels("Eq.trans", vec![lvl()]), [s(), xp(), x(), z(), h2, h1]);
+    let body = Expr::apps(
+        Expr::const_str_levels("Eq.trans", vec![lvl()]),
+        [s(), xp(), x(), z(), h2, h1],
+    );
     // Wrap the binders, innermost first. The binder TYPE is expressed in the context that PRECEDES
     // that binder, so each `Eq`/`S` below uses the index valid at its own depth.
     // λ(h2: Eq S xp x). body          — depth 5 (S,x,xp,z,h1 in scope): S=4,xp=2,x=3
-    let lam_h2 =
-        Expr::lam(BinderInfo::Default, eq(Expr::bvar(4), Expr::bvar(2), Expr::bvar(3)), body);
+    let lam_h2 = Expr::lam(
+        BinderInfo::Default,
+        eq(Expr::bvar(4), Expr::bvar(2), Expr::bvar(3)),
+        body,
+    );
     // λ(h1: Eq S x z). _              — depth 4 (S,x,xp,z): S=3,x=2,z=0
-    let lam_h1 =
-        Expr::lam(BinderInfo::Default, eq(Expr::bvar(3), Expr::bvar(2), Expr::bvar(0)), lam_h2);
+    let lam_h1 = Expr::lam(
+        BinderInfo::Default,
+        eq(Expr::bvar(3), Expr::bvar(2), Expr::bvar(0)),
+        lam_h2,
+    );
     // λ(z:S). λ(xp:S). λ(x:S). λ(S:Type). _   (S referenced at the depth valid for each binder)
     let lam_z = Expr::lam(BinderInfo::Default, Expr::bvar(2), lam_h1); // z:S, depth3: S=2
     let lam_xp = Expr::lam(BinderInfo::Default, Expr::bvar(1), lam_z); // xp:S, depth2: S=1
@@ -701,7 +710,14 @@ fn congruence_stutter_term() -> Expr {
     // Eq.subst S P x x' (Eq S x x') hp : P x'   (transport P along x = x')
     let body = Expr::apps(
         Expr::const_str_levels("Eq.subst", lvl()),
-        [Expr::bvar(5), Expr::bvar(4), Expr::bvar(3), Expr::bvar(2), symm, Expr::bvar(1)],
+        [
+            Expr::bvar(5),
+            Expr::bvar(4),
+            Expr::bvar(3),
+            Expr::bvar(2),
+            symm,
+            Expr::bvar(1),
+        ],
     );
     // λ(hn: Eq S x' x). body          — depth 5 (S,P,x,x',hp): S=4,x'=1,x=2
     let lam_hn = Expr::lam(
@@ -713,9 +729,14 @@ fn congruence_stutter_term() -> Expr {
         body,
     );
     // λ(hp: P x). _                    — depth 4 (S,P,x,x'): P=2,x=1
-    let lam_hp = Expr::lam(BinderInfo::Default, Expr::apps(Expr::bvar(2), [Expr::bvar(1)]), lam_hn);
+    let lam_hp = Expr::lam(
+        BinderInfo::Default,
+        Expr::apps(Expr::bvar(2), [Expr::bvar(1)]),
+        lam_hn,
+    );
     let lam_xp = Expr::lam(BinderInfo::Default, Expr::bvar(2), lam_hp); // x':S, depth3: S=2
     let lam_x = Expr::lam(BinderInfo::Default, Expr::bvar(1), lam_xp); // x:S, depth2: S=1
+
     // λ(P: S→Prop). _                  — depth 1 (S): S=0
     let lam_p = Expr::lam(
         BinderInfo::Default,
@@ -753,11 +774,21 @@ fn faithful_nonneg_congruence_term() -> Expr {
     // Eq.subst Int motive x x' (Eq Int x x') hp : Int.le 0 x'
     let body = Expr::apps(
         Expr::const_str_levels("Eq.subst", lvl()),
-        [int_ty(), motive, Expr::bvar(3), Expr::bvar(2), symm, Expr::bvar(1)],
+        [
+            int_ty(),
+            motive,
+            Expr::bvar(3),
+            Expr::bvar(2),
+            symm,
+            Expr::bvar(1),
+        ],
     );
     let lam_hn = Expr::lam(
         BinderInfo::Default,
-        Expr::apps(Expr::const_str_levels("Eq", lvl()), [int_ty(), Expr::bvar(1), Expr::bvar(2)]),
+        Expr::apps(
+            Expr::const_str_levels("Eq", lvl()),
+            [int_ty(), Expr::bvar(1), Expr::bvar(2)],
+        ),
         body,
     );
     let lam_hp = Expr::lam(BinderInfo::Default, le0(1), lam_hn); // hp: Int.le 0 x, depth2: x=1
@@ -774,7 +805,10 @@ fn faithful_nonneg_congruence_type() -> Expr {
     let mut ty = le0(2); // codomain Int.le 0 x'  (depth4: x'=bvar2)
     ty = Expr::pi(
         BinderInfo::Default,
-        Expr::apps(Expr::const_str_levels("Eq", lvl()), [int_ty(), Expr::bvar(1), Expr::bvar(2)]),
+        Expr::apps(
+            Expr::const_str_levels("Eq", lvl()),
+            [int_ty(), Expr::bvar(1), Expr::bvar(2)],
+        ),
         ty,
     ); // hn: Eq Int x' x (depth3: x'=1,x=2)
     ty = Expr::pi(BinderInfo::Default, le0(1), ty); // hp: Int.le 0 x (depth2: x=1)
@@ -804,16 +838,23 @@ fn encode_int_expr(
     match e {
         E::Int(n) => {
             let v: i64 = n.to_string().parse().ok()?;
-            let of_nat =
-                Expr::apps(Expr::const_str("Int.ofNat"), [Expr::nat_lit(v.unsigned_abs())]);
-            Some(if v < 0 { Expr::apps(Expr::const_str("Int.neg"), [of_nat]) } else { of_nat })
+            let of_nat = Expr::apps(
+                Expr::const_str("Int.ofNat"),
+                [Expr::nat_lit(v.unsigned_abs())],
+            );
+            Some(if v < 0 {
+                Expr::apps(Expr::const_str("Int.neg"), [of_nat])
+            } else {
+                of_nat
+            })
         }
         E::Add(a, b) => bin("Int.add", &a.node, &b.node),
         E::Sub(a, b) => bin("Int.sub", &a.node, &b.node),
         E::Mul(a, b) => bin("Int.mul", &a.node, &b.node),
-        E::Neg(a) => {
-            Some(Expr::apps(Expr::const_str("Int.neg"), [encode_int_expr(&a.node, atom_idx)?]))
-        }
+        E::Neg(a) => Some(Expr::apps(
+            Expr::const_str("Int.neg"),
+            [encode_int_expr(&a.node, atom_idx)?],
+        )),
         _ => None,
     }
 }
@@ -902,8 +943,10 @@ fn int_congruence_type(j: &tla_core::ast::Expr, var: &str) -> Option<Expr> {
     };
     // Π(x:Int)(x':Int). enc_J(x@1) → Eq Int x' x → enc_J(x'@2)
     let cod = encode_int_pred(j, &at(2))?; // depth4: x'=bvar2
-    let hn =
-        Expr::apps(Expr::const_str_levels("Eq", lvl()), [int_ty(), Expr::bvar(1), Expr::bvar(2)]); // depth3: x'=1, x=2
+    let hn = Expr::apps(
+        Expr::const_str_levels("Eq", lvl()),
+        [int_ty(), Expr::bvar(1), Expr::bvar(2)],
+    ); // depth3: x'=1, x=2
     let hp = encode_int_pred(j, &at(1))?; // depth2: x=bvar1
     let mut ty = cod;
     ty = Expr::pi(BinderInfo::Default, hn, ty);
@@ -929,10 +972,19 @@ fn int_congruence_proof(j: &tla_core::ast::Expr, var: &str) -> Option<Expr> {
     );
     let body = Expr::apps(
         Expr::const_str_levels("Eq.subst", lvl()),
-        [int_ty(), motive, Expr::bvar(3), Expr::bvar(2), symm, Expr::bvar(1)],
+        [
+            int_ty(),
+            motive,
+            Expr::bvar(3),
+            Expr::bvar(2),
+            symm,
+            Expr::bvar(1),
+        ],
     );
-    let hn_ty =
-        Expr::apps(Expr::const_str_levels("Eq", lvl()), [int_ty(), Expr::bvar(1), Expr::bvar(2)]);
+    let hn_ty = Expr::apps(
+        Expr::const_str_levels("Eq", lvl()),
+        [int_ty(), Expr::bvar(1), Expr::bvar(2)],
+    );
     let hp_ty = encode_int_pred(j, &at(1))?;
     let lam_hn = Expr::lam(BinderInfo::Default, hn_ty, body);
     let lam_hp = Expr::lam(BinderInfo::Default, hp_ty, lam_hn);
@@ -1001,9 +1053,15 @@ fn ground_nonneg_init_term(c: u64) -> Expr {
         Expr::const_str_levels("Eq.subst", lvl()),
         [int_ty(), motive, ofnat_c(), Expr::bvar(1), symm, ground],
     ); // Int.le 0 x
-    let hx_ty =
-        Expr::apps(Expr::const_str_levels("Eq", lvl()), [int_ty(), Expr::bvar(0), ofnat_c()]); // Eq Int x (ofNat c), depth1
-    Expr::lam(BinderInfo::Default, int_ty(), Expr::lam(BinderInfo::Default, hx_ty, body))
+    let hx_ty = Expr::apps(
+        Expr::const_str_levels("Eq", lvl()),
+        [int_ty(), Expr::bvar(0), ofnat_c()],
+    ); // Eq Int x (ofNat c), depth1
+    Expr::lam(
+        BinderInfo::Default,
+        int_ty(),
+        Expr::lam(BinderInfo::Default, hx_ty, body),
+    )
 }
 fn ground_nonneg_init_type(c: u64) -> Expr {
     use clean_kernel::Level;
@@ -1012,9 +1070,15 @@ fn ground_nonneg_init_type(c: u64) -> Expr {
     let ofnat_c = || Expr::apps(Expr::const_str("Int.ofNat"), [Expr::nat_lit(c)]);
     // Π(x:Int). Eq Int x (ofNat c) → Int.le 0 x
     let cod = Expr::apps(Expr::const_str("Int.le"), [int_zero(), Expr::bvar(1)]); // depth2: x=1
-    let hx_ty =
-        Expr::apps(Expr::const_str_levels("Eq", lvl()), [int_ty(), Expr::bvar(0), ofnat_c()]); // depth1: x=0
-    Expr::pi(BinderInfo::Default, int_ty(), Expr::pi(BinderInfo::Default, hx_ty, cod))
+    let hx_ty = Expr::apps(
+        Expr::const_str_levels("Eq", lvl()),
+        [int_ty(), Expr::bvar(0), ofnat_c()],
+    ); // depth1: x=0
+    Expr::pi(
+        BinderInfo::Default,
+        int_ty(),
+        Expr::pi(BinderInfo::Default, hx_ty, cod),
+    )
 }
 
 /// Parse `x = c` (either orientation) where `c` is a NON-NEGATIVE Int literal → `(var, c)`.
@@ -1027,8 +1091,13 @@ fn parse_var_eq_nonneg_lit(e: &tla_core::ast::Expr) -> Option<(String, u64)> {
         }
         None
     };
-    let var =
-        |x: &E| -> Option<String> { if let E::Ident(n, _) = x { Some(n.clone()) } else { None } };
+    let var = |x: &E| -> Option<String> {
+        if let E::Ident(n, _) = x {
+            Some(n.clone())
+        } else {
+            None
+        }
+    };
     if let E::Eq(a, b) = e {
         if let (Some(v), Some(c)) = (var(&a.node), lit(&b.node)) {
             return Some((v, c));
@@ -1215,8 +1284,10 @@ fn recognize_affine_sum_system(
     use tla_core::ast::Expr as E;
     let mut j_conj = Vec::new();
     flatten_ast_and(j, &mut j_conj);
-    let conj_vars: Vec<String> =
-        j_conj.iter().map(|c| parse_ge_zero_var(c)).collect::<Option<_>>()?;
+    let conj_vars: Vec<String> = j_conj
+        .iter()
+        .map(|c| parse_ge_zero_var(c))
+        .collect::<Option<_>>()?;
     if conj_vars.is_empty() {
         return None;
     }
@@ -1254,7 +1325,11 @@ fn recognize_affine_sum_system(
         updates[idx] = Some(recognize_sum_tree(e, &vars)?);
     }
     let updates: Vec<SumAtom> = updates.into_iter().collect::<Option<_>>()?;
-    Some(AffineSumSystem { vars, j_conjuncts, updates })
+    Some(AffineSumSystem {
+        vars,
+        j_conjuncts,
+        updates,
+    })
 }
 
 /// `Int.NonNeg t`.
@@ -1274,8 +1349,11 @@ fn eq_int(a: Expr, b: Expr) -> Expr {
 fn subst_nonneg_along(from: Expr, to: Expr, heq: Expr, proof: Expr) -> Expr {
     use clean_kernel::Level;
     let lvl1 = || vec![Level::succ(Level::zero())];
-    let motive =
-        Expr::lam(BinderInfo::Default, Expr::const_str("Int"), int_nonneg_of(Expr::bvar(0)));
+    let motive = Expr::lam(
+        BinderInfo::Default,
+        Expr::const_str("Int"),
+        int_nonneg_of(Expr::bvar(0)),
+    );
     let symm = Expr::apps(
         Expr::const_str_levels("Eq.symm", lvl1()),
         [Expr::const_str("Int"), to.clone(), from.clone(), heq],
@@ -1291,9 +1369,10 @@ fn embed_sum(atom: &SumAtom, var_ix: &dyn Fn(usize) -> Expr) -> Expr {
     match atom {
         SumAtom::Lit(c) => ofnat(*c),
         SumAtom::Var(j) => var_ix(*j),
-        SumAtom::Add(a, b) => {
-            Expr::apps(Expr::const_str("Int.add"), [embed_sum(a, var_ix), embed_sum(b, var_ix)])
-        }
+        SumAtom::Add(a, b) => Expr::apps(
+            Expr::const_str("Int.add"),
+            [embed_sum(a, var_ix), embed_sum(b, var_ix)],
+        ),
     }
 }
 
@@ -1337,7 +1416,10 @@ fn affine_sum_consecution(sys: &AffineSumSystem) -> (Expr, Expr) {
     let body_depth = 3 * n + c;
     // A variable's NonNeg hypothesis = the FIRST J conjunct over it.
     let hyp_conj_of_var = |m: usize| -> usize {
-        sys.j_conjuncts.iter().position(|&j| j == m).expect("every var comes from a conjunct")
+        sys.j_conjuncts
+            .iter()
+            .position(|&j| j == m)
+            .expect("every var comes from a conjunct")
     };
     // Conclusion facts: per J CONJUNCT, NonNeg p_{var(k)} — transported along he_{var(k)}.
     let facts: Vec<(Expr, Expr)> = (0..c)
@@ -1426,12 +1508,16 @@ fn project_chain_leaf(leaves: &[Expr], k: usize, h: Expr) -> Expr {
     let mut proof = h;
     for i in 0..k {
         // proof : And leaves[i] suffix(i+1)  ⇒  And.right leaves[i] suffix(i+1) proof
-        proof =
-            Expr::apps(Expr::const_str("And.right"), [leaves[i].clone(), suffix_ty(i + 1), proof]);
+        proof = Expr::apps(
+            Expr::const_str("And.right"),
+            [leaves[i].clone(), suffix_ty(i + 1), proof],
+        );
     }
     if k + 1 < leaves.len() {
-        proof =
-            Expr::apps(Expr::const_str("And.left"), [leaves[k].clone(), suffix_ty(k + 1), proof]);
+        proof = Expr::apps(
+            Expr::const_str("And.left"),
+            [leaves[k].clone(), suffix_ty(k + 1), proof],
+        );
     }
     proof
 }
@@ -1471,11 +1557,16 @@ pub(crate) fn verify_conj_ground_init(
 fn conj_ground_init(init: &tla_core::ast::Expr, j: &tla_core::ast::Expr) -> Option<(Expr, Expr)> {
     let mut init_conj = Vec::new();
     flatten_ast_and(init, &mut init_conj);
-    let pins: Vec<(String, u64)> =
-        init_conj.iter().map(|c| parse_var_eq_nonneg_lit(c)).collect::<Option<_>>()?;
+    let pins: Vec<(String, u64)> = init_conj
+        .iter()
+        .map(|c| parse_var_eq_nonneg_lit(c))
+        .collect::<Option<_>>()?;
     let mut j_conj = Vec::new();
     flatten_ast_and(j, &mut j_conj);
-    let j_vars: Vec<String> = j_conj.iter().map(|c| parse_ge_zero_var(c)).collect::<Option<_>>()?;
+    let j_vars: Vec<String> = j_conj
+        .iter()
+        .map(|c| parse_ge_zero_var(c))
+        .collect::<Option<_>>()?;
     if j_vars.is_empty() {
         return None;
     }
@@ -1563,10 +1654,16 @@ fn conj_projection_safety(
 ) -> Option<(Expr, Expr)> {
     let mut j_conj = Vec::new();
     flatten_ast_and(j, &mut j_conj);
-    let j_vars: Vec<String> = j_conj.iter().map(|c| parse_ge_zero_var(c)).collect::<Option<_>>()?;
+    let j_vars: Vec<String> = j_conj
+        .iter()
+        .map(|c| parse_ge_zero_var(c))
+        .collect::<Option<_>>()?;
     let mut s_conj = Vec::new();
     flatten_ast_and(safety, &mut s_conj);
-    let s_vars: Vec<String> = s_conj.iter().map(|c| parse_ge_zero_var(c)).collect::<Option<_>>()?;
+    let s_vars: Vec<String> = s_conj
+        .iter()
+        .map(|c| parse_ge_zero_var(c))
+        .collect::<Option<_>>()?;
     if j_vars.is_empty() || s_vars.is_empty() {
         return None;
     }
@@ -1596,13 +1693,19 @@ fn conj_projection_safety(
     let c = j_vars.len();
     let depth = n + 1;
     let j_leaves_at = |d: usize| -> Vec<Expr> {
-        j_positions.iter().map(|&u| int_nonneg_of(Expr::bvar((d - 1 - u) as u32))).collect()
+        j_positions
+            .iter()
+            .map(|&u| int_nonneg_of(Expr::bvar((d - 1 - u) as u32)))
+            .collect()
     };
     let body_leaves = j_leaves_at(depth);
     let s_facts: Vec<(Expr, Expr)> = s_positions
         .iter()
         .map(|&pos| {
-            (body_leaves[pos].clone(), project_chain_leaf(&body_leaves, pos, Expr::bvar(0)))
+            (
+                body_leaves[pos].clone(),
+                project_chain_leaf(&body_leaves, pos, Expr::bvar(0)),
+            )
         })
         .collect();
     let (concl_ty, body) = and_intro_chain(&s_facts);
@@ -1694,11 +1797,20 @@ fn violated_init_le_term(c: u64, d: u64) -> Option<Expr> {
     }
     let lvl = || vec![Level::succ(Level::zero())];
     let int_ty = || Expr::const_str("Int");
-    let eq_cc = Expr::apps(Expr::const_str_levels("Eq", lvl()), [int_ty(), ofnat(c), ofnat(c)]);
+    let eq_cc = Expr::apps(
+        Expr::const_str_levels("Eq", lvl()),
+        [int_ty(), ofnat(c), ofnat(c)],
+    );
     let lt_dc = Expr::apps(Expr::const_str("Int.lt"), [ofnat(d), ofnat(c)]);
-    let refl = Expr::apps(Expr::const_str_levels("Eq.refl", lvl()), [int_ty(), ofnat(c)]);
+    let refl = Expr::apps(
+        Expr::const_str_levels("Eq.refl", lvl()),
+        [int_ty(), ofnat(c)],
+    );
     let nonneg = Expr::apps(Expr::const_str("Int.NonNeg.mk"), [Expr::nat_lit(c - d - 1)]);
-    Some(Expr::apps(Expr::const_str("And.intro"), [eq_cc, lt_dc, refl, nonneg]))
+    Some(Expr::apps(
+        Expr::const_str("And.intro"),
+        [eq_cc, lt_dc, refl, nonneg],
+    ))
 }
 
 /// The right-nested membership disjunction `⋁ᵢ (Eq Int x rᵢ)` with `x` at de Bruijn slot `x_slot`.
@@ -1767,8 +1879,11 @@ fn or_rec_membership(
     // Single member: the disjunction degenerated to a bare `Eq x r0`. Feed the membership proof to
     // the case as its `hv` via a redex `(λ hv. case0) hmem` (avoids special-casing the case builder).
     if states.len() == 1 {
-        let lam =
-            Expr::lam(BinderInfo::Default, eq_int_lit(x_slot, states[0]), case(0, depth + 1, x_at));
+        let lam = Expr::lam(
+            BinderInfo::Default,
+            eq_int_lit(x_slot, states[0]),
+            case(0, depth + 1, x_at),
+        );
         return Expr::apps(lam, [Expr::bvar(hmem_slot)]);
     }
     // `Or.rec head rest motive (λ ha. case0) (λ hrest. <recurse>) hmem`.
@@ -1873,14 +1988,17 @@ fn explicit_closed_nstate(states: &[u64]) -> (Expr, Expr) {
     let int_ty = || Expr::const_str("Int");
     // TYPE: Π(x x':Int). (⋁ Eq x rᵢ) → Eq x' x → (⋁ Eq x' rᵢ). Binders x,x',hj,hn.
     let cod = membership_disjunction(states, 2); // ⋁ Eq x' rᵢ  (depth4: x'@2)
-    let hn_ty =
-        Expr::apps(Expr::const_str_levels("Eq", lvl()), [int_ty(), Expr::bvar(1), Expr::bvar(2)]); // Eq x' x  (depth3: x'@1, x@2)
+    let hn_ty = Expr::apps(
+        Expr::const_str_levels("Eq", lvl()),
+        [int_ty(), Expr::bvar(1), Expr::bvar(2)],
+    ); // Eq x' x  (depth3: x'@1, x@2)
     let hj_ty = membership_disjunction(states, 1); // ⋁ Eq x rᵢ  (depth2: x@1)
     let mut ty = cod;
     ty = Expr::pi(BinderInfo::Default, hn_ty.clone(), ty);
     ty = Expr::pi(BinderInfo::Default, hj_ty, ty);
     ty = Expr::pi(BinderInfo::Default, int_ty(), ty); // x'
     let ty = Expr::pi(BinderInfo::Default, int_ty(), ty); // x
+
     // TERM body before any Or.rec binder (depth=4): x@3, x'@2, hj@1, hn@0.
     let st = states.to_vec();
     let cod_fn = move |d: u32| membership_disjunction(&st, d - 2); // ⋁ Eq x' rᵢ, x'@(d-2)
@@ -1893,6 +2011,7 @@ fn explicit_closed_nstate(states: &[u64]) -> (Expr, Expr) {
         let xp = Expr::bvar(d - 2);
         let hn = Expr::bvar(d - 4);
         let hv = Expr::bvar(0); // hv : Eq x v
+
         // Eq.trans Int x' x (ofNat v) hn hv : Eq x' v
         let trans = Expr::apps(
             Expr::const_str_levels("Eq.trans", lvl()),
@@ -1935,7 +2054,11 @@ fn explicit_membership_type(states: &[u64], which: usize) -> Expr {
         [Expr::const_str("Int"), Expr::bvar(0), ofnat(states[which])],
     );
     let cod = membership_disjunction(states, 1);
-    Expr::pi(BinderInfo::Default, Expr::const_str("Int"), Expr::pi(BinderInfo::Default, hx_ty, cod))
+    Expr::pi(
+        BinderInfo::Default,
+        Expr::const_str("Int"),
+        Expr::pi(BinderInfo::Default, hx_ty, cod),
+    )
 }
 #[cfg_attr(not(test), allow(dead_code))] // superseded in the live path; test-validated building block
 fn explicit_membership_term(states: &[u64], which: usize) -> Expr {
@@ -2115,7 +2238,10 @@ fn native_translation_term(c: u64) -> Expr {
     use clean_kernel::Level;
     let lvl = vec![Level::succ(Level::zero())];
     let interp = iadd(iadd(ofnat(c), ofnat(1)), ofnat(1)); // ((c+1)+1)
-    Expr::apps(Expr::const_str_levels("Eq.refl", lvl), [Expr::const_str("Int"), interp])
+    Expr::apps(
+        Expr::const_str_levels("Eq.refl", lvl),
+        [Expr::const_str("Int"), interp],
+    )
 }
 #[cfg_attr(not(test), allow(dead_code))]
 fn native_translation_type(c: u64) -> Expr {
@@ -2123,7 +2249,10 @@ fn native_translation_type(c: u64) -> Expr {
     let lvl = vec![Level::succ(Level::zero())];
     let interp = iadd(iadd(ofnat(c), ofnat(1)), ofnat(1)); // interpreter: increment twice
     let jit = iadd(ofnat(c), ofnat(2)); // JIT: fused add-2
-    Expr::apps(Expr::const_str_levels("Eq", lvl), [Expr::const_str("Int"), interp, jit])
+    Expr::apps(
+        Expr::const_str_levels("Eq", lvl),
+        [Expr::const_str("Int"), interp, jit],
+    )
 }
 
 /// LIA arithmetic CONSECUTION `x≥0 ∧ x'=x+1 ⇒ x'≥0` for an OPAQUE counter, kernel-checked. The
@@ -2141,8 +2270,10 @@ fn lia_consecution() -> (Expr, Expr) {
 
     // --- TYPE: Π(x x':Int). NonNeg x → Eq Int x' (x+1) → NonNeg x' ---
     let cod = nonneg(Expr::bvar(2)); // NonNeg x' (depth4: x'=2)
-    let hn_ty =
-        Expr::apps(Expr::const_str_levels("Eq", lvl()), [int_ty(), Expr::bvar(1), succ_x(2)]); // Eq x' (x+1) (depth3: x'=1, x=2)
+    let hn_ty = Expr::apps(
+        Expr::const_str_levels("Eq", lvl()),
+        [int_ty(), Expr::bvar(1), succ_x(2)],
+    ); // Eq x' (x+1) (depth3: x'=1, x=2)
     let hp_ty = nonneg(Expr::bvar(1)); // NonNeg x (depth2: x=1)
     let mut ty = cod;
     ty = Expr::pi(BinderInfo::Default, hn_ty.clone(), ty);
@@ -2182,7 +2313,14 @@ fn lia_consecution() -> (Expr, Expr) {
     let subst_motive = Expr::lam(BinderInfo::Default, int_ty(), nonneg(Expr::bvar(0)));
     let body = Expr::apps(
         Expr::const_str_levels("Eq.subst", lvl()),
-        [int_ty(), subst_motive, succ_x(3), Expr::bvar(2), symm, step1],
+        [
+            int_ty(),
+            subst_motive,
+            succ_x(3),
+            Expr::bvar(2),
+            symm,
+            step1,
+        ],
     );
     let term = Expr::lam(
         BinderInfo::Default,
@@ -2190,7 +2328,11 @@ fn lia_consecution() -> (Expr, Expr) {
         Expr::lam(
             BinderInfo::Default,
             int_ty(),
-            Expr::lam(BinderInfo::Default, hp_ty, Expr::lam(BinderInfo::Default, hn_ty, body)),
+            Expr::lam(
+                BinderInfo::Default,
+                hp_ty,
+                Expr::lam(BinderInfo::Default, hn_ty, body),
+            ),
         ),
     );
     (ty, term)
@@ -2298,10 +2440,14 @@ pub(crate) fn verify_symmetry_swap(safety: &tla_core::ast::Expr, term_bytes: &[u
 /// proof `λ(A B:Prop)(h:And A B). And.intro B A (And.right A B h) (And.left A B h)`.
 fn symmetry_swap_term() -> Expr {
     // body depth3: A=2, B=1, h=0
-    let right =
-        Expr::apps(Expr::const_str("And.right"), [Expr::bvar(2), Expr::bvar(1), Expr::bvar(0)]);
-    let left =
-        Expr::apps(Expr::const_str("And.left"), [Expr::bvar(2), Expr::bvar(1), Expr::bvar(0)]);
+    let right = Expr::apps(
+        Expr::const_str("And.right"),
+        [Expr::bvar(2), Expr::bvar(1), Expr::bvar(0)],
+    );
+    let left = Expr::apps(
+        Expr::const_str("And.left"),
+        [Expr::bvar(2), Expr::bvar(1), Expr::bvar(0)],
+    );
     let body = Expr::apps(
         Expr::const_str("And.intro"),
         [Expr::bvar(1), Expr::bvar(2), right, left], // And.intro B A (h_B) (h_A)
@@ -2310,7 +2456,11 @@ fn symmetry_swap_term() -> Expr {
     Expr::lam(
         BinderInfo::Default,
         Expr::prop(),
-        Expr::lam(BinderInfo::Default, Expr::prop(), Expr::lam(BinderInfo::Default, and_ab, body)),
+        Expr::lam(
+            BinderInfo::Default,
+            Expr::prop(),
+            Expr::lam(BinderInfo::Default, and_ab, body),
+        ),
     )
 }
 fn symmetry_swap_type() -> Expr {
@@ -2418,7 +2568,10 @@ fn liveness_descent(measures: &[u64]) -> Option<(Expr, Expr)> {
         let (hi, lo) = (w[0], w[1]); // hi > lo : Int.lt lo hi
         facts.push((
             Expr::apps(Expr::const_str("Int.lt"), [ofnat(lo), ofnat(hi)]),
-            Expr::apps(Expr::const_str("Int.NonNeg.mk"), [Expr::nat_lit(hi - lo - 1)]),
+            Expr::apps(
+                Expr::const_str("Int.NonNeg.mk"),
+                [Expr::nat_lit(hi - lo - 1)],
+            ),
         ));
     }
     if facts.len() <= LIVENESS_DESCENT_LEGACY_CHAIN_MAX {
@@ -2474,16 +2627,25 @@ fn k_int_lit(v: i64) -> Expr {
     if v >= 0 {
         ofnat(v as u64)
     } else {
-        Expr::apps(Expr::const_str("Int.negSucc"), [Expr::nat_lit((-v - 1) as u64)])
+        Expr::apps(
+            Expr::const_str("Int.negSucc"),
+            [Expr::nat_lit((-v - 1) as u64)],
+        )
     }
 }
 /// `Eq.symm {Int} x y (h : x=y) : y=x`.
 fn k_symm(x: Expr, y: Expr, h: Expr) -> Expr {
-    Expr::apps(Expr::const_str_levels("Eq.symm", k_lvl1()), [k_int(), x, y, h])
+    Expr::apps(
+        Expr::const_str_levels("Eq.symm", k_lvl1()),
+        [k_int(), x, y, h],
+    )
 }
 /// `Eq.trans {Int} x y z (h1:x=y) (h2:y=z) : x=z`.
 fn k_trans(x: Expr, y: Expr, z: Expr, h1: Expr, h2: Expr) -> Expr {
-    Expr::apps(Expr::const_str_levels("Eq.trans", k_lvl1()), [k_int(), x, y, z, h1, h2])
+    Expr::apps(
+        Expr::const_str_levels("Eq.trans", k_lvl1()),
+        [k_int(), x, y, z, h1, h2],
+    )
 }
 /// `congrArg.{1,1} Int Int a1 a2 f (h:a1=a2) : Eq Int (f a1) (f a2)`.
 fn k_congr(a1: Expr, a2: Expr, f: Expr, h: Expr) -> Expr {
@@ -2527,22 +2689,34 @@ fn shuffle_term() -> Expr {
     let bc_d = k_add(k_add(b(), c()), d()); // (b+c)+d
     let cb_d = k_add(k_add(c(), b()), d()); // (c+b)+d
     let c_bd = k_add(c(), k_add(b(), d())); // c+(b+d)
+
     // inner `bcd : b+(c+d) = c+(b+d)`
     let s1 = k_symm(bc_d.clone(), b_cd.clone(), k_assoc(b(), c(), d())); // b+(c+d) = (b+c)+d
+
     // f = λw. w + d   (d under one extra binder = bvar1)
-    let f_wd = Expr::lam(BinderInfo::Default, k_int(), k_add(Expr::bvar(0), Expr::bvar(1)));
+    let f_wd = Expr::lam(
+        BinderInfo::Default,
+        k_int(),
+        k_add(Expr::bvar(0), Expr::bvar(1)),
+    );
     let s2 = k_congr(k_add(b(), c()), k_add(c(), b()), f_wd, k_comm(b(), c())); // (b+c)+d = (c+b)+d
     let s3 = k_assoc(c(), b(), d()); // (c+b)+d = c+(b+d)
     let s23 = k_trans(bc_d.clone(), cb_d, c_bd.clone(), s2, s3); // (b+c)+d = c+(b+d)
     let bcd = k_trans(b_cd.clone(), bc_d, c_bd.clone(), s1, s23); // b+(c+d) = c+(b+d)
+
     // outer chain: (a+b)+(c+d) = a+(b+(c+d)) = a+(c+(b+d)) = (a+c)+(b+d)
     let e0 = k_add(k_add(a(), b()), k_add(c(), d()));
     let e1 = k_add(a(), b_cd.clone()); // a+(b+(c+d))
     let e2 = k_add(a(), c_bd.clone()); // a+(c+(b+d))
     let e3 = k_add(k_add(a(), c()), k_add(b(), d()));
     let assoc1 = k_assoc(a(), b(), k_add(c(), d())); // e0 = e1
+
     // f = λw. a + w   (a under one extra binder = bvar4)
-    let f_aw = Expr::lam(BinderInfo::Default, k_int(), k_add(Expr::bvar(4), Expr::bvar(0)));
+    let f_aw = Expr::lam(
+        BinderInfo::Default,
+        k_int(),
+        k_add(Expr::bvar(4), Expr::bvar(0)),
+    );
     let cong_step = k_congr(b_cd, c_bd, f_aw, bcd); // e1 = e2
     let symm_assoc2 = k_symm(e3.clone(), e2.clone(), k_assoc(a(), c(), k_add(b(), d()))); // e2 = e3
     let mid = k_trans(e1.clone(), e2, e3.clone(), cong_step, symm_assoc2); // e1 = e3
@@ -2567,7 +2741,11 @@ fn right_sum(items: &[Expr]) -> Expr {
 /// kernel-checks [`descent_sub_one_term`] at its stated type.
 #[cfg(test)]
 fn descent_sub_one_ty() -> Expr {
-    Expr::pi(BinderInfo::Default, k_int(), k_lt(k_sub(Expr::bvar(0), ofnat(1)), Expr::bvar(0)))
+    Expr::pi(
+        BinderInfo::Default,
+        k_int(),
+        k_lt(k_sub(Expr::bvar(0), ofnat(1)), Expr::bvar(0)),
+    )
 }
 /// The closed descent lemma PROOF `λ(m:Int). Int.lt (m-1) m` — `le_refl m` transported along the
 /// constructive identity `(m-1)+1 = m` (`add_assoc` + `add_zero`, `(-1)+1` folding natively).
@@ -2581,9 +2759,13 @@ fn descent_sub_one_term() -> Expr {
     let addzero = Expr::apps(Expr::const_str("Int.add_zero"), [m()]);
     let trans = k_trans(a_expr.clone(), b_expr, m(), assoc, addzero); // (m+neg1)+1 = m
     let heq = k_symm(a_expr.clone(), m(), trans); // m = (m+neg1)+1
+
     // motive λw. NonNeg (sub m w)  (under λw: m=bvar1, w=bvar0)
-    let motive =
-        Expr::lam(BinderInfo::Default, k_int(), int_nonneg_of(k_sub(Expr::bvar(1), Expr::bvar(0))));
+    let motive = Expr::lam(
+        BinderInfo::Default,
+        k_int(),
+        int_nonneg_of(k_sub(Expr::bvar(1), Expr::bvar(0))),
+    );
     let le_refl = Expr::apps(Expr::const_str("Int.le_refl"), [m()]);
     let subst = Expr::apps(
         Expr::const_str_levels("Eq.subst", k_lvl1()),
@@ -2614,7 +2796,11 @@ fn sum_post(k: usize, depth: usize, lo: usize) -> Expr {
 }
 /// `Σ_{j∈lo..k} (c_j + d_j)` (substituted measure).
 fn sum_sub(k: usize, deltas: &[i64], depth: usize, lo: usize) -> Expr {
-    right_sum(&(lo..k).map(|j| k_add(c_pre(depth, j), k_int_lit(deltas[j]))).collect::<Vec<_>>())
+    right_sum(
+        &(lo..k)
+            .map(|j| k_add(c_pre(depth, j), k_int_lit(deltas[j])))
+            .collect::<Vec<_>>(),
+    )
 }
 /// `Σ_{j∈lo..k} d_j` (constant offset sum — closed literals, reduces to `-δ`).
 fn sum_ds(k: usize, deltas: &[i64], lo: usize) -> Expr {
@@ -2640,8 +2826,17 @@ fn rewrite_sum(k: usize, deltas: &[i64], depth: usize, lo: usize) -> Expr {
     let a = k_congr(cpost_lo.clone(), sub_lo.clone(), f_a, he_var(k, depth, lo));
     // B: congrArg (λw. sub_lo + w) tail : sub_lo + t_post = sub_lo + t_sub
     let sub_lo_sh = k_add(c_pre(depth + 1, lo), k_int_lit(deltas[lo]));
-    let f_b = Expr::lam(BinderInfo::Default, k_int(), k_add(sub_lo_sh, Expr::bvar(0)));
-    let b = k_congr(t_post.clone(), t_sub.clone(), f_b, rewrite_sum(k, deltas, depth, lo + 1));
+    let f_b = Expr::lam(
+        BinderInfo::Default,
+        k_int(),
+        k_add(sub_lo_sh, Expr::bvar(0)),
+    );
+    let b = k_congr(
+        t_post.clone(),
+        t_sub.clone(),
+        f_b,
+        rewrite_sum(k, deltas, depth, lo + 1),
+    );
     k_trans(
         k_add(cpost_lo, t_post.clone()),
         k_add(sub_lo.clone(), t_post),
@@ -2668,10 +2863,17 @@ fn split_sum(k: usize, deltas: &[i64], depth: usize, lo: usize) -> Expr {
     // A: congrArg (λw. head + w) tail_split : head + rest_sub = head + (rest_m + rest_ds)
     let head_sh = k_add(c_pre(depth + 1, lo), k_int_lit(deltas[lo]));
     let f_a = Expr::lam(BinderInfo::Default, k_int(), k_add(head_sh, Expr::bvar(0)));
-    let a = k_congr(rest_sub.clone(), rmd.clone(), f_a, split_sum(k, deltas, depth, lo + 1));
+    let a = k_congr(
+        rest_sub.clone(),
+        rmd.clone(),
+        f_a,
+        split_sum(k, deltas, depth, lo + 1),
+    );
     // B: shuffle c_lo d_lo rest_m rest_ds : (c_lo+d_lo)+(rest_m+rest_ds) = (c_lo+rest_m)+(d_lo+rest_ds)
-    let b =
-        Expr::apps(shuffle_term(), [c_lo.clone(), d_lo.clone(), rest_m.clone(), rest_ds.clone()]);
+    let b = Expr::apps(
+        shuffle_term(),
+        [c_lo.clone(), d_lo.clone(), rest_m.clone(), rest_ds.clone()],
+    );
     k_trans(
         k_add(head.clone(), rest_sub),
         k_add(head, rmd),
@@ -2707,8 +2909,13 @@ fn affine_disjunct_descent(deltas: &[i64]) -> Option<(Expr, Expr)> {
     let l_at = Expr::apps(descent_sub_one_term(), [m_pre.clone()]);
     let sub_m1 = k_sub(m_pre.clone(), ofnat(1));
     let symm_agg = k_symm(m_post.clone(), mpre_plus_ds, heq_agg); // (m_pre+ds) = m_post ≡ (m_pre-1)=m_post
+
     // motive λw. Int.lt w m_pre  (m_pre shifted +1)
-    let motive = Expr::lam(BinderInfo::Default, k_int(), k_lt(Expr::bvar(0), sum_pre(k, d + 1, 0)));
+    let motive = Expr::lam(
+        BinderInfo::Default,
+        k_int(),
+        k_lt(Expr::bvar(0), sum_pre(k, d + 1, 0)),
+    );
     let mut term = Expr::apps(
         Expr::const_str_levels("Eq.subst", k_lvl1()),
         [k_int(), motive, sub_m1, m_post.clone(), symm_agg, l_at],
@@ -2717,7 +2924,10 @@ fn affine_disjunct_descent(deltas: &[i64]) -> Option<(Expr, Expr)> {
     // Wrap he_{k-1}..he_0 (their types at their own introduction depth), then 2k Int binders.
     for j in (0..k).rev() {
         let depth = 2 * k + j;
-        let hty = eq_int(c_post(k, depth, j), k_add(c_pre(depth, j), k_int_lit(deltas[j])));
+        let hty = eq_int(
+            c_post(k, depth, j),
+            k_add(c_pre(depth, j), k_int_lit(deltas[j])),
+        );
         ty = Expr::pi(BinderInfo::Default, hty.clone(), ty);
         term = Expr::lam(BinderInfo::Default, hty, term);
     }
@@ -2764,10 +2974,16 @@ fn recognize_measure_columns(m: &tla_core::ast::Expr) -> Option<Vec<ColKey>> {
     for a in flat_atoms {
         let key = match a {
             E::RecordAccess(base, fld) => match &base.node {
-                E::Ident(v, _) => ColKey { var: v.clone(), field: Some(fld.name.node.clone()) },
+                E::Ident(v, _) => ColKey {
+                    var: v.clone(),
+                    field: Some(fld.name.node.clone()),
+                },
                 _ => return None,
             },
-            E::Ident(v, _) => ColKey { var: v.clone(), field: None },
+            E::Ident(v, _) => ColKey {
+                var: v.clone(),
+                field: None,
+            },
             _ => return None,
         };
         if cols.contains(&key) {
@@ -2778,21 +2994,75 @@ fn recognize_measure_columns(m: &tla_core::ast::Expr) -> Option<Vec<ColKey>> {
     (!cols.is_empty()).then_some(cols)
 }
 
-/// An EXCEPT value affine in `@` (the old field value): `@` → 0, `@ + n` → +n, `@ - n` → −n.
-fn except_value_delta(v: &tla_core::ast::Expr) -> Option<i64> {
+/// True only when two EXCEPT paths are provably disjoint at their root field.
+///
+/// The affine record recognizer currently accepts only one-segment field paths. Keeping this
+/// helper conservative is nevertheless important: raw callers can supply duplicate or nested
+/// paths, and TLA+ evaluates multiple EXCEPT specs left-to-right. Any same-root pair may therefore
+/// make a later `@` observe an earlier write and must fail closed. Dynamic index paths are not
+/// proven disjoint here.
+fn except_paths_provably_disjoint(
+    a: &[tla_core::ast::ExceptPathElement],
+    b: &[tla_core::ast::ExceptPathElement],
+) -> bool {
+    use tla_core::ast::ExceptPathElement;
+    matches!(
+        (a.first(), b.first()),
+        (Some(ExceptPathElement::Field(af)), Some(ExceptPathElement::Field(bf)))
+            if af.name.node != bf.name.node
+    )
+}
+
+/// Prove that evaluating `record.field` reads `base_var.field` even when `record` is a chain of
+/// prior EXCEPT updates. This is exact only when every intervening write has a different root field;
+/// a duplicate/nested same-root update or a dynamic index fails closed.
+fn except_base_preserves_field(record: &tla_core::ast::Expr, base_var: &str, field: &str) -> bool {
+    use tla_core::ast::{ExceptPathElement, Expr as E};
+    match record {
+        E::Ident(n, _) | E::StateVar(n, _, _) => n == base_var,
+        E::Except(base, specs) => {
+            except_base_preserves_field(&base.node, base_var, field)
+                && specs.iter().all(|spec| {
+                    matches!(
+                        spec.path.first(),
+                        Some(ExceptPathElement::Field(fld)) if fld.name.node != field
+                    )
+                })
+        }
+        _ => false,
+    }
+}
+
+/// An EXCEPT value affine in the old field value: `@` (before cert normalization) or the exact
+/// explicit projection `base.field` (after `normalize_cert_expr`) maps to 0. Normalization of a
+/// multi-spec EXCEPT may make that base a prior, nested EXCEPT; projection through it is accepted
+/// only when all prior writes are provably disjoint from `field`. Adding/subtracting an integer
+/// literal maps to the corresponding delta. A different base/field or an overlapping prior write
+/// still fails closed.
+fn except_value_delta(v: &tla_core::ast::Expr, base_var: &str, field: &str) -> Option<i64> {
     use tla_core::ast::Expr as E;
-    let is_at = |e: &E| matches!(e, E::Ident(n, _) if n == "@");
+    let is_old_field = |e: &E| match e {
+        E::Ident(n, _) if n == "@" => true,
+        E::RecordAccess(base, fld) => {
+            fld.name.node == field && except_base_preserves_field(&base.node, base_var, field)
+        }
+        _ => false,
+    };
     let lit = |e: &E| -> Option<i64> {
-        if let E::Int(k) = e { k.to_string().parse().ok() } else { None }
+        if let E::Int(k) = e {
+            k.to_string().parse().ok()
+        } else {
+            None
+        }
     };
     match v {
-        E::Ident(n, _) if n == "@" => Some(0),
-        E::Add(a, b) => match (is_at(&a.node), is_at(&b.node)) {
+        old if is_old_field(old) => Some(0),
+        E::Add(a, b) => match (is_old_field(&a.node), is_old_field(&b.node)) {
             (true, false) => lit(&b.node),
             (false, true) => lit(&a.node),
             _ => None,
         },
-        E::Sub(a, b) if is_at(&a.node) => lit(&b.node).map(|x| -x),
+        E::Sub(a, b) if is_old_field(&a.node) => lit(&b.node).map(|x| -x),
         _ => None,
     }
 }
@@ -2802,7 +3072,11 @@ fn affine_ident_delta(rhs: &tla_core::ast::Expr, var: &str) -> Option<i64> {
     use tla_core::ast::Expr as E;
     let is_v = |e: &E| matches!(e, E::Ident(n, _) if n == var);
     let lit = |e: &E| -> Option<i64> {
-        if let E::Int(k) = e { k.to_string().parse().ok() } else { None }
+        if let E::Int(k) = e {
+            k.to_string().parse().ok()
+        } else {
+            None
+        }
     };
     match rhs {
         E::Ident(n, _) if n == var => Some(0),
@@ -2953,7 +3227,9 @@ fn recognize_disjunct(
                     }
                     E::Tuple(items) => {
                         for it in items {
-                            let E::Ident(v, _) = &it.node else { return None };
+                            let E::Ident(v, _) = &it.node else {
+                                return None;
+                            };
                             mark(v, cols, &mut constrained);
                             constrained_vars.insert(v.as_str());
                         }
@@ -2964,7 +3240,9 @@ fn recognize_disjunct(
             }
             E::Eq(l, r) => {
                 let E::Prime(pv) = &l.node else { continue }; // a guard, not an update
-                let E::Ident(pvar, _) = &pv.node else { return None };
+                let E::Ident(pvar, _) = &pv.node else {
+                    return None;
+                };
                 saw_next = true;
                 constrained_vars.insert(pvar.as_str()); // this disjunct constrains pvar's next value
                 match &r.node {
@@ -2979,12 +3257,24 @@ fn recognize_disjunct(
                                 constrained[idx] = true;
                             }
                         }
-                        for sp in specs {
+                        for (spec_idx, sp) in specs.iter().enumerate() {
+                            // TLA+ multiple EXCEPT specs are nested left-to-right. If two paths
+                            // overlap, the later `@` observes the earlier write; treating each RHS
+                            // as an independent delta from the original record is unsound. Accept
+                            // only pairs whose distinct root fields prove them disjoint.
+                            if specs[..spec_idx]
+                                .iter()
+                                .any(|prior| !except_paths_provably_disjoint(&prior.path, &sp.path))
+                            {
+                                return None;
+                            }
                             if sp.path.len() != 1 {
                                 return None;
                             }
-                            let ExceptPathElement::Field(fld) = &sp.path[0] else { return None };
-                            let d = except_value_delta(&sp.value.node)?;
+                            let ExceptPathElement::Field(fld) = &sp.path[0] else {
+                                return None;
+                            };
+                            let d = except_value_delta(&sp.value.node, pvar, &fld.name.node)?;
                             if d != 0 {
                                 changes_state = true; // this field's value actually changes
                             }
@@ -3001,8 +3291,9 @@ fn recognize_disjunct(
                         if d != 0 {
                             changes_state = true; // `v' = v + d`, d≠0 ⇒ the variable changes
                         }
-                        if let Some(idx) =
-                            cols.iter().position(|col| &col.var == pvar && col.field.is_none())
+                        if let Some(idx) = cols
+                            .iter()
+                            .position(|col| &col.var == pvar && col.field.is_none())
                         {
                             deltas[idx] = d;
                             constrained[idx] = true;
@@ -3284,8 +3575,11 @@ pub(crate) fn is_conjunctive_nonneg_safety(
         return false;
     }
     // The INT variables: exactly these must each carry one `x≥0` conjunct; Bool vars carry none.
-    let int_vars: Vec<&str> =
-        vars.iter().zip(sorts).filter_map(|(v, s)| (*s == ColSort::Int).then_some(*v)).collect();
+    let int_vars: Vec<&str> = vars
+        .iter()
+        .zip(sorts)
+        .filter_map(|(v, s)| (*s == ColSort::Int).then_some(*v))
+        .collect();
     if int_vars.is_empty() {
         // No Int columns ⇒ the `R⊆Safety` leg (`⋀_{Int} x≥0`) would be the empty conjunction, which
         // the builder does not form. Fail-closed: an all-Bool state has no nonneg-Safety obligation
@@ -3338,7 +3632,11 @@ fn tuple_eq_prop(r: &[u64], x0_slot: u32, sorts: &[ColSort]) -> Expr {
     let eq_j = |j: usize| {
         Expr::apps(
             Expr::const_str_levels("Eq", lvl()),
-            [col_type(&sorts[j]), tup_var(x0_slot, j), col_lit(&sorts[j], r[j])],
+            [
+                col_type(&sorts[j]),
+                tup_var(x0_slot, j),
+                col_lit(&sorts[j], r[j]),
+            ],
         )
     };
     let mut prop = eq_j(r.len() - 1);
@@ -3352,7 +3650,10 @@ fn tuple_eq_prop(r: &[u64], x0_slot: u32, sorts: &[ColSort]) -> Expr {
 fn tuple_membership_disjunction(states: &[Vec<u64>], x0_slot: u32, sorts: &[ColSort]) -> Expr {
     let mut prop = tuple_eq_prop(&states[states.len() - 1], x0_slot, sorts);
     for r in states[..states.len() - 1].iter().rev() {
-        prop = Expr::apps(Expr::const_str("Or"), [tuple_eq_prop(r, x0_slot, sorts), prop]);
+        prop = Expr::apps(
+            Expr::const_str("Or"),
+            [tuple_eq_prop(r, x0_slot, sorts), prop],
+        );
     }
     prop
 }
@@ -3366,7 +3667,11 @@ fn tuple_eq_proj(r: &[u64], x0_slot: u32, j: usize, hconj: Expr, sorts: &[ColSor
     let eq_at = |k: usize| {
         Expr::apps(
             Expr::const_str_levels("Eq", lvl()),
-            [col_type(&sorts[k]), tup_var(x0_slot, k), col_lit(&sorts[k], r[k])],
+            [
+                col_type(&sorts[k]),
+                tup_var(x0_slot, k),
+                col_lit(&sorts[k], r[k]),
+            ],
         )
     };
     if r.len() == 1 {
@@ -3383,12 +3688,18 @@ fn tuple_eq_proj(r: &[u64], x0_slot: u32, j: usize, hconj: Expr, sorts: &[ColSor
     let mut cur = hconj;
     for k in 0..j {
         // cur : And eq_k (⋀_{l>k} eq_l) ; And.right gives the tail.
-        cur = Expr::apps(Expr::const_str("And.right"), [eq_at(k), tail_and(k + 1), cur]);
+        cur = Expr::apps(
+            Expr::const_str("And.right"),
+            [eq_at(k), tail_and(k + 1), cur],
+        );
     }
     if j == r.len() - 1 {
         cur // the tail is already the bare last Eq
     } else {
-        Expr::apps(Expr::const_str("And.left"), [eq_at(j), tail_and(j + 1), cur])
+        Expr::apps(
+            Expr::const_str("And.left"),
+            [eq_at(j), tail_and(j + 1), cur],
+        )
     }
 }
 
@@ -3448,7 +3759,11 @@ fn or_rec_tuple_membership(
         cod(depth + 1),
     );
     // Left case `λ(ha: head). case0` — body at `depth+1`, the fresh `ha` shifts `x_0` by one.
-    let case_l = Expr::lam(BinderInfo::Default, head.clone(), case(0, depth + 1, x0_slot + 1));
+    let case_l = Expr::lam(
+        BinderInfo::Default,
+        head.clone(),
+        case(0, depth + 1, x0_slot + 1),
+    );
     // Right case `λ(hrest: rest). <recurse on states[1..]>` — every index shifts +1.
     let rec = or_rec_tuple_membership(
         &states[1..],
@@ -3545,8 +3860,10 @@ fn explicit_safety_tuple(states: &[Vec<u64>], sorts: &[ColSort]) -> (Expr, Expr)
             )
         };
         // Conjoin the per-INT-variable NonNeg proofs right-nested via And.intro, matching cod_at(x0).
-        let facts: Vec<(Expr, Expr)> =
-            int_cols_c.iter().map(|&j| (nonneg(tup_var(x0, j)), nonneg_j(j))).collect();
+        let facts: Vec<(Expr, Expr)> = int_cols_c
+            .iter()
+            .map(|&j| (nonneg(tup_var(x0, j)), nonneg_j(j)))
+            .collect();
         and_intro_chain(&facts).1
     };
     let body = or_rec_tuple_membership(states, n as u32, 0, n as u32 + 1, &cod, &case, sorts);
@@ -3595,7 +3912,11 @@ fn concrete_tuple_eq_prop(r: &[u64], v: &[u64], sorts: &[ColSort]) -> Expr {
     let eq_j = |j: usize| {
         Expr::apps(
             Expr::const_str_levels("Eq", lvl()),
-            [col_type(&sorts[j]), col_lit(&sorts[j], v[j]), col_lit(&sorts[j], r[j])],
+            [
+                col_type(&sorts[j]),
+                col_lit(&sorts[j], v[j]),
+                col_lit(&sorts[j], r[j]),
+            ],
         )
     };
     let mut prop = eq_j(r.len() - 1);
@@ -3607,7 +3928,10 @@ fn concrete_tuple_eq_prop(r: &[u64], v: &[u64], sorts: &[ColSort]) -> Expr {
 fn concrete_tuple_disj(states: &[Vec<u64>], v: &[u64], sorts: &[ColSort]) -> Expr {
     let mut prop = concrete_tuple_eq_prop(&states[states.len() - 1], v, sorts);
     for r in states[..states.len() - 1].iter().rev() {
-        prop = Expr::apps(Expr::const_str("Or"), [concrete_tuple_eq_prop(r, v, sorts), prop]);
+        prop = Expr::apps(
+            Expr::const_str("Or"),
+            [concrete_tuple_eq_prop(r, v, sorts), prop],
+        );
     }
     prop
 }
@@ -3649,7 +3973,11 @@ fn concrete_tuple_membership(
         .map(|j| {
             let prop = Expr::apps(
                 Expr::const_str_levels("Eq", lvl()),
-                [col_type(&sorts[j]), col_lit(&sorts[j], v[j]), col_lit(&sorts[j], v[j])],
+                [
+                    col_type(&sorts[j]),
+                    col_lit(&sorts[j], v[j]),
+                    col_lit(&sorts[j], v[j]),
+                ],
             );
             let proof = Expr::apps(
                 Expr::const_str_levels("Eq.refl", lvl()),
@@ -3679,12 +4007,18 @@ fn and_proj(props: &[Expr], j: usize, hconj: Expr) -> Expr {
     }
     let mut cur = hconj;
     for k in 0..j {
-        cur = Expr::apps(Expr::const_str("And.right"), [props[k].clone(), tail(k + 1), cur]);
+        cur = Expr::apps(
+            Expr::const_str("And.right"),
+            [props[k].clone(), tail(k + 1), cur],
+        );
     }
     if j == props.len() - 1 {
         cur
     } else {
-        Expr::apps(Expr::const_str("And.left"), [props[j].clone(), tail(j + 1), cur])
+        Expr::apps(
+            Expr::const_str("And.left"),
+            [props[j].clone(), tail(j + 1), cur],
+        )
     }
 }
 
@@ -3701,11 +4035,16 @@ fn explicit_closed_tuple(states: &[Vec<u64>], sorts: &[ColSort]) -> (Expr, Expr)
     let lvl = || vec![Level::succ(Level::zero())];
     let n = states[0].len();
     let eq_at = |j: usize, a: Expr, b: Expr| {
-        Expr::apps(Expr::const_str_levels("Eq", lvl()), [col_type(&sorts[j]), a, b])
+        Expr::apps(
+            Expr::const_str_levels("Eq", lvl()),
+            [col_type(&sorts[j]), a, b],
+        )
     };
     // The stutter hypothesis `⋀_j Eq T_j x'_j x_j` with x_0 at `x0`, x'_0 at `xp0` (per-column sort).
     let stutter_props = |x0: u32, xp0: u32| -> Vec<Expr> {
-        (0..n).map(|j| eq_at(j, Expr::bvar(xp0 - j as u32), Expr::bvar(x0 - j as u32))).collect()
+        (0..n)
+            .map(|j| eq_at(j, Expr::bvar(xp0 - j as u32), Expr::bvar(x0 - j as u32)))
+            .collect()
     };
     let stutter_ty = |x0: u32, xp0: u32| -> Expr {
         let props = stutter_props(x0, xp0);
@@ -3721,6 +4060,7 @@ fn explicit_closed_tuple(states: &[Vec<u64>], sorts: &[ColSort]) -> (Expr, Expr)
     // x'_0..x'_{n-1}, so the binder at position `i` (outermost=0) has sort `sorts[i % n]`.
     let cod = tuple_membership_disjunction(states, (n + 1) as u32, sorts); // ⋁ x'=r_k, x'_0 @ n+1
     let hn_ty = stutter_ty(2 * n as u32, n as u32); // depth 2n+1: x_0@2n, x'_0@n
+
     // hj domain is at depth 2n (only the 2n vars in scope): x_0 = bvar(2n-1).
     let hj_ty = tuple_membership_disjunction(states, (2 * n - 1) as u32, sorts);
     let mut ty = cod;
@@ -3753,7 +4093,14 @@ fn explicit_closed_tuple(states: &[Vec<u64>], sorts: &[ColSort]) -> (Expr, Expr)
             let hv_j = tuple_eq_proj(r, x0, j, Expr::bvar(0), &srt); // Eq x_j r_{k,j}
             let trans = Expr::apps(
                 Expr::const_str_levels("Eq.trans", lvl()),
-                [col_type(&srt[j]), xpj, xj, col_lit(&srt[j], r[j]), hn_j, hv_j],
+                [
+                    col_type(&srt[j]),
+                    xpj,
+                    xj,
+                    col_lit(&srt[j], r[j]),
+                    hn_j,
+                    hv_j,
+                ],
             ); // Eq x'_j r_{k,j}
             let prop = eq_at(j, Expr::bvar(xp0 - j as u32), col_lit(&srt[j], r[j]));
             facts.push((prop, trans));
@@ -3763,7 +4110,11 @@ fn explicit_closed_tuple(states: &[Vec<u64>], sorts: &[ColSort]) -> (Expr, Expr)
     };
     let body = or_rec_tuple_membership(states, (2 * n + 1) as u32, 1, d0, &cod_fn, &case, sorts);
     // Wrap λ for hn, hj, then the 2n value vars (sort per position).
-    let mut term = Expr::lam(BinderInfo::Default, stutter_ty(2 * n as u32, n as u32), body);
+    let mut term = Expr::lam(
+        BinderInfo::Default,
+        stutter_ty(2 * n as u32, n as u32),
+        body,
+    );
     term = Expr::lam(BinderInfo::Default, hj_ty, term);
     for i in (0..(2 * n)).rev() {
         term = Expr::lam(BinderInfo::Default, col_type(&sorts[i % n]), term);
@@ -3967,7 +4318,9 @@ pub(crate) fn balanced_bool_and(mut legs: Vec<Expr>) -> Expr {
 /// nothing — such a cert must carry the general safety leg, enforced by the verify orchestrator
 /// exactly as in the sub-threshold lane).
 fn explicit_safety_nonneg_bool(states: &[Vec<u64>], sorts: &[ColSort]) -> Expr {
-    let int_cols: Vec<usize> = (0..sorts.len()).filter(|&j| sorts[j] == ColSort::Int).collect();
+    let int_cols: Vec<usize> = (0..sorts.len())
+        .filter(|&j| sorts[j] == ColSort::Int)
+        .collect();
     if int_cols.is_empty() {
         return Expr::const_str("Bool.true");
     }
@@ -3977,7 +4330,10 @@ fn explicit_safety_nonneg_bool(states: &[Vec<u64>], sorts: &[ColSort]) -> Expr {
             let mut per_state: Vec<Expr> = int_cols
                 .iter()
                 .map(|&j| {
-                    Expr::apps(Expr::const_str("Nat.ble"), [Expr::nat_lit(0), Expr::nat_lit(s[j])])
+                    Expr::apps(
+                        Expr::const_str("Nat.ble"),
+                        [Expr::nat_lit(0), Expr::nat_lit(s[j])],
+                    )
                 })
                 .collect();
             if per_state.len() == 1 {
@@ -4024,7 +4380,10 @@ pub(crate) fn certify_explicit_fixpoint_set_reflected(
     img.sort_unstable();
     img.dedup();
     // Fast Rust pre-checks (the kernel is still the arbiter below; these keep declines cheap).
-    if init_canon.iter().any(|iv| states.binary_search(iv).is_err()) {
+    if init_canon
+        .iter()
+        .any(|iv| states.binary_search(iv).is_err())
+    {
         return None; // an Init value outside R → fail-closed
     }
     if img.iter().any(|v| states.binary_search(v).is_err()) {
@@ -4101,9 +4460,10 @@ pub(crate) fn recognize_affine_next(e: &tla_core::ast::Expr, var: &str) -> Optio
     };
     // Try (step, guard) in both conjunct orders.
     for (step, guard) in [(&a.node, &b.node), (&b.node, &a.node)] {
-        if let (Some(delta), Some(bound)) =
-            (parse_prime_eq_var_plus(step, var), parse_var_lt_lit(guard, var))
-        {
+        if let (Some(delta), Some(bound)) = (
+            parse_prime_eq_var_plus(step, var),
+            parse_var_lt_lit(guard, var),
+        ) {
             return Some(AffineNextShape { delta, bound });
         }
     }
@@ -4127,7 +4487,11 @@ fn parse_prime_eq_var_plus(e: &tla_core::ast::Expr, var: &str) -> Option<u64> {
     };
     let lit = |n: &tla_core::ast::Expr| -> Option<u64> {
         if let E::Int(i) = n {
-            i.to_string().parse::<i64>().ok().filter(|v| *v >= 0).map(|v| v as u64)
+            i.to_string()
+                .parse::<i64>()
+                .ok()
+                .filter(|v| *v >= 0)
+                .map(|v| v as u64)
         } else {
             None
         }
@@ -4152,7 +4516,11 @@ fn parse_var_lt_lit(e: &tla_core::ast::Expr, var: &str) -> Option<u64> {
         return None;
     }
     if let E::Int(i) = &b.node {
-        i.to_string().parse::<i64>().ok().filter(|v| *v >= 0).map(|v| v as u64)
+        i.to_string()
+            .parse::<i64>()
+            .ok()
+            .filter(|v| *v >= 0)
+            .map(|v| v as u64)
     } else {
         None
     }
@@ -4226,7 +4594,11 @@ pub(crate) fn recognize_unbounded_affine(
         return None;
     }
     let delta = parse_prime_eq_var_plus(next, var)?;
-    Some(UnboundedAffineShape { init: c, delta, bound })
+    Some(UnboundedAffineShape {
+        init: c,
+        delta,
+        bound,
+    })
 }
 
 /// LEG 1 — INITIATION `Init ⇒ J`, i.e. `x = c ⇒ x ≥ 0` for the recognized ground `c`. The invariant
@@ -4282,7 +4654,11 @@ fn unbounded_preservation() -> (Expr, Expr) {
     let term = Expr::lam(
         BinderInfo::Default,
         int_ty(),
-        Expr::lam(BinderInfo::Default, int_nonneg(Expr::bvar(0)), Expr::bvar(0)),
+        Expr::lam(
+            BinderInfo::Default,
+            int_nonneg(Expr::bvar(0)),
+            Expr::bvar(0),
+        ),
     );
     (ty, term)
 }
@@ -4329,8 +4705,10 @@ fn unbounded_consecution_ge(delta: u64, bound: u64) -> (Expr, Expr) {
     let x = || Expr::bvar(1);
     let h0 = Expr::apps(Expr::const_str("Int.NonNeg.mk"), [Expr::nat_lit(delta)]);
     // add_le_add_left 0 δ h0 x : le (x+0) (x+δ)
-    let step =
-        Expr::apps(Expr::const_str("Int.add_le_add_left"), [ofnat(0), ofnat(delta), h0, x()]);
+    let step = Expr::apps(
+        Expr::const_str("Int.add_le_add_left"),
+        [ofnat(0), ofnat(delta), h0, x()],
+    );
     // motive λw. le w (x+δ)   (under the motive binder, w=bvar0 and x=bvar2)
     let motive = Expr::lam(
         BinderInfo::Default,
@@ -4413,7 +4791,11 @@ pub(crate) fn certify_unbounded_invariant(
     {
         return None;
     }
-    Some((expr_to_bytes(&init_tm)?, expr_to_bytes(&cons_tm)?, expr_to_bytes(&pres_tm)?))
+    Some((
+        expr_to_bytes(&init_tm)?,
+        expr_to_bytes(&cons_tm)?,
+        expr_to_bytes(&pres_tm)?,
+    ))
 }
 
 /// RE-CHECK the three serialized unbounded-invariant legs against the obligation TYPES rebuilt from
@@ -4532,7 +4914,11 @@ fn all_n_initiation() -> (Expr, Expr) {
         ),
     );
     // TERM — binders [N, x, h]: N=bvar2, x=bvar1, h=bvar0.
-    let motive = Expr::lam(BinderInfo::Default, int_ty(), ile(Expr::bvar(3), Expr::bvar(0)));
+    let motive = Expr::lam(
+        BinderInfo::Default,
+        int_ty(),
+        ile(Expr::bvar(3), Expr::bvar(0)),
+    );
     let symm = Expr::apps(
         Expr::const_str_levels("Eq.symm", lvl1()),
         [int_ty(), Expr::bvar(1), Expr::bvar(2), Expr::bvar(0)],
@@ -4554,7 +4940,11 @@ fn all_n_initiation() -> (Expr, Expr) {
         Expr::lam(
             BinderInfo::Default,
             int_ty(),
-            Expr::lam(BinderInfo::Default, eq_int(Expr::bvar(0), Expr::bvar(1)), body),
+            Expr::lam(
+                BinderInfo::Default,
+                eq_int(Expr::bvar(0), Expr::bvar(1)),
+                body,
+            ),
         ),
     );
     (ty, term)
@@ -4631,7 +5021,11 @@ fn all_n_consecution(delta: u64) -> (Expr, Expr) {
         [n(), x(), iadd(x(), ofnat(delta)), Expr::bvar(1), w],
     );
     // transport to x' along Eq.symm heq with motive λv. le N v (v=bvar0, N=bvar5).
-    let motive = Expr::lam(BinderInfo::Default, int_ty(), ile(Expr::bvar(5), Expr::bvar(0)));
+    let motive = Expr::lam(
+        BinderInfo::Default,
+        int_ty(),
+        ile(Expr::bvar(5), Expr::bvar(0)),
+    );
     let symm = Expr::apps(
         Expr::const_str_levels("Eq.symm", lvl1()),
         [int_ty(), xp(), iadd(x(), ofnat(delta)), Expr::bvar(0)],
@@ -4688,7 +5082,11 @@ fn all_n_safety() -> (Expr, Expr) {
         Expr::lam(
             BinderInfo::Default,
             int_ty(),
-            Expr::lam(BinderInfo::Default, ile(Expr::bvar(1), Expr::bvar(0)), Expr::bvar(0)),
+            Expr::lam(
+                BinderInfo::Default,
+                ile(Expr::bvar(1), Expr::bvar(0)),
+                Expr::bvar(0),
+            ),
         ),
     );
     (ty, term)
@@ -4710,7 +5108,11 @@ pub(crate) fn certify_all_n_kernel_legs(
     {
         return None;
     }
-    Some((expr_to_bytes(&init_tm)?, expr_to_bytes(&cons_tm)?, expr_to_bytes(&safe_tm)?))
+    Some((
+        expr_to_bytes(&init_tm)?,
+        expr_to_bytes(&cons_tm)?,
+        expr_to_bytes(&safe_tm)?,
+    ))
 }
 
 /// RE-CHECK one serialized all-N kernel leg against the obligation type rebuilt from the
@@ -4809,10 +5211,12 @@ pub(crate) fn recognize_unbounded_affine_tuple(
     let mut pairs = Vec::with_capacity(vars.len());
     for &v in vars {
         // Init: the unique conjunct `v = c` (nonneg).
-        let c = init_c.iter().find_map(|e| match parse_var_eq_nonneg_lit(e) {
-            Some((w, c)) if w == v => Some(c),
-            _ => None,
-        })?;
+        let c = init_c
+            .iter()
+            .find_map(|e| match parse_var_eq_nonneg_lit(e) {
+                Some((w, c)) if w == v => Some(c),
+                _ => None,
+            })?;
         // Next: the unique conjunct `v' = v + δ` (nonneg, unguarded).
         let delta = next_c.iter().find_map(|e| parse_prime_eq_var_plus(e, v))?;
         // Safety: the unique conjunct `v ≥ 0`.
@@ -4827,9 +5231,12 @@ pub(crate) fn recognize_unbounded_affine_tuple(
     let init_ok = init_c.iter().all(
         |e| matches!(parse_var_eq_nonneg_lit(e), Some((ref w, _)) if vars.contains(&w.as_str())),
     );
-    let next_ok =
-        next_c.iter().all(|e| vars.iter().any(|v| parse_prime_eq_var_plus(e, v).is_some()));
-    let safety_ok = safety_c.iter().all(|e| vars.iter().any(|v| is_var_ge_zero(e, v)));
+    let next_ok = next_c
+        .iter()
+        .all(|e| vars.iter().any(|v| parse_prime_eq_var_plus(e, v).is_some()));
+    let safety_ok = safety_c
+        .iter()
+        .all(|e| vars.iter().any(|v| is_var_ge_zero(e, v)));
     if !init_ok || !next_ok || !safety_ok {
         return None;
     }
@@ -4842,7 +5249,10 @@ fn unbounded_initiation_tuple(pairs: &[(u64, u64)]) -> (Expr, Expr) {
     let facts: Vec<(Expr, Expr)> = pairs
         .iter()
         .map(|&(c, _)| {
-            (ub_nonneg(ofnat(c)), Expr::apps(Expr::const_str("Int.NonNeg.mk"), [Expr::nat_lit(c)]))
+            (
+                ub_nonneg(ofnat(c)),
+                Expr::apps(Expr::const_str("Int.NonNeg.mk"), [Expr::nat_lit(c)]),
+            )
         })
         .collect();
     and_intro_chain(&facts)
@@ -4862,8 +5272,9 @@ fn unbounded_consecution_tuple(pairs: &[(u64, u64)]) -> (Expr, Expr) {
     let ante = ub_and_prop(&ante_props);
     // The codomain lives at depth `n+1` (one more binder for the antecedent hypothesis `h`): x_0 at
     // bvar(n) .. x_{n-1} at bvar(1) → outermost-slot `n`. `NonNeg (x_j + δ_j)`.
-    let cod_props: Vec<Expr> =
-        (0..n).map(|j| ub_nonneg(iadd(ub_var(n as u32, j), ofnat(pairs[j].1)))).collect();
+    let cod_props: Vec<Expr> = (0..n)
+        .map(|j| ub_nonneg(iadd(ub_var(n as u32, j), ofnat(pairs[j].1))))
+        .collect();
     let cod = ub_and_prop(&cod_props);
     let mut ty = Expr::pi(BinderInfo::Default, ante, cod);
     for _ in 0..n {
@@ -4873,6 +5284,7 @@ fn unbounded_consecution_tuple(pairs: &[(u64, u64)]) -> (Expr, Expr) {
     // λ(x_0..x_{n-1}:Int)(h: ⋀_j NonNeg x_j). And.intro-chain over j of `Int.NonNeg.add x_j δ_j (proj_j
     // h) (NonNeg.mk δ_j)`. In the body (depth n+1) x_j = bvar(n-j) and h = bvar(0).
     let x_at = |j: usize| ub_var(n as u32, j); // body depth n+1
+
     // The antecedent's residual prop after `d` right-descents (the tail ⋀_{k≥d} NonNeg x_k), rebuilt at
     // the BODY depth (n+1): x_k = bvar(n-k).
     let residual_prop = |d: usize| -> Expr {
@@ -4911,7 +5323,11 @@ fn unbounded_consecution_tuple(pairs: &[(u64, u64)]) -> (Expr, Expr) {
             (prop, proof)
         })
         .collect();
-    let mut term = Expr::lam(BinderInfo::Default, ante_props_ty(pairs), and_intro_chain(&facts).1);
+    let mut term = Expr::lam(
+        BinderInfo::Default,
+        ante_props_ty(pairs),
+        and_intro_chain(&facts).1,
+    );
     for _ in 0..n {
         term = Expr::lam(BinderInfo::Default, int_ty(), term);
     }
@@ -4963,7 +5379,11 @@ pub(crate) fn certify_unbounded_invariant_tuple(
     {
         return None;
     }
-    Some((expr_to_bytes(&init_tm)?, expr_to_bytes(&cons_tm)?, expr_to_bytes(&pres_tm)?))
+    Some((
+        expr_to_bytes(&init_tm)?,
+        expr_to_bytes(&cons_tm)?,
+        expr_to_bytes(&pres_tm)?,
+    ))
 }
 
 /// RE-CHECK the three serialized multi-var legs against the obligation TYPES rebuilt from `tuple`
@@ -5046,14 +5466,18 @@ pub(crate) fn recognize_unbounded_relational_eq(
     if init_c.len() != 2 {
         return None;
     }
-    let c0 = init_c.iter().find_map(|e| match parse_var_eq_nonneg_lit(e) {
-        Some((w, c)) if w == v0 => Some(c),
-        _ => None,
-    })?;
-    let c1 = init_c.iter().find_map(|e| match parse_var_eq_nonneg_lit(e) {
-        Some((w, c)) if w == v1 => Some(c),
-        _ => None,
-    })?;
+    let c0 = init_c
+        .iter()
+        .find_map(|e| match parse_var_eq_nonneg_lit(e) {
+            Some((w, c)) if w == v0 => Some(c),
+            _ => None,
+        })?;
+    let c1 = init_c
+        .iter()
+        .find_map(|e| match parse_var_eq_nonneg_lit(e) {
+            Some((w, c)) if w == v1 => Some(c),
+            _ => None,
+        })?;
     if c0 != c1 {
         return None; // the two variables must START equal for `x=y` to hold initially
     }
@@ -5068,7 +5492,10 @@ pub(crate) fn recognize_unbounded_relational_eq(
     if d0 != d1 {
         return None; // the SAME increment on both — otherwise x=y is not preserved
     }
-    Some(UnboundedRelationalShape { init: c0, delta: d0 })
+    Some(UnboundedRelationalShape {
+        init: c0,
+        delta: d0,
+    })
 }
 
 /// RELATIONAL LEG 1 — INITIATION `Init ⇒ J`, i.e. `x=c ∧ y=c ⇒ x=y`, which at the ground init is
@@ -5092,17 +5519,24 @@ fn relational_consecution(delta: u64) -> (Expr, Expr) {
     let int_ty = || Expr::const_str("Int");
     // TYPE at depth: x=bvar1, y=bvar0 in the antecedent; under `h` (depth3) x=2,y=1.
     let ante = ub_eq_int(Expr::bvar(1), Expr::bvar(0)); // Eq x y   (depth2: x=1,y=0)
-    let cod = ub_eq_int(iadd(Expr::bvar(2), ofnat(delta)), iadd(Expr::bvar(1), ofnat(delta))); // depth3
+    let cod = ub_eq_int(
+        iadd(Expr::bvar(2), ofnat(delta)),
+        iadd(Expr::bvar(1), ofnat(delta)),
+    ); // depth3
     let mut ty = Expr::pi(BinderInfo::Default, ante, cod);
     ty = Expr::pi(BinderInfo::Default, int_ty(), ty); // y
     let ty = Expr::pi(BinderInfo::Default, int_ty(), ty); // x
+
     // TERM: λ(x y:Int)(h:Eq x y). Eq.subst Int (λw. Eq (x+δ) (w+δ)) x y h (Eq.refl Int (x+δ))
     // In the body (depth3): x=bvar2, y=bvar1, h=bvar0. The motive binds `w` (its body is depth4).
     let motive = Expr::lam(
         BinderInfo::Default,
         int_ty(),
         // depth4: x=3, w=0 → Eq (x+δ) (w+δ)
-        ub_eq_int(iadd(Expr::bvar(3), ofnat(delta)), iadd(Expr::bvar(0), ofnat(delta))),
+        ub_eq_int(
+            iadd(Expr::bvar(3), ofnat(delta)),
+            iadd(Expr::bvar(0), ofnat(delta)),
+        ),
     );
     let refl_xd = Expr::apps(
         Expr::const_str_levels("Eq.refl", lvl()),
@@ -5110,7 +5544,14 @@ fn relational_consecution(delta: u64) -> (Expr, Expr) {
     );
     let subst = Expr::apps(
         Expr::const_str_levels("Eq.subst", lvl()),
-        [int_ty(), motive, Expr::bvar(2), Expr::bvar(1), Expr::bvar(0), refl_xd],
+        [
+            int_ty(),
+            motive,
+            Expr::bvar(2),
+            Expr::bvar(1),
+            Expr::bvar(0),
+            refl_xd,
+        ],
     );
     let term = Expr::lam(
         BinderInfo::Default,
@@ -5118,7 +5559,11 @@ fn relational_consecution(delta: u64) -> (Expr, Expr) {
         Expr::lam(
             BinderInfo::Default,
             int_ty(),
-            Expr::lam(BinderInfo::Default, ub_eq_int(Expr::bvar(1), Expr::bvar(0)), subst),
+            Expr::lam(
+                BinderInfo::Default,
+                ub_eq_int(Expr::bvar(1), Expr::bvar(0)),
+                subst,
+            ),
         ),
     );
     (ty, term)
@@ -5138,7 +5583,11 @@ fn relational_preservation() -> (Expr, Expr) {
         Expr::lam(
             BinderInfo::Default,
             int_ty(),
-            Expr::lam(BinderInfo::Default, ub_eq_int(Expr::bvar(1), Expr::bvar(0)), Expr::bvar(0)),
+            Expr::lam(
+                BinderInfo::Default,
+                ub_eq_int(Expr::bvar(1), Expr::bvar(0)),
+                Expr::bvar(0),
+            ),
         ),
     );
     (ty, term)
@@ -5160,7 +5609,11 @@ pub(crate) fn certify_unbounded_relational(
     {
         return None;
     }
-    Some((expr_to_bytes(&init_tm)?, expr_to_bytes(&cons_tm)?, expr_to_bytes(&pres_tm)?))
+    Some((
+        expr_to_bytes(&init_tm)?,
+        expr_to_bytes(&cons_tm)?,
+        expr_to_bytes(&pres_tm)?,
+    ))
 }
 
 /// RE-CHECK the three serialized relational legs against the obligation TYPES rebuilt from `shape`.
@@ -5220,8 +5673,10 @@ fn next_completeness_bool(reachable: &[u64], domain: &[u64], shape: &AffineNextS
     for &s in reachable {
         for &sp in domain {
             let not_next = Expr::apps(Expr::const_str("Bool.not"), [next_embed_nat(s, sp, shape)]);
-            let leg =
-                Expr::apps(Expr::const_str("Bool.or"), [not_next, bool_lit(rset.contains(&sp))]);
+            let leg = Expr::apps(
+                Expr::const_str("Bool.or"),
+                [not_next, bool_lit(rset.contains(&sp))],
+            );
             legs.push(leg);
         }
     }
@@ -5292,7 +5747,10 @@ pub(crate) fn liveness_enabledness_bool(
         .iter()
         .zip(has_succ.iter())
         .map(|(s, &hs)| {
-            Expr::apps(Expr::const_str("Bool.or"), [embed_pred_ir(p, s, s), bool_lit(hs)])
+            Expr::apps(
+                Expr::const_str("Bool.or"),
+                [embed_pred_ir(p, s, s), bool_lit(hs)],
+            )
         })
         .collect();
     balanced_bool_and(legs)
@@ -5303,7 +5761,10 @@ pub(crate) fn liveness_enabledness_bool(
 /// (`pred == m ≥ 0`, asserting the affine measure is Nat-bounded on every reachable state). Folded
 /// BALANCED over `R`; reduces to `Bool.true` iff `pred` holds at every state. Empty `R` ⇒ `Bool.true`.
 pub(crate) fn liveness_state_pred_fold_bool(reachable: &[Vec<u64>], pred: &PredIR) -> Expr {
-    let legs: Vec<Expr> = reachable.iter().map(|s| embed_pred_ir(pred, s, s)).collect();
+    let legs: Vec<Expr> = reachable
+        .iter()
+        .map(|s| embed_pred_ir(pred, s, s))
+        .collect();
     balanced_bool_and(legs)
 }
 
@@ -5320,8 +5781,10 @@ pub(crate) fn liveness_edge_pred_fold_bool(
     edges: &[(usize, usize)],
     pred: &PredIR,
 ) -> Expr {
-    let legs: Vec<Expr> =
-        edges.iter().map(|&(s, t)| embed_pred_ir(pred, &reachable[s], &reachable[t])).collect();
+    let legs: Vec<Expr> = edges
+        .iter()
+        .map(|&(s, t)| embed_pred_ir(pred, &reachable[s], &reachable[t]))
+        .collect();
     balanced_bool_and(legs)
 }
 
@@ -5377,7 +5840,12 @@ pub(crate) fn verify_next_completeness(
 /// The kernel-reducible `Bool` `Init_embed(s) = ⋁_i Nat.beq s c_i` for `Init = ⋁_i (x = c_i)`. Empty
 /// init ⇒ `Bool.false` (Init never holds).
 fn init_embed_nat(s: u64, init_values: &[u64]) -> Expr {
-    let beq = |c: u64| Expr::apps(Expr::const_str("Nat.beq"), [Expr::nat_lit(s), Expr::nat_lit(c)]);
+    let beq = |c: u64| {
+        Expr::apps(
+            Expr::const_str("Nat.beq"),
+            [Expr::nat_lit(s), Expr::nat_lit(c)],
+        )
+    };
     let mut acc: Option<Expr> = None;
     for &c in init_values {
         acc = Some(match acc {
@@ -5395,8 +5863,14 @@ fn init_completeness_bool(domain: &[u64], reachable: &[u64], init_values: &[u64]
     let rset: std::collections::BTreeSet<u64> = reachable.iter().copied().collect();
     let mut legs = Vec::with_capacity(domain.len());
     for &s in domain {
-        let not_init = Expr::apps(Expr::const_str("Bool.not"), [init_embed_nat(s, init_values)]);
-        let leg = Expr::apps(Expr::const_str("Bool.or"), [not_init, bool_lit(rset.contains(&s))]);
+        let not_init = Expr::apps(
+            Expr::const_str("Bool.not"),
+            [init_embed_nat(s, init_values)],
+        );
+        let leg = Expr::apps(
+            Expr::const_str("Bool.or"),
+            [not_init, bool_lit(rset.contains(&s))],
+        );
         legs.push(leg);
     }
     balanced_bool_and(legs)
@@ -5547,7 +6021,10 @@ fn embed_pred(e: &tla_core::ast::Expr, s: &[u64], sp: &[u64], vars: &[&str]) -> 
             embed_pred(&b.node, s, sp, vars)?,
         )),
         E::Equiv(a, b) => {
-            let (pa, pb) = (embed_pred(&a.node, s, sp, vars)?, embed_pred(&b.node, s, sp, vars)?);
+            let (pa, pb) = (
+                embed_pred(&a.node, s, sp, vars)?,
+                embed_pred(&b.node, s, sp, vars)?,
+            );
             Some(b2(
                 "Bool.or",
                 b2("Bool.and", pa.clone(), pb.clone()),
@@ -5572,7 +6049,9 @@ fn embed_pred(e: &tla_core::ast::Expr, s: &[u64], sp: &[u64], vars: &[&str]) -> 
             E::Tuple(items) => {
                 let mut acc: Option<Expr> = None;
                 for it in items {
-                    let E::Ident(name, _) = &it.node else { return None };
+                    let E::Ident(name, _) = &it.node else {
+                        return None;
+                    };
                     let c = col(name)?;
                     let l = beq(Expr::nat_lit(*sp.get(c)?), Expr::nat_lit(*s.get(c)?));
                     acc = Some(match acc {
@@ -5630,7 +6109,11 @@ fn embed_eq_pred(
     let cond = embed_pred(c, s, sp, vars)?;
     let then_eq = embed_eq_pred(v, t, s, sp, vars)?;
     let else_eq = embed_eq_pred(v, e, s, sp, vars)?;
-    Some(b2("Bool.or", b2("Bool.and", cond.clone(), then_eq), b2("Bool.and", bnot(cond), else_eq)))
+    Some(b2(
+        "Bool.or",
+        b2("Bool.and", cond.clone(), then_eq),
+        b2("Bool.and", bnot(cond), else_eq),
+    ))
 }
 
 /// Outcome of the Phase-A RUNTIME recognizer/embedder cross-check (`docs/kernel-checked-tla-plan.md`,
@@ -5671,7 +6154,11 @@ pub(crate) fn cross_check_pred_embedders<'a>(
             }
         }
     }
-    if compared > 0 { EmbedCrossCheck::Agree(compared) } else { EmbedCrossCheck::Uncovered }
+    if compared > 0 {
+        EmbedCrossCheck::Agree(compared)
+    } else {
+        EmbedCrossCheck::Uncovered
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))] // staged: general TLA+ predicate embedder, wired (with a serializable IR) in the next slice
@@ -5692,8 +6179,10 @@ fn next_completeness_general_bool(
         for &sp in domain {
             let next = embed_pred(next_ast, &[s], &[sp], &vars)?; // out of fragment → None
             let not_next = Expr::apps(Expr::const_str("Bool.not"), [next]);
-            let leg =
-                Expr::apps(Expr::const_str("Bool.or"), [not_next, bool_lit(rset.contains(&sp))]);
+            let leg = Expr::apps(
+                Expr::const_str("Bool.or"),
+                [not_next, bool_lit(rset.contains(&sp))],
+            );
             legs.push(leg);
         }
     }
@@ -5906,9 +6395,19 @@ pub(crate) fn recognize_val_sorts(
         // making `rec.on >= 0` (Bool punned as Int) fail closed. Byte-identical for all-Int records.
         E::RecordAccess(inner, field) => {
             let (pack, sort) = col_ref(&inner.node)?;
-            let ColSort::Record { base, fields, cells } = sort else { return None };
+            let ColSort::Record {
+                base,
+                fields,
+                cells,
+            } = sort
+            else {
+                return None;
+            };
             let idx = fields.iter().position(|f| f == &field.name.node)?;
-            if !matches!(crate::explicit_fixpoint_cert::cell_kind(cells, idx), CellSort::Int) {
+            if !matches!(
+                crate::explicit_fixpoint_cert::cell_kind(cells, idx),
+                CellSort::Int
+            ) {
                 return None; // non-Int position (Bool / Enum) ⇒ EQUALITY-ONLY ⇒ not a bare value
             }
             let place = base.checked_pow(idx as u32)?;
@@ -5923,7 +6422,13 @@ pub(crate) fn recognize_val_sorts(
                 // on a Bool position fails closed). The index is an Int LITERAL (Int-prefix domain) OR an
                 // atom KEY (model/String domain), resolved to its slot via the SHARED
                 // [`resolve_func_domain_slot`] (kind-checked, out-of-domain / cross-kind ⇒ closed).
-                ColSort::Func { base, arity, cells, dom, dom_kind } => {
+                ColSort::Func {
+                    base,
+                    arity,
+                    cells,
+                    dom,
+                    dom_kind,
+                } => {
                     let i = resolve_func_domain_slot(&arg.node, dom, *dom_kind, *arity)?;
                     if !matches!(
                         crate::explicit_fixpoint_cert::cell_kind(cells, i as usize),
@@ -5937,7 +6442,11 @@ pub(crate) fn recognize_val_sorts(
                 // SEQUENCE 1-based index `s[i]` (TLA sequences are 1-indexed): element `i` lives at pack
                 // place `i-1` in base `D=base+1`, and `∸1` undoes the `+1` digit shift. EXACT for a
                 // present element (digit `≥1`). `i≥1` required; `i=0` is out of fragment.
-                ColSort::Seq { base, max_len, elem } => {
+                ColSort::Seq {
+                    base,
+                    max_len,
+                    elem,
+                } => {
                     // A bare `s[i]` VALUE is only an Int element (a genuine Nat, usable in ordering/arith);
                     // a Bool/atom element is EQUALITY-ONLY (a code carries no order) ⇒ decline the bare value
                     // (fail-closed), exactly like a Bool/Enum `Record`/`Func` position.
@@ -5950,7 +6459,10 @@ pub(crate) fn recognize_val_sorts(
                     }
                     let d = base.checked_add(1)?;
                     let place = d.checked_pow((i - 1) as u32)?;
-                    Some(ValIR::Sub(Box::new(digit(pack, place, d)), Box::new(ValIR::Lit(1))))
+                    Some(ValIR::Sub(
+                        Box::new(digit(pack, place, d)),
+                        Box::new(ValIR::Lit(1)),
+                    ))
                 }
                 _ => None,
             }
@@ -5958,27 +6470,43 @@ pub(crate) fn recognize_val_sorts(
         // ── SEQUENCE `Head(s)` = (pack mod D) ∸ 1 over a Seq column. ──
         E::Apply(head, args) if is_op_name(&head.node, "Head") && args.len() == 1 => {
             let (pack, sort) = col_ref(&args[0].node)?;
-            let ColSort::Seq { base, elem, .. } = sort else { return None };
+            let ColSort::Seq { base, elem, .. } = sort else {
+                return None;
+            };
             // Bare `Head(s)` VALUE is Int-element only (equality-only for a Bool/atom element) — fail-closed.
             if !matches!(elem, CellSort::Int) {
                 return None;
             }
             let d = base.checked_add(1)?;
-            Some(ValIR::Sub(Box::new(digit(pack, 1, d)), Box::new(ValIR::Lit(1))))
+            Some(ValIR::Sub(
+                Box::new(digit(pack, 1, d)),
+                Box::new(ValIR::Lit(1)),
+            ))
         }
         // ── SEQUENCE `Len(s)` = count of NONZERO base-D digits over a Seq column. Bounded fold over the
         // fixed `max_len` positions; EXACT on the self-delimiting pack. ──
         E::Apply(head, args) if is_op_name(&head.node, "Len") && args.len() == 1 => {
             let (pack, sort) = col_ref(&args[0].node)?;
             // `Len` is ELEMENT-AGNOSTIC (a count of nonzero base-`D` digits) — sound for any element leaf.
-            let ColSort::Seq { base, max_len, .. } = sort else { return None };
-            Some(ValIR::SeqLen { pack: Box::new(pack), base: *base, max_len: *max_len })
+            let ColSort::Seq { base, max_len, .. } = sort else {
+                return None;
+            };
+            Some(ValIR::SeqLen {
+                pack: Box::new(pack),
+                base: *base,
+                max_len: *max_len,
+            })
         }
         // ── SEQUENCE `Tail(s)` = pack / D (drops the first digit) over a Seq column. EXACT. ──
         E::Apply(head, args) if is_op_name(&head.node, "Tail") && args.len() == 1 => {
             let (pack, sort) = col_ref(&args[0].node)?;
-            let ColSort::Seq { base, .. } = sort else { return None };
-            Some(ValIR::SeqTail { pack: Box::new(pack), base: *base })
+            let ColSort::Seq { base, .. } = sort else {
+                return None;
+            };
+            Some(ValIR::SeqTail {
+                pack: Box::new(pack),
+                base: *base,
+            })
         }
         // ── SEQUENCE `Append(s, e)` = pack + (e+1)·D^Len(s) over a Seq column: writes the shifted element
         // into the first free digit. EXACT for a sequence with room (`Len < max_len`); an over-full result
@@ -5986,7 +6514,14 @@ pub(crate) fn recognize_val_sorts(
         // element `e` must itself recognize as a `ValIR` (a nonneg small Int value). ──
         E::Apply(head, args) if is_op_name(&head.node, "Append") && args.len() == 2 => {
             let (pack, sort) = col_ref(&args[0].node)?;
-            let ColSort::Seq { base, max_len, elem } = sort else { return None };
+            let ColSort::Seq {
+                base,
+                max_len,
+                elem,
+            } = sort
+            else {
+                return None;
+            };
             // The appended element's CODE by leaf: an Int element is a recognized `ValIR` (its Nat value);
             // a `Bool` is `1|0`; an atom (`Enum`) is its label INDEX in the column's element union (KIND-
             // guarded). SeqAppend then writes `(code+1)·D^Len` — the SAME shift the encoder packs with, so
@@ -6022,7 +6557,10 @@ pub(crate) fn recognize_val_sorts(
                 }
                 _ => return None,
             };
-            Some(ValIR::SetCard { set: setir, universe })
+            Some(ValIR::SetCard {
+                set: setir,
+                universe,
+            })
         }
         // ── RECORD CONSTRUCTOR `[f_0 |-> e_0, …]` ⇒ the positional pack `Σ_i e_{σ(i)}·base^i` over the
         // CANONICAL (sorted-by-name) field order. The DUAL of field access; it
@@ -6036,15 +6574,22 @@ pub(crate) fn recognize_val_sorts(
         // the historical default `RECORD_FUNC_BASE`; columns with these fields but DIFFERENT bases
         // (ambiguous radix) fail closed — a pack at the wrong radix would misstate the equality. ──
         E::Record(entries) => {
-            let mut sorted: Vec<(&str, &tla_core::ast::Expr)> =
-                entries.iter().map(|(n, v)| (n.node.as_str(), &v.node)).collect();
+            let mut sorted: Vec<(&str, &tla_core::ast::Expr)> = entries
+                .iter()
+                .map(|(n, v)| (n.node.as_str(), &v.node))
+                .collect();
             sorted.sort_by(|a, b| a.0.cmp(b.0));
             let mut base: Option<u64> = None;
             for s in sorts {
                 // Only an ALL-INT record column (empty `cells`) admits the positional Int-value pack this
                 // constructor arm builds; a column with a Bool position would misstate the pack (its Bool
                 // field values never recognize as `ValIR` anyway, but skip it explicitly — fail-closed).
-                if let ColSort::Record { base: b, fields, cells } = s {
+                if let ColSort::Record {
+                    base: b,
+                    fields,
+                    cells,
+                } = s
+                {
                     if cells.is_empty()
                         && fields.len() == sorted.len()
                         && fields.iter().zip(sorted.iter()).all(|(f, (n, _))| f == n)
@@ -6141,7 +6686,9 @@ fn recognize_cardinality_count_fold(
     }
 
     // SHAPE 2 — Cardinality of a SET COMPREHENSION `{d ∈ D : P(d)}` over a fixed finite domain.
-    let E::SetFilter(bv, body) = arg else { return None };
+    let E::SetFilter(bv, body) = arg else {
+        return None;
+    };
     if bv.pattern.is_some() {
         return None; // tuple-destructured bound var ⇒ out of fragment
     }
@@ -6189,8 +6736,10 @@ fn recognize_cardinality_count_fold(
     for r in &repls {
         let mut subs = std::collections::HashMap::new();
         subs.insert(bound_name, r);
-        let mut substituter =
-            tla_core::SubstituteExpr { subs, span_policy: tla_core::SpanPolicy::DummyAll };
+        let mut substituter = tla_core::SubstituteExpr {
+            subs,
+            span_policy: tla_core::SpanPolicy::DummyAll,
+        };
         let substituted = tla_core::ExprFold::fold_expr(
             &mut substituter,
             tla_core::Spanned::dummy(body.node.clone()),
@@ -6348,7 +6897,11 @@ fn bool_valued_eq_form(
     // Recognize the Bool-valued side's TRUTH at UNKNOWN polarity (exact; no Nat-truncating form).
     let rhs = recognize_pred_sorts_pol(other, vars, sorts, None, mvsets, col_max)?;
     let equiv = PredIR::Equiv(Box::new(col_pred), Box::new(rhs));
-    Some(if neg { PredIR::Not(Box::new(equiv)) } else { equiv })
+    Some(if neg {
+        PredIR::Not(Box::new(equiv))
+    } else {
+        equiv
+    })
 }
 
 /// Recognize a PREDICATE as a `PredIR`, ALL-INT column assumption (no Bool columns). EXACT mirror of
@@ -6732,7 +7285,13 @@ fn recognize_setmask_eq(
     mvsets: &BTreeMap<String, Vec<String>>,
     neg: bool,
 ) -> Option<PredIR> {
-    let eq = |x: SetIR, y: SetIR| if neg { PredIR::SetNeq(x, y) } else { PredIR::SetEq(x, y) };
+    let eq = |x: SetIR, y: SetIR| {
+        if neg {
+            PredIR::SetNeq(x, y)
+        } else {
+            PredIR::SetEq(x, y)
+        }
+    };
     // Column = Column (same universe).
     if let (Some((sa, da, ka)), Some((sb, db, kb))) =
         (setmask_col(a, vars, sorts), setmask_col(b, vars, sorts))
@@ -6773,7 +7332,9 @@ fn funcsetmask_app<'a>(
 ) -> Option<(SetIR, &'a [String], crate::explicit_fixpoint_cert::EnumKind)> {
     use tla_core::ast::Expr as E;
     let col = |name: &str| vars.iter().position(|v| *v == name);
-    let E::FuncApply(inner, arg) = x else { return None };
+    let E::FuncApply(inner, arg) = x else {
+        return None;
+    };
     let (pack, i) = match &inner.node {
         E::Ident(n, _) => {
             let i = col(n)?;
@@ -6788,13 +7349,28 @@ fn funcsetmask_app<'a>(
         },
         _ => return None,
     };
-    let ColSort::FuncSetMask { arity, fdom, fdom_kind, dom, dom_kind } = sorts.get(i)? else {
+    let ColSort::FuncSetMask {
+        arity,
+        fdom,
+        fdom_kind,
+        dom,
+        dom_kind,
+    } = sorts.get(i)?
+    else {
         return None;
     };
     let slot = resolve_func_domain_slot(&arg.node, fdom, *fdom_kind, *arity)?;
     let base = sorts.get(i)?.funcsetmask_base()?;
     let place = base.checked_pow(u32::try_from(slot).ok()?)?;
-    Some((SetIR::Digit { pack: Box::new(pack), place, base }, dom.as_slice(), *dom_kind))
+    Some((
+        SetIR::Digit {
+            pack: Box::new(pack),
+            place,
+            base,
+        },
+        dom.as_slice(),
+        *dom_kind,
+    ))
 }
 
 /// A FUNC-to-SET SET-VALUED expression over one or more [`ColSort::FuncSetMask`] applications: a bare `f[k]`
@@ -6848,17 +7424,21 @@ fn recognize_funcsetmask_pred(
         // ATOM membership `x ∈ f[k]`: `x` a ground atom of the value universe's kind, bit-tested on the digit.
         E::In(x, s) => {
             let (setir, dom, kind) = funcsetmask_set_expr(&s.node, vars, sorts)?;
-            Some(match setmask_atom_index(&x.node, kind, dom, vars, mvsets)? {
-                Some(idx) => PredIR::SetMem(idx, setir),
-                None => PredIR::BoolLit(false), // a valid value-type atom absent from the universe ⇒ never a member
-            })
+            Some(
+                match setmask_atom_index(&x.node, kind, dom, vars, mvsets)? {
+                    Some(idx) => PredIR::SetMem(idx, setir),
+                    None => PredIR::BoolLit(false), // a valid value-type atom absent from the universe ⇒ never a member
+                },
+            )
         }
         E::NotIn(x, s) => {
             let (setir, dom, kind) = funcsetmask_set_expr(&s.node, vars, sorts)?;
-            Some(match setmask_atom_index(&x.node, kind, dom, vars, mvsets)? {
-                Some(idx) => PredIR::SetNotMem(idx, setir),
-                None => PredIR::BoolLit(true),
-            })
+            Some(
+                match setmask_atom_index(&x.node, kind, dom, vars, mvsets)? {
+                    Some(idx) => PredIR::SetNotMem(idx, setir),
+                    None => PredIR::BoolLit(true),
+                },
+            )
         }
         // Subset `f[k] ⊆ T`: two same-universe funcsetmask expressions, OR `f[k] ⊆ C` with `C` a constant
         // atom set (masked over the digit's `dom` — atoms of `C` outside `dom` can never be in `f[k]`).
@@ -6905,16 +7485,33 @@ fn recognize_funcsetmask_eq(
     mvsets: &BTreeMap<String, Vec<String>>,
     neg: bool,
 ) -> Option<PredIR> {
-    let eq = |x: SetIR, y: SetIR| if neg { PredIR::SetNeq(x, y) } else { PredIR::SetEq(x, y) };
-    match (funcsetmask_set_expr(a, vars, sorts), funcsetmask_set_expr(b, vars, sorts)) {
+    let eq = |x: SetIR, y: SetIR| {
+        if neg {
+            PredIR::SetNeq(x, y)
+        } else {
+            PredIR::SetEq(x, y)
+        }
+    };
+    match (
+        funcsetmask_set_expr(a, vars, sorts),
+        funcsetmask_set_expr(b, vars, sorts),
+    ) {
         (Some((sa, da, ka)), Some((sb, db, kb))) => (da == db && ka == kb).then(|| eq(sa, sb)),
         (Some((sa, dom, kind)), None) => {
             let (mask, subset_ok) = setmask_const_set(b, kind, dom, mvsets)?;
-            Some(if subset_ok { eq(sa, SetIR::Lit(mask)) } else { PredIR::BoolLit(neg) })
+            Some(if subset_ok {
+                eq(sa, SetIR::Lit(mask))
+            } else {
+                PredIR::BoolLit(neg)
+            })
         }
         (None, Some((sb, dom, kind))) => {
             let (mask, subset_ok) = setmask_const_set(a, kind, dom, mvsets)?;
-            Some(if subset_ok { eq(sb, SetIR::Lit(mask)) } else { PredIR::BoolLit(neg) })
+            Some(if subset_ok {
+                eq(sb, SetIR::Lit(mask))
+            } else {
+                PredIR::BoolLit(neg)
+            })
         }
         (None, None) => None,
     }
@@ -7051,7 +7648,9 @@ fn record_set_materialize(
         // An explicit set of record LITERALS `{[f|->v,…], …}`: key each literal directly.
         E::SetEnum(elems) => {
             for el in elems {
-                let E::Record(rfields) = &el.node else { return None }; // non-record literal ⇒ closed
+                let E::Record(rfields) = &el.node else {
+                    return None;
+                }; // non-record literal ⇒ closed
                 let mut record: Vec<(String, char, String)> = Vec::with_capacity(rfields.len());
                 for (name, vexpr) in rfields {
                     let v = record_literal_field_value(&vexpr.node)?; // a ground atom/Int/Bool leaf
@@ -7077,7 +7676,10 @@ fn record_literal_field_value(e: &tla_core::ast::Expr) -> Option<crate::value::V
         E::String(s) => Some(Value::String(Rp::from(s.as_str()))),
         E::Ident(n, _) => Some(Value::ModelValue(Rp::from(n.as_str()))),
         E::Bool(b) => Some(Value::Bool(*b)),
-        E::Int(n) => i64::try_from(n.clone()).ok().filter(|v| *v >= 0).map(Value::SmallInt),
+        E::Int(n) => i64::try_from(n.clone())
+            .ok()
+            .filter(|v| *v >= 0)
+            .map(Value::SmallInt),
         _ => None,
     }
 }
@@ -7165,10 +7767,17 @@ fn recognize_setmaskrec_eq(
     neg: bool,
     mask_over_dom: &dyn Fn(&std::collections::BTreeSet<String>, &[String]) -> u64,
 ) -> Option<PredIR> {
-    let eq = |x: SetIR, y: SetIR| if neg { PredIR::SetNeq(x, y) } else { PredIR::SetEq(x, y) };
-    if let (Some((sa, da)), Some((sb, db))) =
-        (setmaskrec_col(a, vars, sorts), setmaskrec_col(b, vars, sorts))
-    {
+    let eq = |x: SetIR, y: SetIR| {
+        if neg {
+            PredIR::SetNeq(x, y)
+        } else {
+            PredIR::SetEq(x, y)
+        }
+    };
+    if let (Some((sa, da)), Some((sb, db))) = (
+        setmaskrec_col(a, vars, sorts),
+        setmaskrec_col(b, vars, sorts),
+    ) {
         return (da == db).then(|| eq(sa, sb));
     }
     let (setir, dom, other) = if let Some((s, d)) = setmaskrec_col(a, vars, sorts) {
@@ -7216,7 +7825,9 @@ fn set_ir_universe(ir: &SetIR, sorts: &[ColSort]) -> u32 {
         SetIR::Cup(a, b) | SetIR::Cap(a, b) => {
             set_ir_universe(a, sorts).max(set_ir_universe(b, sorts))
         }
-        SetIR::Filter { source, universe, .. } => set_ir_universe(source, sorts).min(*universe),
+        SetIR::Filter {
+            source, universe, ..
+        } => set_ir_universe(source, sorts).min(*universe),
     }
 }
 
@@ -7429,8 +8040,12 @@ fn recognize_bounded_quant(
             if vars.iter().any(|v| *v == bn) || names.contains(&bn) {
                 break 'atom; // shadows a column / repeated bound name ⇒ ambiguous ⇒ closed
             }
-            let Some(dom_expr) = bv.domain.as_ref() else { break 'atom };
-            let Some(m) = materialize_atom_set(&dom_expr.node, mvsets) else { break 'atom };
+            let Some(dom_expr) = bv.domain.as_ref() else {
+                break 'atom;
+            };
+            let Some(m) = materialize_atom_set(&dom_expr.node, mvsets) else {
+                break 'atom;
+            };
             per_var.push(m);
             names.push(bn);
         }
@@ -7479,8 +8094,10 @@ fn recognize_bounded_quant(
             for (n, r) in names.iter().zip(repls.iter()) {
                 subs.insert(*n, r);
             }
-            let mut substituter =
-                tla_core::SubstituteExpr { subs, span_policy: tla_core::SpanPolicy::DummyAll };
+            let mut substituter = tla_core::SubstituteExpr {
+                subs,
+                span_policy: tla_core::SpanPolicy::DummyAll,
+            };
             let substituted = tla_core::ExprFold::fold_expr(
                 &mut substituter,
                 tla_core::Spanned::dummy(body.clone()),
@@ -7569,8 +8186,10 @@ fn recognize_bounded_quant(
         if let Some(body_ir) =
             recognize_pred_sorts_pol(body, &ext_vars, &ext_sorts, pos, mvsets, col_max)
         {
-            let instances: Vec<PredIR> =
-                elems.iter().map(|&s| subst_pred_col(&body_ir, bound_col, s)).collect();
+            let instances: Vec<PredIR> = elems
+                .iter()
+                .map(|&s| subst_pred_col(&body_ir, bound_col, s))
+                .collect();
             return Some(fold_finite_expansion(is_forall, instances));
         }
         // PATH B (fallback): AST-substitute the bound var with each element LITERAL, then recognize
@@ -7588,8 +8207,10 @@ fn recognize_bounded_quant(
             let lit = tla_core::Spanned::dummy(E::Int(num_bigint::BigInt::from(s)));
             let mut subs = std::collections::HashMap::new();
             subs.insert(bound_name, &lit);
-            let mut substituter =
-                tla_core::SubstituteExpr { subs, span_policy: tla_core::SpanPolicy::DummyAll };
+            let mut substituter = tla_core::SubstituteExpr {
+                subs,
+                span_policy: tla_core::SpanPolicy::DummyAll,
+            };
             let substituted = tla_core::ExprFold::fold_expr(
                 &mut substituter,
                 tla_core::Spanned::dummy(body.clone()),
@@ -7633,11 +8254,15 @@ fn recognize_bounded_quant(
         let hi_ir = recognize_val_sorts(&hi_e.node, vars, sorts)?;
         let cm = col_max?; // no per-column maxima ⇒ cannot bound a state-dependent domain (fail-closed)
         let m = val_ir_static_upper_bound(&hi_ir, cm)?; // `hi` has no static upper bound ⇒ decline
+
         // Cap the instance count (fail-closed above it), same budget as the ground R4 expansion. An
         // `M < lo` interval is EMPTY on every reachable state ⇒ `card = 0`, `lo..=m` empty, and the
         // fold below yields the quantifier's unit (`TRUE` for ∀, `FALSE` for ∃) — the correct vacuous
         // value.
-        let card = m.checked_sub(lo).and_then(|d| d.checked_add(1)).unwrap_or(0);
+        let card = m
+            .checked_sub(lo)
+            .and_then(|d| d.checked_add(1))
+            .unwrap_or(0);
         if card as usize > R4_FINITE_SET_CARD_CAP {
             return None;
         }
@@ -7648,8 +8273,10 @@ fn recognize_bounded_quant(
             let lit = tla_core::Spanned::dummy(E::Int(num_bigint::BigInt::from(k)));
             let mut subs = std::collections::HashMap::new();
             subs.insert(bound_name, &lit);
-            let mut substituter =
-                tla_core::SubstituteExpr { subs, span_policy: tla_core::SpanPolicy::DummyAll };
+            let mut substituter = tla_core::SubstituteExpr {
+                subs,
+                span_policy: tla_core::SpanPolicy::DummyAll,
+            };
             let substituted = tla_core::ExprFold::fold_expr(
                 &mut substituter,
                 tla_core::Spanned::dummy(body.clone()),
@@ -7683,9 +8310,19 @@ fn recognize_bounded_quant(
         ext_sorts.push(ColSort::Set { universe });
         let bpred = recognize_pred_sorts_pol(body, &ext_vars, &ext_sorts, pos, mvsets, col_max)?;
         return Some(if is_forall {
-            PredIR::SubsetForall { source, universe, bound_col, body: Box::new(bpred) }
+            PredIR::SubsetForall {
+                source,
+                universe,
+                bound_col,
+                body: Box::new(bpred),
+            }
         } else {
-            PredIR::SubsetExists { source, universe, bound_col, body: Box::new(bpred) }
+            PredIR::SubsetExists {
+                source,
+                universe,
+                bound_col,
+                body: Box::new(bpred),
+            }
         });
     }
 
@@ -7695,9 +8332,19 @@ fn recognize_bounded_quant(
     ext_sorts.push(ColSort::Int);
     let bpred = recognize_pred_sorts_pol(body, &ext_vars, &ext_sorts, pos, mvsets, col_max)?;
     Some(if is_forall {
-        PredIR::SetForall { source, universe: SET_UNIVERSE_BITS, bound_col, body: Box::new(bpred) }
+        PredIR::SetForall {
+            source,
+            universe: SET_UNIVERSE_BITS,
+            bound_col,
+            body: Box::new(bpred),
+        }
     } else {
-        PredIR::SetExists { source, universe: SET_UNIVERSE_BITS, bound_col, body: Box::new(bpred) }
+        PredIR::SetExists {
+            source,
+            universe: SET_UNIVERSE_BITS,
+            bound_col,
+            body: Box::new(bpred),
+        }
     })
 }
 
@@ -7880,41 +8527,57 @@ fn subst_val_col(v: &ValIR, col: usize, lit: u64) -> ValIR {
     match v {
         V::Var(i) | V::Prime(i) if *i == col => V::Lit(lit),
         V::Var(_) | V::Prime(_) | V::Lit(_) => v.clone(),
-        V::Add(a, b) => {
-            V::Add(Box::new(subst_val_col(a, col, lit)), Box::new(subst_val_col(b, col, lit)))
-        }
-        V::Mul(a, b) => {
-            V::Mul(Box::new(subst_val_col(a, col, lit)), Box::new(subst_val_col(b, col, lit)))
-        }
-        V::Div(a, b) => {
-            V::Div(Box::new(subst_val_col(a, col, lit)), Box::new(subst_val_col(b, col, lit)))
-        }
-        V::Mod(a, b) => {
-            V::Mod(Box::new(subst_val_col(a, col, lit)), Box::new(subst_val_col(b, col, lit)))
-        }
-        V::Sub(a, b) => {
-            V::Sub(Box::new(subst_val_col(a, col, lit)), Box::new(subst_val_col(b, col, lit)))
-        }
-        V::SeqLen { pack, base, max_len } => V::SeqLen {
+        V::Add(a, b) => V::Add(
+            Box::new(subst_val_col(a, col, lit)),
+            Box::new(subst_val_col(b, col, lit)),
+        ),
+        V::Mul(a, b) => V::Mul(
+            Box::new(subst_val_col(a, col, lit)),
+            Box::new(subst_val_col(b, col, lit)),
+        ),
+        V::Div(a, b) => V::Div(
+            Box::new(subst_val_col(a, col, lit)),
+            Box::new(subst_val_col(b, col, lit)),
+        ),
+        V::Mod(a, b) => V::Mod(
+            Box::new(subst_val_col(a, col, lit)),
+            Box::new(subst_val_col(b, col, lit)),
+        ),
+        V::Sub(a, b) => V::Sub(
+            Box::new(subst_val_col(a, col, lit)),
+            Box::new(subst_val_col(b, col, lit)),
+        ),
+        V::SeqLen {
+            pack,
+            base,
+            max_len,
+        } => V::SeqLen {
             pack: Box::new(subst_val_col(pack, col, lit)),
             base: *base,
             max_len: *max_len,
         },
-        V::SeqTail { pack, base } => {
-            V::SeqTail { pack: Box::new(subst_val_col(pack, col, lit)), base: *base }
-        }
-        V::SeqAppend { pack, elem, base, max_len } => V::SeqAppend {
+        V::SeqTail { pack, base } => V::SeqTail {
+            pack: Box::new(subst_val_col(pack, col, lit)),
+            base: *base,
+        },
+        V::SeqAppend {
+            pack,
+            elem,
+            base,
+            max_len,
+        } => V::SeqAppend {
             pack: Box::new(subst_val_col(pack, col, lit)),
             elem: Box::new(subst_val_col(elem, col, lit)),
             base: *base,
             max_len: *max_len,
         },
-        V::SetCard { set, universe } => {
-            V::SetCard { set: subst_set_col(set, col, lit), universe: *universe }
-        }
-        V::CountFold { terms } => {
-            V::CountFold { terms: terms.iter().map(|t| subst_pred_col(t, col, lit)).collect() }
-        }
+        V::SetCard { set, universe } => V::SetCard {
+            set: subst_set_col(set, col, lit),
+            universe: *universe,
+        },
+        V::CountFold { terms } => V::CountFold {
+            terms: terms.iter().map(|t| subst_pred_col(t, col, lit)).collect(),
+        },
     }
 }
 
@@ -7927,16 +8590,25 @@ fn subst_set_col(s: &SetIR, col: usize, lit: u64) -> SetIR {
         S::Lit(_) | S::Var(_) | S::Prime(_) => s.clone(),
         // A FUNC-to-SET digit's `pack` is a real state-column ref (never the Int bound var), but substitute
         // defensively so a future bound-var-in-pack shape stays correct.
-        S::Digit { pack, place, base } => {
-            S::Digit { pack: Box::new(subst_val_col(pack, col, lit)), place: *place, base: *base }
-        }
-        S::Cup(a, b) => {
-            S::Cup(Box::new(subst_set_col(a, col, lit)), Box::new(subst_set_col(b, col, lit)))
-        }
-        S::Cap(a, b) => {
-            S::Cap(Box::new(subst_set_col(a, col, lit)), Box::new(subst_set_col(b, col, lit)))
-        }
-        S::Filter { source, universe, bound_col, pred } => S::Filter {
+        S::Digit { pack, place, base } => S::Digit {
+            pack: Box::new(subst_val_col(pack, col, lit)),
+            place: *place,
+            base: *base,
+        },
+        S::Cup(a, b) => S::Cup(
+            Box::new(subst_set_col(a, col, lit)),
+            Box::new(subst_set_col(b, col, lit)),
+        ),
+        S::Cap(a, b) => S::Cap(
+            Box::new(subst_set_col(a, col, lit)),
+            Box::new(subst_set_col(b, col, lit)),
+        ),
+        S::Filter {
+            source,
+            universe,
+            bound_col,
+            pred,
+        } => S::Filter {
             source: Box::new(subst_set_col(source, col, lit)),
             universe: *universe,
             bound_col: *bound_col,
@@ -7976,25 +8648,45 @@ fn subst_pred_col(p: &PredIR, col: usize, lit: u64) -> PredIR {
         P::SetMem(e, s) => P::SetMem(*e, sc(s)),
         P::SetNotMem(e, s) => P::SetNotMem(*e, sc(s)),
         P::SetSubseteq(a, b) => P::SetSubseteq(sc(a), sc(b)),
-        P::SetForall { source, universe, bound_col, body } => P::SetForall {
+        P::SetForall {
+            source,
+            universe,
+            bound_col,
+            body,
+        } => P::SetForall {
             source: sc(source),
             universe: *universe,
             bound_col: *bound_col,
             body: pc(body),
         },
-        P::SetExists { source, universe, bound_col, body } => P::SetExists {
+        P::SetExists {
+            source,
+            universe,
+            bound_col,
+            body,
+        } => P::SetExists {
             source: sc(source),
             universe: *universe,
             bound_col: *bound_col,
             body: pc(body),
         },
-        P::SubsetForall { source, universe, bound_col, body } => P::SubsetForall {
+        P::SubsetForall {
+            source,
+            universe,
+            bound_col,
+            body,
+        } => P::SubsetForall {
             source: sc(source),
             universe: *universe,
             bound_col: *bound_col,
             body: pc(body),
         },
-        P::SubsetExists { source, universe, bound_col, body } => P::SubsetExists {
+        P::SubsetExists {
+            source,
+            universe,
+            bound_col,
+            body,
+        } => P::SubsetExists {
             source: sc(source),
             universe: *universe,
             bound_col: *bound_col,
@@ -8045,7 +8737,10 @@ fn fold_finite_expansion(conjunctive: bool, instances: Vec<PredIR>) -> PredIR {
 /// a literal-bound `a..b` range; or a `base^idx` place overflow.
 fn record_set_membership_form(
     x: &tla_core::ast::Expr,
-    doms: &[(tla_core::Spanned<String>, tla_core::Spanned<tla_core::ast::Expr>)],
+    doms: &[(
+        tla_core::Spanned<String>,
+        tla_core::Spanned<tla_core::ast::Expr>,
+    )],
     vars: &[&str],
     sorts: &[ColSort],
     mvsets: &BTreeMap<String, Vec<String>>,
@@ -8061,7 +8756,14 @@ fn record_set_membership_form(
         },
         _ => return None,
     };
-    let ColSort::Record { base, fields, cells } = sorts.get(i)? else { return None };
+    let ColSort::Record {
+        base,
+        fields,
+        cells,
+    } = sorts.get(i)?
+    else {
+        return None;
+    };
     // The record-set's field names must be EXACTLY the sort's canonical field set (no duplicates,
     // none missing, none extra) — the sorted name list must match the sort's `fields` verbatim.
     let mut names: Vec<&str> = doms.iter().map(|(n, _)| n.node.as_str()).collect();
@@ -8079,7 +8781,10 @@ fn record_set_membership_form(
         let idx = fields.iter().position(|f| f == &name.node)?;
         let place = base.checked_pow(idx as u32)?;
         let digit = ValIR::Mod(
-            Box::new(ValIR::Div(Box::new(pack.clone()), Box::new(ValIR::Lit(place)))),
+            Box::new(ValIR::Div(
+                Box::new(pack.clone()),
+                Box::new(ValIR::Lit(place)),
+            )),
             Box::new(ValIR::Lit(*base)),
         );
         let conj = match crate::explicit_fixpoint_cert::cell_kind(cells, idx) {
@@ -8102,7 +8807,10 @@ fn record_set_membership_form(
                     let elems = materialize_finite_int_set(&dom.node, vars, sorts)?;
                     fold_finite_expansion(
                         false,
-                        elems.iter().map(|&v| PredIR::Eq(digit.clone(), ValIR::Lit(v))).collect(),
+                        elems
+                            .iter()
+                            .map(|&v| PredIR::Eq(digit.clone(), ValIR::Lit(v)))
+                            .collect(),
                     )
                 }
             }
@@ -8131,10 +8839,14 @@ fn record_set_membership_form(
                     // claiming an `Int`-kind enum position is malformed ⇒ fail-closed.
                     EnumKind::Int => return None,
                     EnumKind::Str => {
-                        let E::SetEnum(elems) = &dom.node else { return None };
+                        let E::SetEnum(elems) = &dom.node else {
+                            return None;
+                        };
                         let mut acc: Option<PredIR> = None;
                         for el in elems {
-                            let E::String(lbl) = &el.node else { return None }; // string labels only
+                            let E::String(lbl) = &el.node else {
+                                return None;
+                            }; // string labels only
                             let li = labels.iter().position(|l| l == lbl.as_str())?; // must be observed
                             let leg = PredIR::Eq(digit.clone(), ValIR::Lit(li as u64));
                             acc = Some(match acc {
@@ -8245,8 +8957,13 @@ fn func_set_membership_form(
             _ => break 'fsm,
         };
         let Some(fi) = fi else { break 'fsm };
-        let ColSort::FuncSetMask { arity, fdom, fdom_kind, dom: cell_univ, dom_kind } =
-            sorts.get(fi)?
+        let ColSort::FuncSetMask {
+            arity,
+            fdom,
+            fdom_kind,
+            dom: cell_univ,
+            dom_kind,
+        } = sorts.get(fi)?
         else {
             break 'fsm;
         };
@@ -8307,6 +9024,7 @@ fn func_set_membership_form(
             break 'fsm;
         }
         let _ = is_prime; // a type invariant mentions no primed column in practice; pack is unused (tautology)
+
         // Every conjunct discharged as a tautology on R ⇒ the whole membership is TRUE.
         return Some(PredIR::BoolLit(true));
     }
@@ -8323,7 +9041,10 @@ fn func_set_membership_form(
     let digit = |idx: u64, base: u64| -> Option<ValIR> {
         let place = base.checked_pow(u32::try_from(idx).ok()?)?;
         Some(ValIR::Mod(
-            Box::new(ValIR::Div(Box::new(pack.clone()), Box::new(ValIR::Lit(place)))),
+            Box::new(ValIR::Div(
+                Box::new(pack.clone()),
+                Box::new(ValIR::Lit(place)),
+            )),
             Box::new(ValIR::Lit(base)),
         ))
     };
@@ -8334,7 +9055,13 @@ fn func_set_membership_form(
     };
     let mut conjs: Vec<PredIR> = Vec::new();
     match sorts.get(i)? {
-        ColSort::Func { base, arity, cells, dom: col_dom, dom_kind } => {
+        ColSort::Func {
+            base,
+            arity,
+            cells,
+            dom: col_dom,
+            dom_kind,
+        } => {
             // The declared domain `D` must EQUAL the column's actual domain. Int-prefix Func (`col_dom`
             // empty) ⇒ `D == {0..arity-1}`; atom-domain Func (`col_dom` non-empty) ⇒ `D` materializes —
             // PER THE COLUMN's `dom_kind` — to a config CONSTANT model-value set (`Model`) or a
@@ -8394,7 +9121,10 @@ fn func_set_membership_form(
                 // GROUND-fold BOTH endpoints (`const_eval_nonneg_int` handles a bare literal, `Add`/`Sub`/
                 // `Mul`/`IF` of constants — so `0..(M-1)` folds after CONSTANT inlining). A non-ground /
                 // negative / underflowing endpoint ⇒ `None` (fail-closed).
-                Codom::Range(const_eval_nonneg_int(&lo.node)?, const_eval_nonneg_int(&hi.node)?)
+                Codom::Range(
+                    const_eval_nonneg_int(&lo.node)?,
+                    const_eval_nonneg_int(&hi.node)?,
+                )
             } else if let E::SetEnum(_) = codom {
                 // Explicit `{v₁,…,vₙ}` codomain of GROUND nonneg-Int elements — REUSE the same
                 // `materialize_finite_int_set` machinery the value-membership `x ∈ {…}` fold uses
@@ -8427,7 +9157,10 @@ fn func_set_membership_form(
                     // declining is sound; never conflate the `{0,1}` Int set with `BOOLEAN`).
                     (Codom::IntSet(elems), CellSort::Int) => fold_finite_expansion(
                         false,
-                        elems.iter().map(|&v| PredIR::Eq(dig.clone(), ValIR::Lit(v))).collect(),
+                        elems
+                            .iter()
+                            .map(|&v| PredIR::Eq(dig.clone(), ValIR::Lit(v)))
+                            .collect(),
                     ),
                     // kind ↔ codomain mismatch (BOOLEAN/Nat/Int-set on an Int/Bool position mismatch)
                     _ => return None,
@@ -8435,7 +9168,12 @@ fn func_set_membership_form(
                 conjs.push(conj);
             }
         }
-        ColSort::FuncEnum { arity, labels, dom: col_dom, dom_kind } => {
+        ColSort::FuncEnum {
+            arity,
+            labels,
+            dom: col_dom,
+            dom_kind,
+        } => {
             // The declared domain `D` must EQUAL the column's actual domain. Int-prefix FuncEnum
             // (`col_dom` empty) ⇒ `D == {0..arity-1}`; atom-domain FuncEnum (`col_dom` non-empty) ⇒ `D`
             // materializes — PER THE COLUMN's `dom_kind` — to a config CONSTANT model-value set
@@ -8469,10 +9207,14 @@ fn func_set_membership_form(
             }
             // The codomain must be a set of STRING literals `S` (e.g. `Color` inlined to `{"white",
             // "black"}`). Each value's label must be in `S`: per index `⋁_{ℓ∈S∩labels} digit = idx(ℓ)`.
-            let E::SetEnum(elems) = codom else { return None };
+            let E::SetEnum(elems) = codom else {
+                return None;
+            };
             let mut wanted: Vec<usize> = Vec::new();
             for el in elems {
-                let E::String(lbl) = &el.node else { return None }; // string labels only
+                let E::String(lbl) = &el.node else {
+                    return None;
+                }; // string labels only
                 if let Some(idx) = labels.iter().position(|l| l == lbl.as_str()) {
                     if !wanted.contains(&idx) {
                         wanted.push(idx);
@@ -8505,7 +9247,13 @@ fn func_set_membership_form(
         // `f[k] ⊆ (2^|e_dom|-1)` — the all-ones value mask, which every digit `< 2^|e_dom|` satisfies, so it
         // REDUCES to `Bool.true` (structurally honest — one subset leg per key). `e_dom ⊄ E` ⇒ a value could
         // fall outside `SUBSET E` ⇒ NOT a tautology ⇒ decline (fail-closed).
-        ColSort::FuncSetMask { arity, fdom, fdom_kind, dom: e_dom, dom_kind: e_kind } => {
+        ColSort::FuncSetMask {
+            arity,
+            fdom,
+            fdom_kind,
+            dom: e_dom,
+            dom_kind: e_kind,
+        } => {
             use crate::explicit_fixpoint_cert::EnumKind;
             // DOMAIN f = D — same discharge as the Func/FuncEnum arms.
             if fdom.is_empty() {
@@ -8532,7 +9280,9 @@ fn func_set_membership_form(
                 }
             }
             // The codomain must be `SUBSET E`; materialize `E`'s atoms (kind-matched to the value universe).
-            let E::Powerset(inner) = codom else { return None };
+            let E::Powerset(inner) = codom else {
+                return None;
+            };
             let e_atoms: Vec<String> = match e_kind {
                 EnumKind::Model => materialize_model_value_names(&inner.node, mvsets)?,
                 EnumKind::Str => materialize_string_set_names(&inner.node)?,
@@ -8552,10 +9302,18 @@ fn func_set_membership_form(
             let base = sorts.get(i)?.funcsetmask_base()?;
             // The all-ones value mask `2^|e_dom|-1` = `E ∩ e_dom` (since e_dom ⊆ E); every digit `< base` is
             // `⊆` it, so each per-cell subset reduces to `Bool.true`.
-            let full_mask: u64 = if e_dom.is_empty() { 0 } else { (1u64 << e_dom.len()) - 1 };
+            let full_mask: u64 = if e_dom.is_empty() {
+                0
+            } else {
+                (1u64 << e_dom.len()) - 1
+            };
             for d in 0..u64::from(*arity) {
                 let place = base.checked_pow(u32::try_from(d).ok()?)?;
-                let dig = SetIR::Digit { pack: Box::new(pack.clone()), place, base };
+                let dig = SetIR::Digit {
+                    pack: Box::new(pack.clone()),
+                    place,
+                    base,
+                };
                 conjs.push(PredIR::SetSubseteq(dig, SetIR::Lit(full_mask)));
             }
         }
@@ -8692,7 +9450,9 @@ fn derive_funcenum_sort(
     use crate::explicit_fixpoint_cert::EnumKind;
     use tla_core::ast::Expr as E;
     // Codomain: a non-empty set of STRING literals ⇒ the FuncEnum value labels.
-    let E::SetEnum(elems) = codom else { return None };
+    let E::SetEnum(elems) = codom else {
+        return None;
+    };
     let mut labels: Vec<String> = Vec::with_capacity(elems.len());
     for el in elems {
         let E::String(s) = &el.node else { return None };
@@ -8709,7 +9469,12 @@ fn derive_funcenum_sort(
             return None;
         }
         let arity = u32::try_from(dom_names.len()).ok()?;
-        return Some(ColSort::FuncEnum { arity, labels, dom: dom_names, dom_kind });
+        return Some(ColSort::FuncEnum {
+            arity,
+            labels,
+            dom: dom_names,
+            dom_kind,
+        });
     }
     // Otherwise a BOUNDED nonneg-Int interval `lo..hi`. `materialize_finite_int_set` yields the values
     // sorted-deduped (an interval is already contiguous; a set literal is sorted here). REQUIRE a
@@ -8742,8 +9507,15 @@ fn derive_funcenum_sort(
     }
     // `lo ≥ 1`: decimal-text keys `["lo",…,"lo+len-1"]` in sorted-by-value == position order, `Int` kind —
     // EXACTLY `int_interval_domain_keys(lo, len)`.
-    let dom_names: Vec<String> = (lo..lo.checked_add(len as u64)?).map(|k| k.to_string()).collect();
-    Some(ColSort::FuncEnum { arity, labels, dom: dom_names, dom_kind: EnumKind::Int })
+    let dom_names: Vec<String> = (lo..lo.checked_add(len as u64)?)
+        .map(|k| k.to_string())
+        .collect();
+    Some(ColSort::FuncEnum {
+        arity,
+        labels,
+        dom: dom_names,
+        dom_kind: EnumKind::Int,
+    })
 }
 
 /// Flatten a (possibly `And`-nested) predicate into its top-level conjunct list. `A /\ B /\ C` ⇒
@@ -8823,16 +9595,33 @@ fn compound_bool_digit(e: &tla_core::ast::Expr, vars: &[&str], sorts: &[ColSort]
     match e {
         E::RecordAccess(inner, field) => {
             let (pack, i) = col_ref(&inner.node)?;
-            let ColSort::Record { base, fields, cells } = sorts.get(i)? else { return None };
+            let ColSort::Record {
+                base,
+                fields,
+                cells,
+            } = sorts.get(i)?
+            else {
+                return None;
+            };
             let idx = fields.iter().position(|f| f == &field.name.node)?;
-            if !matches!(crate::explicit_fixpoint_cert::cell_kind(cells, idx), CellSort::Bool) {
+            if !matches!(
+                crate::explicit_fixpoint_cert::cell_kind(cells, idx),
+                CellSort::Bool
+            ) {
                 return None;
             }
             Some(digit(pack, base.checked_pow(idx as u32)?, *base))
         }
         E::FuncApply(inner, arg) => {
             let (pack, i) = col_ref(&inner.node)?;
-            let ColSort::Func { base, arity, cells, dom, dom_kind } = sorts.get(i)? else {
+            let ColSort::Func {
+                base,
+                arity,
+                cells,
+                dom,
+                dom_kind,
+            } = sorts.get(i)?
+            else {
                 return None;
             };
             let idx = resolve_func_domain_slot(&arg.node, dom, *dom_kind, *arity)?;
@@ -9017,7 +9806,7 @@ fn compound_enum_digit<'a>(
     vars: &[&str],
     sorts: &'a [ColSort],
 ) -> Option<(ValIR, &'a [String], crate::explicit_fixpoint_cert::EnumKind)> {
-    use crate::explicit_fixpoint_cert::{CellSort, cell_kind};
+    use crate::explicit_fixpoint_cert::{cell_kind, CellSort};
     use tla_core::ast::Expr as E;
     let col = |name: &str| vars.iter().position(|v| *v == name);
     let col_ref = |x: &tla_core::ast::Expr| -> Option<(ValIR, usize)> {
@@ -9039,21 +9828,45 @@ fn compound_enum_digit<'a>(
     match e {
         E::RecordAccess(inner, field) => {
             let (pack, i) = col_ref(&inner.node)?;
-            let ColSort::Record { base, fields, cells } = sorts.get(i)? else { return None };
+            let ColSort::Record {
+                base,
+                fields,
+                cells,
+            } = sorts.get(i)?
+            else {
+                return None;
+            };
             let idx = fields.iter().position(|f| f == &field.name.node)?;
-            let CellSort::Enum { labels, kind } = cell_kind(cells, idx) else { return None };
-            Some((digit(pack, base.checked_pow(idx as u32)?, *base), labels.as_slice(), *kind))
+            let CellSort::Enum { labels, kind } = cell_kind(cells, idx) else {
+                return None;
+            };
+            Some((
+                digit(pack, base.checked_pow(idx as u32)?, *base),
+                labels.as_slice(),
+                *kind,
+            ))
         }
         E::FuncApply(inner, arg) => {
             let (pack, i) = col_ref(&inner.node)?;
-            let ColSort::Func { base, arity, cells, dom, dom_kind } = sorts.get(i)? else {
+            let ColSort::Func {
+                base,
+                arity,
+                cells,
+                dom,
+                dom_kind,
+            } = sorts.get(i)?
+            else {
                 return None;
             };
             let idx = resolve_func_domain_slot(&arg.node, dom, *dom_kind, *arity)?;
             let CellSort::Enum { labels, kind } = cell_kind(cells, idx as usize) else {
                 return None;
             };
-            Some((digit(pack, base.checked_pow(idx as u32)?, *base), labels.as_slice(), *kind))
+            Some((
+                digit(pack, base.checked_pow(idx as u32)?, *base),
+                labels.as_slice(),
+                *kind,
+            ))
         }
         _ => None,
     }
@@ -9104,9 +9917,10 @@ fn compound_enum_eq_form(
     }
     // Shape 2: enum-position digit vs enum-position digit — SAME label space AND SAME kind only (bijection
     // preserved). Different label spaces / kinds ⇒ index equality would NOT track label equality ⇒ closed.
-    if let (Some((d1, l1, k1)), Some((d2, l2, k2))) =
-        (compound_enum_digit(a, vars, sorts), compound_enum_digit(b, vars, sorts))
-    {
+    if let (Some((d1, l1, k1)), Some((d2, l2, k2))) = (
+        compound_enum_digit(a, vars, sorts),
+        compound_enum_digit(b, vars, sorts),
+    ) {
         if l1 != l2 || k1 != k2 {
             return None;
         }
@@ -9137,7 +9951,9 @@ fn compound_enum_in_form(
         E::SetEnum(elems) => {
             let mut names = Vec::with_capacity(elems.len());
             for el in elems {
-                let E::String(lbl) = &el.node else { return None }; // string labels only
+                let E::String(lbl) = &el.node else {
+                    return None;
+                }; // string labels only
                 names.push(lbl.as_str());
             }
             (names, EnumKind::Str)
@@ -9283,7 +10099,10 @@ fn recognize_pred_sorts_pol(
         ))
     };
     match e {
-        E::And(a, b) => Some(PredIR::And(Box::new(rec(&a.node)?), Box::new(rec(&b.node)?))),
+        E::And(a, b) => Some(PredIR::And(
+            Box::new(rec(&a.node)?),
+            Box::new(rec(&b.node)?),
+        )),
         E::Or(a, b) => Some(PredIR::Or(Box::new(rec(&a.node)?), Box::new(rec(&b.node)?))),
         // A negation FLIPS the polarity of its child — but `Unknown` (`None`) is a FIXPOINT under `¬`
         // (negating an unknown-sign position stays unknown), so a `Not` nested inside an `Equiv` side can
@@ -9298,15 +10117,28 @@ fn recognize_pred_sorts_pol(
         )?))),
         // `a ⇒ b` ≡ `¬a ∨ b`: the antecedent `a` is at FLIPPED polarity, the consequent `b` unchanged.
         E::Implies(a, b) => Some(PredIR::Implies(
-            Box::new(recognize_pred_sorts_pol(&a.node, vars, sorts, neg(pos), mvsets, col_max)?),
-            Box::new(recognize_pred_sorts_pol(&b.node, vars, sorts, pos, mvsets, col_max)?),
+            Box::new(recognize_pred_sorts_pol(
+                &a.node,
+                vars,
+                sorts,
+                neg(pos),
+                mvsets,
+                col_max,
+            )?),
+            Box::new(recognize_pred_sorts_pol(
+                &b.node, vars, sorts, pos, mvsets, col_max,
+            )?),
         )),
         // `a ⇔ b` uses each side in BOTH polarities ⇒ neither side has a fixed sign. Recurse at UNKNOWN
         // polarity (`None`) — which forbids the polarity-gated `Sub` form on either side AND survives any
         // nested `Not` (a `Not` cannot flip `None` back to `Positive`).
         E::Equiv(a, b) => Some(PredIR::Equiv(
-            Box::new(recognize_pred_sorts_pol(&a.node, vars, sorts, None, mvsets, col_max)?),
-            Box::new(recognize_pred_sorts_pol(&b.node, vars, sorts, None, mvsets, col_max)?),
+            Box::new(recognize_pred_sorts_pol(
+                &a.node, vars, sorts, None, mvsets, col_max,
+            )?),
+            Box::new(recognize_pred_sorts_pol(
+                &b.node, vars, sorts, None, mvsets, col_max,
+            )?),
         )),
         E::Bool(v) => Some(PredIR::BoolLit(*v)),
         // `IsFiniteSet(S)` over a bitmask set COLUMN (`Set` / `SetMask`) is a TAUTOLOGY — a `|D|`-bit
@@ -9520,8 +10352,10 @@ fn recognize_pred_sorts_pol(
             // ground-element restriction). Empty set ⇒ FALSE. Tried before the bitmask reading.
             if let Some(elems) = materialize_finite_int_set(&s.node, vars, sorts) {
                 if let Some(x_ir) = recognize_val_sorts(&x.node, vars, sorts) {
-                    let instances =
-                        elems.iter().map(|&v| PredIR::Eq(x_ir.clone(), ValIR::Lit(v))).collect();
+                    let instances = elems
+                        .iter()
+                        .map(|&v| PredIR::Eq(x_ir.clone(), ValIR::Lit(v)))
+                        .collect();
                     return Some(fold_finite_expansion(false, instances));
                 }
             }
@@ -9577,8 +10411,10 @@ fn recognize_pred_sorts_pol(
             }
             if let Some(elems) = materialize_finite_int_set(&s.node, vars, sorts) {
                 if let Some(x_ir) = recognize_val_sorts(&x.node, vars, sorts) {
-                    let instances =
-                        elems.iter().map(|&v| PredIR::Neq(x_ir.clone(), ValIR::Lit(v))).collect();
+                    let instances = elems
+                        .iter()
+                        .map(|&v| PredIR::Neq(x_ir.clone(), ValIR::Lit(v)))
+                        .collect();
                     return Some(fold_finite_expansion(true, instances));
                 }
             }
@@ -9645,7 +10481,9 @@ fn recognize_pred_sorts_pol(
                 E::Tuple(items) => {
                     let mut acc: Option<PredIR> = None;
                     for it in items {
-                        let E::Ident(name, _) = &it.node else { return None };
+                        let E::Ident(name, _) = &it.node else {
+                            return None;
+                        };
                         let l = leaf(name)?;
                         acc = Some(match acc {
                             None => l,
@@ -9861,7 +10699,9 @@ fn enum_choose_flip_form(
         (E::Choose(bv, body), E::Prime(p)) => (&p.node, bv, body),
         _ => return None,
     };
-    let E::Ident(col_name, _) = prime_inner else { return None };
+    let E::Ident(col_name, _) = prime_inner else {
+        return None;
+    };
     let ci = col(col_name)?;
     let (labels, kind) = match sorts.get(ci)? {
         ColSort::Enum { labels, kind } => (labels.as_slice(), *kind),
@@ -9875,7 +10715,9 @@ fn enum_choose_flip_form(
     }
     let atoms = enum_atom_set(&bv.domain.as_ref()?.node, kind, mvsets)?;
     // The predicate must be `d /= col` (either orientation), `col` the SAME unprimed column as `col'`.
-    let E::Neq(l, r) = &cbody.node else { return None };
+    let E::Neq(l, r) = &cbody.node else {
+        return None;
+    };
     let is_d = |x: &E| matches!(x, E::Ident(n, _) if n == dname);
     let is_col = |x: &E| matches!(x, E::Ident(n, _) if n == col_name);
     if !((is_d(&l.node) && is_col(&r.node)) || (is_col(&l.node) && is_d(&r.node))) {
@@ -9926,8 +10768,8 @@ fn if_membership_form(
     mvsets: &BTreeMap<String, Vec<String>>,
     col_max: Option<&[Option<u64>]>,
 ) -> Option<PredIR> {
-    use tla_core::Spanned;
     use tla_core::ast::Expr as E;
+    use tla_core::Spanned;
     let cond = recognize_pred_sorts_pol(&c.node, vars, sorts, None, mvsets, col_max)?;
     let mem = |v: &Spanned<E>| -> Option<PredIR> {
         let node = if neg {
@@ -9941,7 +10783,10 @@ fn if_membership_form(
     let else_p = mem(e)?;
     Some(PredIR::Or(
         Box::new(PredIR::And(Box::new(cond.clone()), Box::new(then_p))),
-        Box::new(PredIR::And(Box::new(PredIR::Not(Box::new(cond))), Box::new(else_p))),
+        Box::new(PredIR::And(
+            Box::new(PredIR::Not(Box::new(cond))),
+            Box::new(else_p),
+        )),
     ))
 }
 
@@ -10080,7 +10925,9 @@ fn enum_in_form(
         E::SetEnum(elems) => {
             let mut names = Vec::with_capacity(elems.len());
             for el in elems {
-                let E::String(lbl) = &el.node else { return None }; // string labels only
+                let E::String(lbl) = &el.node else {
+                    return None;
+                }; // string labels only
                 names.push(lbl.as_str());
             }
             (names, EnumKind::Str)
@@ -10180,7 +11027,9 @@ fn func_enum_app<'a>(
 ) -> Option<(ValIR, &'a [String])> {
     use tla_core::ast::Expr as E;
     let col = |name: &str| vars.iter().position(|v| *v == name);
-    let E::FuncApply(inner, arg) = x else { return None };
+    let E::FuncApply(inner, arg) = x else {
+        return None;
+    };
     // The function operand must be a bare (possibly primed) column reference.
     let (pack, i_col) = match &inner.node {
         E::Ident(n, _) => {
@@ -10196,7 +11045,15 @@ fn func_enum_app<'a>(
         },
         _ => return None,
     };
-    let ColSort::FuncEnum { arity, labels, dom, dom_kind } = sorts.get(i_col)? else { return None };
+    let ColSort::FuncEnum {
+        arity,
+        labels,
+        dom,
+        dom_kind,
+    } = sorts.get(i_col)?
+    else {
+        return None;
+    };
     // The index is EITHER an Int LITERAL (the classic `0..arity-1` domain ⇒ `dom` EMPTY) OR an ATOM KEY
     // matching the domain's KIND (a `[RM -> ..]` model-value or `[{"r1",..} -> ..]` String-atom domain) —
     // resolved to the key's SLOT via the SHARED [`resolve_func_domain_slot`] (kind-checked, out-of-domain
@@ -10302,7 +11159,9 @@ fn func_enum_in_form(
     let E::SetEnum(elems) = set else { return None };
     let mut acc: Option<PredIR> = None;
     for el in elems {
-        let E::String(lbl) = &el.node else { return None }; // string labels only
+        let E::String(lbl) = &el.node else {
+            return None;
+        }; // string labels only
         let idx = labels.iter().position(|l| l == lbl.as_str())?; // label must be observed
         let leg = PredIR::Eq(digit.clone(), ValIR::Lit(idx as u64));
         acc = Some(match acc {
@@ -10330,7 +11189,7 @@ fn eq_sub_form(
     use tla_core::ast::Expr as E;
     if pos != Some(true) {
         return None; // admitted ONLY at strictly-POSITIVE polarity; Negative/Unknown (∴ ⇔ sides, and
-        // any `Not` reaching an Unknown) fail closed — truncation could flip real-TRUE→emb-FALSE
+                     // any `Not` reaching an Unknown) fail closed — truncation could flip real-TRUE→emb-FALSE
     }
     let col = |name: &str| vars.iter().position(|v| *v == name);
     let is_int = |i: usize| sorts.get(i) == Some(&ColSort::Int);
@@ -10363,7 +11222,10 @@ fn eq_sub_form(
     };
     let p_ir = recognize_val_sorts(p, vars, sorts)?;
     let q_ir = recognize_val_sorts(q, vars, sorts)?;
-    Some(PredIR::Eq(bound_ir, ValIR::Sub(Box::new(p_ir), Box::new(q_ir))))
+    Some(PredIR::Eq(
+        bound_ir,
+        ValIR::Sub(Box::new(p_ir), Box::new(q_ir)),
+    ))
 }
 
 /// The IF-THEN-ELSE equality form `v = IF c THEN t ELSE e` (either orientation), DESUGARED AT
@@ -10403,7 +11265,10 @@ fn eq_if_form(
     let else_eq = recognize_eq_arm(v, e, vars, sorts, pos, mvsets)?;
     Some(PredIR::Or(
         Box::new(PredIR::And(Box::new(cond.clone()), Box::new(then_eq))),
-        Box::new(PredIR::And(Box::new(PredIR::Not(Box::new(cond))), Box::new(else_eq))),
+        Box::new(PredIR::And(
+            Box::new(PredIR::Not(Box::new(cond))),
+            Box::new(else_eq),
+        )),
     ))
 }
 
@@ -10421,7 +11286,10 @@ fn recognize_eq_arm(
     mvsets: &BTreeMap<String, Vec<String>>,
 ) -> Option<PredIR> {
     // SET equality arm (mirrors `recognize_set_pred`'s `E::Eq` handling).
-    if let (Some(sa), Some(sb)) = (recognize_set(v, vars, sorts), recognize_set(arm, vars, sorts)) {
+    if let (Some(sa), Some(sb)) = (
+        recognize_set(v, vars, sorts),
+        recognize_set(arm, vars, sorts),
+    ) {
         return Some(PredIR::SetEq(sa, sb));
     }
     bool_eq_form(v, arm, vars, sorts, false)
@@ -10443,8 +11311,8 @@ fn recognize_eq_arm(
 /// `@` denotes the OLD field `col.f`. A pure structural clone-and-replace over the arithmetic/logical/
 /// record fragment the update values ever use; nodes with no `@` are cloned unchanged.
 fn subst_at(e: &tla_core::ast::Expr, replacement: &tla_core::ast::Expr) -> tla_core::ast::Expr {
-    use tla_core::Spanned;
     use tla_core::ast::Expr as E;
+    use tla_core::Spanned;
     let sub = |x: &Spanned<E>| Box::new(Spanned::dummy(subst_at(&x.node, replacement)));
     match e {
         E::Ident(n, _) if n == "@" => replacement.clone(),
@@ -10508,7 +11376,9 @@ fn record_update_eq_form(
         let E::Prime(p) = e else { return None };
         let E::Ident(n, _) = &p.node else { return None };
         let i = col(n)?;
-        let ColSort::Record { base, fields, .. } = sorts.get(i)? else { return None };
+        let ColSort::Record { base, fields, .. } = sorts.get(i)? else {
+            return None;
+        };
         Some((i, *base, fields.clone()))
     };
     let ((i, base, fields), update) = match primed_record(a) {
@@ -10520,7 +11390,10 @@ fn record_update_eq_form(
     // recognizers (they match on the field-name string / column-name string), so use INVALID.
     let old_field = |f: &str| -> E {
         E::RecordAccess(
-            Box::new(Spanned::dummy(E::Ident(col_name.to_string(), NameId::INVALID))),
+            Box::new(Spanned::dummy(E::Ident(
+                col_name.to_string(),
+                NameId::INVALID,
+            ))),
             RecordFieldName::new(Spanned::dummy(f.to_string())),
         )
     };
@@ -10539,7 +11412,9 @@ fn record_update_eq_form(
                 if sp.path.len() != 1 {
                     return None; // nested / indexed paths ⇒ fail-closed
                 }
-                let ExceptPathElement::Field(fld) = &sp.path[0] else { return None };
+                let ExceptPathElement::Field(fld) = &sp.path[0] else {
+                    return None;
+                };
                 let j = fields.iter().position(|f| f == &fld.name.node)?;
                 // `@` inside the value denotes the CURRENT value at this path — the OLD field, or an
                 // earlier same-field update's result (TLA EXCEPT applies specs left-to-right). Substitute
@@ -10576,8 +11451,10 @@ fn record_update_eq_form(
     // declines and closure rests on the honest enumerated `image ⊆ R` leg. An all-Int record has empty
     // `cells`, so every position takes the Int branch and the emitted IR is BYTE-IDENTICAL (CoffeeCan).
     let recognize_field_val = |j: usize, v: &E| -> Option<ValIR> {
-        use crate::explicit_fixpoint_cert::{CellSort, EnumKind, cell_kind};
-        let ColSort::Record { cells, .. } = sorts.get(i)? else { return None };
+        use crate::explicit_fixpoint_cert::{cell_kind, CellSort, EnumKind};
+        let ColSort::Record { cells, .. } = sorts.get(i)? else {
+            return None;
+        };
         match cell_kind(cells, j) {
             CellSort::Int => {
                 if let E::Sub(x, y) = v {
@@ -10603,7 +11480,10 @@ fn record_update_eq_form(
                     }
                     let place = base.checked_pow(j as u32)?;
                     return Some(ValIR::Mod(
-                        Box::new(ValIR::Div(Box::new(ValIR::Var(i)), Box::new(ValIR::Lit(place)))),
+                        Box::new(ValIR::Div(
+                            Box::new(ValIR::Var(i)),
+                            Box::new(ValIR::Lit(place)),
+                        )),
                         Box::new(ValIR::Lit(base)),
                     ));
                 }
@@ -10628,7 +11508,10 @@ fn record_update_eq_form(
     let mut pack: Option<ValIR> = None;
     for (j, v) in values.iter().enumerate() {
         let place = base.checked_pow(j as u32)?;
-        let term = ValIR::Mul(Box::new(recognize_field_val(j, v)?), Box::new(ValIR::Lit(place)));
+        let term = ValIR::Mul(
+            Box::new(recognize_field_val(j, v)?),
+            Box::new(ValIR::Lit(place)),
+        );
         pack = Some(match pack {
             None => term,
             Some(p) => ValIR::Add(Box::new(p), Box::new(term)),
@@ -10696,7 +11579,15 @@ fn func_enum_update_eq_form(
         Some(r) => (r, b),
         None => (funcenum_ref(b)?, a),
     };
-    let ColSort::FuncEnum { arity, labels, dom, dom_kind } = sorts.get(i)? else { return None };
+    let ColSort::FuncEnum {
+        arity,
+        labels,
+        dom,
+        dom_kind,
+    } = sorts.get(i)?
+    else {
+        return None;
+    };
     let (arity, dom_kind) = (*arity, *dom_kind);
     let base = labels.len() as u64;
     if base == 0 {
@@ -10707,7 +11598,10 @@ fn func_enum_update_eq_form(
     let old_digit = |p: u64| -> Option<ValIR> {
         let place = base.checked_pow(u32::try_from(p).ok()?)?;
         Some(ValIR::Mod(
-            Box::new(ValIR::Div(Box::new(ValIR::Var(i)), Box::new(ValIR::Lit(place)))),
+            Box::new(ValIR::Div(
+                Box::new(ValIR::Var(i)),
+                Box::new(ValIR::Lit(place)),
+            )),
             Box::new(ValIR::Lit(base)),
         ))
     };
@@ -10716,9 +11610,10 @@ fn func_enum_update_eq_form(
     // everything else fails closed (a never-observed label, or an out-of-fragment value expr).
     let slot_value = |v: &E, p: u64| -> Option<ValIR> {
         match v {
-            E::String(lbl) => {
-                labels.iter().position(|l| l == lbl).map(|idx| ValIR::Lit(idx as u64))
-            }
+            E::String(lbl) => labels
+                .iter()
+                .position(|l| l == lbl)
+                .map(|idx| ValIR::Lit(idx as u64)),
             E::Ident(n, _) if n == "@" => old_digit(p),
             _ => None,
         }
@@ -10743,7 +11638,9 @@ fn func_enum_update_eq_form(
                 if sp.path.len() != 1 {
                     return None; // nested / multi-element paths ⇒ fail-closed
                 }
-                let ExceptPathElement::Index(key) = &sp.path[0] else { return None };
+                let ExceptPathElement::Index(key) = &sp.path[0] else {
+                    return None;
+                };
                 let slot = resolve_func_domain_slot(&key.node, dom, dom_kind, arity)?;
                 values[slot as usize] = slot_value(&sp.value.node, slot)?;
             }
@@ -10789,8 +11686,10 @@ fn func_enum_update_eq_form(
                 });
                 let mut subs = std::collections::HashMap::new();
                 subs.insert(bname, &key_lit);
-                let mut substituter =
-                    tla_core::SubstituteExpr { subs, span_policy: tla_core::SpanPolicy::DummyAll };
+                let mut substituter = tla_core::SubstituteExpr {
+                    subs,
+                    span_policy: tla_core::SpanPolicy::DummyAll,
+                };
                 let substituted = tla_core::ExprFold::fold_expr(
                     &mut substituter,
                     tla_core::Spanned::dummy(body.node.clone()),
@@ -10810,7 +11709,11 @@ fn func_enum_update_eq_form(
             Some(prev) => ValIR::Add(Box::new(prev), Box::new(term)),
         });
     }
-    let lhs = if primed { ValIR::Prime(i) } else { ValIR::Var(i) };
+    let lhs = if primed {
+        ValIR::Prime(i)
+    } else {
+        ValIR::Var(i)
+    };
     Some(PredIR::Eq(lhs, pack.unwrap_or(ValIR::Lit(0))))
 }
 
@@ -10865,7 +11768,9 @@ fn func_bool_update_eq_form(
             E::Ident(n, _) => (col(n)?, false),
             _ => return None,
         };
-        let ColSort::Func { arity, cells, .. } = sorts.get(i)? else { return None };
+        let ColSort::Func { arity, cells, .. } = sorts.get(i)? else {
+            return None;
+        };
         if cells.len() != *arity as usize || !cells.iter().all(|c| matches!(c, CellSort::Bool)) {
             return None;
         }
@@ -10875,7 +11780,16 @@ fn func_bool_update_eq_form(
         Some(r) => (r, b),
         None => (func_bool_ref(b)?, a),
     };
-    let ColSort::Func { base, arity, dom, dom_kind, .. } = sorts.get(i)? else { return None };
+    let ColSort::Func {
+        base,
+        arity,
+        dom,
+        dom_kind,
+        ..
+    } = sorts.get(i)?
+    else {
+        return None;
+    };
     let (base, arity, dom_kind) = (*base, *arity, *dom_kind);
     // A Bool cell demands `base ≥ 2` (its digit is `{0,1}`, and `1 < base`); the encoder floors a compound
     // radix at `RECORD_FUNC_BASE = 10`, so this always holds — but assert it, fail-closed otherwise.
@@ -10888,7 +11802,10 @@ fn func_bool_update_eq_form(
     let old_digit = |p: u64| -> Option<ValIR> {
         let place = base.checked_pow(u32::try_from(p).ok()?)?;
         Some(ValIR::Mod(
-            Box::new(ValIR::Div(Box::new(ValIR::Var(i)), Box::new(ValIR::Lit(place)))),
+            Box::new(ValIR::Div(
+                Box::new(ValIR::Var(i)),
+                Box::new(ValIR::Lit(place)),
+            )),
             Box::new(ValIR::Lit(base)),
         ))
     };
@@ -10928,7 +11845,9 @@ fn func_bool_update_eq_form(
                 if sp.path.len() != 1 {
                     return None; // nested / multi-element paths ⇒ fail-closed
                 }
-                let ExceptPathElement::Index(key) = &sp.path[0] else { return None };
+                let ExceptPathElement::Index(key) = &sp.path[0] else {
+                    return None;
+                };
                 let slot = resolve_func_domain_slot(&key.node, dom, dom_kind, arity)?;
                 if !written.insert(slot) {
                     return None; // duplicate write to one slot ⇒ `@` semantics ambiguous ⇒ fail-closed
@@ -10974,8 +11893,10 @@ fn func_bool_update_eq_form(
                 });
                 let mut subs = std::collections::HashMap::new();
                 subs.insert(bname, &key_lit);
-                let mut substituter =
-                    tla_core::SubstituteExpr { subs, span_policy: tla_core::SpanPolicy::DummyAll };
+                let mut substituter = tla_core::SubstituteExpr {
+                    subs,
+                    span_policy: tla_core::SpanPolicy::DummyAll,
+                };
                 let substituted = tla_core::ExprFold::fold_expr(
                     &mut substituter,
                     tla_core::Spanned::dummy(body.node.clone()),
@@ -10995,7 +11916,11 @@ fn func_bool_update_eq_form(
             Some(prev) => ValIR::Add(Box::new(prev), Box::new(term)),
         });
     }
-    let lhs = if primed { ValIR::Prime(i) } else { ValIR::Var(i) };
+    let lhs = if primed {
+        ValIR::Prime(i)
+    } else {
+        ValIR::Var(i)
+    };
     Some(PredIR::Eq(lhs, pack.unwrap_or(ValIR::Lit(0))))
 }
 
@@ -11014,15 +11939,24 @@ pub(crate) fn embed_val_ir(ir: &ValIR, s: &[u64], sp: &[u64]) -> Expr {
         ValIR::Mod(a, b) => nat2("Nat.mod", embed_val_ir(a, s, sp), embed_val_ir(b, s, sp)),
         ValIR::Sub(a, b) => nat2("Nat.sub", embed_val_ir(a, s, sp), embed_val_ir(b, s, sp)),
         // Len(s) = Σ_{i<max_len} boolToNat( Nat.ble 1 ((pack/D^i) mod D) ) — count of NONZERO base-D digits.
-        ValIR::SeqLen { pack, base, max_len } => {
-            seq_len_term(embed_val_ir(pack, s, sp), *base, *max_len)
-        }
+        ValIR::SeqLen {
+            pack,
+            base,
+            max_len,
+        } => seq_len_term(embed_val_ir(pack, s, sp), *base, *max_len),
         // Tail(s) = pack / D (D = base+1) — drops the lowest digit.
-        ValIR::SeqTail { pack, base } => {
-            nat2("Nat.div", embed_val_ir(pack, s, sp), Expr::nat_lit(base + 1))
-        }
+        ValIR::SeqTail { pack, base } => nat2(
+            "Nat.div",
+            embed_val_ir(pack, s, sp),
+            Expr::nat_lit(base + 1),
+        ),
         // Append(s,e) = pack + (e+1)·D^Len(s) — writes the shifted element into the first free digit.
-        ValIR::SeqAppend { pack, elem, base, max_len } => {
+        ValIR::SeqAppend {
+            pack,
+            elem,
+            base,
+            max_len,
+        } => {
             let d = base + 1;
             let pk = embed_val_ir(pack, s, sp);
             let len = seq_len_term(pk.clone(), *base, *max_len);
@@ -11073,7 +12007,11 @@ fn seq_len_term(pack: Expr, base: u64, max_len: u32) -> Expr {
     let mut acc: Option<Expr> = None;
     for i in 0..u64::from(max_len) {
         let dpow = nat2("Nat.pow", Expr::nat_lit(d), Expr::nat_lit(i));
-        let digit = nat2("Nat.mod", nat2("Nat.div", pack.clone(), dpow), Expr::nat_lit(d));
+        let digit = nat2(
+            "Nat.mod",
+            nat2("Nat.div", pack.clone(), dpow),
+            Expr::nat_lit(d),
+        );
         let nonzero = nat2("Nat.ble", Expr::nat_lit(1), digit); // 1 ≤ digit ⟺ digit ≠ 0
         let leg = bool_to_nat(nonzero); // 0/1
         acc = Some(match acc {
@@ -11108,7 +12046,12 @@ pub(crate) fn embed_set_ir(ir: &SetIR, s: &[u64], sp: &[u64]) -> Expr {
         // `i` iff it is set in `source` AND `P(i)` holds; the `Nat.lor` combines the disjoint single-bit
         // contributions. `bit_i(source)` is the 0/1 `Nat.land(Nat.shiftRight source i, 1)`; `boolToNat`
         // turns the embedded predicate (at `x=i`) into its 0/1 multiplier. EXACTLY the TLA filter.
-        SetIR::Filter { source, universe, bound_col, pred } => {
+        SetIR::Filter {
+            source,
+            universe,
+            bound_col,
+            pred,
+        } => {
             let src = embed_set_ir(source, s, sp);
             // Extend the concrete tuples with the bound-var column (index == bound_col) for `embed_pred_ir`.
             let mut acc: Option<Expr> = None;
@@ -11130,7 +12073,11 @@ pub(crate) fn embed_set_ir(ir: &SetIR, s: &[u64], sp: &[u64]) -> Expr {
                     Expr::nat_lit(1),
                 );
                 // keep = bit_i(source) · boolToNat(P(i))   (0/1 Nat)
-                let keep = nat2("Nat.mul", bit, bool_to_nat(embed_pred_ir(pred, &s_ext, &sp_ext)));
+                let keep = nat2(
+                    "Nat.mul",
+                    bit,
+                    bool_to_nat(embed_pred_ir(pred, &s_ext, &sp_ext)),
+                );
                 // leg_i = (1<<i) · keep   (either `1<<i` or `0`)
                 let leg = nat2("Nat.mul", Expr::nat_lit(1u64 << i), keep);
                 acc = Some(match acc {
@@ -11154,7 +12101,12 @@ pub(crate) fn eval_set_ir(ir: &SetIR, s: &[u64], sp: &[u64]) -> u64 {
         SetIR::Digit { pack, place, base } => (eval_val_ir(pack, s, sp) / *place) % *base,
         SetIR::Cup(a, b) => eval_set_ir(a, s, sp) | eval_set_ir(b, s, sp),
         SetIR::Cap(a, b) => eval_set_ir(a, s, sp) & eval_set_ir(b, s, sp),
-        SetIR::Filter { source, universe, bound_col, pred } => {
+        SetIR::Filter {
+            source,
+            universe,
+            bound_col,
+            pred,
+        } => {
             let src = eval_set_ir(source, s, sp);
             let mut out = 0u64;
             for i in 0..u64::from(*universe) {
@@ -11184,7 +12136,11 @@ pub(crate) fn eval_set_ir(ir: &SetIR, s: &[u64], sp: &[u64]) -> u64 {
 /// embedded per-element predicate into the `0/1` multiplier that masks bit `i` in/out.
 fn bool_to_nat(b: Expr) -> Expr {
     use clean_kernel::Level;
-    let motive = Expr::lam(BinderInfo::Default, Expr::const_str("Bool"), Expr::const_str("Nat")); // fun _ : Bool => Nat
+    let motive = Expr::lam(
+        BinderInfo::Default,
+        Expr::const_str("Bool"),
+        Expr::const_str("Nat"),
+    ); // fun _ : Bool => Nat
     Expr::apps(
         Expr::const_str_levels("Bool.rec", vec![Level::succ(Level::zero())]),
         [motive, Expr::nat_lit(0), Expr::nat_lit(1), b],
@@ -11213,9 +12169,11 @@ pub(crate) fn embed_pred_ir(ir: &PredIR, s: &[u64], sp: &[u64]) -> Expr {
         PredIR::And(a, b) => b2("Bool.and", embed_pred_ir(a, s, sp), embed_pred_ir(b, s, sp)),
         PredIR::Or(a, b) => b2("Bool.or", embed_pred_ir(a, s, sp), embed_pred_ir(b, s, sp)),
         PredIR::Not(a) => bnot(embed_pred_ir(a, s, sp)),
-        PredIR::Implies(a, b) => {
-            b2("Bool.or", bnot(embed_pred_ir(a, s, sp)), embed_pred_ir(b, s, sp))
-        }
+        PredIR::Implies(a, b) => b2(
+            "Bool.or",
+            bnot(embed_pred_ir(a, s, sp)),
+            embed_pred_ir(b, s, sp),
+        ),
         PredIR::Equiv(a, b) => {
             let pa = embed_pred_ir(a, s, sp);
             let pb = embed_pred_ir(b, s, sp);
@@ -11251,7 +12209,12 @@ pub(crate) fn embed_pred_ir(ir: &PredIR, s: &[u64], sp: &[u64]) -> Expr {
         // `Bool.or(Bool.not(mem_bit(y,src)), P(y))` — vacuously TRUE for a non-member. `body` embeds at
         // the extended tuple with column `bound_col := y` (the literal element). Empty universe ⇒
         // `Bool.true`. EXACT to TLA `∀y∈S:P` on the bitmask.
-        PredIR::SetForall { source, universe, bound_col, body } => {
+        PredIR::SetForall {
+            source,
+            universe,
+            bound_col,
+            body,
+        } => {
             let src = embed_set_ir(source, s, sp);
             let mut acc: Option<Expr> = None;
             for y in 0..u64::from(*universe) {
@@ -11269,7 +12232,12 @@ pub(crate) fn embed_pred_ir(ir: &PredIR, s: &[u64], sp: &[u64]) -> Expr {
             acc.unwrap_or_else(|| bool_lit(true))
         }
         // BOUNDED ∃y∈S: P(y) = ⋁_{y<K} (mem(y,source) ∧ P(y)). Kernel `Bool.or`-fold; empty ⇒ `Bool.false`.
-        PredIR::SetExists { source, universe, bound_col, body } => {
+        PredIR::SetExists {
+            source,
+            universe,
+            bound_col,
+            body,
+        } => {
             let src = embed_set_ir(source, s, sp);
             let mut acc: Option<Expr> = None;
             for y in 0..u64::from(*universe) {
@@ -11290,7 +12258,12 @@ pub(crate) fn embed_pred_ir(ir: &PredIR, s: &[u64], sp: &[u64]) -> Expr {
         // (there are 2^popcount(src) ≤ 2^K of them, enumerated at embed time). Each submask is a WHOLE
         // bitmask literal substituted into the bound-var (Set-valued) column `bound_col`. EXACT finite
         // enumeration of the powerset. Empty S ⇒ the single submask `0` (the empty set) ⇒ `P({})`.
-        PredIR::SubsetForall { source, bound_col, body, .. } => {
+        PredIR::SubsetForall {
+            source,
+            bound_col,
+            body,
+            ..
+        } => {
             let src = eval_set_ir(source, s, sp);
             let mut acc: Option<Expr> = None;
             for t in submasks(src) {
@@ -11304,7 +12277,12 @@ pub(crate) fn embed_pred_ir(ir: &PredIR, s: &[u64], sp: &[u64]) -> Expr {
             acc.unwrap_or_else(|| bool_lit(true))
         }
         // BOUNDED ∃T∈SUBSET S: P(T) = ⋁_{T ⊆ src} P(T). Dual of `SubsetForall`; empty S ⇒ `P({})`.
-        PredIR::SubsetExists { source, bound_col, body, .. } => {
+        PredIR::SubsetExists {
+            source,
+            bound_col,
+            body,
+            ..
+        } => {
             let src = eval_set_ir(source, s, sp);
             let mut acc: Option<Expr> = None;
             for t in submasks(src) {
@@ -11366,33 +12344,55 @@ pub(crate) fn eval_val_ir(ir: &ValIR, s: &[u64], sp: &[u64]) -> u64 {
         ValIR::Mul(a, b) => eval_val_ir(a, s, sp).saturating_mul(eval_val_ir(b, s, sp)),
         ValIR::Div(a, b) => {
             let d = eval_val_ir(b, s, sp);
-            if d == 0 { 0 } else { eval_val_ir(a, s, sp) / d }
+            if d == 0 {
+                0
+            } else {
+                eval_val_ir(a, s, sp) / d
+            }
         }
         ValIR::Mod(a, b) => {
             let d = eval_val_ir(b, s, sp);
             let n = eval_val_ir(a, s, sp);
-            if d == 0 { n } else { n % d }
+            if d == 0 {
+                n
+            } else {
+                n % d
+            }
         }
         ValIR::Sub(a, b) => eval_val_ir(a, s, sp).saturating_sub(eval_val_ir(b, s, sp)),
         // Len = count of nonzero base-D digits over the fixed max_len positions.
-        ValIR::SeqLen { pack, base, max_len } => {
+        ValIR::SeqLen {
+            pack,
+            base,
+            max_len,
+        } => {
             let d = base + 1;
             let p = eval_val_ir(pack, s, sp);
-            (0..u64::from(*max_len)).filter(|&i| (p / d.pow(i as u32)) % d != 0).count() as u64
+            (0..u64::from(*max_len))
+                .filter(|&i| (p / d.pow(i as u32)) % d != 0)
+                .count() as u64
         }
         ValIR::SeqTail { pack, base } => eval_val_ir(pack, s, sp) / (base + 1),
-        ValIR::SeqAppend { pack, elem, base, max_len } => {
+        ValIR::SeqAppend {
+            pack,
+            elem,
+            base,
+            max_len,
+        } => {
             let d = base + 1;
             let p = eval_val_ir(pack, s, sp);
-            let len =
-                (0..u64::from(*max_len)).filter(|&i| (p / d.pow(i as u32)) % d != 0).count() as u32;
+            let len = (0..u64::from(*max_len))
+                .filter(|&i| (p / d.pow(i as u32)) % d != 0)
+                .count() as u32;
             let e = eval_val_ir(elem, s, sp);
             p.saturating_add((e + 1).saturating_mul(d.saturating_pow(len)))
         }
         // Cardinality = popcount of the bitmask over the K-bit universe.
         ValIR::SetCard { set, universe } => {
             let m = eval_set_ir(set, s, sp);
-            (0..u64::from(*universe)).filter(|&i| (m >> i) & 1 == 1).count() as u64
+            (0..u64::from(*universe))
+                .filter(|&i| (m >> i) & 1 == 1)
+                .count() as u64
         }
         // Cardinality({d∈D:P(d)}) = count of per-element predicates that hold.
         ValIR::CountFold { terms } => {
@@ -11431,28 +12431,48 @@ pub(crate) fn eval_pred_ir(ir: &PredIR, s: &[u64], sp: &[u64]) -> bool {
         PredIR::SetUnchanged(i) => sp[*i] == s[*i],
         // Oracle mirror of the bounded folds: ∀y∈S over members / ∃y∈S over members / ∀T⊆S over
         // submasks / ∃T⊆S over submasks (EXACT to the kernel folds above).
-        PredIR::SetForall { source, universe, bound_col, body } => {
+        PredIR::SetForall {
+            source,
+            universe,
+            bound_col,
+            body,
+        } => {
             let src = eval_set_ir(source, s, sp);
             (0..u64::from(*universe)).all(|y| {
                 let (s_ext, sp_ext) = extend_bound(s, sp, *bound_col, y);
                 (src >> y) & 1 == 0 || eval_pred_ir(body, &s_ext, &sp_ext)
             })
         }
-        PredIR::SetExists { source, universe, bound_col, body } => {
+        PredIR::SetExists {
+            source,
+            universe,
+            bound_col,
+            body,
+        } => {
             let src = eval_set_ir(source, s, sp);
             (0..u64::from(*universe)).any(|y| {
                 let (s_ext, sp_ext) = extend_bound(s, sp, *bound_col, y);
                 (src >> y) & 1 == 1 && eval_pred_ir(body, &s_ext, &sp_ext)
             })
         }
-        PredIR::SubsetForall { source, bound_col, body, .. } => {
+        PredIR::SubsetForall {
+            source,
+            bound_col,
+            body,
+            ..
+        } => {
             let src = eval_set_ir(source, s, sp);
             submasks(src).into_iter().all(|t| {
                 let (s_ext, sp_ext) = extend_bound(s, sp, *bound_col, t);
                 eval_pred_ir(body, &s_ext, &sp_ext)
             })
         }
-        PredIR::SubsetExists { source, bound_col, body, .. } => {
+        PredIR::SubsetExists {
+            source,
+            bound_col,
+            body,
+            ..
+        } => {
             let src = eval_set_ir(source, s, sp);
             submasks(src).into_iter().any(|t| {
                 let (s_ext, sp_ext) = extend_bound(s, sp, *bound_col, t);
@@ -11475,8 +12495,10 @@ fn general_completeness_bool(reachable: &[Vec<u64>], domain: &[Vec<u64>], ir: &P
         for sp in domain {
             let pred = embed_pred_ir(ir, s, sp);
             let not_pred = Expr::apps(Expr::const_str("Bool.not"), [pred]);
-            let leg =
-                Expr::apps(Expr::const_str("Bool.or"), [not_pred, bool_lit(rset.contains(sp))]);
+            let leg = Expr::apps(
+                Expr::const_str("Bool.or"),
+                [not_pred, bool_lit(rset.contains(sp))],
+            );
             legs.push(leg);
         }
     }
@@ -11503,12 +12525,30 @@ fn pred_ir_bounds_ok(p: &PredIR) -> bool {
             set_ir_bounds_ok(s) && set_ir_bounds_ok(t)
         }
         PredIR::SetMem(_, s) | PredIR::SetNotMem(_, s) => set_ir_bounds_ok(s),
-        PredIR::SetForall { source, universe, body, .. }
-        | PredIR::SetExists { source, universe, body, .. } => {
-            *universe <= SET_UNIVERSE_BITS && set_ir_bounds_ok(source) && pred_ir_bounds_ok(body)
+        PredIR::SetForall {
+            source,
+            universe,
+            body,
+            ..
         }
-        PredIR::SubsetForall { source, universe, body, .. }
-        | PredIR::SubsetExists { source, universe, body, .. } => {
+        | PredIR::SetExists {
+            source,
+            universe,
+            body,
+            ..
+        } => *universe <= SET_UNIVERSE_BITS && set_ir_bounds_ok(source) && pred_ir_bounds_ok(body),
+        PredIR::SubsetForall {
+            source,
+            universe,
+            body,
+            ..
+        }
+        | PredIR::SubsetExists {
+            source,
+            universe,
+            body,
+            ..
+        } => {
             *universe <= SUBSET_QUANT_POPCOUNT_CAP
                 && set_ir_bounds_ok(source)
                 && pred_ir_bounds_ok(body)
@@ -11530,9 +12570,12 @@ fn set_ir_bounds_ok(s: &SetIR) -> bool {
     use crate::explicit_fixpoint_cert::SET_UNIVERSE_BITS;
     match s {
         SetIR::Cup(a, b) | SetIR::Cap(a, b) => set_ir_bounds_ok(a) && set_ir_bounds_ok(b),
-        SetIR::Filter { source, universe, pred, .. } => {
-            *universe <= SET_UNIVERSE_BITS && set_ir_bounds_ok(source) && pred_ir_bounds_ok(pred)
-        }
+        SetIR::Filter {
+            source,
+            universe,
+            pred,
+            ..
+        } => *universe <= SET_UNIVERSE_BITS && set_ir_bounds_ok(source) && pred_ir_bounds_ok(pred),
         // A FUNC-to-SET digit is `Nat.div`/`Nat.mod` of the concrete pack — no bit-shift overflow risk (the
         // `place`/`base` are valid `u64` by construction of the FuncSetMask column). Always bounds-OK.
         SetIR::Digit { .. } => true,
@@ -11542,9 +12585,10 @@ fn set_ir_bounds_ok(s: &SetIR) -> bool {
 
 /// The GENERAL `Next`-completeness obligation RESTRICTED to a SINGLE source state `s`:
 /// `C_s = ⋀_{sp∈D}(¬Next(s,sp) ∨ sp∈R)`. The full obligation is `⋀_{s∈R} C_s`, so proving each
-/// `C_s ⇒ Bool.true` INDEPENDENTLY is LOGICALLY IDENTICAL to proving the monolith (`⋀` distributes),
-/// but each kernel reduction is bounded at `|D|` legs — under the kernel's per-call heartbeat +
-/// memory budget — where the `|R|×|D|` monolith overflows BOTH for a multi-FuncEnum product domain
+/// `C_s ⇒ Bool.true` INDEPENDENTLY is LOGICALLY IDENTICAL to proving the monolith (`⋀` distributes).
+/// The caller may further partition `D`; conjunction over those slices is exactly `C_s`. This keeps
+/// every reduction under the kernel's per-call heartbeat/memory boundary, where the monolith overflows
+/// for a multi-FuncEnum product domain
 /// (VoucherLifeCycle V=3: `64×1728 = 110592` legs exhausts the 2M-step heartbeat at ~34 GB). The
 /// domain `D` (and thus the `D ⊇ Succ(R)` coverage) is UNCHANGED — this is proof DECOMPOSITION, not
 /// a domain change. Shares [`embed_pred_ir`] verbatim with [`general_completeness_bool`].
@@ -11558,13 +12602,20 @@ fn general_completeness_bool_for_state(
     for sp in domain {
         let pred = embed_pred_ir(ir, s, sp);
         let not_pred = Expr::apps(Expr::const_str("Bool.not"), [pred]);
-        let leg = Expr::apps(Expr::const_str("Bool.or"), [not_pred, bool_lit(rset.contains(sp))]);
+        let leg = Expr::apps(
+            Expr::const_str("Bool.or"),
+            [not_pred, bool_lit(rset.contains(sp))],
+        );
         legs.push(leg);
     }
     balanced_bool_and(legs)
 }
 
-/// Stack reservation for one PARALLEL chunk worker (the per-source-state completeness
+/// Bound each structurally complex per-source completeness term. The full domain is still covered by
+/// an exact conjunction of these slices; this changes proof shape only, never `D` or the closure claim.
+const GENERAL_COMPLETENESS_DOMAIN_CHUNK: usize = 256;
+
+/// Stack reservation for one PARALLEL chunk worker (the per-source/domain completeness
 /// legs below). Same figure and rationale as the sweep's `CERTIFY_WORKER_STACK_BYTES`
 /// (cmd_corpus/sweep.rs): a chunk obligation is a `|D|`-leg fold whose construction,
 /// serde-free deep drop, and kernel reduction all recurse on term depth in a debug
@@ -11573,15 +12624,15 @@ fn general_completeness_bool_for_state(
 const CERT_CHUNK_WORKER_STACK_BYTES: usize = 64 * 1024 * 1024;
 
 /// Run `check(0..n)` across worker threads and return whether ALL chunks pass — the
-/// PARALLEL driver for the per-source-state completeness chunks (`⋀_{s∈R} C_s`: each
-/// chunk is an INDEPENDENT kernel obligation; conjunction is order-independent).
+/// PARALLEL driver for the per-source/domain completeness chunks (each is an INDEPENDENT kernel
+/// obligation; their conjunction is order-independent and covers `R×D` exactly).
 ///
 /// PERF (perf(cert), 2026-07): the chunked general-`Next`-completeness leg is the
 /// dominant certify cost for the large-product corpus specs (VoucherLifeCycle
-/// `64×1728`, Peterson `42×1224`) — |R| independent `kernel_accepts` calls run twice
+/// `64×1728`, Peterson `42×1224`) — independent `kernel_accepts` calls run twice
 /// (mint + Leg-E re-check). This driver fans them out; it changes NO obligation, NO
 /// term, and NO cert byte:
-///  * each chunk's obligation is a DETERMINISTIC pure function of `(s, D, R, ir)` —
+///  * each chunk's obligation is a DETERMINISTIC pure function of `(s, D-slice, R, ir)` —
 ///    identical to the sequential loop's, whichever thread builds it;
 ///  * the accept condition is `all(chunks)` — order-independent, same verdict, and the
 ///    stored proof token is the CONSTANT `Eq.refl Bool Bool.true` either way;
@@ -11600,29 +12651,30 @@ fn par_chunks_all<F>(n: usize, check: F) -> bool
 where
     F: Fn(usize) -> bool + Sync,
 {
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
     if n == 0 {
         return true;
     }
-    let threads = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1).min(n);
+    let threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .min(n);
     let next = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
     // The chunk loop shared by the caller and every worker: pull the next chunk index,
     // stop on exhaustion or any failure (early exit — the caller declines anyway).
-    let run = |on_fail_stop: &AtomicBool| {
-        loop {
-            if on_fail_stop.load(Ordering::Relaxed) {
-                break;
-            }
-            let i = next.fetch_add(1, Ordering::Relaxed);
-            if i >= n {
-                break;
-            }
-            if !check(i) {
-                on_fail_stop.store(true, Ordering::Relaxed);
-                break;
-            }
+    let run = |on_fail_stop: &AtomicBool| loop {
+        if on_fail_stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let i = next.fetch_add(1, Ordering::Relaxed);
+        if i >= n {
+            break;
+        }
+        if !check(i) {
+            on_fail_stop.store(true, Ordering::Relaxed);
+            break;
         }
     };
     if threads <= 1 {
@@ -11634,8 +12686,10 @@ where
     // chunks the caller itself runs tally straight into the active tally, unchanged.)
     let want_ck0 = crate::ck0_bridge::tally_active();
     let want_ax = crate::kernel_census::axiom_tally_active();
-    let acc: Mutex<(crate::ck0_bridge::Ck0Tally, crate::kernel_census::GateAxiomTally)> =
-        Mutex::new(Default::default());
+    let acc: Mutex<(
+        crate::ck0_bridge::Ck0Tally,
+        crate::kernel_census::GateAxiomTally,
+    )> = Mutex::new(Default::default());
     std::thread::scope(|sc| {
         let mut handles = Vec::with_capacity(threads - 1);
         for _ in 0..threads - 1 {
@@ -11650,10 +12704,20 @@ where
                         crate::kernel_census::begin_axiom_tally();
                     }
                     run(&failed);
-                    let t = if want_ck0 { crate::ck0_bridge::take_tally() } else { None };
-                    let a = if want_ax { crate::kernel_census::take_axiom_tally() } else { None };
+                    let t = if want_ck0 {
+                        crate::ck0_bridge::take_tally()
+                    } else {
+                        None
+                    };
+                    let a = if want_ax {
+                        crate::kernel_census::take_axiom_tally()
+                    } else {
+                        None
+                    };
                     if t.is_some() || a.is_some() {
-                        let mut g = acc.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let mut g = acc
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         if let Some(t) = t {
                             g.0.corroborated += t.corroborated;
                             g.0.unavailable += t.unavailable;
@@ -11683,7 +12747,9 @@ where
         }
     });
     // EXACT-COUNT merge of the workers' tallies into the caller's active tallies.
-    let (t, a) = acc.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (t, a) = acc
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     crate::ck0_bridge::merge_into_active_tally(t);
     crate::kernel_census::merge_into_active_axiom_tally(a);
     !failed.load(Ordering::Relaxed)
@@ -11697,27 +12763,35 @@ pub(crate) fn certify_general_completeness(
     if reachable.is_empty() || domain.is_empty() || !pred_ir_bounds_ok(ir) {
         return None;
     }
-    // SMALL obligations: the historical SINGLE-term path (`⋀_{s∈R,sp∈D} leg`) — byte-identical certs
-    // and unchanged ck0 corroboration for every existing enumerator-free spec (all `≤` the cap).
+    // SMALL obligations: prefer the historical SINGLE-term path (`⋀_{s∈R,sp∈D} leg`) for
+    // byte-identical certs and unchanged ck0 corroboration. A structurally complex predicate can hit
+    // the kernel's reduction/term-resource guard even below the leg-count cap (TCommit's nested global
+    // guards do this at only 34×64 legs). In that case fall through to the EXACT per-source partition:
+    // every chunk proves a conjunct partition of the same obligation, so this is no weakening.
     if reachable.len().saturating_mul(domain.len())
         <= crate::explicit_fixpoint_cert::GENERAL_COMPLETENESS_MONOLITH_CAP
     {
         let (ty, term) = bool_true_eq(general_completeness_bool(reachable, domain, ir));
-        if !kernel_accepts(&term, &ty) {
-            return None;
+        if kernel_accepts(&term, &ty) {
+            return expr_to_bytes(&term);
         }
-        return expr_to_bytes(&term);
     }
-    // LARGE product domain (beyond the single-call heartbeat/memory budget): prove the obligation
-    // PER SOURCE STATE. `⋀_{s∈R} C_s = ⋀_{s∈R,sp∈D} leg`, so accepting iff EVERY chunk kernel-reduces
-    // to `Bool.true` is equivalent to the monolith — but each chunk is `|D| ≤ state_cap` legs, within
-    // the regime the monolith cap already deemed safe. A single escaping successor (non-closed `R`)
-    // makes its source state's chunk ≠ `true` ⇒ that chunk's `kernel_accepts` FAILS ⇒ decline.
+    // LARGE product domain, or a small but structurally expensive monolith: prove the obligation PER
+    // SOURCE STATE. `⋀_{s∈R} C_s = ⋀_{s∈R,sp∈D} leg`, so accepting iff EVERY chunk kernel-reduces to
+    // `Bool.true` is equivalent to the monolith. A single escaping successor (non-closed `R`) makes its
+    // source state's chunk ≠ `true` ⇒ that chunk's `kernel_accepts` FAILS ⇒ decline.
     // The chunks are INDEPENDENT obligations — checked in parallel (see [`par_chunks_all`]:
     // same obligations, same constant proof token, exact tally counts).
     let rset: std::collections::BTreeSet<&Vec<u64>> = reachable.iter().collect();
-    let ok = par_chunks_all(reachable.len(), |i| {
-        let c_s = general_completeness_bool_for_state(&reachable[i], domain, &rset, ir);
+    let domain_chunks = domain.len().div_ceil(GENERAL_COMPLETENESS_DOMAIN_CHUNK);
+    let jobs = reachable.len().checked_mul(domain_chunks)?;
+    let ok = par_chunks_all(jobs, |job| {
+        let source = job / domain_chunks;
+        let chunk = job % domain_chunks;
+        let lo = chunk * GENERAL_COMPLETENESS_DOMAIN_CHUNK;
+        let hi = (lo + GENERAL_COMPLETENESS_DOMAIN_CHUNK).min(domain.len());
+        let c_s =
+            general_completeness_bool_for_state(&reachable[source], &domain[lo..hi], &rset, ir);
         let (ty, term) = bool_true_eq(c_s);
         kernel_accepts(&term, &ty)
     });
@@ -11751,16 +12825,27 @@ pub(crate) fn verify_general_completeness(
         <= crate::explicit_fixpoint_cert::GENERAL_COMPLETENESS_MONOLITH_CAP
     {
         let (ty, _) = bool_true_eq(general_completeness_bool(reachable, domain, ir));
-        return kernel_accepts(&term, &ty);
+        if kernel_accepts(&term, &ty) {
+            return true;
+        }
     }
-    // PER-SOURCE-STATE re-check: the stored `Eq.refl Bool Bool.true` proves `C_s = Bool.true` for
-    // EACH `s∈R` (defeq re-reduces each chunk). ALL chunks must pass — one escaping successor in `D`
-    // makes its chunk `≠ true` ⇒ `kernel_accepts` fails ⇒ NOT-CLOSED.
+    // PER-SOURCE-STATE re-check, including the deterministic fallback when a below-cap monolith exceeds
+    // the kernel's structural resource guard: the stored `Eq.refl Bool Bool.true` proves `C_s =
+    // Bool.true` for EACH `s∈R`. ALL chunks must pass — one escaping successor makes one chunk fail.
     // The chunks are INDEPENDENT obligations — re-checked in parallel (see [`par_chunks_all`]:
     // same obligations rebuilt per chunk, same verdict, exact tally counts).
     let rset: std::collections::BTreeSet<&Vec<u64>> = reachable.iter().collect();
-    par_chunks_all(reachable.len(), |i| {
-        let c_s = general_completeness_bool_for_state(&reachable[i], domain, &rset, ir);
+    let domain_chunks = domain.len().div_ceil(GENERAL_COMPLETENESS_DOMAIN_CHUNK);
+    let Some(jobs) = reachable.len().checked_mul(domain_chunks) else {
+        return false;
+    };
+    par_chunks_all(jobs, |job| {
+        let source = job / domain_chunks;
+        let chunk = job % domain_chunks;
+        let lo = chunk * GENERAL_COMPLETENESS_DOMAIN_CHUNK;
+        let hi = (lo + GENERAL_COMPLETENESS_DOMAIN_CHUNK).min(domain.len());
+        let c_s =
+            general_completeness_bool_for_state(&reachable[source], &domain[lo..hi], &rset, ir);
         let (ty, _) = bool_true_eq(c_s);
         kernel_accepts(&term, &ty)
     })
@@ -11780,7 +12865,10 @@ fn general_init_completeness_bool(
         // Init mentions no primed columns; pass `s` for `sp` too so any column index is in range.
         let pred = embed_pred_ir(ir, s, s);
         let not_pred = Expr::apps(Expr::const_str("Bool.not"), [pred]);
-        let leg = Expr::apps(Expr::const_str("Bool.or"), [not_pred, bool_lit(rset.contains(s))]);
+        let leg = Expr::apps(
+            Expr::const_str("Bool.or"),
+            [not_pred, bool_lit(rset.contains(s))],
+        );
         legs.push(leg);
     }
     balanced_bool_and(legs)
@@ -11843,8 +12931,11 @@ fn deadlock_witness_bool_general(
     witnesses: &[Vec<u64>],
     ir: &PredIR,
 ) -> Expr {
-    let legs: Vec<Expr> =
-        reachable.iter().zip(witnesses.iter()).map(|(s, w)| embed_pred_ir(ir, s, w)).collect();
+    let legs: Vec<Expr> = reachable
+        .iter()
+        .zip(witnesses.iter())
+        .map(|(s, w)| embed_pred_ir(ir, s, w))
+        .collect();
     balanced_bool_and(legs)
 }
 
@@ -11871,7 +12962,10 @@ pub(crate) fn verify_deadlock_witness_general(
     if reachable.is_empty() || reachable.len() != witnesses.len() || !pred_ir_bounds_ok(ir) {
         return false;
     }
-    verify_bool_true_obligation(deadlock_witness_bool_general(reachable, witnesses, ir), bytes)
+    verify_bool_true_obligation(
+        deadlock_witness_bool_general(reachable, witnesses, ir),
+        bytes,
+    )
 }
 
 /// AFFINE (single-`Int`) deadlock-witness obligation, `balanced_bool_and`-folded over `R`.
@@ -11910,7 +13004,10 @@ pub(crate) fn verify_deadlock_witness_affine(
     if reachable.is_empty() || reachable.len() != witnesses.len() {
         return false;
     }
-    verify_bool_true_obligation(deadlock_witness_bool_affine(reachable, witnesses, shape), bytes)
+    verify_bool_true_obligation(
+        deadlock_witness_bool_affine(reachable, witnesses, shape),
+        bytes,
+    )
 }
 
 // ── SOUND domain extraction for the general single-Int leg (the `D ⊇ Succ(R)` coverage proof) ────────
@@ -11940,7 +13037,11 @@ fn is_primed_var(e: &tla_core::ast::Expr, var: &str) -> bool {
 fn lit_nonneg(e: &tla_core::ast::Expr) -> Option<u64> {
     use tla_core::ast::Expr as E;
     if let E::Int(i) = e {
-        i.to_string().parse::<i64>().ok().filter(|v| *v >= 0).map(|v| v as u64)
+        i.to_string()
+            .parse::<i64>()
+            .ok()
+            .filter(|v| *v >= 0)
+            .map(|v| v as u64)
     } else {
         None
     }
@@ -12329,7 +13430,10 @@ pub(crate) fn next_domain_bounds_cov_from_ir(
                 // elements ⇒ `S' ⊆ S` ⇒ the successor mask is `≤ max(R's i-th column)`). Both bound the
                 // axis by the reachable masks — a SMALL domain that lets the comprehension leg FIRE even
                 // though the Set universe (16) far exceeds the enumeration cap.
-                if conj.iter().any(|c| is_set_stutter_ir(c, i) || is_set_filter_subset_ir(c, i)) {
+                if conj
+                    .iter()
+                    .any(|c| is_set_stutter_ir(c, i) || is_set_filter_subset_ir(c, i))
+                {
                     let h = reachable.iter().filter_map(|t| t.get(i).copied()).max();
                     bounds.push((h.unwrap_or(0), DomainCoverage::RustDerived));
                     continue;
@@ -12380,11 +13484,15 @@ pub(crate) fn next_domain_bounds_cov_from_ir(
             // An UNRECOGNIZED Bool-Func next (a non-Bool write, or a shape `func_bool_update_eq_form`
             // declines) never reaches here — the Next recognizer returns `None` and the whole general leg is
             // declined, so this arm never over-claims a cover it does not have.
-            ColSort::Func { ref cells, arity, base, .. }
-                if cells.len() == arity as usize
-                    && cells
-                        .iter()
-                        .all(|c| matches!(c, crate::explicit_fixpoint_cert::CellSort::Bool)) =>
+            ColSort::Func {
+                ref cells,
+                arity,
+                base,
+                ..
+            } if cells.len() == arity as usize
+                && cells
+                    .iter()
+                    .all(|c| matches!(c, crate::explicit_fixpoint_cert::CellSort::Bool)) =>
             {
                 // PER-COLUMN, recognition-gated cap: the RAISED cap for a recognized cell-kind-safe
                 // compound (mixed-cell Record / FuncEnum / Bool-Func — exact successor pack), else the
@@ -12419,7 +13527,11 @@ pub(crate) fn next_domain_bounds_cov_from_ir(
                 // conservative floor. Deterministic on the sort ⇒ certify and verify agree per column.
                 let cap = sorts[i].completeness_pack_cap();
                 if conj.iter().any(|c| is_stutter_ir(c, i)) {
-                    let h = reachable.iter().filter_map(|t| t.get(i).copied()).max().unwrap_or(0);
+                    let h = reachable
+                        .iter()
+                        .filter_map(|t| t.get(i).copied())
+                        .max()
+                        .unwrap_or(0);
                     if h > cap {
                         return None; // stuttered pack too large ⇒ decline (keep D small); image⊆R covers it.
                     }
@@ -12557,7 +13669,9 @@ fn init_int_direct_bound(c: &PredIR, i: usize) -> Option<u64> {
         // FINITE-Int-set membership `s_i ∈ {lits}` (Or-fold of same-column Eq-literals) ⇒ max(lits).
         PredIR::Or(_, _) => {
             let mut acc = None;
-            eq_lit_disjunction_max(c, i, &mut acc).then_some(()).and(acc)
+            eq_lit_disjunction_max(c, i, &mut acc)
+                .then_some(())
+                .and(acc)
         }
         _ => None,
     }
@@ -12655,11 +13769,15 @@ pub(crate) fn init_domain_bounds_cov_from_ir(
             // `≤ H`, so `{0..=H} ⊇ {s : Init(s)}` on this axis BY CONSTRUCTION (mirroring the Next-side Bool-
             // `Func` arm + FuncEnum's Init arm). `UniverseComplete`; declines (⇒ Init rests on the enumerated
             // `init_values ⊆ R`) only if `H` overflows / exceeds the cap.
-            ColSort::Func { ref cells, arity, base, .. }
-                if cells.len() == arity as usize
-                    && cells
-                        .iter()
-                        .all(|c| matches!(c, crate::explicit_fixpoint_cert::CellSort::Bool)) =>
+            ColSort::Func {
+                ref cells,
+                arity,
+                base,
+                ..
+            } if cells.len() == arity as usize
+                && cells
+                    .iter()
+                    .all(|c| matches!(c, crate::explicit_fixpoint_cert::CellSort::Bool)) =>
             {
                 // PER-COLUMN, recognition-gated cap: the RAISED cap for a recognized cell-kind-safe
                 // compound (mixed-cell Record / FuncEnum / Bool-Func — exact successor pack), else the
@@ -12866,9 +13984,18 @@ fn embed_val_ir_sym(ir: &ValIR, s: &[u64], n_cols: usize, base: u32, primed: boo
         ValIR::Div(a, b) => nat2("Nat.div", rec(a)?, rec(b)?),
         ValIR::Mod(a, b) => nat2("Nat.mod", rec(a)?, rec(b)?),
         ValIR::Sub(a, b) => nat2("Nat.sub", rec(a)?, rec(b)?),
-        ValIR::SeqLen { pack, base: b, max_len } => seq_len_term(rec(pack)?, *b, *max_len),
+        ValIR::SeqLen {
+            pack,
+            base: b,
+            max_len,
+        } => seq_len_term(rec(pack)?, *b, *max_len),
         ValIR::SeqTail { pack, base: b } => nat2("Nat.div", rec(pack)?, Expr::nat_lit(b + 1)),
-        ValIR::SeqAppend { pack, elem, base: b, max_len } => {
+        ValIR::SeqAppend {
+            pack,
+            elem,
+            base: b,
+            max_len,
+        } => {
             let d = b + 1;
             let pk = rec(pack)?;
             let len = seq_len_term(pk.clone(), *b, *max_len);
@@ -12994,7 +14121,10 @@ fn bool_true() -> Expr {
 }
 fn eq_bool(a: Expr, b: Expr) -> Expr {
     use clean_kernel::Level;
-    Expr::apps(Expr::const_str_levels("Eq", vec![Level::succ(Level::zero())]), [bool_ty(), a, b])
+    Expr::apps(
+        Expr::const_str_levels("Eq", vec![Level::succ(Level::zero())]),
+        [bool_ty(), a, b],
+    )
 }
 fn refl_bool_true() -> Expr {
     use clean_kernel::Level;
@@ -13065,7 +14195,10 @@ fn bool_and_left_lemma() -> Expr {
                     motive,
                     Expr::lam(
                         BinderInfo::Default,
-                        eq_bool(band(Expr::const_str("Bool.false"), Expr::bvar(0)), bool_true()),
+                        eq_bool(
+                            band(Expr::const_str("Bool.false"), Expr::bvar(0)),
+                            bool_true(),
+                        ),
                         Expr::bvar(0),
                     ),
                     Expr::lam(
@@ -13097,7 +14230,10 @@ fn bool_and_right_lemma() -> Expr {
     );
     let case_false = Expr::lam(
         BinderInfo::Default,
-        eq_bool(band(Expr::const_str("Bool.false"), Expr::bvar(0)), bool_true()),
+        eq_bool(
+            band(Expr::const_str("Bool.false"), Expr::bvar(0)),
+            bool_true(),
+        ),
         Expr::apps(
             Expr::const_str_levels("False.elim", vec![Level::zero()]),
             [
@@ -13149,7 +14285,11 @@ fn bool_or_elim_lemma() -> Expr {
             // under h: a' = 1, G = 2, b = 3
             Expr::pi(
                 BinderInfo::Default,
-                Expr::pi(BinderInfo::Default, eq_bool(Expr::bvar(1), bool_true()), Expr::bvar(3)),
+                Expr::pi(
+                    BinderInfo::Default,
+                    eq_bool(Expr::bvar(1), bool_true()),
+                    Expr::bvar(3),
+                ),
                 // under k1: G = 3, b = 4
                 Expr::pi(
                     BinderInfo::Default,
@@ -13167,7 +14307,10 @@ fn bool_or_elim_lemma() -> Expr {
     // case a = false: λh k1 k2. k2 h   (h : Eq (or false b) true ≡ Eq b true definitionally)
     let case_false = Expr::lam(
         BinderInfo::Default,
-        eq_bool(bor(Expr::const_str("Bool.false"), Expr::bvar(1)), bool_true()),
+        eq_bool(
+            bor(Expr::const_str("Bool.false"), Expr::bvar(1)),
+            bool_true(),
+        ),
         Expr::lam(
             BinderInfo::Default,
             Expr::pi(
@@ -13177,7 +14320,11 @@ fn bool_or_elim_lemma() -> Expr {
             ),
             Expr::lam(
                 BinderInfo::Default,
-                Expr::pi(BinderInfo::Default, eq_bool(Expr::bvar(3), bool_true()), Expr::bvar(3)),
+                Expr::pi(
+                    BinderInfo::Default,
+                    eq_bool(Expr::bvar(3), bool_true()),
+                    Expr::bvar(3),
+                ),
                 Expr::apps(Expr::bvar(0), [Expr::bvar(2)]),
             ),
         ),
@@ -13188,10 +14335,18 @@ fn bool_or_elim_lemma() -> Expr {
         eq_bool(bor(bool_true(), Expr::bvar(1)), bool_true()),
         Expr::lam(
             BinderInfo::Default,
-            Expr::pi(BinderInfo::Default, eq_bool(bool_true(), bool_true()), Expr::bvar(2)),
+            Expr::pi(
+                BinderInfo::Default,
+                eq_bool(bool_true(), bool_true()),
+                Expr::bvar(2),
+            ),
             Expr::lam(
                 BinderInfo::Default,
-                Expr::pi(BinderInfo::Default, eq_bool(Expr::bvar(3), bool_true()), Expr::bvar(3)),
+                Expr::pi(
+                    BinderInfo::Default,
+                    eq_bool(Expr::bvar(3), bool_true()),
+                    Expr::bvar(3),
+                ),
                 Expr::apps(Expr::bvar(1), [refl_bool_true()]),
             ),
         ),
@@ -13269,7 +14424,11 @@ fn beq_to_ble_lemma(c: u64, h: u64, sym_first: bool) -> Expr {
     use clean_kernel::Level;
     let nat = || Expr::const_str("Nat");
     let beq_at = |n: Expr, cl: u64| {
-        let (a, b) = if sym_first { (n, Expr::nat_lit(cl)) } else { (Expr::nat_lit(cl), n) };
+        let (a, b) = if sym_first {
+            (n, Expr::nat_lit(cl))
+        } else {
+            (Expr::nat_lit(cl), n)
+        };
         Expr::apps(Expr::const_str("Nat.beq"), [a, b])
     };
     let ble = |a: Expr, b: Expr| Expr::apps(Expr::const_str("Nat.ble"), [a, b]);
@@ -13400,7 +14559,10 @@ fn nat_eq_of_beq_term() -> Expr {
         )
     };
     let natrec0 = |m: Expr, z: Expr, s: Expr| {
-        Expr::apps(Expr::const_str_levels("Nat.rec", vec![Level::zero()]), [m, z, s])
+        Expr::apps(
+            Expr::const_str_levels("Nat.rec", vec![Level::zero()]),
+            [m, z, s],
+        )
     };
     let lam = |ty: Expr, body: Expr| Expr::lam(BinderInfo::Default, ty, body);
     let bv = Expr::bvar;
@@ -13408,10 +14570,17 @@ fn nat_eq_of_beq_term() -> Expr {
     // outer motive C := λa. Π b. Eq(beq a b) true → Eq Nat a b   (under λa: a=0; under Πb: a=1,b=0)
     let outer_c = lam(
         nat(),
-        Expr::pi(BinderInfo::Default, nat(), Expr::arrow(beq_t(bv(1), bv(0)), eq_n(bv(2), bv(1)))),
+        Expr::pi(
+            BinderInfo::Default,
+            nat(),
+            Expr::arrow(beq_t(bv(1), bv(0)), eq_n(bv(2), bv(1))),
+        ),
     );
     // z_case : C 0 = Π b. Eq(beq 0 b) true → Eq Nat 0 b   (inner Nat.rec on b)
-    let z_motive = lam(nat(), Expr::arrow(beq_t(zero(), bv(0)), eq_n(zero(), bv(1))));
+    let z_motive = lam(
+        nat(),
+        Expr::arrow(beq_t(zero(), bv(0)), eq_n(zero(), bv(1))),
+    );
     let z_inner_z = lam(beq_t(zero(), zero()), refl_n(zero())); // b=0 : Eq.refl 0
     let z_inner_s = lam(
         nat(), // k = bvar0
@@ -13467,7 +14636,10 @@ fn nat_eq_of_beq_ty() -> Expr {
     let beq_t =
         |a: Expr, b: Expr| eq_bool(Expr::apps(Expr::const_str("Nat.beq"), [a, b]), bool_true());
     let eq_n = |a: Expr, b: Expr| {
-        Expr::apps(Expr::const_str_levels("Eq", vec![Level::succ(Level::zero())]), [nat(), a, b])
+        Expr::apps(
+            Expr::const_str_levels("Eq", vec![Level::succ(Level::zero())]),
+            [nat(), a, b],
+        )
     };
     Expr::pi(
         BinderInfo::Default,
@@ -13475,7 +14647,10 @@ fn nat_eq_of_beq_ty() -> Expr {
         Expr::pi(
             BinderInfo::Default,
             nat(),
-            Expr::arrow(beq_t(Expr::bvar(1), Expr::bvar(0)), eq_n(Expr::bvar(2), Expr::bvar(1))),
+            Expr::arrow(
+                beq_t(Expr::bvar(1), Expr::bvar(0)),
+                eq_n(Expr::bvar(2), Expr::bvar(1)),
+            ),
         ),
     )
 }
@@ -13493,10 +14668,16 @@ fn beq_ble_trans(h: u64) -> Expr {
     let beq_t =
         |a: Expr, b: Expr| eq_bool(Expr::apps(Expr::const_str("Nat.beq"), [a, b]), bool_true());
     let ble_t = |x: Expr| {
-        eq_bool(Expr::apps(Expr::const_str("Nat.ble"), [x, Expr::nat_lit(h)]), bool_true())
+        eq_bool(
+            Expr::apps(Expr::const_str("Nat.ble"), [x, Expr::nat_lit(h)]),
+            bool_true(),
+        )
     };
     // Under [a,b,hab,hbleb]: a=3, b=2, hab=1, hbleb=0.
-    let eq_ab = Expr::apps(nat_eq_of_beq_term(), [Expr::bvar(3), Expr::bvar(2), Expr::bvar(1)]);
+    let eq_ab = Expr::apps(
+        nat_eq_of_beq_term(),
+        [Expr::bvar(3), Expr::bvar(2), Expr::bvar(1)],
+    );
     let symm = Expr::apps(
         Expr::const_str_levels("Eq.symm", lvl1()),
         [nat(), Expr::bvar(3), Expr::bvar(2), eq_ab], // Eq.symm Nat a b (eq_ab : Eq Nat a b) : Eq Nat b a
@@ -13506,7 +14687,14 @@ fn beq_ble_trans(h: u64) -> Expr {
     // Eq.subst Nat P b a (symm : Eq Nat b a) (hbleb : P b) : P a
     let subst = Expr::apps(
         Expr::const_str_levels("Eq.subst", lvl1()),
-        [nat(), motive, Expr::bvar(2), Expr::bvar(3), symm, Expr::bvar(0)],
+        [
+            nat(),
+            motive,
+            Expr::bvar(2),
+            Expr::bvar(3),
+            symm,
+            Expr::bvar(0),
+        ],
     );
     Expr::lam(
         BinderInfo::Default,
@@ -13534,7 +14722,10 @@ fn beq_ble_trans_ty(h: u64) -> Expr {
     let beq_t =
         |a: Expr, b: Expr| eq_bool(Expr::apps(Expr::const_str("Nat.beq"), [a, b]), bool_true());
     let ble_t = |x: Expr| {
-        eq_bool(Expr::apps(Expr::const_str("Nat.ble"), [x, Expr::nat_lit(h)]), bool_true())
+        eq_bool(
+            Expr::apps(Expr::const_str("Nat.ble"), [x, Expr::nat_lit(h)]),
+            bool_true(),
+        )
     };
     Expr::pi(
         BinderInfo::Default,
@@ -13611,8 +14802,10 @@ fn coverage_leaf(c: &PredIR, i: usize, hi: u64, s: &[u64], primed: bool) -> Opti
         }
     };
     let pin = |c_val: u64, sym_first: bool| {
-        (c_val <= hi && c_val <= COVERAGE_SYNTH_MAX_PIN)
-            .then_some(CoverageLeaf::Pin { c: c_val, sym_first })
+        (c_val <= hi && c_val <= COVERAGE_SYNTH_MAX_PIN).then_some(CoverageLeaf::Pin {
+            c: c_val,
+            sym_first,
+        })
     };
     match c {
         // Direct upper bounds on the symbolic column.
@@ -13738,7 +14931,12 @@ fn cross_col_coverage_proof(
     let h_j = coverage_proof_body(ir, h, j, hi, s, n_cols, primed, base)?;
     Some(Expr::apps(
         beq_ble_trans(hi),
-        [sym_col_bvar(n_cols, i, base), sym_col_bvar(n_cols, j, base), h_beq, h_j],
+        [
+            sym_col_bvar(n_cols, i, base),
+            sym_col_bvar(n_cols, j, base),
+            h_beq,
+            h_j,
+        ],
     ))
 }
 
@@ -13762,9 +14960,10 @@ fn coverage_proof_body(
     if let Some(leaf) = coverage_leaf(ir, i, hi, s, primed) {
         return Some(match leaf {
             CoverageLeaf::Hypothesis => h,
-            CoverageLeaf::Pin { c, sym_first } => {
-                Expr::apps(beq_to_ble_lemma(c, hi, sym_first), [sym_col_bvar(n_cols, i, base), h])
-            }
+            CoverageLeaf::Pin { c, sym_first } => Expr::apps(
+                beq_to_ble_lemma(c, hi, sym_first),
+                [sym_col_bvar(n_cols, i, base), h],
+            ),
         });
     }
     // CROSS-COLUMN Init pin `Var(i) = Var(j)` (the `ack = rdy` shape): column `i` inherits column
@@ -13800,15 +14999,26 @@ fn coverage_proof_body(
             let ble = |x: Expr, y: Expr| Expr::apps(Expr::const_str("Nat.ble"), [x, y]);
             let ea = embed_pred_ir_sym(a, s, n_cols, base, primed)?;
             let eb = embed_pred_ir_sym(b, s, n_cols, base, primed)?;
-            let goal = eq_bool(ble(sym_col_bvar(n_cols, i, base), Expr::nat_lit(hi)), bool_true());
+            let goal = eq_bool(
+                ble(sym_col_bvar(n_cols, i, base), Expr::nat_lit(hi)),
+                bool_true(),
+            );
             // A lambda's BINDER TYPE renders at the depth OUTSIDE its binder (`base`); only the
             // BODY sits under the new hypothesis binder (`base + 1`).
             let ka_body =
                 coverage_proof_body(a, Expr::bvar(0), i, hi, s, n_cols, primed, base + 1)?;
-            let ka = Expr::lam(BinderInfo::Default, eq_bool(ea.clone(), bool_true()), ka_body);
+            let ka = Expr::lam(
+                BinderInfo::Default,
+                eq_bool(ea.clone(), bool_true()),
+                ka_body,
+            );
             let kb_body =
                 coverage_proof_body(b, Expr::bvar(0), i, hi, s, n_cols, primed, base + 1)?;
-            let kb = Expr::lam(BinderInfo::Default, eq_bool(eb.clone(), bool_true()), kb_body);
+            let kb = Expr::lam(
+                BinderInfo::Default,
+                eq_bool(eb.clone(), bool_true()),
+                kb_body,
+            );
             Some(Expr::apps(bool_or_elim_lemma(), [ea, eb, goal, h, ka, kb]))
         }
         _ => None,
@@ -13830,7 +15040,10 @@ fn coverage_lemma(
     let ble = |a: Expr, b: Expr| Expr::apps(Expr::const_str("Nat.ble"), [a, b]);
     // Hypothesis type sits under the n_cols Π-binders (base 0); goal + body under h too (base 1).
     let hyp = eq_bool(embed_pred_ir_sym(ir, s, n_cols, 0, primed)?, bool_true());
-    let goal = eq_bool(ble(sym_col_bvar(n_cols, i, 1), Expr::nat_lit(hi)), bool_true());
+    let goal = eq_bool(
+        ble(sym_col_bvar(n_cols, i, 1), Expr::nat_lit(hi)),
+        bool_true(),
+    );
     let body = coverage_proof_body(ir, Expr::bvar(0), i, hi, s, n_cols, primed, 1)?;
     let mut ty = Expr::pi(BinderInfo::Default, hyp.clone(), goal);
     let mut tm = Expr::lam(BinderInfo::Default, hyp, body);
@@ -13861,8 +15074,11 @@ fn sym_embed_matches_concrete(
     // reversal only surfaces at the FIRST MULTI-COLUMN coverage obligation (AsynchInterface).
     let lits: Vec<Expr> = tuple.iter().rev().map(|v| Expr::nat_lit(*v)).collect();
     let inst = sym.instantiate_rev(&lits);
-    let concrete =
-        if primed { embed_pred_ir(ir, s, tuple) } else { embed_pred_ir(ir, tuple, tuple) };
+    let concrete = if primed {
+        embed_pred_ir(ir, s, tuple)
+    } else {
+        embed_pred_ir(ir, tuple, tuple)
+    };
     inst == concrete
 }
 
@@ -13985,7 +15201,12 @@ pub(crate) fn product_domain(bounds: &[u64], cap: usize) -> Option<Vec<Vec<u64>>
 #[cfg_attr(not(test), allow(dead_code))] // staged: finite set-theory relations, wired into set-valued state next
 /// `e ∈ set` — kernel-reducible Bool `⋁_{a∈set} Nat.beq e a` (concrete finite set; `e ∈ {}` = false).
 fn set_mem_bool(e: u64, set: &[u64]) -> Expr {
-    let beq = |a: u64| Expr::apps(Expr::const_str("Nat.beq"), [Expr::nat_lit(e), Expr::nat_lit(a)]);
+    let beq = |a: u64| {
+        Expr::apps(
+            Expr::const_str("Nat.beq"),
+            [Expr::nat_lit(e), Expr::nat_lit(a)],
+        )
+    };
     let mut acc: Option<Expr> = None;
     for &a in set {
         acc = Some(match acc {
@@ -14013,7 +15234,10 @@ fn set_subseteq_bool(s1: &[u64], s2: &[u64]) -> Expr {
 #[cfg_attr(not(test), allow(dead_code))] // staged: finite set-theory relations, wired into set-valued state next
 /// `s1 = s2` — kernel-reducible Bool set equality as mutual subset (order/duplication-independent).
 fn set_eq_bool(s1: &[u64], s2: &[u64]) -> Expr {
-    Expr::apps(Expr::const_str("Bool.and"), [set_subseteq_bool(s1, s2), set_subseteq_bool(s2, s1)])
+    Expr::apps(
+        Expr::const_str("Bool.and"),
+        [set_subseteq_bool(s1, s2), set_subseteq_bool(s2, s1)],
+    )
 }
 
 #[cfg_attr(not(test), allow(dead_code))] // staged: finite set-theory relations, wired into set-valued state next
@@ -14054,7 +15278,10 @@ fn explicit_safety_2state(a: u64, b: u64) -> (Expr, Expr) {
     let int_ty = || Expr::const_str("Int");
     let nonneg = |e: Expr| Expr::apps(Expr::const_str("Int.NonNeg"), [e]);
     let eq_at = |slot: u32, lit: u64| {
-        Expr::apps(Expr::const_str_levels("Eq", lvl()), [int_ty(), Expr::bvar(slot), ofnat(lit)])
+        Expr::apps(
+            Expr::const_str_levels("Eq", lvl()),
+            [int_ty(), Expr::bvar(slot), ofnat(lit)],
+        )
     };
     let or = |p: Expr, q: Expr| Expr::apps(Expr::const_str("Or"), [p, q]);
 
@@ -14089,13 +15316,27 @@ fn explicit_safety_2state(a: u64, b: u64) -> (Expr, Expr) {
         Expr::lam(BinderInfo::Default, eq_at(1, v), body) // hv : Eq x v, x=bvar1 (depth2)
     };
     // motive λ(_:Or (x=a)(x=b)). NonNeg x  — binder (depth2: x=1), body (depth3: x=2)
-    let motive =
-        Expr::lam(BinderInfo::Default, or(eq_at(1, a), eq_at(1, b)), nonneg(Expr::bvar(2)));
+    let motive = Expr::lam(
+        BinderInfo::Default,
+        or(eq_at(1, a), eq_at(1, b)),
+        nonneg(Expr::bvar(2)),
+    );
     let rec = Expr::apps(
         Expr::const_str("Or.rec"),
-        [eq_at(1, a), eq_at(1, b), motive, case(a), case(b), Expr::bvar(0)],
+        [
+            eq_at(1, a),
+            eq_at(1, b),
+            motive,
+            case(a),
+            case(b),
+            Expr::bvar(0),
+        ],
     );
-    let term = Expr::lam(BinderInfo::Default, int_ty(), Expr::lam(BinderInfo::Default, hj_ty, rec));
+    let term = Expr::lam(
+        BinderInfo::Default,
+        int_ty(),
+        Expr::lam(BinderInfo::Default, hj_ty, rec),
+    );
     (ty, term)
 }
 
@@ -14109,14 +15350,19 @@ fn explicit_closed_2state(a: u64, b: u64) -> (Expr, Expr) {
     let lvl = || vec![Level::succ(Level::zero())];
     let int_ty = || Expr::const_str("Int");
     let eq_at = |slot: u32, lit: u64| {
-        Expr::apps(Expr::const_str_levels("Eq", lvl()), [int_ty(), Expr::bvar(slot), ofnat(lit)])
+        Expr::apps(
+            Expr::const_str_levels("Eq", lvl()),
+            [int_ty(), Expr::bvar(slot), ofnat(lit)],
+        )
     };
     let or = |p: Expr, q: Expr| Expr::apps(Expr::const_str("Or"), [p, q]);
 
     // --- TYPE: Π(x x':Int). Or(Eq x a)(Eq x b) → Eq x' x → Or(Eq x' a)(Eq x' b) ---
     let cod = or(eq_at(2, a), eq_at(2, b)); // depth4: x'=bvar2
-    let hn_ty =
-        Expr::apps(Expr::const_str_levels("Eq", lvl()), [int_ty(), Expr::bvar(1), Expr::bvar(2)]); // depth3: x'=1, x=2
+    let hn_ty = Expr::apps(
+        Expr::const_str_levels("Eq", lvl()),
+        [int_ty(), Expr::bvar(1), Expr::bvar(2)],
+    ); // depth3: x'=1, x=2
     let hj_ty = or(eq_at(1, a), eq_at(1, b)); // depth2: x=bvar1
     let mut ty = cod;
     ty = Expr::pi(BinderInfo::Default, hn_ty, ty);
@@ -14130,7 +15376,14 @@ fn explicit_closed_2state(a: u64, b: u64) -> (Expr, Expr) {
     let case = |v: u64, inj: &str| {
         let trans = Expr::apps(
             Expr::const_str_levels("Eq.trans", lvl()),
-            [int_ty(), Expr::bvar(3), Expr::bvar(4), ofnat(v), Expr::bvar(1), Expr::bvar(0)],
+            [
+                int_ty(),
+                Expr::bvar(3),
+                Expr::bvar(4),
+                ofnat(v),
+                Expr::bvar(1),
+                Expr::bvar(0),
+            ],
         ); // Eq.trans Int x' x v hn ha : Eq x' v
         let inj_term = Expr::apps(
             Expr::const_str(inj),
@@ -14148,7 +15401,14 @@ fn explicit_closed_2state(a: u64, b: u64) -> (Expr, Expr) {
     );
     let body = Expr::apps(
         Expr::const_str("Or.rec"),
-        [eq_at(3, a), eq_at(3, b), motive, case_a, case_b, Expr::bvar(1)],
+        [
+            eq_at(3, a),
+            eq_at(3, b),
+            motive,
+            case_a,
+            case_b,
+            Expr::bvar(1),
+        ],
     );
     let term = Expr::lam(
         BinderInfo::Default,
@@ -14256,7 +15516,10 @@ fn and_intro_chain(facts: &[(Expr, Expr)]) -> (Expr, Expr) {
     let mut term = last_pf.clone();
     for (p, pf) in facts[..facts.len() - 1].iter().rev() {
         // And.intro p ty pf term : And p ty
-        term = Expr::apps(Expr::const_str("And.intro"), [p.clone(), ty.clone(), pf.clone(), term]);
+        term = Expr::apps(
+            Expr::const_str("And.intro"),
+            [p.clone(), ty.clone(), pf.clone(), term],
+        );
         ty = Expr::apps(Expr::const_str("And"), [p.clone(), ty]);
     }
     (ty, term)
@@ -14279,10 +15542,7 @@ fn balanced_and_intro_chain(facts: Vec<(Expr, Expr)>) -> Option<(Expr, Expr)> {
                 next.push((left_ty, left_term));
                 break;
             };
-            let ty = Expr::apps(
-                Expr::const_str("And"),
-                [left_ty.clone(), right_ty.clone()],
-            );
+            let ty = Expr::apps(Expr::const_str("And"), [left_ty.clone(), right_ty.clone()]);
             let term = Expr::apps(
                 Expr::const_str("And.intro"),
                 [left_ty, right_ty, left_term, right_term],
@@ -14311,7 +15571,12 @@ fn violated_trace_le(init: u64, steps: u64, d: u64) -> Option<(Expr, Expr)> {
     let int_ty = || Expr::const_str("Int");
     let eq_ty =
         |a: Expr, b: Expr| Expr::apps(Expr::const_str_levels("Eq", lvl()), [int_ty(), a, b]);
-    let refl = |v: u64| Expr::apps(Expr::const_str_levels("Eq.refl", lvl()), [int_ty(), ofnat(v)]);
+    let refl = |v: u64| {
+        Expr::apps(
+            Expr::const_str_levels("Eq.refl", lvl()),
+            [int_ty(), ofnat(v)],
+        )
+    };
     let mut facts: Vec<(Expr, Expr)> = Vec::new();
     // Init(s0): s0 = init  (Eq.refl)
     facts.push((eq_ty(ofnat(init), ofnat(init)), refl(init)));
@@ -14324,7 +15589,10 @@ fn violated_trace_le(init: u64, steps: u64, d: u64) -> Option<(Expr, Expr)> {
     // violation: d < s_N  (Int.lt d s_N = Int.NonNeg.mk (s_N - d - 1))
     facts.push((
         Expr::apps(Expr::const_str("Int.lt"), [ofnat(d), ofnat(s_n)]),
-        Expr::apps(Expr::const_str("Int.NonNeg.mk"), [Expr::nat_lit(s_n - d - 1)]),
+        Expr::apps(
+            Expr::const_str("Int.NonNeg.mk"),
+            [Expr::nat_lit(s_n - d - 1)],
+        ),
     ));
     Some(and_intro_chain(&facts))
 }
@@ -14332,7 +15600,11 @@ fn violated_trace_le(init: u64, steps: u64, d: u64) -> Option<(Expr, Expr)> {
 /// `Int.ofNat n` (n≥0) or `Int.neg (Int.ofNat |n|)` (n<0) — a faithful kernel literal for any i64.
 fn int_lit(n: i64) -> Expr {
     let mag = ofnat(n.unsigned_abs());
-    if n < 0 { Expr::apps(Expr::const_str("Int.neg"), [mag]) } else { mag }
+    if n < 0 {
+        Expr::apps(Expr::const_str("Int.neg"), [mag])
+    } else {
+        mag
+    }
 }
 
 /// GROUND-evaluate a TLA Int expression `e` under the single state variable `var := val`
@@ -14391,8 +15663,10 @@ fn ground_pred_proof(
             return None;
         }
         let prop = Expr::apps(Expr::const_str("Int.lt"), [int_lit(a), int_lit(b)]);
-        let proof =
-            Expr::apps(Expr::const_str("Int.NonNeg.mk"), [Expr::nat_lit((b - a - 1) as u64)]);
+        let proof = Expr::apps(
+            Expr::const_str("Int.NonNeg.mk"),
+            [Expr::nat_lit((b - a - 1) as u64)],
+        );
         Some((prop, proof))
     };
     let le_proof = |a: i64, b: i64| -> Option<(Expr, Expr)> {
@@ -14400,7 +15674,10 @@ fn ground_pred_proof(
             return None;
         }
         let prop = Expr::apps(Expr::const_str("Int.le"), [int_lit(a), int_lit(b)]);
-        let proof = Expr::apps(Expr::const_str("Int.NonNeg.mk"), [Expr::nat_lit((b - a) as u64)]);
+        let proof = Expr::apps(
+            Expr::const_str("Int.NonNeg.mk"),
+            [Expr::nat_lit((b - a) as u64)],
+        );
         Some((prop, proof))
     };
     match e {
@@ -14414,8 +15691,10 @@ fn ground_pred_proof(
                 Expr::const_str_levels("Eq", lvl()),
                 [int_ty(), int_lit(av), int_lit(bv)],
             );
-            let proof =
-                Expr::apps(Expr::const_str_levels("Eq.refl", lvl()), [int_ty(), int_lit(av)]);
+            let proof = Expr::apps(
+                Expr::const_str_levels("Eq.refl", lvl()),
+                [int_ty(), int_lit(av)],
+            );
             Some((prop, proof))
         }
         E::Leq(a, b) => le_proof(ev(&a.node)?, ev(&b.node)?),
@@ -14594,7 +15873,11 @@ fn euf_obligation_type(n: usize, hyps: &[(usize, usize)], goals: &[(usize, usize
     };
     let cod_depth = 1 + n + m;
     // Codomain: a right-nested `And` of the goal equalities (a single goal stays a bare `Eq`).
-    let mut ty = eq_at(cod_depth, goals[goals.len() - 1].0, goals[goals.len() - 1].1);
+    let mut ty = eq_at(
+        cod_depth,
+        goals[goals.len() - 1].0,
+        goals[goals.len() - 1].1,
+    );
     for g in goals[..goals.len() - 1].iter().rev() {
         ty = Expr::apps(Expr::const_str("And"), [eq_at(cod_depth, g.0, g.1), ty]);
     }
@@ -14702,7 +15985,10 @@ fn certify_equality_consecution(
         Some(proof)
     };
     // One chain per goal equality (multi-equality J), combined right-nested via And.intro.
-    let goal_proofs: Vec<Expr> = goals.iter().map(|&g| chain_proof(g)).collect::<Option<_>>()?;
+    let goal_proofs: Vec<Expr> = goals
+        .iter()
+        .map(|&g| chain_proof(g))
+        .collect::<Option<_>>()?;
     let mut proof = goal_proofs.last().unwrap().clone();
     let mut rest_prop = eq_at(d, goals[goals.len() - 1].0, goals[goals.len() - 1].1);
     for i in (0..goals.len() - 1).rev() {
@@ -14710,7 +15996,12 @@ fn certify_equality_consecution(
         // And.intro eq_gi rest_prop proof_gi proof : And eq_gi rest_prop
         proof = Expr::apps(
             Expr::const_str("And.intro"),
-            [eq_gi.clone(), rest_prop.clone(), goal_proofs[i].clone(), proof],
+            [
+                eq_gi.clone(),
+                rest_prop.clone(),
+                goal_proofs[i].clone(),
+                proof,
+            ],
         );
         rest_prop = Expr::apps(Expr::const_str("And"), [eq_gi, rest_prop]);
     }
@@ -14857,11 +16148,17 @@ fn embed_prop(
     match e {
         E::And(a, b) => Some(Expr::apps(
             Expr::const_str("And"),
-            [embed_prop(&a.node, atom_idx)?, embed_prop(&b.node, atom_idx)?],
+            [
+                embed_prop(&a.node, atom_idx)?,
+                embed_prop(&b.node, atom_idx)?,
+            ],
         )),
         E::Or(a, b) => Some(Expr::apps(
             Expr::const_str("Or"),
-            [embed_prop(&a.node, atom_idx)?, embed_prop(&b.node, atom_idx)?],
+            [
+                embed_prop(&a.node, atom_idx)?,
+                embed_prop(&b.node, atom_idx)?,
+            ],
         )),
         E::Bool(true) => Some(Expr::const_str("True")),
         E::Bool(false) => Some(Expr::const_str("False")),
@@ -14887,9 +16184,10 @@ fn reflexive_faithful_type_term(
     let n = vars.len();
     let var_db = |depth: usize, e: &tla_core::ast::Expr| -> Option<u32> {
         match e {
-            tla_core::ast::Expr::Ident(name, _) => {
-                vars.iter().position(|v| v == name).map(|j| (depth - 1 - j) as u32)
-            }
+            tla_core::ast::Expr::Ident(name, _) => vars
+                .iter()
+                .position(|v| v == name)
+                .map(|j| (depth - 1 - j) as u32),
             _ => None,
         }
     };
@@ -14958,8 +16256,8 @@ mod tests {
     #[test]
     fn resolve_func_domain_slot_is_kind_guarded_and_fail_closed() {
         use crate::explicit_fixpoint_cert::EnumKind;
-        use tla_core::NameId;
         use tla_core::ast::Expr as E;
+        use tla_core::NameId;
         let s = |t: &str| E::String(t.to_string());
         let ident = |t: &str| E::Ident(t.to_string(), NameId::INVALID);
         let int = |n: i64| E::Int(num_bigint::BigInt::from(n));
@@ -14967,25 +16265,61 @@ mod tests {
         let str_dom = vec!["a".to_string(), "b".to_string()];
 
         // Matching kind resolves to the sorted slot.
-        assert_eq!(resolve_func_domain_slot(&ident("m1"), &model_dom, EnumKind::Model, 2), Some(0));
-        assert_eq!(resolve_func_domain_slot(&ident("m2"), &model_dom, EnumKind::Model, 2), Some(1));
-        assert_eq!(resolve_func_domain_slot(&s("a"), &str_dom, EnumKind::Str, 2), Some(0));
-        assert_eq!(resolve_func_domain_slot(&s("b"), &str_dom, EnumKind::Str, 2), Some(1));
+        assert_eq!(
+            resolve_func_domain_slot(&ident("m1"), &model_dom, EnumKind::Model, 2),
+            Some(0)
+        );
+        assert_eq!(
+            resolve_func_domain_slot(&ident("m2"), &model_dom, EnumKind::Model, 2),
+            Some(1)
+        );
+        assert_eq!(
+            resolve_func_domain_slot(&s("a"), &str_dom, EnumKind::Str, 2),
+            Some(0)
+        );
+        assert_eq!(
+            resolve_func_domain_slot(&s("b"), &str_dom, EnumKind::Str, 2),
+            Some(1)
+        );
 
         // CROSS-KIND: a String key on a Model dom, and a model-value Ident on a Str dom, BOTH fail closed
         // (the sharp `String "m1" ≠ model value m1` guard).
-        assert_eq!(resolve_func_domain_slot(&s("m1"), &model_dom, EnumKind::Model, 2), None);
-        assert_eq!(resolve_func_domain_slot(&ident("a"), &str_dom, EnumKind::Str, 2), None);
+        assert_eq!(
+            resolve_func_domain_slot(&s("m1"), &model_dom, EnumKind::Model, 2),
+            None
+        );
+        assert_eq!(
+            resolve_func_domain_slot(&ident("a"), &str_dom, EnumKind::Str, 2),
+            None
+        );
 
         // An out-of-domain name, and an Int literal on an atom dom, fail closed.
-        assert_eq!(resolve_func_domain_slot(&ident("m9"), &model_dom, EnumKind::Model, 2), None);
-        assert_eq!(resolve_func_domain_slot(&int(0), &model_dom, EnumKind::Model, 2), None);
+        assert_eq!(
+            resolve_func_domain_slot(&ident("m9"), &model_dom, EnumKind::Model, 2),
+            None
+        );
+        assert_eq!(
+            resolve_func_domain_slot(&int(0), &model_dom, EnumKind::Model, 2),
+            None
+        );
 
         // Int-prefix domain (`dom` empty): ONLY an Int literal `< arity` resolves; an atom key fails closed.
-        assert_eq!(resolve_func_domain_slot(&int(1), &[], EnumKind::Model, 2), Some(1));
-        assert_eq!(resolve_func_domain_slot(&int(2), &[], EnumKind::Model, 2), None); // slot >= arity
-        assert_eq!(resolve_func_domain_slot(&ident("m1"), &[], EnumKind::Model, 2), None);
-        assert_eq!(resolve_func_domain_slot(&s("a"), &[], EnumKind::Str, 2), None);
+        assert_eq!(
+            resolve_func_domain_slot(&int(1), &[], EnumKind::Model, 2),
+            Some(1)
+        );
+        assert_eq!(
+            resolve_func_domain_slot(&int(2), &[], EnumKind::Model, 2),
+            None
+        ); // slot >= arity
+        assert_eq!(
+            resolve_func_domain_slot(&ident("m1"), &[], EnumKind::Model, 2),
+            None
+        );
+        assert_eq!(
+            resolve_func_domain_slot(&s("a"), &[], EnumKind::Str, 2),
+            None
+        );
     }
 
     #[test]
@@ -15068,7 +16402,10 @@ mod tests {
             "Int.ofNat",
             "Or.rec",
         ] {
-            assert!(const_in_lambda_leg(c), "λ_leg must contain the measured leg const `{c}`");
+            assert!(
+                const_in_lambda_leg(c),
+                "λ_leg must contain the measured leg const `{c}`"
+            );
         }
         // Exotica the full kernel supports but the legs never use — MUST be outside λ_leg so they
         // fail closed (this is exactly the surface the gate carves away from the trusted base).
@@ -15125,8 +16462,14 @@ mod tests {
             Expr::const_str_levels("Eq.refl", lvl1),
             [Expr::const_str("Bool"), Expr::const_str("Bool.true")],
         );
-        assert!(term_in_lambda_leg(&ty), "the fold obligation TYPE is inside λ_leg");
-        assert!(term_in_lambda_leg(&term), "the fold proof TERM is inside λ_leg");
+        assert!(
+            term_in_lambda_leg(&ty),
+            "the fold obligation TYPE is inside λ_leg"
+        );
+        assert!(
+            term_in_lambda_leg(&term),
+            "the fold proof TERM is inside λ_leg"
+        );
         assert!(
             kernel_accepts(&term, &ty),
             "an in-λ_leg fold obligation still certifies with the gate live"
@@ -15146,16 +16489,28 @@ mod tests {
         let lvl1 = vec![Level::succ(Level::zero())];
         let ty = Expr::apps(
             Expr::const_str_levels("Eq", lvl1),
-            [Expr::const_str("Bool"), Expr::const_str("Bool.true"), Expr::const_str("Bool.true")],
+            [
+                Expr::const_str("Bool"),
+                Expr::const_str("Bool.true"),
+                Expr::const_str("Bool.true"),
+            ],
         );
         // term = trustedArith.{0} (Eq Bool Bool.true Bool.true)  — a closed proof of `ty` via the
         // polymorphic trust axiom `{α:Sort u}→α`. `ty : Prop = Sort 0`, so the axiom is at level 0.
         // OUTSIDE λ_leg (`trustedArith` not whitelisted).
-        let bad_term =
-            Expr::app(Expr::const_str_levels("trustedArith", vec![Level::zero()]), ty.clone());
+        let bad_term = Expr::app(
+            Expr::const_str_levels("trustedArith", vec![Level::zero()]),
+            ty.clone(),
+        );
         // The GATE declines the term (its type is fine; the term escapes the fragment).
-        assert!(term_in_lambda_leg(&ty), "the obligation type is in-fragment");
-        assert!(!term_in_lambda_leg(&bad_term), "the trustedArith proof term is OUTSIDE λ_leg");
+        assert!(
+            term_in_lambda_leg(&ty),
+            "the obligation type is in-fragment"
+        );
+        assert!(
+            !term_in_lambda_leg(&bad_term),
+            "the trustedArith proof term is OUTSIDE λ_leg"
+        );
         // The RAW kernel would accept `trustedArith … : ty` (proof of anything) …
         assert!(
             {
@@ -15176,7 +16531,10 @@ mod tests {
             Expr::const_str("Bool.and"),
             [Expr::str_lit("x"), Expr::const_str("Bool.true")],
         );
-        assert!(!term_in_lambda_leg(&str_term), "a String literal is outside λ_leg (fail closed)");
+        assert!(
+            !term_in_lambda_leg(&str_term),
+            "a String literal is outside λ_leg (fail closed)"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -15214,7 +16572,10 @@ mod tests {
         // Prime(0) = (black-1)·1 + white·5, with black=digit0=(v/1)%5, white=digit1=(v/5)%5.
         let digit = |place: u64| {
             ValIR::Mod(
-                Box::new(ValIR::Div(Box::new(ValIR::Var(0)), Box::new(ValIR::Lit(place)))),
+                Box::new(ValIR::Div(
+                    Box::new(ValIR::Var(0)),
+                    Box::new(ValIR::Lit(place)),
+                )),
                 Box::new(ValIR::Lit(5)),
             )
         };
@@ -15228,7 +16589,10 @@ mod tests {
                 Box::new(ValIR::Mul(Box::new(digit(5)), Box::new(ValIR::Lit(5)))),
             ),
         );
-        assert_eq!(got, expected, "single pack equality pinning the whole successor pack");
+        assert_eq!(
+            got, expected,
+            "single pack equality pinning the whole successor pack"
+        );
         // At NEGATIVE polarity the truncating `@-1` (Nat.sub) is forbidden (could drop a real successor).
         assert!(
             recognize_pred_sorts_pol(&eq, &["can"], &sorts, Some(false), empty_mvsets(), None)
@@ -15275,26 +16639,47 @@ mod tests {
         let w_nxt = || digit(ValIR::Prime(0), base);
         let per_digit = {
             let d1 = and(
-                and(PredIR::Gt(bean(), ValIR::Lit(1)), PredIR::Geq(w_cur(), ValIR::Lit(2))),
                 and(
-                    PredIR::Eq(b_nxt(), ValIR::Add(Box::new(b_cur()), Box::new(ValIR::Lit(1)))),
-                    PredIR::Eq(w_nxt(), ValIR::Sub(Box::new(w_cur()), Box::new(ValIR::Lit(2)))),
+                    PredIR::Gt(bean(), ValIR::Lit(1)),
+                    PredIR::Geq(w_cur(), ValIR::Lit(2)),
+                ),
+                and(
+                    PredIR::Eq(
+                        b_nxt(),
+                        ValIR::Add(Box::new(b_cur()), Box::new(ValIR::Lit(1))),
+                    ),
+                    PredIR::Eq(
+                        w_nxt(),
+                        ValIR::Sub(Box::new(w_cur()), Box::new(ValIR::Lit(2))),
+                    ),
                 ),
             );
             let d2 = and(
-                and(PredIR::Gt(bean(), ValIR::Lit(1)), PredIR::Geq(b_cur(), ValIR::Lit(2))),
                 and(
-                    PredIR::Eq(b_nxt(), ValIR::Sub(Box::new(b_cur()), Box::new(ValIR::Lit(1)))),
+                    PredIR::Gt(bean(), ValIR::Lit(1)),
+                    PredIR::Geq(b_cur(), ValIR::Lit(2)),
+                ),
+                and(
+                    PredIR::Eq(
+                        b_nxt(),
+                        ValIR::Sub(Box::new(b_cur()), Box::new(ValIR::Lit(1))),
+                    ),
                     PredIR::Eq(w_nxt(), w_cur()),
                 ),
             );
             let d3 = and(
                 and(
-                    and(PredIR::Gt(bean(), ValIR::Lit(1)), PredIR::Geq(b_cur(), ValIR::Lit(1))),
+                    and(
+                        PredIR::Gt(bean(), ValIR::Lit(1)),
+                        PredIR::Geq(b_cur(), ValIR::Lit(1)),
+                    ),
                     PredIR::Geq(w_cur(), ValIR::Lit(1)),
                 ),
                 and(
-                    PredIR::Eq(b_nxt(), ValIR::Sub(Box::new(b_cur()), Box::new(ValIR::Lit(1)))),
+                    PredIR::Eq(
+                        b_nxt(),
+                        ValIR::Sub(Box::new(b_cur()), Box::new(ValIR::Lit(1))),
+                    ),
                     PredIR::Eq(w_nxt(), w_cur()),
                 ),
             );
@@ -15321,16 +16706,25 @@ mod tests {
         let subk = |v: ValIR, k: u64| ValIR::Sub(Box::new(v), Box::new(ValIR::Lit(k)));
         let single = {
             let d1 = and(
-                and(PredIR::Gt(bean(), ValIR::Lit(1)), PredIR::Geq(w_cur(), ValIR::Lit(2))),
+                and(
+                    PredIR::Gt(bean(), ValIR::Lit(1)),
+                    PredIR::Geq(w_cur(), ValIR::Lit(2)),
+                ),
                 PredIR::Eq(ValIR::Prime(0), pack_of(add1(b_cur()), subk(w_cur(), 2))),
             );
             let d2 = and(
-                and(PredIR::Gt(bean(), ValIR::Lit(1)), PredIR::Geq(b_cur(), ValIR::Lit(2))),
+                and(
+                    PredIR::Gt(bean(), ValIR::Lit(1)),
+                    PredIR::Geq(b_cur(), ValIR::Lit(2)),
+                ),
                 PredIR::Eq(ValIR::Prime(0), pack_of(subk(b_cur(), 1), w_cur())),
             );
             let d3 = and(
                 and(
-                    and(PredIR::Gt(bean(), ValIR::Lit(1)), PredIR::Geq(b_cur(), ValIR::Lit(1))),
+                    and(
+                        PredIR::Gt(bean(), ValIR::Lit(1)),
+                        PredIR::Geq(b_cur(), ValIR::Lit(1)),
+                    ),
                     PredIR::Geq(w_cur(), ValIR::Lit(1)),
                 ),
                 PredIR::Eq(ValIR::Prime(0), pack_of(subk(b_cur(), 1), w_cur())),
@@ -15370,14 +16764,15 @@ mod tests {
     /// certify and verify: the enlarged product domain must NOT vacuously accept a non-inductive `R`.
     #[test]
     fn general_completeness_chunked_per_state_and_fail_closed_on_non_closed_r() {
-        use crate::explicit_fixpoint_cert::{GENERAL_COMPLETENESS_MONOLITH_CAP, PredIR, ValIR};
+        use crate::explicit_fixpoint_cert::{PredIR, ValIR, GENERAL_COMPLETENESS_MONOLITH_CAP};
         // 13 Bool columns ⇒ D = {0,1}^13, |D| = 8192; two source states ⇒ |R|×|D| = 16384 > cap ⇒ the
-        // PER-SOURCE-STATE decomposition fires (2 chunks of 8192 legs — under the heartbeat), where the
-        // 16384-leg monolith would not. Bool legs keep each `embed_pred_ir` cheap.
+        // PER-SOURCE/DOMAIN decomposition fires (64 chunks of 256 legs), where the 16384-leg monolith
+        // would not. Bool legs keep each `embed_pred_ir` cheap.
         let ncols = 13usize;
         let dsize = 1u64 << ncols;
-        let domain: Vec<Vec<u64>> =
-            (0..dsize).map(|m| (0..ncols).map(|i| (m >> i) & 1).collect()).collect();
+        let domain: Vec<Vec<u64>> = (0..dsize)
+            .map(|m| (0..ncols).map(|i| (m >> i) & 1).collect())
+            .collect();
         assert!(
             2 * (dsize as usize) > GENERAL_COMPLETENESS_MONOLITH_CAP,
             "the setup must cross the monolith cap so the chunked path is exercised"
@@ -15389,7 +16784,10 @@ mod tests {
             ValIR::Sub(Box::new(ValIR::Lit(1)), Box::new(ValIR::Var(0))),
         );
         for i in 1..ncols {
-            ir = PredIR::And(Box::new(ir), Box::new(PredIR::Eq(ValIR::Prime(i), ValIR::Var(i))));
+            ir = PredIR::And(
+                Box::new(ir),
+                Box::new(PredIR::Eq(ValIR::Prime(i), ValIR::Var(i))),
+            );
         }
         let a: Vec<u64> = vec![0; ncols]; // [0,0,…]
         let mut a_flip = a.clone();
@@ -15440,10 +16838,11 @@ mod tests {
     /// depth. A true Init over an empty reachable set remains a decisive rejection.
     #[test]
     fn general_init_completeness_balanced_at_domain_cap_and_fail_closed() {
-        use crate::explicit_fixpoint_cert::{DEFAULT_FIXPOINT_STATE_CAP, PredIR};
+        use crate::explicit_fixpoint_cert::{PredIR, DEFAULT_FIXPOINT_STATE_CAP};
 
-        let domain: Vec<Vec<u64>> =
-            (0..DEFAULT_FIXPOINT_STATE_CAP as u64).map(|value| vec![value]).collect();
+        let domain: Vec<Vec<u64>> = (0..DEFAULT_FIXPOINT_STATE_CAP as u64)
+            .map(|value| vec![value])
+            .collect();
         let never_init = PredIR::BoolLit(false);
         let bytes = certify_general_init_completeness(&[], &domain, &never_init)
             .expect("false Init over the full admitted domain certifies at bounded depth");
@@ -15479,7 +16878,12 @@ mod tests {
         // pack_universe = 4^3 = 64, so hi = 63.
         let fe = || ColSort::FuncEnum {
             arity: 3,
-            labels: vec!["aborted".into(), "committed".into(), "prepared".into(), "working".into()],
+            labels: vec![
+                "aborted".into(),
+                "committed".into(),
+                "prepared".into(),
+                "working".into(),
+            ],
             dom: vec!["r1".into(), "r2".into(), "r3".into()],
             dom_kind: EnumKind::Model,
         };
@@ -15576,7 +16980,10 @@ mod tests {
         };
         let old_digit = |place: u64| {
             ValIR::Mod(
-                Box::new(ValIR::Div(Box::new(ValIR::Var(0)), Box::new(ValIR::Lit(place)))),
+                Box::new(ValIR::Div(
+                    Box::new(ValIR::Var(0)),
+                    Box::new(ValIR::Lit(place)),
+                )),
                 Box::new(ValIR::Lit(10)),
             )
         };
@@ -15590,17 +16997,26 @@ mod tests {
                 value: Spanned::dummy(E::Bool(true)),
             }],
         );
-        let eq_next = E::Eq(sp(E::Prime(sp(E::Ident("c".into(), NameId::INVALID)))), sp(except));
+        let eq_next = E::Eq(
+            sp(E::Prime(sp(E::Ident("c".into(), NameId::INVALID)))),
+            sp(except),
+        );
         let got = recognize_pred_sorts(&eq_next, &["c"], &[cbool()])
             .expect("Bool-Func EXCEPT must recognize");
         let expected = PredIR::Eq(
             ValIR::Prime(0),
             ValIR::Add(
                 Box::new(ValIR::Mul(Box::new(ValIR::Lit(1)), Box::new(ValIR::Lit(1)))),
-                Box::new(ValIR::Mul(Box::new(old_digit(10)), Box::new(ValIR::Lit(10)))),
+                Box::new(ValIR::Mul(
+                    Box::new(old_digit(10)),
+                    Box::new(ValIR::Lit(10)),
+                )),
             ),
         );
-        assert_eq!(got, expected, "single pack pin: TRUE→1 at slot 0, old digit kept at slot 1");
+        assert_eq!(
+            got, expected,
+            "single pack pin: TRUE→1 at slot 0, old digit kept at slot 1"
+        );
         // A non-Bool-celled (Int) Func of the SAME EXCEPT declines the Bool arm (value 5≠Bool would too).
         // Here the Int-cell version's `TRUE` write is not a valid Int cell value, so it must NOT reuse the
         // Bool pin; recognition either declines or takes a different (non-Bool) path — never THIS pin.
@@ -15626,7 +17042,10 @@ mod tests {
             ValIR::Var(0),
             ValIR::Add(
                 Box::new(ValIR::Mul(Box::new(ValIR::Lit(0)), Box::new(ValIR::Lit(1)))),
-                Box::new(ValIR::Mul(Box::new(ValIR::Lit(0)), Box::new(ValIR::Lit(10)))),
+                Box::new(ValIR::Mul(
+                    Box::new(ValIR::Lit(0)),
+                    Box::new(ValIR::Lit(10)),
+                )),
             ),
         );
         assert_eq!(got_init, expected_init, "all-FALSE constructor packs to 0");
@@ -15640,7 +17059,10 @@ mod tests {
                 value: Spanned::dummy(E::Eq(sp(E::Int(1.into())), sp(E::Int(1.into())))),
             }],
         );
-        let eq_bad = E::Eq(sp(E::Prime(sp(E::Ident("c".into(), NameId::INVALID)))), sp(except_bad));
+        let eq_bad = E::Eq(
+            sp(E::Prime(sp(E::Ident("c".into(), NameId::INVALID)))),
+            sp(except_bad),
+        );
         // The Bool update arm returns None; recognition of the whole Eq must not produce the Bool pack pin.
         assert!(
             super::func_bool_update_eq_form(
@@ -15720,7 +17142,10 @@ mod tests {
             ValIR::Prime(0),
             ValIR::Add(
                 Box::new(ValIR::Mul(Box::new(ValIR::Lit(1)), Box::new(ValIR::Lit(1)))),
-                Box::new(ValIR::Mul(Box::new(ValIR::Lit(1)), Box::new(ValIR::Lit(10)))),
+                Box::new(ValIR::Mul(
+                    Box::new(ValIR::Lit(1)),
+                    Box::new(ValIR::Lit(10)),
+                )),
             ),
         ); // = 11
         let bounds = next_domain_bounds_from_ir(&all_ones, 1, &vec![vec![11u64]], &[cbool()])
@@ -15854,7 +17279,9 @@ mod tests {
             let mut adapter = serde_stacker::Serializer::new(&mut serializer);
             adapter.red_zone = crate::cert::STACKER_RED_ZONE;
             adapter.stack_size = crate::cert::STACKER_GROWTH;
-            too_deep.serialize(adapter).expect("adversarial fixture serialization");
+            too_deep
+                .serialize(adapter)
+                .expect("adversarial fixture serialization");
             assert!(
                 expr_from_bytes(&bytes).is_none(),
                 "decoded adversarial terms must fail before recursive kernel entry"
@@ -15885,12 +17312,18 @@ mod tests {
         // All-true: both shapes reduce to Bool.true (Eq.refl accepted).
         for c in [balanced_bool_and(all_true()), chain(all_true())] {
             let (ty, term) = bool_true_eq(c);
-            assert!(kernel_accepts(&term, &ty), "all-true must reduce to Bool.true");
+            assert!(
+                kernel_accepts(&term, &ty),
+                "all-true must reduce to Bool.true"
+            );
         }
         // One-false: both shapes REFUSE the Bool.true claim (fail-closed identically).
         for c in [balanced_bool_and(one_false()), chain(one_false())] {
             let (ty, term) = bool_true_eq(c);
-            assert!(!kernel_accepts(&term, &ty), "a false leg must refute either shape");
+            assert!(
+                !kernel_accepts(&term, &ty),
+                "a false leg must refute either shape"
+            );
         }
         // Degenerate shapes: empty ⇒ Bool.true; singleton ⇒ the leg itself.
         let (ty, term) = bool_true_eq(balanced_bool_and(Vec::new()));
@@ -15900,7 +17333,10 @@ mod tests {
         // the default heartbeat budget; its depth is ⌈log₂ n⌉, hostile to nothing.
         let big: Vec<Expr> = (0..5151).map(|_| t()).collect();
         let (ty, term) = bool_true_eq(balanced_bool_and(big));
-        assert!(kernel_accepts(&term, &ty), "5K-leg balanced conjunction reduces to true");
+        assert!(
+            kernel_accepts(&term, &ty),
+            "5K-leg balanced conjunction reduces to true"
+        );
     }
 
     /// `valir_prime`: current-state columns → next-state columns (for the `live_decrease` ground leg
@@ -15919,7 +17355,10 @@ mod tests {
             Some(V::Mul(Box::new(V::Lit(3)), Box::new(V::Prime(1))))
         );
         // Rail 1: a Nat-truncating `Sub` measure DECLINES (never a faked decrease across the 0 floor).
-        assert_eq!(valir_prime(&V::Sub(Box::new(V::Var(0)), Box::new(V::Var(1)))), None);
+        assert_eq!(
+            valir_prime(&V::Sub(Box::new(V::Var(0)), Box::new(V::Var(1)))),
+            None
+        );
         assert_eq!(
             valir_prime(&V::Add(
                 Box::new(V::Var(0)),
@@ -15931,8 +17370,14 @@ mod tests {
         // An already-primed leaf DECLINES (a measure is a STATE expression).
         assert_eq!(valir_prime(&V::Prime(0)), None);
         // `valir_contains_sub` agrees with the Rail-1 gate.
-        assert!(valir_contains_sub(&V::Sub(Box::new(V::Var(0)), Box::new(V::Lit(1)))));
-        assert!(!valir_contains_sub(&V::Add(Box::new(V::Var(0)), Box::new(V::Lit(1)))));
+        assert!(valir_contains_sub(&V::Sub(
+            Box::new(V::Var(0)),
+            Box::new(V::Lit(1))
+        )));
+        assert!(!valir_contains_sub(&V::Add(
+            Box::new(V::Var(0)),
+            Box::new(V::Lit(1))
+        )));
     }
 
     /// `liveness_edge_pred_fold_bool`: the `⋀_{(s,t)∈E} ⟦pred⟧(source, target)` fold reduces to
@@ -15945,8 +17390,10 @@ mod tests {
         let reachable = vec![vec![0u64], vec![1u64], vec![2u64]];
         let edges = vec![(2usize, 1usize), (1usize, 0usize)];
         // Decrease edge pred `P(s) ∨ m'(t) < m(s)` with `P = (x < 0)` (false everywhere) and `m = x`.
-        let dec =
-            P::Or(Box::new(P::Lt(V::Var(0), V::Lit(0))), Box::new(P::Lt(V::Prime(0), V::Var(0))));
+        let dec = P::Or(
+            Box::new(P::Lt(V::Var(0), V::Lit(0))),
+            Box::new(P::Lt(V::Prime(0), V::Var(0))),
+        );
         let bytes =
             certify_bool_true_obligation(liveness_edge_pred_fold_bool(&reachable, &edges, &dec))
                 .expect("descending edges reduce to Bool.true");
@@ -15965,7 +17412,10 @@ mod tests {
         );
         // Empty edge set ⇒ vacuously `Bool.true`.
         let empty = liveness_edge_pred_fold_bool(&reachable, &[], &dec);
-        assert!(certify_bool_true_obligation(empty).is_some(), "empty E ⇒ vacuous Bool.true");
+        assert!(
+            certify_bool_true_obligation(empty).is_some(),
+            "empty E ⇒ vacuous Bool.true"
+        );
     }
 
     /// PROBE (before wiring — the repo discipline): the or-elimination lemma the IF-desugared
@@ -16020,11 +17470,20 @@ mod tests {
             )),
         );
         let b = init_domain_bounds_cov_from_ir(&ir, 1, &[ColSort::Int]).expect("bounded");
-        assert_eq!(b[0].0, 2, "H = max literal (2), covers every admissible rdy value");
+        assert_eq!(
+            b[0].0, 2,
+            "H = max literal (2), covers every admissible rdy value"
+        );
         // The coverage lemma is kernel-provable at the derived bound (or-elim + beq→ble pins).
-        assert!(kernel_prove_init_coverage_column(&ir, 1, 2, 0), "Init ⇒ rdy ≤ 2 kernel-proven");
+        assert!(
+            kernel_prove_init_coverage_column(&ir, 1, 2, 0),
+            "Init ⇒ rdy ≤ 2 kernel-proven"
+        );
         // A TOO-TIGHT bound (1, dropping the rdy=2 value) is NOT kernel-provable — fail-safe.
-        assert!(!kernel_prove_init_coverage_column(&ir, 1, 1, 0), "too-tight H=1 must NOT prove");
+        assert!(
+            !kernel_prove_init_coverage_column(&ir, 1, 1, 0),
+            "too-tight H=1 must NOT prove"
+        );
     }
 
     /// `rdy ∈ {0,1,2,3} ∧ ack = rdy` over `[rdy=Int(0), ack=Int(1)]`: `H_rdy = 3`, and `ack`
@@ -16043,13 +17502,19 @@ mod tests {
             )),
         );
         // ack = rdy  ⇒  Eq(Var(ack=1), Var(rdy=0))
-        let ir = PredIR::And(Box::new(rdy_in), Box::new(PredIR::Eq(ValIR::Var(1), ValIR::Var(0))));
+        let ir = PredIR::And(
+            Box::new(rdy_in),
+            Box::new(PredIR::Eq(ValIR::Var(1), ValIR::Var(0))),
+        );
         let b =
             init_domain_bounds_cov_from_ir(&ir, 2, &[ColSort::Int, ColSort::Int]).expect("bounded");
         assert_eq!(b[0].0, 3, "H_rdy = max{{0,1,2,3}} = 3");
         assert_eq!(b[1].0, 3, "H_ack = H_rdy = 3 (0..3, not too tight)");
         // The ack cross-column coverage is kernel-provable at H=3; too-tight H=2 is NOT.
-        assert!(kernel_prove_init_coverage_column(&ir, 2, 3, 1), "Init ⇒ ack ≤ 3 kernel-proven");
+        assert!(
+            kernel_prove_init_coverage_column(&ir, 2, 3, 1),
+            "Init ⇒ ack ≤ 3 kernel-proven"
+        );
         assert!(
             !kernel_prove_init_coverage_column(&ir, 2, 2, 1),
             "too-tight H_ack=2 must NOT prove"
@@ -16099,7 +17564,10 @@ mod tests {
         let bor = |a: Expr, b: Expr| Expr::apps(Expr::const_str("Bool.or"), [a, b]);
         // TYPE: Π(n:Nat). Eq (or (beq n 6) (beq n 1)) true → Eq (ble n 13) true
         let hyp = eq_bool(
-            bor(beq(Expr::bvar(0), Expr::nat_lit(6)), beq(Expr::bvar(0), Expr::nat_lit(1))),
+            bor(
+                beq(Expr::bvar(0), Expr::nat_lit(6)),
+                beq(Expr::bvar(0), Expr::nat_lit(1)),
+            ),
             bool_true(),
         );
         let goal = eq_bool(ble(Expr::bvar(1), Expr::nat_lit(13)), bool_true());
@@ -16116,7 +17584,10 @@ mod tests {
             Expr::lam(
                 BinderInfo::Default,
                 eq_bool(beq(Expr::bvar(1), Expr::nat_lit(c)), bool_true()),
-                Expr::apps(beq_to_ble_lemma(c, 13, true), [Expr::bvar(2), Expr::bvar(0)]),
+                Expr::apps(
+                    beq_to_ble_lemma(c, 13, true),
+                    [Expr::bvar(2), Expr::bvar(0)],
+                ),
             )
         };
         let body = Expr::apps(
@@ -16135,7 +17606,10 @@ mod tests {
             Expr::const_str("Nat"),
             Expr::lam(BinderInfo::Default, hyp, body),
         );
-        assert!(kernel_accepts(&tm, &ty), "or-elim must compose with the beq→ble pin lemmas");
+        assert!(
+            kernel_accepts(&tm, &ty),
+            "or-elim must compose with the beq→ble pin lemmas"
+        );
     }
 
     /// The HourClock `Next` AST `x' = IF x # 12 THEN x + 1 ELSE 1` (shared by the IF-desugaring
@@ -16148,9 +17622,16 @@ mod tests {
         let x = || E::Ident("x".to_string(), NameId::INVALID);
         let xp = || E::Prime(sp(x()));
         let lit = |n: i64| E::Int(num_bigint::BigInt::from(n));
-        let ite =
-            E::If(sp(E::Neq(sp(x()), sp(lit(12)))), sp(E::Add(sp(x()), sp(lit(1)))), sp(lit(1)));
-        if flip { E::Eq(sp(ite), sp(xp())) } else { E::Eq(sp(xp()), sp(ite)) }
+        let ite = E::If(
+            sp(E::Neq(sp(x()), sp(lit(12)))),
+            sp(E::Add(sp(x()), sp(lit(1)))),
+            sp(lit(1)),
+        );
+        if flip {
+            E::Eq(sp(ite), sp(xp()))
+        } else {
+            E::Eq(sp(xp()), sp(ite))
+        }
     }
 
     /// The IR the desugaring must PIN: `(x≠12 ∧ x'=x+1) ∨ (¬(x≠12) ∧ x'=1)`.
@@ -16183,7 +17664,11 @@ mod tests {
         assert_eq!(ir, hourclock_next_ir(), "pinned desugared Or shape");
         let flipped = recognize_pred_sorts(&hourclock_next_ast(true), &["x"], &sorts)
             .expect("the flipped orientation must recognize too");
-        assert_eq!(flipped, hourclock_next_ir(), "orientation-normalized to the SAME IR");
+        assert_eq!(
+            flipped,
+            hourclock_next_ir(),
+            "orientation-normalized to the SAME IR"
+        );
     }
 
     /// FAIL-CLOSED: an IF whose CONDITION is outside the fragment declines the whole equality;
@@ -16202,7 +17687,10 @@ mod tests {
         let bad_cond = E::Eq(
             sp(xp()),
             sp(E::If(
-                sp(E::Neq(sp(E::Ident("y".to_string(), NameId::INVALID)), sp(lit(12)))),
+                sp(E::Neq(
+                    sp(E::Ident("y".to_string(), NameId::INVALID)),
+                    sp(lit(12)),
+                )),
                 sp(E::Add(sp(x()), sp(lit(1)))),
                 sp(lit(1)),
             )),
@@ -16237,7 +17725,11 @@ mod tests {
         let sorts = [ColSort::Int];
         let bounds = next_domain_bounds_cov_from_ir(&ir, 1, &reachable, &sorts)
             .expect("RULE 4 must bound the Or-shaped Next");
-        assert_eq!(bounds, vec![(13, DomainCoverage::RustDerived)], "max over arms: max(13,1)");
+        assert_eq!(
+            bounds,
+            vec![(13, DomainCoverage::RustDerived)],
+            "max over arms: max(13,1)"
+        );
         // The kernel proves the successor bound per state: or-elim on the disjunction, then the
         // And-projection walk to each arm's Eq-pin, discharged by the beq→ble lemma at H=13.
         assert!(
@@ -16267,8 +17759,10 @@ mod tests {
         let false_ty = Expr::const_str("False");
         for marker in ["sorry", "trustedArith", "trustedAy"] {
             // `<marker>.{0} False : False`
-            let term =
-                Expr::apps(Expr::const_str_levels(marker, vec![Level::zero()]), [false_ty.clone()]);
+            let term = Expr::apps(
+                Expr::const_str_levels(marker, vec![Level::zero()]),
+                [false_ty.clone()],
+            );
             // (a) the kernel genuinely type-checks it — the soundness hole is real.
             let env = Environment::with_prelude();
             let tc = TypeChecker::new(&env);
@@ -16460,7 +17954,10 @@ mod tests {
         // LIA: x≥0 ∧ x'=x+1 ⇒ x'≥0 for an OPAQUE counter (≥0 as Int.NonNeg), kernel-checked via
         // NonNeg.rec + Eq.subst. The monotone-counter lower-bound consecution — the LIA piece.
         let (ty, term) = lia_consecution();
-        assert!(kernel_accepts(&term, &ty), "the kernel must check x≥0 ∧ x'=x+1 ⇒ x'≥0");
+        assert!(
+            kernel_accepts(&term, &ty),
+            "the kernel must check x≥0 ∧ x'=x+1 ⇒ x'≥0"
+        );
     }
 
     #[test]
@@ -16508,7 +18005,11 @@ mod tests {
             "re-check of the 3 parametric legs against the rebuilt types must pass"
         );
         // A leg re-checked against a DIFFERENT (c,δ) must fail (binds the legs to (c,δ)).
-        let other = UnboundedAffineShape { init: 0, delta: 2, bound: 0 };
+        let other = UnboundedAffineShape {
+            init: 0,
+            delta: 2,
+            bound: 0,
+        };
         assert!(
             !verify_unbounded_invariant(&other, &initiation, &consecution, &preservation),
             "a δ=1 consecution must NOT satisfy the δ=2 obligation"
@@ -16590,7 +18091,10 @@ mod tests {
                 "CONSECUTION ∀x,y. x=y → x+δ=y+δ (Eq.subst) for δ={delta}"
             );
             let (pres_ty, pres_tm) = relational_preservation();
-            assert!(kernel_accepts(&pres_tm, &pres_ty), "PRESERVATION x=y⇒x=y identity");
+            assert!(
+                kernel_accepts(&pres_tm, &pres_ty),
+                "PRESERVATION x=y⇒x=y identity"
+            );
         }
     }
 
@@ -16603,10 +18107,19 @@ mod tests {
         let lit = |n: i64| E::Int(num_bigint::BigInt::from(n));
         let and = |a: E, b: E| E::And(sp(a), sp(b));
         // Init x=0∧y=0 / Next x'=x+1∧y'=y+1 / Safety x=y — the RELATIONAL lock-step counter.
-        let init = and(E::Eq(sp(id("x")), sp(lit(0))), E::Eq(sp(id("y")), sp(lit(0))));
+        let init = and(
+            E::Eq(sp(id("x")), sp(lit(0))),
+            E::Eq(sp(id("y")), sp(lit(0))),
+        );
         let next = and(
-            E::Eq(sp(E::Prime(sp(id("x")))), sp(E::Add(sp(id("x")), sp(lit(1))))),
-            E::Eq(sp(E::Prime(sp(id("y")))), sp(E::Add(sp(id("y")), sp(lit(1))))),
+            E::Eq(
+                sp(E::Prime(sp(id("x")))),
+                sp(E::Add(sp(id("x")), sp(lit(1)))),
+            ),
+            E::Eq(
+                sp(E::Prime(sp(id("y")))),
+                sp(E::Add(sp(id("y")), sp(lit(1)))),
+            ),
         );
         let safety = E::Eq(sp(id("x")), sp(id("y")));
         let shape = recognize_unbounded_relational_eq(&init, &next, &safety, "x", "y")
@@ -16626,8 +18139,14 @@ mod tests {
         );
         // FAIL-CLOSED: DIFFERENT increments (x'=x+1 ∧ y'=y+2) break x=y ⇒ decline.
         let next_diff = and(
-            E::Eq(sp(E::Prime(sp(id("x")))), sp(E::Add(sp(id("x")), sp(lit(1))))),
-            E::Eq(sp(E::Prime(sp(id("y")))), sp(E::Add(sp(id("y")), sp(lit(2))))),
+            E::Eq(
+                sp(E::Prime(sp(id("x")))),
+                sp(E::Add(sp(id("x")), sp(lit(1)))),
+            ),
+            E::Eq(
+                sp(E::Prime(sp(id("y")))),
+                sp(E::Add(sp(id("y")), sp(lit(2)))),
+            ),
         );
         assert!(
             recognize_unbounded_relational_eq(&init, &next_diff, &safety, "x", "y").is_none(),
@@ -16644,12 +18163,24 @@ mod tests {
         let lit = |n: i64| E::Int(num_bigint::BigInt::from(n));
         let and = |a: E, b: E| E::And(sp(a), sp(b));
         // Init x=0 ∧ y=3 / Next x'=x+1 ∧ y'=y+2 (NO guard) / Safety x≥0 ∧ y≥0 — the MULTI-VAR counter.
-        let init = and(E::Eq(sp(id("x")), sp(lit(0))), E::Eq(sp(id("y")), sp(lit(3))));
-        let next = and(
-            E::Eq(sp(E::Prime(sp(id("x")))), sp(E::Add(sp(id("x")), sp(lit(1))))),
-            E::Eq(sp(E::Prime(sp(id("y")))), sp(E::Add(sp(id("y")), sp(lit(2))))),
+        let init = and(
+            E::Eq(sp(id("x")), sp(lit(0))),
+            E::Eq(sp(id("y")), sp(lit(3))),
         );
-        let safety = and(E::Geq(sp(id("x")), sp(lit(0))), E::Geq(sp(id("y")), sp(lit(0))));
+        let next = and(
+            E::Eq(
+                sp(E::Prime(sp(id("x")))),
+                sp(E::Add(sp(id("x")), sp(lit(1)))),
+            ),
+            E::Eq(
+                sp(E::Prime(sp(id("y")))),
+                sp(E::Add(sp(id("y")), sp(lit(2)))),
+            ),
+        );
+        let safety = and(
+            E::Geq(sp(id("x")), sp(lit(0))),
+            E::Geq(sp(id("y")), sp(lit(0))),
+        );
         let tuple = recognize_unbounded_affine_tuple(&init, &next, &safety, &["x", "y"])
             .expect("the multi-var unbounded affine counter must be recognized");
         assert_eq!(tuple.pairs, vec![(0, 1), (3, 2)]);
@@ -16660,7 +18191,9 @@ mod tests {
             "re-check of the 3 conjoined legs against the rebuilt types must pass"
         );
         // Re-checking against a DIFFERENT (c_j,δ_j) vector must fail (binds the legs to `pairs`).
-        let other = UnboundedAffineTuple { pairs: vec![(0, 1), (3, 3)] };
+        let other = UnboundedAffineTuple {
+            pairs: vec![(0, 1), (3, 3)],
+        };
         assert!(
             !verify_unbounded_invariant_tuple(&other, &initiation, &consecution, &preservation),
             "a δ_1=2 consecution must NOT satisfy the δ_1=3 obligation"
@@ -16676,27 +18209,48 @@ mod tests {
         let lit = |n: i64| E::Int(num_bigint::BigInt::from(n));
         let and = |a: E, b: E| E::And(sp(a), sp(b));
         let vars = ["x", "y"];
-        let init = and(E::Eq(sp(id("x")), sp(lit(0))), E::Eq(sp(id("y")), sp(lit(3))));
-        let next = and(
-            E::Eq(sp(E::Prime(sp(id("x")))), sp(E::Add(sp(id("x")), sp(lit(1))))),
-            E::Eq(sp(E::Prime(sp(id("y")))), sp(E::Add(sp(id("y")), sp(lit(2))))),
+        let init = and(
+            E::Eq(sp(id("x")), sp(lit(0))),
+            E::Eq(sp(id("y")), sp(lit(3))),
         );
-        let safety = and(E::Geq(sp(id("x")), sp(lit(0))), E::Geq(sp(id("y")), sp(lit(0))));
+        let next = and(
+            E::Eq(
+                sp(E::Prime(sp(id("x")))),
+                sp(E::Add(sp(id("x")), sp(lit(1)))),
+            ),
+            E::Eq(
+                sp(E::Prime(sp(id("y")))),
+                sp(E::Add(sp(id("y")), sp(lit(2)))),
+            ),
+        );
+        let safety = and(
+            E::Geq(sp(id("x")), sp(lit(0))),
+            E::Geq(sp(id("y")), sp(lit(0))),
+        );
         // (1) A GUARDED conjunct on one variable (x<10) makes Next's conjunct count exceed vars.len()
         //     ⇒ decline (the finite path owns guarded shapes).
         let next_guarded = and(
             and(
-                E::Eq(sp(E::Prime(sp(id("x")))), sp(E::Add(sp(id("x")), sp(lit(1))))),
+                E::Eq(
+                    sp(E::Prime(sp(id("x")))),
+                    sp(E::Add(sp(id("x")), sp(lit(1)))),
+                ),
                 E::Lt(sp(id("x")), sp(lit(10))),
             ),
-            E::Eq(sp(E::Prime(sp(id("y")))), sp(E::Add(sp(id("y")), sp(lit(2))))),
+            E::Eq(
+                sp(E::Prime(sp(id("y")))),
+                sp(E::Add(sp(id("y")), sp(lit(2)))),
+            ),
         );
         assert!(
             recognize_unbounded_affine_tuple(&init, &next_guarded, &safety, &vars).is_none(),
             "a guarded conjunct ⇒ decline (extra conjunct raises the count)"
         );
         // (2) A non-nonneg Safety on one variable (y≤10) ⇒ decline.
-        let safety_mixed = and(E::Geq(sp(id("x")), sp(lit(0))), E::Leq(sp(id("y")), sp(lit(10))));
+        let safety_mixed = and(
+            E::Geq(sp(id("x")), sp(lit(0))),
+            E::Leq(sp(id("y")), sp(lit(10))),
+        );
         assert!(
             recognize_unbounded_affine_tuple(&init, &next, &safety_mixed, &vars).is_none(),
             "a non-nonneg Safety conjunct ⇒ decline"
@@ -16709,8 +18263,14 @@ mod tests {
         );
         // (4) A NEGATIVE increment (δ<0, encoded as Sub) is not `parse_prime_eq_var_plus` ⇒ decline.
         let next_neg = and(
-            E::Eq(sp(E::Prime(sp(id("x")))), sp(E::Sub(sp(id("x")), sp(lit(1))))),
-            E::Eq(sp(E::Prime(sp(id("y")))), sp(E::Add(sp(id("y")), sp(lit(2))))),
+            E::Eq(
+                sp(E::Prime(sp(id("x")))),
+                sp(E::Sub(sp(id("x")), sp(lit(1)))),
+            ),
+            E::Eq(
+                sp(E::Prime(sp(id("y")))),
+                sp(E::Add(sp(id("y")), sp(lit(2)))),
+            ),
         );
         assert!(
             recognize_unbounded_affine_tuple(&init, &next_neg, &safety, &vars).is_none(),
@@ -16729,7 +18289,10 @@ mod tests {
         let next = E::Eq(sp(E::Prime(sp(x()))), sp(E::Add(sp(x()), sp(lit(1))))); // x' = x + 1
         let bytes = certify_lia_consecution(&j, &next)
             .expect("monotone-counter LIA must be kernel-certified");
-        assert!(verify_lia_consecution(&j, &next, &bytes), "obligation-aware re-check accepts");
+        assert!(
+            verify_lia_consecution(&j, &next, &bytes),
+            "obligation-aware re-check accepts"
+        );
         // A non-monotone Next (stutter x'=x) is not the LIA shape → None (the congruence engine
         // handles that case instead).
         let next_stutter = E::Eq(sp(E::Prime(sp(x()))), sp(x()));
@@ -16802,21 +18365,24 @@ mod tests {
         // LIVENESS: a measure 5>3>1>0 strictly descends to the target — the per-step decreases
         // (3<5 ∧ 1<3 ∧ 0<1) are kernel-checked; bounded-below ⇒ well-founded ⇒ terminates.
         let (ty, term) = liveness_descent(&[5, 3, 1, 0]).expect("strictly decreasing");
-        assert!(kernel_accepts(&term, &ty), "the kernel must check the well-founded descent chain");
+        assert!(
+            kernel_accepts(&term, &ty),
+            "the kernel must check the well-founded descent chain"
+        );
         let (ty2, term2) = liveness_descent(&[10, 9]).expect("single step");
         assert!(kernel_accepts(&term2, &ty2));
 
         // Cross the byte-compatibility threshold to exercise the balanced proof tree. It proves the
         // same conjunction, remains under the global structural limits, and kernel-checks.
-        let balanced_measures: Vec<u64> =
-            (0..=LIVENESS_DESCENT_LEGACY_CHAIN_MAX as u64 + 1).rev().collect();
+        let balanced_measures: Vec<u64> = (0..=LIVENESS_DESCENT_LEGACY_CHAIN_MAX as u64 + 1)
+            .rev()
+            .collect();
         let (balanced_ty, balanced_term) =
             liveness_descent(&balanced_measures).expect("balanced descent builds");
         assert!(kernel_term_within_resource_limits(&balanced_term));
         assert!(kernel_accepts(&balanced_term, &balanced_ty));
 
-        let over_cap: Vec<u64> =
-            (0..=LIVENESS_DESCENT_STEP_CAP as u64 + 1).rev().collect();
+        let over_cap: Vec<u64> = (0..=LIVENESS_DESCENT_STEP_CAP as u64 + 1).rev().collect();
         assert!(
             liveness_descent(&over_cap).is_none(),
             "an over-cap direct measure chain must fail closed"
@@ -16849,16 +18415,24 @@ mod tests {
         // a_expr = (m + neg1) + 1   (def-eq to (m-1)+1)
         let a_expr = Expr::apps(
             Expr::const_str("Int.add"),
-            [Expr::apps(Expr::const_str("Int.add"), [m(), neg_one.clone()]), one.clone()],
+            [
+                Expr::apps(Expr::const_str("Int.add"), [m(), neg_one.clone()]),
+                one.clone(),
+            ],
         );
         // b_expr = m + (neg1 + 1)
         let b_expr = Expr::apps(
             Expr::const_str("Int.add"),
-            [m(), Expr::apps(Expr::const_str("Int.add"), [neg_one.clone(), one.clone()])],
+            [
+                m(),
+                Expr::apps(Expr::const_str("Int.add"), [neg_one.clone(), one.clone()]),
+            ],
         );
         // add_assoc m neg1 1 : ((m+neg1)+1) = (m+(neg1+1))
-        let assoc =
-            Expr::apps(Expr::const_str("Int.add_assoc"), [m(), neg_one.clone(), one.clone()]);
+        let assoc = Expr::apps(
+            Expr::const_str("Int.add_assoc"),
+            [m(), neg_one.clone(), one.clone()],
+        );
         // add_zero m : (m+0) = m   (b_expr ≡ m+0 by native fold of neg1+1)
         let addzero = Expr::apps(Expr::const_str("Int.add_zero"), [m()]);
         // trans : ((m+neg1)+1) = m
@@ -16875,7 +18449,10 @@ mod tests {
         let motive = Expr::lam(
             BinderInfo::Default,
             int(),
-            int_nonneg_of(Expr::apps(Expr::const_str("Int.sub"), [Expr::bvar(1), Expr::bvar(0)])),
+            int_nonneg_of(Expr::apps(
+                Expr::const_str("Int.sub"),
+                [Expr::bvar(1), Expr::bvar(0)],
+            )),
         );
         let le_refl = Expr::apps(Expr::const_str("Int.le_refl"), [m()]);
         // Eq.subst Int motive m a_expr heq le_refl : motive a_expr ≡ Int.lt (m-1) m
@@ -16928,10 +18505,22 @@ mod tests {
             );
         }
         // Fail-closed: net 0 (stutter), net +1 (increase), net -2 (decrease by 2, outside δ=1).
-        assert!(affine_disjunct_descent(&[0, 0]).is_none(), "stutter (δ=0) not certifiable");
-        assert!(affine_disjunct_descent(&[1, 0]).is_none(), "net +1 increase not certifiable");
-        assert!(affine_disjunct_descent(&[-2, 0]).is_none(), "δ=2 outside the exact-1 fragment");
-        assert!(affine_disjunct_descent(&[]).is_none(), "no columns not certifiable");
+        assert!(
+            affine_disjunct_descent(&[0, 0]).is_none(),
+            "stutter (δ=0) not certifiable"
+        );
+        assert!(
+            affine_disjunct_descent(&[1, 0]).is_none(),
+            "net +1 increase not certifiable"
+        );
+        assert!(
+            affine_disjunct_descent(&[-2, 0]).is_none(),
+            "δ=2 outside the exact-1 fragment"
+        );
+        assert!(
+            affine_disjunct_descent(&[]).is_none(),
+            "no columns not certifiable"
+        );
     }
 
     /// SOUNDNESS REGRESSION (2026-07-04 audit): `recognize_disjunct`/`certify_affine_descent`
@@ -17009,6 +18598,87 @@ mod tests {
         );
     }
 
+    /// Certificate normalization replaces EXCEPT's `@` with the exact old-field projection. That
+    /// representation change must preserve affine descent while a projection of any other field
+    /// still fails closed.
+    #[test]
+    fn affine_descent_accepts_normalized_except_old_field_only() {
+        let measure = parse_pred("can.black + can.white");
+        let normalized = parse_pred(
+            "(can.black + can.white > 1 /\\ can.black >= 2 /\\ \
+             can' = [can EXCEPT !.black = can.black - 1]) \
+             \\/ (can.black + can.white > 1 /\\ can.white >= 2 /\\ \
+             can' = [can EXCEPT !.black = can.black + 1, !.white = can.white - 2]) \
+             \\/ (can.black + can.white = 1 /\\ UNCHANGED can)",
+        );
+        assert!(
+            recognize_affine_descent(&measure, &normalized, &["can"]).is_some(),
+            "exact normalized old-field form must retain CoffeeCan affine descent"
+        );
+        assert!(
+            certify_affine_descent(&measure, &normalized, &["can"]).is_some(),
+            "normalized CoffeeCan descent must kernel-certify"
+        );
+
+        let wrong_field = parse_pred(
+            "(can.black + can.white > 1 /\\ can.black >= 2 /\\ \
+             can' = [can EXCEPT !.black = can.white - 1]) \
+             \\/ (can.black + can.white = 1 /\\ UNCHANGED can)",
+        );
+        assert!(
+            recognize_affine_descent(&measure, &wrong_field, &["can"]).is_none(),
+            "a different old field must fail closed"
+        );
+    }
+
+    /// Multiple EXCEPT specs are evaluated left-to-right. A later `@` on the same or a nested
+    /// path therefore observes the prior write, so the affine recognizer must reject overlapping
+    /// paths rather than overwriting a previously recorded delta. Conversely, certificate
+    /// normalization may project a disjoint field through the prior EXCEPT; that exact projection
+    /// remains equal to the original field and must preserve CoffeeCan certification.
+    #[test]
+    fn affine_descent_except_paths_are_left_to_right_and_disjoint_only() {
+        let measure = parse_pred("can.black + can.white");
+
+        // Net effect is ZERO: black -> black+1 -> (black+1)-1. Treating both `@` occurrences as
+        // the original black value would keep only the final -1 and falsely prove descent.
+        let duplicate = parse_pred("can' = [can EXCEPT !.black = @ + 1, !.black = @ - 1]");
+        assert!(
+            recognize_affine_descent(&measure, &duplicate, &["can"]).is_none(),
+            "duplicate EXCEPT paths must fail closed under left-to-right @ semantics"
+        );
+        assert!(
+            certify_affine_descent(&measure, &duplicate, &["can"]).is_none(),
+            "a net-zero duplicate-path update must never receive a descent certificate"
+        );
+
+        // A parent/child pair is overlapping for the same reason. The shape is outside the
+        // scalar-field fragment in any case, but this regression pins the overlap gate itself.
+        let nested_overlap = parse_pred("can' = [can EXCEPT !.black = @, !.black.x = @]");
+        assert!(
+            recognize_affine_descent(&measure, &nested_overlap, &["can"]).is_none(),
+            "parent/child EXCEPT paths must fail closed"
+        );
+
+        // This is the exact representation emitted by left-to-right `@` desugaring for
+        // CoffeeCan's coupled update: the second old-value projection starts from the prior
+        // black-field EXCEPT. Because black and white are distinct root fields, the projection is
+        // exactly can.white and the total delta remains +1-2 = -1.
+        let disjoint_normalized = parse_pred(
+            "can' = [can EXCEPT \
+             !.black = can.black + 1, \
+             !.white = ([can EXCEPT !.black = can.black + 1]).white - 2]",
+        );
+        assert!(
+            recognize_affine_descent(&measure, &disjoint_normalized, &["can"]).is_some(),
+            "projection through a provably disjoint prior EXCEPT must preserve affine descent"
+        );
+        assert!(
+            certify_affine_descent(&measure, &disjoint_normalized, &["can"]).is_some(),
+            "the disjoint left-to-right CoffeeCan update must still kernel-certify"
+        );
+    }
+
     /// SOUNDNESS REGRESSION (2026-07-05 confirmed false-safe): `next_constrains_all_vars` must REJECT
     /// a `Next` that leaves a declared variable unconstrained (the enumerator would FREEZE it, under-
     /// approximating R and dropping reachable violating states), and ACCEPT a well-formed `Next`.
@@ -17016,13 +18686,22 @@ mod tests {
     fn next_constrains_all_vars_gate() {
         // `y` never primed ⇒ FREE ⇒ reject (the SafeFree exploit shape).
         let free = parse_pred("x >= 1 /\\ x' = x - 1");
-        assert!(!next_constrains_all_vars(&free, &["x", "y"]), "free `y` must be rejected");
+        assert!(
+            !next_constrains_all_vars(&free, &["x", "y"]),
+            "free `y` must be rejected"
+        );
         // Same action holding `y` explicitly ⇒ accept.
         let held = parse_pred("x >= 1 /\\ x' = x - 1 /\\ y' = y");
-        assert!(next_constrains_all_vars(&held, &["x", "y"]), "explicit `y' = y` is well-formed");
+        assert!(
+            next_constrains_all_vars(&held, &["x", "y"]),
+            "explicit `y' = y` is well-formed"
+        );
         // `UNCHANGED <<y>>` ⇒ accept.
         let unch = parse_pred("x >= 1 /\\ x' = x - 1 /\\ UNCHANGED <<y>>");
-        assert!(next_constrains_all_vars(&unch, &["x", "y"]), "UNCHANGED y is well-formed");
+        assert!(
+            next_constrains_all_vars(&unch, &["x", "y"]),
+            "UNCHANGED y is well-formed"
+        );
         // Disjunction where ONE branch leaves `y` free ⇒ reject (per-action check).
         let disj = parse_pred("(x' = x - 1 /\\ y' = y) \\/ (x' = x + 1)");
         assert!(
@@ -17062,7 +18741,10 @@ mod tests {
         let x = || E::Ident("x".to_string(), NameId::INVALID);
         let lit = |n: i64| E::Int(num_bigint::BigInt::from(n));
         // Init: x=2 ∨ x=5, Next: x'=x (stutter), Safety: x≥0 — reachable set R={2,5}.
-        let init = E::Or(sp(E::Eq(sp(x()), sp(lit(2)))), sp(E::Eq(sp(x()), sp(lit(5)))));
+        let init = E::Or(
+            sp(E::Eq(sp(x()), sp(lit(2)))),
+            sp(E::Eq(sp(x()), sp(lit(5)))),
+        );
         let next = E::Eq(sp(E::Prime(sp(x()))), sp(x()));
         let safety = E::Geq(sp(x()), sp(lit(0)));
         let (closed, sleg) = certify_explicit_state_fixpoint(&init, &next, &safety)
@@ -17079,7 +18761,10 @@ mod tests {
         // NonNeg.mk — kernel-checked. With membership (Init⊆R) and closed-under-Next this completes
         // all three legs of the fixpoint witness Init⊆R ∧ closed ∧ R⊆Safety.
         let (ty, term) = explicit_safety_2state(3, 7);
-        assert!(kernel_accepts(&term, &ty), "the kernel must check the 2-state R⊆Safety leg");
+        assert!(
+            kernel_accepts(&term, &ty),
+            "the kernel must check the 2-state R⊆Safety leg"
+        );
         let (ty2, term2) = explicit_safety_2state(0, 100);
         assert!(kernel_accepts(&term2, &ty2));
     }
@@ -17103,7 +18788,10 @@ mod tests {
         // (A∨B) ∧ ¬A ⇒ B — the resolution/unit-propagation step (∨-elim + False-elim), kernel-checked
         // at its exact type. The propositional half of clean_supported reconstruction.
         assert!(
-            kernel_accepts(&propositional_resolution_term(), &propositional_resolution_type()),
+            kernel_accepts(
+                &propositional_resolution_term(),
+                &propositional_resolution_type()
+            ),
             "the kernel must check (A∨B)→¬A→B via Or.elim/False.elim"
         );
     }
@@ -17121,9 +18809,15 @@ mod tests {
             vec![0, 4, 8, 15, 16, 23, 42],
         ] {
             let (ct, cterm) = explicit_closed_nstate(&r);
-            assert!(kernel_accepts(&cterm, &ct), "closed-under-Next must kernel-check for R={r:?}");
+            assert!(
+                kernel_accepts(&cterm, &ct),
+                "closed-under-Next must kernel-check for R={r:?}"
+            );
             let (st, sterm) = explicit_safety_nstate(&r);
-            assert!(kernel_accepts(&sterm, &st), "R⊆Safety must kernel-check for R={r:?}");
+            assert!(
+                kernel_accepts(&sterm, &st),
+                "R⊆Safety must kernel-check for R={r:?}"
+            );
         }
     }
 
@@ -17139,7 +18833,11 @@ mod tests {
             certify_explicit_fixpoint_set(&reachable, &init_values, &image, &s1)
                 .expect("scalar fixpoint set certifies");
         assert_eq!(init_terms.len(), 2);
-        assert_eq!(closed.len(), 2, "one closed-leg membership per distinct image tuple");
+        assert_eq!(
+            closed.len(),
+            2,
+            "one closed-leg membership per distinct image tuple"
+        );
         assert!(verify_explicit_fixpoint_set(
             &reachable,
             &init_values,
@@ -17175,23 +18873,25 @@ mod tests {
         let s2v = all_int(2);
         let (c2, s2, i2) = certify_explicit_fixpoint_set(&r2, &iv2, &img2, &s2v)
             .expect("2-variable tuple fixpoint certifies");
-        assert!(verify_explicit_fixpoint_set(&r2, &iv2, &img2, &s2v, &c2, &s2, &i2));
+        assert!(verify_explicit_fixpoint_set(
+            &r2, &iv2, &img2, &s2v, &c2, &s2, &i2
+        ));
         // Ragged arity → fail-closed.
-        assert!(
-            certify_explicit_fixpoint_set(
-                &[vec![0, 2], vec![3]],
-                &[vec![0, 2]],
-                &[vec![0, 2]],
-                &s2v
-            )
-            .is_none()
-        );
+        assert!(certify_explicit_fixpoint_set(
+            &[vec![0, 2], vec![3]],
+            &[vec![0, 2]],
+            &[vec![0, 2]],
+            &s2v
+        )
+        .is_none());
         // A 3-variable singleton certifies + re-checks.
         let r3: Vec<Vec<u64>> = vec![vec![1, 2, 3]];
         let s3v = all_int(3);
         let (c3, s3, i3) =
             certify_explicit_fixpoint_set(&r3, &r3, &r3, &s3v).expect("3-var singleton certifies");
-        assert!(verify_explicit_fixpoint_set(&r3, &r3, &r3, &s3v, &c3, &s3, &i3));
+        assert!(verify_explicit_fixpoint_set(
+            &r3, &r3, &r3, &s3v, &c3, &s3, &i3
+        ));
     }
 
     #[test]
@@ -17207,16 +18907,25 @@ mod tests {
         }
         let cases = vec![
             // (Int, Bool): R={(0,true),(2,false)}.
-            Case { sorts: vec![Int, Bool], set: vec![vec![0, 1], vec![2, 0]] },
+            Case {
+                sorts: vec![Int, Bool],
+                set: vec![vec![0, 1], vec![2, 0]],
+            },
             // (Bool, Int): leading Bool column.
-            Case { sorts: vec![Bool, Int], set: vec![vec![1, 3], vec![0, 7]] },
+            Case {
+                sorts: vec![Bool, Int],
+                set: vec![vec![1, 3], vec![0, 7]],
+            },
             // (Int, Bool, Int): Bool in the middle, two Int columns.
             Case {
                 sorts: vec![Int, Bool, Int],
                 set: vec![vec![0, 0, 5], vec![4, 1, 2], vec![9, 0, 0]],
             },
             // Singleton mixed tuple (degenerate disjunction).
-            Case { sorts: vec![Int, Bool], set: vec![vec![6, 1]] },
+            Case {
+                sorts: vec![Int, Bool],
+                set: vec![vec![6, 1]],
+            },
         ];
         for c in &cases {
             let r = &c.set;
@@ -17240,7 +18949,10 @@ mod tests {
                     "membership {which} must kernel-check for {r:?} sorts {s:?}"
                 );
                 let (cty, cmem) = concrete_tuple_membership(r, &r[which], s).expect("member ∈ R");
-                assert!(kernel_accepts(&cmem, &cty), "concrete membership {which} for {r:?}");
+                assert!(
+                    kernel_accepts(&cmem, &cty),
+                    "concrete membership {which} for {r:?}"
+                );
             }
         }
         // End-to-end certify + re-check over a mixed Int/Bool set with a non-stutter image.
@@ -17346,12 +19058,17 @@ mod tests {
         // Serialized round-trip: the witness re-checks for the closed set, fails for the broken one.
         let bytes = certify_next_completeness(&r_full, &domain, &shape).unwrap();
         assert!(verify_next_completeness(&r_full, &domain, &shape, &bytes));
-        assert!(!verify_next_completeness(&r_broken, &domain, &shape, &bytes));
+        assert!(!verify_next_completeness(
+            &r_broken, &domain, &shape, &bytes
+        ));
         // A larger increment whose successors exceed the guard bound still reduces correctly: δ=2,
         // bound=3, Init 0 → R={0,2,4} (0→2→4, 4<3 false stops), domain must cover the successor 4.
         let s2 = AffineNextShape { delta: 2, bound: 3 };
         let d2: Vec<u64> = (0..=5).collect();
-        assert!(certify_next_completeness(&[0, 2, 4], &d2, &s2).is_some(), "R={{0,2,4}} is closed");
+        assert!(
+            certify_next_completeness(&[0, 2, 4], &d2, &s2).is_some(),
+            "R={{0,2,4}} is closed"
+        );
         assert!(
             certify_next_completeness(&[0, 2], &d2, &s2).is_none(),
             "missing successor 4 → reject"
@@ -17361,7 +19078,9 @@ mod tests {
     /// Parse a full module spec and return the body AST of operator `name`.
     fn op_body(spec: &str, name: &str) -> tla_core::ast::Expr {
         let tree = tla_core::parse_to_syntax_tree(spec);
-        let module = tla_core::lower(tla_core::FileId(0), &tree).module.expect("module");
+        let module = tla_core::lower(tla_core::FileId(0), &tree)
+            .module
+            .expect("module");
         for u in &module.units {
             if let tla_core::ast::Unit::Operator(op) = &u.node {
                 if op.name.node == name {
@@ -17428,16 +19147,27 @@ mod tests {
         assert!(acc(set_eq_bool(&[1, 2, 3], &[3, 2, 1])));
         assert!(!acc(set_eq_bool(&[1, 2], &[1, 2, 3])));
         // bounded quantifiers: ∀x∈{1,2,3}: x∈{1,2,3,4} ; ¬∃x∈{5,6}: x∈{1,2,3} ; ∃x∈{5,2}: x∈{1,2,3}
-        assert!(acc(set_forall_bool(&[1, 2, 3], |x| set_mem_bool(x, &[1, 2, 3, 4]))));
-        assert!(!acc(set_exists_bool(&[5, 6], |x| set_mem_bool(x, &[1, 2, 3]))));
-        assert!(acc(set_exists_bool(&[5, 2], |x| set_mem_bool(x, &[1, 2, 3]))));
+        assert!(acc(set_forall_bool(&[1, 2, 3], |x| set_mem_bool(
+            x,
+            &[1, 2, 3, 4]
+        ))));
+        assert!(!acc(set_exists_bool(&[5, 6], |x| set_mem_bool(
+            x,
+            &[1, 2, 3]
+        ))));
+        assert!(acc(set_exists_bool(&[5, 2], |x| set_mem_bool(
+            x,
+            &[1, 2, 3]
+        ))));
         // UNION evaluated EXTENSIONALLY by the kernel (no Rust set-union): over element universe U,
         // {1,2,3} = {1,2} ∪ {2,3} iff ∀x∈U: x∈{1,2,3} ⟺ (x∈{1,2} ∨ x∈{2,3}).
         let (s1, s2, s3): (&[u64], &[u64], &[u64]) = (&[1, 2], &[2, 3], &[1, 2, 3]);
         let iff = |x: u64| {
             let lhs = set_mem_bool(x, s3);
-            let rhs =
-                Expr::apps(Expr::const_str("Bool.or"), [set_mem_bool(x, s1), set_mem_bool(x, s2)]);
+            let rhs = Expr::apps(
+                Expr::const_str("Bool.or"),
+                [set_mem_bool(x, s1), set_mem_bool(x, s2)],
+            );
             let bnot = |e: Expr| Expr::apps(Expr::const_str("Bool.not"), [e]);
             Expr::apps(
                 Expr::const_str("Bool.or"),
@@ -17465,7 +19195,10 @@ mod tests {
         let ast_hi = next_domain_bound(&next, "x").expect("AST domain bound from x' < 9");
         let ir = recognize_pred(&next, &["x"]).expect("Next recognizes to a PredIR");
         let ir_hi = next_domain_bound_from_ir(&ir).expect("IR domain bound");
-        assert_eq!(ir_hi, ast_hi, "IR-recomputed bound must match the AST bound");
+        assert_eq!(
+            ir_hi, ast_hi,
+            "IR-recomputed bound must match the AST bound"
+        );
         assert_eq!(ir_hi, 8, "H = 8 read straight off the primed bound x' < 9");
     }
 
@@ -17518,7 +19251,10 @@ mod tests {
         let safety = E::Leq(sp(x()), sp(lit(3)));
         let bytes = certify_violated_init(&init, &safety)
             .expect("x=5 violates x≤3 → kernel-checked counterexample");
-        assert!(verify_violated_init(&init, &safety, &bytes), "obligation-aware re-check accepts");
+        assert!(
+            verify_violated_init(&init, &safety, &bytes),
+            "obligation-aware re-check accepts"
+        );
         // No violation (x=2 satisfies x≤3) → no counterexample certificate (fail-closed).
         let init_ok = E::Eq(sp(x()), sp(lit(2)));
         assert!(certify_violated_init(&init_ok, &safety).is_none());
@@ -17529,7 +19265,10 @@ mod tests {
         // VIOLATED class: Init x=5 violates Safety x≤3. Witness And (5=5) (3<5), kernel-checked —
         // a sound counterexample that an initial state is unsafe, reduced to the Clean kernel.
         assert!(
-            kernel_accepts(&violated_init_le_term(5, 3).unwrap(), &violated_init_le_type(5, 3)),
+            kernel_accepts(
+                &violated_init_le_term(5, 3).unwrap(),
+                &violated_init_le_type(5, 3)
+            ),
             "the kernel must check the x=5 violates x≤3 counterexample"
         );
         // Larger gap.
@@ -17558,7 +19297,14 @@ mod tests {
         // The real violating trace the checker would find.
         let bytes = certify_violated_trace(&init, &next, &safety, "x", &[0, 1, 2, 3])
             .expect("x=0→1→2→3 violates x<3 → kernel-checked finite-trace cert");
-        assert!(verify_violated_trace(&init, &next, &safety, "x", &[0, 1, 2, 3], &bytes));
+        assert!(verify_violated_trace(
+            &init,
+            &next,
+            &safety,
+            "x",
+            &[0, 1, 2, 3],
+            &bytes
+        ));
 
         // Fail-closed: a NON-violating final state (x=2 still satisfies x<3) → no cert.
         assert!(certify_violated_trace(&init, &next, &safety, "x", &[0, 1, 2]).is_none());
@@ -17567,14 +19313,28 @@ mod tests {
         // Fail-closed: a trace whose Init doesn't hold (starts at 1, not 0) → no cert.
         assert!(certify_violated_trace(&init, &next, &safety, "x", &[1, 2, 3]).is_none());
         // Tamper: a cert for [0,1,2,3] must NOT re-check against [0,1,2,3,4].
-        assert!(!verify_violated_trace(&init, &next, &safety, "x", &[0, 1, 2, 3, 4], &bytes));
+        assert!(!verify_violated_trace(
+            &init,
+            &next,
+            &safety,
+            "x",
+            &[0, 1, 2, 3, 4],
+            &bytes
+        ));
 
         // Single-state (initial-only) violation: Safety x≤2 violated at x=5 (Init x=5).
         let init5 = E::Eq(sp(x()), sp(lit(5)));
         let safety_le2 = E::Leq(sp(x()), sp(lit(2)));
         let b2 = certify_violated_trace(&init5, &next, &safety_le2, "x", &[5])
             .expect("x=5 violates x≤2 at the initial state");
-        assert!(verify_violated_trace(&init5, &next, &safety_le2, "x", &[5], &b2));
+        assert!(verify_violated_trace(
+            &init5,
+            &next,
+            &safety_le2,
+            "x",
+            &[5],
+            &b2
+        ));
     }
 
     #[test]
@@ -17619,7 +19379,10 @@ mod tests {
 
         let bytes = certify_int_congruence(&j, &next)
             .expect("x≥0 preserved under x'=x must be kernel-certified (faithful Int.le)");
-        assert!(verify_int_congruence(&j, &next, &bytes), "obligation-aware re-check accepts");
+        assert!(
+            verify_int_congruence(&j, &next, &bytes),
+            "obligation-aware re-check accepts"
+        );
         // x'=x+1 is not a stutter — the congruence does not apply.
         let next_inc = E::Eq(sp(E::Prime(sp(x()))), sp(E::Add(sp(x()), sp(lit(1)))));
         assert!(
@@ -17640,7 +19403,10 @@ mod tests {
         // real literal `0` — so the proof is bound to the ACTUAL `≥0` predicate (faithfulness by the
         // real encoding, not an opaque stand-in). First piece of the faithful Int embedding.
         assert!(
-            kernel_accepts(&faithful_nonneg_congruence_term(), &faithful_nonneg_congruence_type()),
+            kernel_accepts(
+                &faithful_nonneg_congruence_term(),
+                &faithful_nonneg_congruence_type()
+            ),
             "the kernel must check the faithful x≥0 congruence at its real Int.le type"
         );
     }
@@ -17676,6 +19442,7 @@ mod tests {
         let xprime = || E::Prime(sp(x()));
         let j = E::Eq(sp(x()), sp(zero())); // x = 0
         let next = E::Eq(sp(xprime()), sp(x())); // x' = x
+
         // The extractor primes J to the goal (x' = 0) and the kernel certifies the transitivity.
         let bytes = certify_tla_equality_consecution(&j, &next)
             .expect("x-stays-0 consecution must be kernel-certified directly from TLA Exprs");
@@ -17709,8 +19476,10 @@ mod tests {
         assert!(!verify_tla_equality_consecution(&j, &next, b"garbage"));
         // SPEC PROVENANCE: a mutated transition re-derives a DIFFERENT obligation, so the proof
         // built for the original Next must NOT re-check (`x'=x` ⇒ `x'=y` changes the hypothesis).
-        let next_mutated =
-            E::Eq(sp(E::Prime(sp(x()))), sp(E::Ident("y".to_string(), NameId::INVALID))); // x' = y
+        let next_mutated = E::Eq(
+            sp(E::Prime(sp(x()))),
+            sp(E::Ident("y".to_string(), NameId::INVALID)),
+        ); // x' = y
         assert!(
             !verify_tla_equality_consecution(&j, &next_mutated, &bytes),
             "a mutated transition must fail the kernel re-check"
@@ -17733,7 +19502,9 @@ mod tests {
         let spec =
             format!("---- MODULE M ----\nEXTENDS Integers\nVARIABLES {decls}\nP == {body}\n====");
         let tree = tla_core::parse_to_syntax_tree(&spec);
-        let module = tla_core::lower(tla_core::FileId(0), &tree).module.expect("module");
+        let module = tla_core::lower(tla_core::FileId(0), &tree)
+            .module
+            .expect("module");
         let op = module
             .units
             .iter()
@@ -17751,8 +19522,10 @@ mod tests {
     #[test]
     fn choose_flip_recognizes_as_exact_two_element_flip() {
         use crate::explicit_fixpoint_cert::EnumKind;
-        let sorts =
-            [ColSort::Enum { labels: vec!["left".into(), "right".into()], kind: EnumKind::Str }];
+        let sorts = [ColSort::Enum {
+            labels: vec!["left".into(), "right".into()],
+            kind: EnumKind::Str,
+        }];
         let ir = recognize_body(
             &["direction"],
             &sorts,
@@ -17770,7 +19543,10 @@ mod tests {
                 Box::new(PredIR::Eq(ValIR::Prime(0), ValIR::Lit(0))),
             )),
         );
-        assert_eq!(ir, expect, "the flip IR must be the exact 2-element index flip");
+        assert_eq!(
+            ir, expect,
+            "the flip IR must be the exact 2-element index flip"
+        );
     }
 
     /// SOUNDNESS-CRITICAL (the whole point): a CHOOSE that is NOT provably single-valued MUST DECLINE —
@@ -17779,7 +19555,10 @@ mod tests {
     #[test]
     fn nondeterministic_choose_declines() {
         use crate::explicit_fixpoint_cert::EnumKind;
-        let e3 = |labels: Vec<String>| ColSort::Enum { labels, kind: EnumKind::Str };
+        let e3 = |labels: Vec<String>| ColSort::Enum {
+            labels,
+            kind: EnumKind::Str,
+        };
         // (a) 3-ELEMENT domain: `CHOOSE d ∈ {l,r,u} : d /= dir` is NOT single-valued (two atoms satisfy
         //     d/=dir) ⇒ genuine nondeterminism ⇒ DECLINE.
         let s3 = [e3(vec!["left".into(), "right".into(), "up".into()])];
@@ -17809,7 +19588,10 @@ mod tests {
         );
         // (c) 2-element domain but predicate against a DIFFERENT column `d /= other` — `direction'` is then
         //     pinned to the-other-relative-to-`other`, whose value is NOT constrained to {a,b}. DECLINE.
-        let s2 = [e3(vec!["left".into(), "right".into()]), e3(vec!["left".into(), "right".into()])];
+        let s2 = [
+            e3(vec!["left".into(), "right".into()]),
+            e3(vec!["left".into(), "right".into()]),
+        ];
         assert!(
             recognize_body(
                 &["direction", "other"],
@@ -18013,7 +19795,9 @@ mod tests {
             vars.join(", ")
         );
         let tree = tla_core::parse_to_syntax_tree(&spec);
-        let module = tla_core::lower(tla_core::FileId(0), &tree).module.expect("module");
+        let module = tla_core::lower(tla_core::FileId(0), &tree)
+            .module
+            .expect("module");
         module
             .units
             .iter()
@@ -18042,7 +19826,10 @@ mod tests {
             ir,
             PredIR::Equiv(
                 Box::new(PredIR::Eq(ValIR::Prime(0), ValIR::Lit(1))),
-                Box::new(PredIR::Not(Box::new(PredIR::Eq(ValIR::Var(0), ValIR::Lit(1))))),
+                Box::new(PredIR::Not(Box::new(PredIR::Eq(
+                    ValIR::Var(0),
+                    ValIR::Lit(1)
+                )))),
             ),
         );
         // Truth-exact: the kernel reduction of the embedded Bool matches the oracle at every (x, x').
@@ -18055,7 +19842,11 @@ mod tests {
                     "oracle exact at ({x},{xp})"
                 );
                 let (ty, refl) = bool_true_eq(embed_pred_ir(&ir, &[x, 0], &[xp, 0]));
-                assert_eq!(kernel_accepts(&refl, &ty), want, "kernel reduces exact at ({x},{xp})");
+                assert_eq!(
+                    kernel_accepts(&refl, &ty),
+                    want,
+                    "kernel reduces exact at ({x},{xp})"
+                );
             }
         }
         // `x' = (y = z)` shape — the Eq-RHS arm ⇒ Equiv(Prime x=1, Eq(Var y, Var z)).
@@ -18104,8 +19895,12 @@ mod tests {
         let vars4 = ["x", "y", "a", "b"];
         let sorts4 = [Bool, Bool, Int, Int];
         assert!(
-            recognize_pred_sorts(&parse_pred_vars("x' = (y = a - b)", &vars4), &vars4, &sorts4)
-                .is_none(),
+            recognize_pred_sorts(
+                &parse_pred_vars("x' = (y = a - b)", &vars4),
+                &vars4,
+                &sorts4
+            )
+            .is_none(),
             "a truncating `Sub` inside the Bool-valued RHS must fail closed (polarity gate holds)"
         );
     }
@@ -18171,14 +19966,20 @@ mod tests {
         let lit12 = SetIR::Lit(0b110);
         let eq = app2("Nat.beq", embed_set_ir(&lit12, &[], &[]), Expr::nat_lit(6));
         let (ty, refl) = bool_true_eq(eq);
-        assert!(kernel_accepts(&refl, &ty), "set literal {{1,2}} reduces to bitmask 6");
+        assert!(
+            kernel_accepts(&refl, &ty),
+            "set literal {{1,2}} reduces to bitmask 6"
+        );
         // 1 ∈ {1,2} = true ; 0 ∈ {1,2} = false — kernel bit test.
         let mem1 = embed_pred_ir(&PredIR::SetMem(1, SetIR::Lit(6)), &[], &[]);
         let (t1, r1) = bool_true_eq(mem1);
         assert!(kernel_accepts(&r1, &t1), "1 ∈ {{1,2}} reduces to true");
         let mem0 = embed_pred_ir(&PredIR::SetMem(0, SetIR::Lit(6)), &[], &[]);
         let (t0, r0) = bool_true_eq(mem0);
-        assert!(!kernel_accepts(&r0, &t0), "0 ∈ {{1,2}} must NOT reduce to true");
+        assert!(
+            !kernel_accepts(&r0, &t0),
+            "0 ∈ {{1,2}} must NOT reduce to true"
+        );
     }
 
     /// FUNC-of-ENUM `pc[i] = "label"` / `pc[i] \in {…}` recognizes as the digit-extraction equality
@@ -18236,7 +20037,12 @@ mod tests {
         );
 
         // FAIL-CLOSED: non-literal index, out-of-range index, never-observed label, ordering.
-        for src in ["pc[1 + 0] = \"a\"", "pc[5] = \"a\"", "pc[1] = \"zzz\"", "pc[1] < 2"] {
+        for src in [
+            "pc[1 + 0] = \"a\"",
+            "pc[5] = \"a\"",
+            "pc[1] = \"zzz\"",
+            "pc[1] < 2",
+        ] {
             assert!(
                 recognize_pred_sorts(&parse_pred_vars(src, &vars), &vars, &sorts).is_none(),
                 "`{src}` is out of the func-enum equality fragment ⇒ fail-closed"
@@ -18254,6 +20060,7 @@ mod tests {
     fn packed_compound_access_kernel_reduces_to_tla_semantics() {
         let app2 = |f: &str, a: Expr, b: Expr| Expr::apps(Expr::const_str(f), [a, b]);
         let base: u64 = 10; // RECORD_FUNC_BASE
+
         // === RECORD / FUNCTION positional pack: pack = Σ_i v_i·base^i ; rec.f_i = (pack/base^i) mod base.
         // Sample several records over fields (a,b,c) with base-10 values.
         for (v0, v1, v2) in [(1u64, 2, 3), (7, 0, 9), (0, 0, 0), (9, 9, 9)] {
@@ -18274,7 +20081,11 @@ mod tests {
         // s[i] = (pack/D^i) mod D - 1 ; Head = (pack mod D)-1 ; Tail = pack/D.
         let d = base + 1; // SEQ pack radix (SEQ_BASE+1 where SEQ_BASE=9 ⇒ d=10)
         for seq in [vec![3u64, 1], vec![0, 5, 8], vec![9], vec![2, 2, 2, 2]] {
-            let pack: u64 = seq.iter().enumerate().map(|(i, a)| (a + 1) * d.pow(i as u32)).sum();
+            let pack: u64 = seq
+                .iter()
+                .enumerate()
+                .map(|(i, a)| (a + 1) * d.pow(i as u32))
+                .sum();
             for (i, ai) in seq.iter().enumerate() {
                 let dpow = app2("Nat.pow", Expr::nat_lit(d), Expr::nat_lit(i as u64));
                 let div = app2("Nat.div", Expr::nat_lit(pack), dpow);
@@ -18293,11 +20104,17 @@ mod tests {
                 Expr::nat_lit(1),
             );
             let (ty, term) = bool_true_eq(app2("Nat.beq", head, Expr::nat_lit(seq[0])));
-            assert!(kernel_accepts(&term, &ty), "Head = (pack mod D)-1 must reduce to seq[0]");
+            assert!(
+                kernel_accepts(&term, &ty),
+                "Head = (pack mod D)-1 must reduce to seq[0]"
+            );
             // Tail pack = pack / D (drops the head digit) — canonical re-pack of seq[1..].
             let tail_pack: u64 = pack / d;
-            let expected_tail: u64 =
-                seq[1..].iter().enumerate().map(|(i, a)| (a + 1) * d.pow(i as u32)).sum();
+            let expected_tail: u64 = seq[1..]
+                .iter()
+                .enumerate()
+                .map(|(i, a)| (a + 1) * d.pow(i as u32))
+                .sum();
             assert_eq!(
                 tail_pack, expected_tail,
                 "Tail = pack/D is the canonical re-pack of seq[1..]"
@@ -18318,14 +20135,26 @@ mod tests {
             let ir = recognize_val_sorts(&ast, &["c"], std::slice::from_ref(&sort))
                 .unwrap_or_else(|| panic!("`{src}` must recognize against {sort:?}"));
             // sanity oracle agrees.
-            assert_eq!(eval_val_ir(&ir, &[pack], &[pack]), want, "eval `{src}` (pack={pack})");
-            let (ty, refl) =
-                bool_true_eq(beq(embed_val_ir(&ir, &[pack], &[pack]), Expr::nat_lit(want)));
-            assert!(kernel_accepts(&refl, &ty), "kernel: `{src}` over pack {pack} = {want}");
+            assert_eq!(
+                eval_val_ir(&ir, &[pack], &[pack]),
+                want,
+                "eval `{src}` (pack={pack})"
+            );
+            let (ty, refl) = bool_true_eq(beq(
+                embed_val_ir(&ir, &[pack], &[pack]),
+                Expr::nat_lit(want),
+            ));
+            assert!(
+                kernel_accepts(&refl, &ty),
+                "kernel: `{src}` over pack {pack} = {want}"
+            );
         };
         // RECORD field access `c.a`/`c.b` over [a|->v0,b|->v1], pack = v0 + v1*10.
-        let recsort =
-            ColSort::Record { base: 10, fields: vec!["a".into(), "b".into()], cells: vec![] };
+        let recsort = ColSort::Record {
+            base: 10,
+            fields: vec!["a".into(), "b".into()],
+            cells: vec![],
+        };
         for (v0, v1) in [(1u64, 2), (7, 9), (0, 0)] {
             check("c.a", recsort.clone(), v0 + v1 * 10, v0);
             check("c.b", recsort.clone(), v0 + v1 * 10, v1);
@@ -18406,12 +20235,20 @@ mod tests {
                 // TLA truth of `x' = x - 1` (Int): only defined-equal when x≥1 and xp = x-1.
                 let tla = x >= 1 && xp == x - 1;
                 let want = eval_pred_ir(&ir, &s, &sp); // Nat oracle: xp == sat_sub(x,1)
+
                 // On REAL transitions (tla true) the Nat oracle MUST agree (⊇ soundness at the value level).
                 if tla {
-                    assert!(want, "real transition x={x} x'={xp} must satisfy embedded eq");
+                    assert!(
+                        want,
+                        "real transition x={x} x'={xp} must satisfy embedded eq"
+                    );
                 }
                 let (ty, refl) = bool_true_eq(embed_pred_ir(&ir, &s, &sp));
-                assert_eq!(kernel_accepts(&refl, &ty), want, "kernel `x'=x-1` at x={x} x'={xp}");
+                assert_eq!(
+                    kernel_accepts(&refl, &ty),
+                    want,
+                    "kernel `x'=x-1` at x={x} x'={xp}"
+                );
             }
         }
         // FAIL-CLOSED (unsound positions): Sub under negation, Sub in a comparison, bare Sub, Neq-with-Sub.
@@ -18500,7 +20337,10 @@ mod tests {
             bound_col: 0,
             body: Box::new(PredIR::BoolLit(true)),
         };
-        assert!(!pred_ir_bounds_ok(&panic_uni), "universe > SET_UNIVERSE_BITS must be rejected");
+        assert!(
+            !pred_ir_bounds_ok(&panic_uni),
+            "universe > SET_UNIVERSE_BITS must be rejected"
+        );
         let blowup = PredIR::SubsetForall {
             source: SetIR::Lit(0xFFFF),
             universe: 16,
@@ -18523,7 +20363,10 @@ mod tests {
                 },
             )),
         );
-        assert!(!pred_ir_bounds_ok(&nested), "a nested oversized Filter universe must be rejected");
+        assert!(
+            !pred_ir_bounds_ok(&nested),
+            "a nested oversized Filter universe must be rejected"
+        );
         // A valid in-bounds IR passes.
         let ok = PredIR::SetForall {
             source: SetIR::Lit(3),
@@ -18547,8 +20390,12 @@ mod tests {
             let (ty, refl) = bool_true_eq(t);
             kernel_accepts(&refl, &ty)
         };
-        for src in ["x' = x + 1", "x' = x * 2", "x' = x + 1 /\\ x < 3", "x' = x + 1 \\/ x' = x + 2"]
-        {
+        for src in [
+            "x' = x + 1",
+            "x' = x * 2",
+            "x' = x + 1 /\\ x < 3",
+            "x' = x + 1 \\/ x' = x + 2",
+        ] {
             let ast = parse_pred_vars(src, &vars);
             let ir = recognize_pred_sorts(&ast, &vars, &sorts).expect("recognizes to IR");
             for x in 0u64..4 {
@@ -18580,7 +20427,9 @@ mod tests {
         let ir = recognize_pred_sorts(&ast, &vars, &sorts).expect("recognizes");
         let states: Vec<Vec<u64>> = (0u64..4).map(|v| vec![v]).collect();
         let pairs = || {
-            states.iter().flat_map(|s| states.iter().map(move |sp| (s.as_slice(), sp.as_slice())))
+            states
+                .iter()
+                .flat_map(|s| states.iter().map(move |sp| (s.as_slice(), sp.as_slice())))
         };
         // Faithful IR: agreement over every comparable pair.
         assert!(
@@ -18625,13 +20474,16 @@ mod tests {
     #[test]
     fn bounded_set_quantifiers_recognize_and_kernel_reduce() {
         use crate::explicit_fixpoint_cert::ColSort::{Int, Set};
-        let beq = |a: Expr, b: Expr| Expr::apps(Expr::const_str("Nat.beq"), [a, b]);
         // Columns: x:Int (col 0, a threshold), s:Set (col 1). Universe K=4 keeps masks small.
         let vars = ["x", "s"];
         let sorts = [Int, Set { universe: 4 }];
         // `∀y∈s: y < x`  and  `∃y∈s: y = x`  — the body refers to the Int column x AND the bound var y.
         for (src, is_forall, pred_fn) in [
-            ("\\A y \\in s : y < x", true, &(|y: u64, x: u64| y < x) as &dyn Fn(u64, u64) -> bool),
+            (
+                "\\A y \\in s : y < x",
+                true,
+                &(|y: u64, x: u64| y < x) as &dyn Fn(u64, u64) -> bool,
+            ),
             (
                 "\\E y \\in s : y = x",
                 false,
@@ -18696,9 +20548,18 @@ mod tests {
         // `∀T∈SUBSET s: T = {}` (TRUE iff s = {}),
         // `∃T∈SUBSET s: 0 \in T` (TRUE iff 0 ∈ s).
         for (src, want_fn) in [
-            ("\\A t \\in SUBSET s : t \\subseteq s", &(|_m: u64| true) as &dyn Fn(u64) -> bool),
-            ("\\E t \\in SUBSET s : t = s", &(|_m: u64| true) as &dyn Fn(u64) -> bool),
-            ("\\A t \\in SUBSET s : t = {}", &(|m: u64| m == 0) as &dyn Fn(u64) -> bool),
+            (
+                "\\A t \\in SUBSET s : t \\subseteq s",
+                &(|_m: u64| true) as &dyn Fn(u64) -> bool,
+            ),
+            (
+                "\\E t \\in SUBSET s : t = s",
+                &(|_m: u64| true) as &dyn Fn(u64) -> bool,
+            ),
+            (
+                "\\A t \\in SUBSET s : t = {}",
+                &(|m: u64| m == 0) as &dyn Fn(u64) -> bool,
+            ),
             (
                 "\\E t \\in SUBSET s : 0 \\in t",
                 &(|m: u64| (m >> 0) & 1 == 1) as &dyn Fn(u64) -> bool,
@@ -18712,9 +20573,17 @@ mod tests {
             for &mask in &[0u64, 0b0001, 0b0110, 0b1011, 0b1111] {
                 let s = [mask];
                 let want = want_fn(mask);
-                assert_eq!(eval_pred_ir(&ir, &s, &s), want, "eval `{src}` over {mask:#b}");
+                assert_eq!(
+                    eval_pred_ir(&ir, &s, &s),
+                    want,
+                    "eval `{src}` over {mask:#b}"
+                );
                 let (ty, refl) = bool_true_eq(embed_pred_ir(&ir, &s, &s));
-                assert_eq!(kernel_accepts(&refl, &ty), want, "kernel: `{src}` over {mask:#b}");
+                assert_eq!(
+                    kernel_accepts(&refl, &ty),
+                    want,
+                    "kernel: `{src}` over {mask:#b}"
+                );
             }
         }
     }
@@ -18734,8 +20603,14 @@ mod tests {
                 "UNION {s, t, {0, 1}}",
                 &(|ms: u64, mt: u64| ms | mt | 0b0000_0011) as &dyn Fn(u64, u64) -> u64,
             ),
-            ("UNION (SUBSET s)", &(|ms: u64, _mt: u64| ms) as &dyn Fn(u64, u64) -> u64),
-            ("UNION {}", &(|_ms: u64, _mt: u64| 0u64) as &dyn Fn(u64, u64) -> u64),
+            (
+                "UNION (SUBSET s)",
+                &(|ms: u64, _mt: u64| ms) as &dyn Fn(u64, u64) -> u64,
+            ),
+            (
+                "UNION {}",
+                &(|_ms: u64, _mt: u64| 0u64) as &dyn Fn(u64, u64) -> u64,
+            ),
         ] {
             let ast = parse_pred_vars(src, &vars);
             let set_ir = recognize_set(&ast, &vars, &sorts)
@@ -18767,8 +20642,13 @@ mod tests {
         };
         // A Set column at the FULL universe (16) far exceeds the popcount cap (6) ⇒ SUBSET quant declines.
         let vars = ["s"];
-        let sorts = [Set { universe: SET_UNIVERSE_BITS }];
-        assert!(SET_UNIVERSE_BITS > SUBSET_QUANT_POPCOUNT_CAP, "the test premise: universe > cap");
+        let sorts = [Set {
+            universe: SET_UNIVERSE_BITS,
+        }];
+        assert!(
+            SET_UNIVERSE_BITS > SUBSET_QUANT_POPCOUNT_CAP,
+            "the test premise: universe > cap"
+        );
         assert!(
             recognize_pred_sorts(
                 &parse_pred_vars("\\A t \\in SUBSET s : t = s", &vars),
@@ -18799,12 +20679,18 @@ mod tests {
         use crate::explicit_fixpoint_cert::ColSort;
         let d = 10u64; // D = SEQ_BASE+1
         let max_len = 4u32;
-        let seqsort =
-            ColSort::Seq { base: 9, max_len, elem: crate::explicit_fixpoint_cert::CellSort::Int };
+        let seqsort = ColSort::Seq {
+            base: 9,
+            max_len,
+            elem: crate::explicit_fixpoint_cert::CellSort::Int,
+        };
         let vars = ["c", "e"];
         let sorts = [seqsort.clone(), ColSort::Int];
         let pack_of = |seq: &[u64]| -> u64 {
-            seq.iter().enumerate().map(|(i, a)| (a + 1) * d.pow(i as u32)).sum()
+            seq.iter()
+                .enumerate()
+                .map(|(i, a)| (a + 1) * d.pow(i as u32))
+                .sum()
         };
         let beq = |a: Expr, b: Expr| Expr::apps(Expr::const_str("Nat.beq"), [a, b]);
         // A concrete-pack value check: recognize `src`, embed at (pack, elem), assert kernel == want.
@@ -18848,22 +20734,18 @@ mod tests {
             }
         }
         // FAIL-CLOSED: sequence ops against a NON-Seq column ⇒ None.
-        assert!(
-            recognize_val_sorts(
-                &parse_pred_vars("Len(c)", &vars),
-                &vars,
-                &[ColSort::Int, ColSort::Int]
-            )
-            .is_none()
-        );
-        assert!(
-            recognize_val_sorts(
-                &parse_pred_vars("Tail(c)", &vars),
-                &vars,
-                &[ColSort::Int, ColSort::Int]
-            )
-            .is_none()
-        );
+        assert!(recognize_val_sorts(
+            &parse_pred_vars("Len(c)", &vars),
+            &vars,
+            &[ColSort::Int, ColSort::Int]
+        )
+        .is_none());
+        assert!(recognize_val_sorts(
+            &parse_pred_vars("Tail(c)", &vars),
+            &vars,
+            &[ColSort::Int, ColSort::Int]
+        )
+        .is_none());
     }
 
     /// DIRECT recognize+embed+kernel test of the SET-COMPREHENSION `SetIR::Filter` (priority b): the
@@ -18875,11 +20757,22 @@ mod tests {
         let beq = |a: Expr, b: Expr| Expr::apps(Expr::const_str("Nat.beq"), [a, b]);
         // single Set column `chosen`. Comprehensions filtering by a literal-comparison predicate on x.
         let vars = ["chosen"];
-        let sorts = [ColSort::Set { universe: SET_UNIVERSE_BITS }];
+        let sorts = [ColSort::Set {
+            universe: SET_UNIVERSE_BITS,
+        }];
         for (src, pred_fn) in [
-            ("{x \\in chosen : x # 2}", &(|x: u64| x != 2) as &dyn Fn(u64) -> bool),
-            ("{x \\in chosen : x < 3}", &(|x: u64| x < 3) as &dyn Fn(u64) -> bool),
-            ("{x \\in chosen : x = 1}", &(|x: u64| x == 1) as &dyn Fn(u64) -> bool),
+            (
+                "{x \\in chosen : x # 2}",
+                &(|x: u64| x != 2) as &dyn Fn(u64) -> bool,
+            ),
+            (
+                "{x \\in chosen : x < 3}",
+                &(|x: u64| x < 3) as &dyn Fn(u64) -> bool,
+            ),
+            (
+                "{x \\in chosen : x = 1}",
+                &(|x: u64| x == 1) as &dyn Fn(u64) -> bool,
+            ),
         ] {
             // `chosen' = {x ∈ chosen : P}` ⇒ a SetEq(Prime, Filter). Pull the Filter out for a value check.
             let eqast = parse_pred_vars(&format!("chosen' = {src}"), &vars);
@@ -18901,7 +20794,11 @@ mod tests {
                     .map(|i| 1u64 << i)
                     .sum();
                 let s = [mask];
-                assert_eq!(eval_set_ir(&filt, &s, &s), want, "eval filter `{src}` over {mask:#b}");
+                assert_eq!(
+                    eval_set_ir(&filt, &s, &s),
+                    want,
+                    "eval filter `{src}` over {mask:#b}"
+                );
                 let (ty, refl) =
                     bool_true_eq(beq(embed_set_ir(&filt, &s, &s), Expr::nat_lit(want)));
                 assert!(
@@ -18919,21 +20816,31 @@ mod tests {
     fn powerset_and_general_setbuilder_fail_closed() {
         use crate::explicit_fixpoint_cert::{ColSort, SET_UNIVERSE_BITS};
         let vars = ["chosen"];
-        let sorts = [ColSort::Set { universe: SET_UNIVERSE_BITS }];
+        let sorts = [ColSort::Set {
+            universe: SET_UNIVERSE_BITS,
+        }];
         // SUBSET chosen as a set ⇒ None (no SetIR). `chosen' = SUBSET chosen` ⇒ the predicate declines.
         assert!(
             recognize_set(&parse_pred_vars("SUBSET chosen", &vars), &vars, &sorts).is_none(),
             "SUBSET (powerset) must not recognize as a bitmask set"
         );
         assert!(
-            recognize_pred_sorts(&parse_pred_vars("chosen' = SUBSET chosen", &vars), &vars, &sorts)
-                .is_none(),
+            recognize_pred_sorts(
+                &parse_pred_vars("chosen' = SUBSET chosen", &vars),
+                &vars,
+                &sorts
+            )
+            .is_none(),
             "a powerset-valued Next conjunct must fail closed (no general leg)"
         );
         // A general set-builder `{x*2 : x ∈ chosen}` (map, not filter) is also out of fragment ⇒ None.
         assert!(
-            recognize_set(&parse_pred_vars("{x * 2 : x \\in chosen}", &vars), &vars, &sorts)
-                .is_none(),
+            recognize_set(
+                &parse_pred_vars("{x * 2 : x \\in chosen}", &vars),
+                &vars,
+                &sorts
+            )
+            .is_none(),
             "a mapping set-builder is not a bitmask filter ⇒ fail closed"
         );
         // UNION chosen (flatten) ⇒ None.
@@ -18964,31 +20871,55 @@ mod tests {
             recognize_pred(&parse_pred("x' # x - 1"), &vars).is_none(),
             "Sub against Neq rejected"
         );
-        assert!(recognize_pred(&parse_pred("x' = x \\div 2"), &vars).is_none(), "IntDiv rejected");
+        assert!(
+            recognize_pred(&parse_pred("x' = x \\div 2"), &vars).is_none(),
+            "IntDiv rejected"
+        );
         // An unknown identifier (no column) rejects too.
-        assert!(recognize_pred(&parse_pred("x' = y + 1"), &vars).is_none(), "unknown var rejected");
+        assert!(
+            recognize_pred(&parse_pred("x' = y + 1"), &vars).is_none(),
+            "unknown var rejected"
+        );
     }
 
     /// RULE 1 (primed upper bound) is preferred and reads the successor bound straight off `x' < M`.
     #[test]
     fn domain_rule1_primed_upper_bound() {
-        assert_eq!(next_domain_bound(&parse_pred("x' = x + 2 /\\ x' < 9"), "x"), Some(8));
-        assert_eq!(next_domain_bound(&parse_pred("x' = x + 2 /\\ x' <= 9"), "x"), Some(9));
-        assert_eq!(next_domain_bound(&parse_pred("x' = x * 3 /\\ 7 > x'"), "x"), Some(6));
+        assert_eq!(
+            next_domain_bound(&parse_pred("x' = x + 2 /\\ x' < 9"), "x"),
+            Some(8)
+        );
+        assert_eq!(
+            next_domain_bound(&parse_pred("x' = x + 2 /\\ x' <= 9"), "x"),
+            Some(9)
+        );
+        assert_eq!(
+            next_domain_bound(&parse_pred("x' = x * 3 /\\ 7 > x'"), "x"),
+            Some(6)
+        );
     }
 
     /// RULE 2 (affine fallback) fires only when no primed upper bound exists and `x'` is in one conjunct.
     #[test]
     fn domain_rule2_affine_fallback_and_failclosed() {
         // No primed bound, affine update + current guard ⇒ H=(N-1)+δ = (3-1)+1 = 3.
-        assert_eq!(next_domain_bound(&parse_pred("x' = x + 1 /\\ x < 3"), "x"), Some(3));
+        assert_eq!(
+            next_domain_bound(&parse_pred("x' = x + 1 /\\ x < 3"), "x"),
+            Some(3)
+        );
         // No bound at all (unbounded counter) ⇒ None.
         assert_eq!(next_domain_bound(&parse_pred("x' = x + 1"), "x"), None);
         // `x'` mentioned in a SECOND conjunct (only a lower bound `x'>0`) ⇒ no RULE-1 upper bound AND
         // RULE 2 declines (x' appears in 2 conjuncts, not just the update) ⇒ fail-closed None.
-        assert_eq!(next_domain_bound(&parse_pred("x' = x + 1 /\\ x < 3 /\\ x' > 0"), "x"), None);
+        assert_eq!(
+            next_domain_bound(&parse_pred("x' = x + 1 /\\ x < 3 /\\ x' > 0"), "x"),
+            None
+        );
         // A pure lower bound on x' gives no upper bound and the extra primed conjunct blocks RULE 2.
-        assert_eq!(next_domain_bound(&parse_pred("x' = x + 1 /\\ x' >= 1"), "x"), None);
+        assert_eq!(
+            next_domain_bound(&parse_pred("x' = x + 1 /\\ x' >= 1"), "x"),
+            None
+        );
     }
 
     /// PER-COLUMN Next bounds: primed-upper-bound (Int), stutter (Int, bounded by max-R), Bool=1.
@@ -19010,9 +20941,12 @@ mod tests {
             "H_x=2 (x'<3), H_y=4 (stutter ⇒ max R y-column)"
         );
         // UNCHANGED form of stutter is also recognized.
-        let ir_unch =
-            recognize_pred_sorts(&parse_pred("x' < 3 /\\ UNCHANGED y"), &["x", "y"], &[Int, Int])
-                .expect("recognizes UNCHANGED");
+        let ir_unch = recognize_pred_sorts(
+            &parse_pred("x' < 3 /\\ UNCHANGED y"),
+            &["x", "y"],
+            &[Int, Int],
+        )
+        .expect("recognizes UNCHANGED");
         assert_eq!(
             next_domain_bounds_from_ir(&ir_unch, 2, &reachable, &[Int, Int]),
             Some(vec![2, 4])
@@ -19064,10 +20998,20 @@ mod tests {
         // {0..=2} × {0..=1} = 6 tuples, lexicographic by column 0 outermost.
         assert_eq!(
             product_domain(&[2, 1], 64),
-            Some(vec![vec![0, 0], vec![0, 1], vec![1, 0], vec![1, 1], vec![2, 0], vec![2, 1],])
+            Some(vec![
+                vec![0, 0],
+                vec![0, 1],
+                vec![1, 0],
+                vec![1, 1],
+                vec![2, 0],
+                vec![2, 1],
+            ])
         );
         // Single column degenerates to 1-tuples; empty bounds ⇒ the single empty tuple.
-        assert_eq!(product_domain(&[2], 64), Some(vec![vec![0], vec![1], vec![2]]));
+        assert_eq!(
+            product_domain(&[2], 64),
+            Some(vec![vec![0], vec![1], vec![2]])
+        );
         assert_eq!(product_domain(&[], 64), Some(vec![vec![]]));
         // Blow-up past the cap ⇒ None (fail-closed). 10×10×10 = 1000 > cap 100.
         assert_eq!(product_domain(&[9, 9, 9], 100), None);
@@ -19100,7 +21044,10 @@ mod tests {
         // `~b` (Bool) ⇒ Not(Eq(Var0,1)).
         assert_eq!(
             recognize_pred_sorts(&parse_pred("~b"), &["b"], &[Bool]),
-            Some(PredIR::Not(Box::new(PredIR::Eq(ValIR::Var(0), ValIR::Lit(1)))))
+            Some(PredIR::Not(Box::new(PredIR::Eq(
+                ValIR::Var(0),
+                ValIR::Lit(1)
+            ))))
         );
         // An INT ident as a bare predicate is NOT a predicate ⇒ None (it is a value).
         assert!(recognize_pred_sorts(&parse_pred("x"), &["x"], &[Int]).is_none());
@@ -19114,9 +21061,14 @@ mod tests {
     fn probe_bool_to_nat_reduces() {
         for (b, want) in [("Bool.true", 1u64), ("Bool.false", 0)] {
             let term = bool_to_nat(Expr::const_str(b));
-            let (ty, refl) =
-                bool_true_eq(Expr::apps(Expr::const_str("Nat.beq"), [term, Expr::nat_lit(want)]));
-            assert!(kernel_accepts(&refl, &ty), "bool_to_nat({b}) must reduce to {want}");
+            let (ty, refl) = bool_true_eq(Expr::apps(
+                Expr::const_str("Nat.beq"),
+                [term, Expr::nat_lit(want)],
+            ));
+            assert!(
+                kernel_accepts(&refl, &ty),
+                "bool_to_nat({b}) must reduce to {want}"
+            );
         }
     }
 
@@ -19132,7 +21084,10 @@ mod tests {
         for (a, b, want) in [(5u64, 3u64, 2u64), (3, 5, 0), (0, 0, 0), (7, 7, 0)] {
             let term = app2("Nat.sub", Expr::nat_lit(a), Expr::nat_lit(b));
             let (ty, refl) = bool_true_eq(beq(term, Expr::nat_lit(want)));
-            assert!(kernel_accepts(&refl, &ty), "Nat.sub {a} {b} must reduce to {want}");
+            assert!(
+                kernel_accepts(&refl, &ty),
+                "Nat.sub {a} {b} must reduce to {want}"
+            );
         }
         // (2) Len fold over a Seq pack in base D = SEQ_BASE+1 = 10, length bound max_len.
         let d = 10u64;
@@ -19142,8 +21097,11 @@ mod tests {
             let mut acc: Option<Expr> = None;
             for i in 0..u64::from(max_len) {
                 let dpow = app2("Nat.pow", Expr::nat_lit(d), Expr::nat_lit(i));
-                let digit =
-                    app2("Nat.mod", app2("Nat.div", Expr::nat_lit(pack), dpow), Expr::nat_lit(d));
+                let digit = app2(
+                    "Nat.mod",
+                    app2("Nat.div", Expr::nat_lit(pack), dpow),
+                    Expr::nat_lit(d),
+                );
                 let nonzero = app2("Nat.ble", Expr::nat_lit(1), digit); // 1 ≤ digit ⟺ digit ≠ 0
                 let leg = bool_to_nat(nonzero);
                 acc = Some(match acc {
@@ -19153,28 +21111,55 @@ mod tests {
             }
             acc.unwrap_or_else(|| Expr::nat_lit(0))
         };
-        for seq in [vec![3u64, 1], vec![0, 5, 8], vec![9], vec![], vec![2, 2, 2, 2]] {
-            let pack: u64 = seq.iter().enumerate().map(|(i, a)| (a + 1) * d.pow(i as u32)).sum();
+        for seq in [
+            vec![3u64, 1],
+            vec![0, 5, 8],
+            vec![9],
+            vec![],
+            vec![2, 2, 2, 2],
+        ] {
+            let pack: u64 = seq
+                .iter()
+                .enumerate()
+                .map(|(i, a)| (a + 1) * d.pow(i as u32))
+                .sum();
             let want = seq.len() as u64;
             let (ty, refl) = bool_true_eq(beq(len_fold(pack), Expr::nat_lit(want)));
-            assert!(kernel_accepts(&refl, &ty), "Len fold over pack {pack} must reduce to {want}");
+            assert!(
+                kernel_accepts(&refl, &ty),
+                "Len fold over pack {pack} must reduce to {want}"
+            );
         }
         // (3) Append power: append e to seq of length L<max_len ⇒ pack + (e+1)·D^L.
         for (seq, e) in [(vec![3u64, 1], 7u64), (vec![], 4), (vec![9], 0)] {
-            let pack: u64 = seq.iter().enumerate().map(|(i, a)| (a + 1) * d.pow(i as u32)).sum();
+            let pack: u64 = seq
+                .iter()
+                .enumerate()
+                .map(|(i, a)| (a + 1) * d.pow(i as u32))
+                .sum();
             let l = seq.len() as u64;
             let dpow_l = app2("Nat.pow", Expr::nat_lit(d), len_fold(pack));
             let term = app2(
                 "Nat.add",
                 Expr::nat_lit(pack),
-                app2("Nat.mul", app2("Nat.add", Expr::nat_lit(e), Expr::nat_lit(1)), dpow_l),
+                app2(
+                    "Nat.mul",
+                    app2("Nat.add", Expr::nat_lit(e), Expr::nat_lit(1)),
+                    dpow_l,
+                ),
             );
             let mut want_seq = seq.clone();
             want_seq.push(e);
-            let want: u64 =
-                want_seq.iter().enumerate().map(|(i, a)| (a + 1) * d.pow(i as u32)).sum();
+            let want: u64 = want_seq
+                .iter()
+                .enumerate()
+                .map(|(i, a)| (a + 1) * d.pow(i as u32))
+                .sum();
             let (ty, refl) = bool_true_eq(beq(term, Expr::nat_lit(want)));
-            assert!(kernel_accepts(&refl, &ty), "Append e={e} to len {l} must reduce to {want}");
+            assert!(
+                kernel_accepts(&refl, &ty),
+                "Append e={e} to len {l} must reduce to {want}"
+            );
         }
     }
 
@@ -19190,8 +21175,12 @@ mod tests {
     fn probe_general_sub_is_unsound_for_superset() {
         let app2 = |f: &str, a: Expr, b: Expr| Expr::apps(Expr::const_str(f), [a, b]);
         let (a, b) = (1u64, 3u64); // a < b: a real transition for NOT(a-b=0)
+
         // TLA: a - b = 1 - 3 = -2 ≠ 0 ⇒ NOT(...) TRUE (this IS a real successor).
-        assert!((a as i64 - b as i64) != 0, "TLA a-b ≠ 0 ⇒ predicate is real-TRUE");
+        assert!(
+            (a as i64 - b as i64) != 0,
+            "TLA a-b ≠ 0 ⇒ predicate is real-TRUE"
+        );
         // embedded: NOT (Nat.beq (Nat.sub a b) 0). Nat.sub 1 3 = 0 ⇒ beq 0 0 = true ⇒ NOT = false.
         let emb = Expr::apps(
             Expr::const_str("Bool.not"),
@@ -19217,8 +21206,11 @@ mod tests {
         use crate::explicit_fixpoint_cert::ColSort;
         let ast = parse_pred_vars("r \\in [a : 1..3, b : 0..2]", &["r"]);
         for base in [10u64, 1024] {
-            let sorts =
-                [ColSort::Record { base, fields: vec!["a".into(), "b".into()], cells: vec![] }];
+            let sorts = [ColSort::Record {
+                base,
+                fields: vec!["a".into(), "b".into()],
+                cells: vec![],
+            }];
             let ir = recognize_pred_sorts(&ast, &["r"], &sorts)
                 .unwrap_or_else(|| panic!("record-set membership must recognize at base {base}"));
             let digit = |idx: u32| {
@@ -19237,14 +21229,22 @@ mod tests {
                 )
             };
             let expected = PredIR::And(Box::new(field(0, 1, 3)), Box::new(field(1, 0, 2)));
-            assert_eq!(ir, expected, "pinned record-set membership IR at base {base}");
+            assert_eq!(
+                ir, expected,
+                "pinned record-set membership IR at base {base}"
+            );
             // The general R⊆Safety leg's exactness gate ADMITS the digit form…
             assert!(
                 crate::refinement_cert::pred_exact(&ir, &sorts),
                 "record digit extraction is truth-direction exact"
             );
             // …and the IR evaluates to the exact TLA truth over sampled packs.
-            for (a, b, want) in [(1u64, 0u64, true), (3, 2, true), (0, 0, false), (4, 2, false)] {
+            for (a, b, want) in [
+                (1u64, 0u64, true),
+                (3, 2, true),
+                (0, 0, false),
+                (4, 2, false),
+            ] {
                 let pack = a + b * base;
                 assert_eq!(
                     eval_pred_ir(&ir, &[pack], &[pack]),
@@ -19257,8 +21257,11 @@ mod tests {
         // `rdy : {0,1}` class). Pin the IR: `a : {2, 0}` (sorted+deduped to [0,2]) ⇒ `digit_a=0 ∨ digit_a=2`,
         // `b : 0..2` unchanged. Byte-order is the deterministic sorted set order.
         {
-            let sorts10 =
-                [ColSort::Record { base: 10, fields: vec!["a".into(), "b".into()], cells: vec![] }];
+            let sorts10 = [ColSort::Record {
+                base: 10,
+                fields: vec!["a".into(), "b".into()],
+                cells: vec![],
+            }];
             let ast = parse_pred_vars("r \\in [a : {2, 0}, b : 0..2]", &["r"]);
             let ir = recognize_pred_sorts(&ast, &["r"], &sorts10)
                 .expect("Int-set field domain recognizes");
@@ -19290,8 +21293,11 @@ mod tests {
             );
         }
         // Fail-closed edges: wrong field set, non-literal bound, non-Record column, non-ground-Int dom.
-        let sorts10 =
-            [ColSort::Record { base: 10, fields: vec!["a".into(), "b".into()], cells: vec![] }];
+        let sorts10 = [ColSort::Record {
+            base: 10,
+            fields: vec!["a".into(), "b".into()],
+            cells: vec![],
+        }];
         for bad in [
             "r \\in [a : 1..3]",                     // missing field
             "r \\in [a : 1..3, c : 0..2]",           // wrong field name
@@ -19344,7 +21350,10 @@ mod tests {
                 },
             ],
         }];
-        let ast = parse_pred_vars("chan \\in [val : Data, rdy : {0, 1}, ack : {0, 1}]", &["chan"]);
+        let ast = parse_pred_vars(
+            "chan \\in [val : Data, rdy : {0, 1}, ack : {0, 1}]",
+            &["chan"],
+        );
         let ir = recognize_pred_sorts_with_mvsets(&ast, &["chan"], &sorts, &mvsets)
             .expect("Channel record-set membership must recognize");
         assert!(
@@ -19352,8 +21361,10 @@ mod tests {
             "record model-enum + int-set membership must be truth-direction exact"
         );
         // A `String`-literal set on a MODEL enum position is a KIND MISMATCH ⇒ fail closed.
-        let bad =
-            parse_pred_vars("chan \\in [val : {\"d1\"}, rdy : {0, 1}, ack : {0, 1}]", &["chan"]);
+        let bad = parse_pred_vars(
+            "chan \\in [val : {\"d1\"}, rdy : {0, 1}, ack : {0, 1}]",
+            &["chan"],
+        );
         assert!(
             recognize_pred_sorts_with_mvsets(&bad, &["chan"], &sorts, &mvsets).is_none(),
             "String-literal domain on a Model enum field must fail closed"
@@ -19380,15 +21391,24 @@ mod tests {
             ),
             "scalar bool membership IR"
         );
-        assert!(crate::refinement_cert::pred_exact(&ir, &sorts), "bool membership is exact");
+        assert!(
+            crate::refinement_cert::pred_exact(&ir, &sorts),
+            "bool membership is exact"
+        );
         // b = FALSE ⇒ Eq(Var(0), 0), exact.
         let eqf = parse_pred_vars("b = FALSE", &["b", "c"]);
         let ir_eq = recognize_pred_sorts(&eqf, &["b", "c"], &sorts).expect("bool eq recognizes");
-        assert!(crate::refinement_cert::pred_exact(&ir_eq, &sorts), "bool = FALSE is exact");
+        assert!(
+            crate::refinement_cert::pred_exact(&ir_eq, &sorts),
+            "bool = FALSE is exact"
+        );
         // b = c (two bool columns) ⇒ exact.
         let eqc = parse_pred_vars("b = c", &["b", "c"]);
         let ir_c = recognize_pred_sorts(&eqc, &["b", "c"], &sorts).expect("bool=bool recognizes");
-        assert!(crate::refinement_cert::pred_exact(&ir_c, &sorts), "bool = bool is exact");
+        assert!(
+            crate::refinement_cert::pred_exact(&ir_c, &sorts),
+            "bool = bool is exact"
+        );
         // b < 2 (Bool ORDERING) — recognizes as Lt(Var(0),Lit(2)) but must NOT be exact (undefined pun).
         let lt = parse_pred_vars("b < 2", &["b", "c"]);
         if let Some(ir_lt) = recognize_pred_sorts(&lt, &["b", "c"], &sorts) {
@@ -19406,8 +21426,11 @@ mod tests {
     #[test]
     fn surface_div_mod_on_compound_column_fails_closed() {
         use crate::explicit_fixpoint_cert::ColSort;
-        let sorts =
-            [ColSort::Record { base: 1024, fields: vec!["a".into(), "b".into()], cells: vec![] }];
+        let sorts = [ColSort::Record {
+            base: 1024,
+            fields: vec!["a".into(), "b".into()],
+            cells: vec![],
+        }];
         for src in ["(r / 1) % 1024", "r % 1024", "r / 1024", "r \\div 1024"] {
             let ast = parse_pred_vars(src, &["r"]);
             assert!(
@@ -19436,18 +21459,38 @@ mod tests {
         use crate::explicit_fixpoint_cert::ColSort;
         let beq = |a: Expr, b: Expr| Expr::apps(Expr::const_str("Nat.beq"), [a, b]);
         // Wide column: `[a |-> 99, b |-> 3]` must pack 99 + 3·1024.
-        let wide =
-            [ColSort::Record { base: 1024, fields: vec!["a".into(), "b".into()], cells: vec![] }];
+        let wide = [ColSort::Record {
+            base: 1024,
+            fields: vec!["a".into(), "b".into()],
+            cells: vec![],
+        }];
         let ast = parse_pred_vars("[a |-> 99, b |-> 3]", &["r"]);
         let ir = recognize_val_sorts(&ast, &["r"], &wide).expect("wide ctor recognizes");
-        assert_eq!(eval_val_ir(&ir, &[0], &[0]), 99 + 3 * 1024, "wide pack radix");
-        let (ty, refl) =
-            bool_true_eq(beq(embed_val_ir(&ir, &[0], &[0]), Expr::nat_lit(99 + 3 * 1024)));
-        assert!(kernel_accepts(&refl, &ty), "kernel reduces the wide ctor pack");
+        assert_eq!(
+            eval_val_ir(&ir, &[0], &[0]),
+            99 + 3 * 1024,
+            "wide pack radix"
+        );
+        let (ty, refl) = bool_true_eq(beq(
+            embed_val_ir(&ir, &[0], &[0]),
+            Expr::nat_lit(99 + 3 * 1024),
+        ));
+        assert!(
+            kernel_accepts(&refl, &ty),
+            "kernel reduces the wide ctor pack"
+        );
         // Ambiguous radix: two record columns with the same fields at different bases.
         let ambiguous = [
-            ColSort::Record { base: 10, fields: vec!["a".into(), "b".into()], cells: vec![] },
-            ColSort::Record { base: 1024, fields: vec!["a".into(), "b".into()], cells: vec![] },
+            ColSort::Record {
+                base: 10,
+                fields: vec!["a".into(), "b".into()],
+                cells: vec![],
+            },
+            ColSort::Record {
+                base: 1024,
+                fields: vec!["a".into(), "b".into()],
+                cells: vec![],
+            },
         ];
         assert!(
             recognize_val_sorts(&ast, &["r", "s"], &ambiguous).is_none(),
@@ -19456,7 +21499,11 @@ mod tests {
         // No matching record column: the historical default radix (10) is preserved.
         let none = [ColSort::Int];
         let ir10 = recognize_val_sorts(&ast, &["x"], &none).expect("ctor recognizes w/o a match");
-        assert_eq!(eval_val_ir(&ir10, &[0], &[0]), 99 + 3 * 10, "historical base-10 pack");
+        assert_eq!(
+            eval_val_ir(&ir10, &[0], &[0]),
+            99 + 3 * 10,
+            "historical base-10 pack"
+        );
     }
 
     /// MIXED-CELL RECORD UPDATE (`record_update_eq_form`, the Channel `chan ∈ [val:Data, rdy:{0,1},
@@ -19488,7 +21535,11 @@ mod tests {
         let send = rec("chan' = [chan EXCEPT !.val = d1, !.rdy = 1 - @]").expect("Send recognizes");
         match &send {
             PredIR::Eq(ValIR::Prime(0), pack) => {
-                assert_eq!(eval_val_ir(pack, &[100], &[0]), 10, "exact Send successor pack");
+                assert_eq!(
+                    eval_val_ir(pack, &[100], &[0]),
+                    10,
+                    "exact Send successor pack"
+                );
             }
             other => panic!("expected Eq(Prime(0), pack), got {other:?}"),
         }
@@ -19554,7 +21605,11 @@ mod tests {
         .expect("all-Int record update still recognizes");
         match &coffee {
             PredIR::Eq(ValIR::Prime(0), pack) => {
-                assert_eq!(eval_val_ir(pack, &[5], &[0]), 4, "all-Int record pack unchanged");
+                assert_eq!(
+                    eval_val_ir(pack, &[5], &[0]),
+                    4,
+                    "all-Int record pack unchanged"
+                );
             }
             other => panic!("expected Eq(Prime(0), pack), got {other:?}"),
         }
@@ -19575,7 +21630,11 @@ mod coupled_engine_tests {
     #[test]
     fn affine_sum_engine_mints_and_reverifies() {
         let next = pp("a' = a + 1 /\\ b' = b + a");
-        for j_src in ["b >= 0 /\\ a >= 0", "a >= 0 /\\ b >= 0", "b >= 0 /\\ 0 <= a /\\ 0 <= b"] {
+        for j_src in [
+            "b >= 0 /\\ a >= 0",
+            "a >= 0 /\\ b >= 0",
+            "b >= 0 /\\ 0 <= a /\\ 0 <= b",
+        ] {
             let j = pp(j_src);
             let bytes = certify_affine_sum_consecution(&j, &next)
                 .unwrap_or_else(|| panic!("must mint for J = `{j_src}`"));

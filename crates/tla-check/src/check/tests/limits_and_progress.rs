@@ -134,6 +134,57 @@ SmallValue == x < 3
 
 #[cfg_attr(test, ntest::timeout(10000))]
 #[test]
+fn test_initial_invariant_terminal_retains_partial_raw_generation_count() {
+    use tla_core::{lower, parse_to_syntax_tree, FileId};
+
+    let src = r#"
+---- MODULE InitialInvariantRawWork ----
+EXTENDS Naturals
+VARIABLE x
+Init == x \in 0..3
+Inv == x < 2
+Next == FALSE
+====
+"#;
+    let tree = parse_to_syntax_tree(src);
+    let lower_result = lower(FileId(0), &tree);
+    let module = lower_result.module.unwrap();
+    let config = Config {
+        init: Some("Init".to_string()),
+        next: Some("Next".to_string()),
+        invariants: vec!["Inv".to_string()],
+        ..Default::default()
+    };
+
+    for store_full_states in [false, true] {
+        let mut checker = ModelChecker::new(&module, &config);
+        checker.set_store_states(store_full_states);
+        checker.set_deadlock_check(false);
+        if !store_full_states {
+            checker.set_auto_create_trace_file(false);
+        }
+
+        match checker.check() {
+            CheckResult::InvariantViolation {
+                invariant, stats, ..
+            } => {
+                assert_eq!(invariant, "Inv");
+                assert_eq!(
+                    stats.raw_initial_states_generated, 3,
+                    "x = 0, x = 1, and the violating x = 2 must be counted"
+                );
+                assert_eq!(stats.raw_successors_generated, 0);
+                assert_eq!(stats.states_generated(), 3);
+            }
+            other => panic!(
+                "expected initial invariant violation in store_full_states={store_full_states}, got {other:?}"
+            ),
+        }
+    }
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
 fn test_success_within_limits() {
     use tla_core::{lower, parse_to_syntax_tree, FileId};
 
@@ -262,6 +313,10 @@ fn assert_duplicate_init_progress_counts(
                 assert_eq!(
                     stats.states_found, expected_distinct,
                     "{mode_name}: stuttering Next should keep the reachable count at the distinct init count"
+                );
+                assert_eq!(
+                    stats.raw_initial_states_generated, expected_generated,
+                    "{mode_name}: CheckStats must retain the pre-constraint/pre-dedup Init count"
                 );
             }
             other => panic!("{mode_name}: expected Success, got {:?}", other),

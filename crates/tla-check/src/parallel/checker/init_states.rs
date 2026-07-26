@@ -58,7 +58,7 @@ impl ParallelChecker {
         &self,
         ctx: &mut EvalCtx,
         init_name: &str,
-    ) -> Result<Option<BulkStateStorage>, CheckError> {
+    ) -> Result<Option<(BulkStateStorage, usize)>, CheckError> {
         let init_name = ctx.resolve_op_name(init_name).to_string();
         let def = self
             .op_defs
@@ -73,7 +73,7 @@ impl ParallelChecker {
                 let vars_len = ctx.var_registry().len();
                 let mut storage = BulkStateStorage::new(vars_len, 1000);
 
-                let count = enumerate_constraints_to_bulk(
+                let count = enumerate_constraints_to_bulk_with_stats(
                     ctx,
                     &self.vars,
                     &branches,
@@ -82,7 +82,7 @@ impl ParallelChecker {
                 );
 
                 return match count {
-                    Ok(Some(_)) => Ok(Some(storage)),
+                    Ok(Some(stats)) => Ok(Some((storage, stats.generated))),
                     Ok(None) => Ok(None),
                     Err(e) => Err(EvalCheckError::Eval(e).into()),
                 };
@@ -113,7 +113,7 @@ impl ParallelChecker {
             let vars_len = ctx.var_registry().len();
             let mut storage = BulkStateStorage::new(vars_len, 1000);
 
-            let count = enumerate_constraints_to_bulk(
+            let count = enumerate_constraints_to_bulk_with_stats(
                 ctx,
                 &self.vars,
                 &branches,
@@ -125,7 +125,7 @@ impl ParallelChecker {
             );
 
             match count {
-                Ok(Some(_)) => return Ok(Some(storage)),
+                Ok(Some(stats)) => return Ok(Some((storage, stats.generated))),
                 Ok(None) => {}
                 Err(e) => return Err(EvalCheckError::Eval(e).into()),
             }
@@ -145,6 +145,17 @@ impl ParallelChecker {
         ctx: &EvalCtx,
         init_name: &str,
     ) -> Result<Vec<State>, CheckError> {
+        self.generate_initial_states_with_raw_count(ctx, init_name)
+            .map(|(states, _raw_initial_states_generated)| states)
+    }
+
+    /// Generate distinct initial states together with the number produced
+    /// before semantic deduplication.
+    pub(super) fn generate_initial_states_with_raw_count(
+        &self,
+        ctx: &EvalCtx,
+        init_name: &str,
+    ) -> Result<(Vec<State>, usize), CheckError> {
         let init_name = ctx.resolve_op_name(init_name).to_string();
         let def = self
             .op_defs
@@ -158,12 +169,22 @@ impl ParallelChecker {
         {
             let unconstrained = find_unconstrained_vars(&self.vars, &branches);
             if unconstrained.is_empty() {
-                return match enumerate_states_from_constraint_branches(
+                return match enumerate_states_from_constraint_branches_with_multiplicity(
                     Some(ctx),
                     &self.vars,
                     &branches,
                 ) {
-                    Ok(Some(states)) => Ok(states),
+                    Ok(Some(states)) => {
+                        let mut raw_initial_states_generated = 0usize;
+                        let mut distinct_states = Vec::with_capacity(states.len());
+                        for (state, multiplicity) in states {
+                            raw_initial_states_generated = raw_initial_states_generated
+                                .checked_add(multiplicity)
+                                .expect("raw initial-state generation count overflowed usize");
+                            distinct_states.push(state);
+                        }
+                        Ok((distinct_states, raw_initial_states_generated))
+                    }
                     Ok(None) => Err(ConfigCheckError::InitCannotEnumerate(
                         "failed to enumerate states from constraints".to_string(),
                     )
@@ -197,16 +218,20 @@ impl ParallelChecker {
                 continue;
             }
 
-            let base_states =
-                match enumerate_states_from_constraint_branches(Some(ctx), &self.vars, &branches) {
-                    Ok(Some(states)) => states,
-                    Ok(None) => continue,
-                    Err(e) => return Err(EvalCheckError::Eval(e).into()),
-                };
+            let base_states = match enumerate_states_from_constraint_branches_with_multiplicity(
+                Some(ctx),
+                &self.vars,
+                &branches,
+            ) {
+                Ok(Some(states)) => states,
+                Ok(None) => continue,
+                Err(e) => return Err(EvalCheckError::Eval(e).into()),
+            };
 
             // Filter base states by the original Init predicate
             let mut filtered: Vec<State> = Vec::new();
-            for state in base_states {
+            let mut raw_initial_states_generated = 0usize;
+            for (state, multiplicity) in base_states {
                 let mut eval_ctx = ctx.clone();
                 for (name, value) in state.vars() {
                     eval_ctx.bind_mut(Arc::clone(name), value.clone());
@@ -222,11 +247,14 @@ impl ParallelChecker {
                 };
 
                 if keep {
+                    raw_initial_states_generated = raw_initial_states_generated
+                        .checked_add(multiplicity)
+                        .expect("raw initial-state generation count overflowed usize");
                     filtered.push(state);
                 }
             }
 
-            return Ok(filtered);
+            return Ok((filtered, raw_initial_states_generated));
         }
 
         Err(ConfigCheckError::InitCannotEnumerate(direct_hint).into())
@@ -298,10 +326,11 @@ Next == x' = x
         let mut bulk_ctx = checker
             .prepare_base_ctx()
             .expect("parallel init fallback bulk replay should prepare ctx");
-        let bulk = checker
+        let (bulk, generated) = checker
             .generate_initial_states_to_bulk(&mut bulk_ctx, "Init")
             .expect("bulk fallback should not error")
             .expect("bulk fallback should enumerate initial states");
+        assert_eq!(generated, 2);
         assert_eq!(
             sorted_x_values_from_bulk(&bulk),
             vec![Value::int(1), Value::int(2)],
@@ -311,13 +340,48 @@ Next == x' = x
         let vec_ctx = checker
             .prepare_base_ctx()
             .expect("parallel init fallback Vec replay should prepare ctx");
-        let states = checker
-            .generate_initial_states(&vec_ctx, "Init")
+        let (states, generated) = checker
+            .generate_initial_states_with_raw_count(&vec_ctx, "Init")
             .expect("Vec fallback should not error");
+        assert_eq!(generated, 2);
         assert_eq!(
             sorted_x_values_from_states(states),
             vec![Value::int(1), Value::int(2)],
             "Vec init fallback should use replacement-routed TypeOK candidate"
+        );
+    }
+
+    #[cfg_attr(test, ntest::timeout(30000))]
+    #[test]
+    fn parallel_vec_init_preserves_raw_duplicate_multiplicity() {
+        let _serial = crate::test_utils::acquire_interner_lock();
+        let module = parse_module(
+            r"
+---- MODULE ParallelInitVecMultiplicity ----
+VARIABLE x
+Init == x \in {0, 1} \/ x = 0
+Next == FALSE
+====
+",
+        );
+        let config = crate::Config {
+            init: Some("Init".to_string()),
+            next: Some("Next".to_string()),
+            ..Default::default()
+        };
+        let checker = ParallelChecker::new(&module, &config, 2);
+        let ctx = checker
+            .prepare_base_ctx()
+            .expect("parallel Vec Init replay should prepare ctx");
+
+        let (states, raw_initial_states_generated) = checker
+            .generate_initial_states_with_raw_count(&ctx, "Init")
+            .expect("parallel Vec Init solve should succeed");
+
+        assert_eq!(states.len(), 2);
+        assert_eq!(
+            raw_initial_states_generated, 3,
+            "raw count must retain the duplicate x = 0 branch"
         );
     }
 }

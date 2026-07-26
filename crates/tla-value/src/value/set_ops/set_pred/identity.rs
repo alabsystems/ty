@@ -11,9 +11,9 @@
 
 use super::super::super::value_fingerprint::{fp_usize_to_i32, FingerprintResult};
 use super::super::super::*;
-use std::sync::Arc;
 use super::value::SetPredValue;
 use crate::fingerprint::fp64_extend_i64;
+use std::sync::Arc;
 
 #[inline]
 fn cmp_optional_value_slices(lhs: Option<&[Value]>, rhs: Option<&[Value]>) -> Ordering {

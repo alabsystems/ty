@@ -79,7 +79,6 @@
 //! design (§2.6, §7.1 R2).
 
 use std::cell::RefCell;
-use tla_value::Rp;
 
 use tla_value::value::Value;
 
@@ -363,6 +362,7 @@ mod tests {
     use super::super::handle::{clear_tla_arena, handle_to_value, NIL_HANDLE};
     use super::*;
     use tla_value::value::{SortedSet, Value};
+    use tla_value::Rp;
 
     fn fresh() {
         clear_tla_arena();

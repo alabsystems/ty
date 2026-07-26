@@ -1,7 +1,6 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 
 use serde_json::{json, Value};
 
@@ -11,8 +10,6 @@ use super::tlc_java_single_thread_args;
 use crate::cli_schema::{
     SupremacyMatrixArgs, SupremacyMatrixRuntimeScope, SupremacyMode, SupremacyOutputFormat,
 };
-
-static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 struct PathRestore {
     original: Option<std::ffi::OsString>,
@@ -121,13 +118,14 @@ fn assert_java_command_uses_single_thread_jvm_profile(command_path: &Path, argv:
 
 #[test]
 fn matrix_refresh_runtime_explicit_specs_write_rust_runtime_evidence_without_python_gate() {
-    let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    let _guard = crate::env_guard::lock_env();
     let original_path = env::var_os("PATH");
     let _path_restore = PathRestore {
         original: original_path.clone(),
     };
     let dir = tempfile::tempdir().unwrap();
-    let bin_dir = dir.path().join("bin");
+    let java_home = dir.path().join("jdk");
+    let bin_dir = java_home.join("bin");
     let examples_dir = dir.path().join("examples");
     let output_dir = dir.path().join("runtime-output");
     fs::create_dir_all(&bin_dir).unwrap();
@@ -146,7 +144,12 @@ fn matrix_refresh_runtime_explicit_specs_write_rust_runtime_evidence_without_pyt
     let fake_java = bin_dir.join("java");
     write_executable(
         &fake_java,
-        r#"#!/bin/sh
+        &format!(
+            r#"#!/bin/sh
+if [ "$1" = "-XshowSettings:properties" ]; then
+  echo "    java.home = {}" >&2
+  exit 0
+fi
 if [ "$1" = "-version" ]; then
   echo "fake java for matrix runtime CLI test" >&2
   exit 0
@@ -156,6 +159,8 @@ echo "Finished computing initial states: 1 distinct states generated at fixture 
 echo "3 states generated, 3 distinct states found, 0 states left on queue."
 exit 0
 "#,
+            java_home.display()
+        ),
     );
     let fake_ty = bin_dir.join("ty");
     write_executable(
@@ -164,6 +169,8 @@ exit 0
 echo "Model checking complete."
 echo "States found: 3"
 echo "Transitions: 2"
+echo "Initial states generated: 1"
+echo "States generated: 3"
 exit 0
 "#,
     );
@@ -207,6 +214,7 @@ exit 0
         runtime_limit: None,
         runtime_specs: vec!["B".to_string()],
         runtime_timeout: 5,
+        runtime_runs: 5,
         production_runtime: true,
         runtime_ty_bin: Some(fake_ty.clone()),
         allow_debug_runtime: true,
@@ -255,21 +263,39 @@ exit 0
     .unwrap();
     assert_eq!(
         evidence["schema"],
-        json!("ty.supremacy.matrix_runtime_evidence.v1")
+        json!("ty.supremacy.matrix_runtime_evidence.v4")
     );
+    assert_eq!(evidence["runs"], json!(5));
     assert_eq!(evidence["selected_runtime_specs"], json!(["B"]));
     assert_eq!(evidence["selected_runtime_spec_count"], json!(1));
     assert_eq!(evidence["collected_runtime_specs"], json!(["B"]));
     assert_eq!(evidence["collected_runtime_spec_count"], json!(1));
-    assert_eq!(evidence["complete"], json!(true));
+    assert_eq!(evidence["complete"], json!(false));
+    assert_eq!(evidence["finalization_pending"], json!(true));
     assert_eq!(evidence["uncollected_selected_runtime_specs"], json!([]));
     assert_eq!(evidence["rows"].as_array().unwrap().len(), 1);
     assert_eq!(evidence["rows"][0]["spec"], json!("B"));
     assert_eq!(evidence["rows"][0]["refreshed"], json!(true));
     assert_eq!(evidence["rows"][0]["verified_match"], json!(true));
     assert_eq!(evidence["rows"][0]["tlc"]["states"], json!(3));
+    assert_eq!(evidence["rows"][0]["tlc"]["transitions"], json!(2));
     assert_eq!(evidence["rows"][0]["ty"]["states"], json!(3));
-    assert!(evidence.get("errors").is_none());
+    assert_eq!(evidence["rows"][0]["ty"]["transitions"], json!(2));
+    assert_eq!(
+        evidence["rows"][0]["tlc"]["samples"]
+            .as_array()
+            .unwrap()
+            .len(),
+        5
+    );
+    assert_eq!(
+        evidence["rows"][0]["ty"]["production_samples"]
+            .as_array()
+            .unwrap()
+            .len(),
+        5
+    );
+    assert_eq!(evidence["errors"], json!([]));
 
     let refreshed_baseline: Value = serde_json::from_str(
         &fs::read_to_string(output_dir.join("spec_baseline.refreshed.json")).unwrap(),
@@ -297,25 +323,36 @@ exit 0
         refreshed_baseline["specs"]["B"]["ty"]["production_states"],
         json!(3)
     );
+    assert_eq!(
+        refreshed_baseline["specs"]["B"]["ty"]["production_transitions"],
+        json!(2)
+    );
     assert!(evidence["rows"][0]["ty"]["production_runtime_seconds"]
         .as_f64()
         .is_some_and(|seconds| seconds > 0.0));
 
-    // Reducer levers are CLI flags now, not env pins: the pinned (count-verify)
-    // run carries `--no-reduction` in its argv; the production run executes the
-    // same argv with exactly that flag removed. Neither run pins the retired
-    // TY_AUTO_SYMMETRY / TY_AUTO_POR env vars (the child ignores ambient env).
+    // The separate count-equivalence arm adds exactly the three semantic/work
+    // controls. Both TY arms retain AUTO routing: no --backend and no routing
+    // environment overrides.
     let pinned_command: Value = serde_json::from_str(
-        &fs::read_to_string(output_dir.join("B/ty-trust_cg-run1/command.json")).unwrap(),
+        &fs::read_to_string(output_dir.join("B/run-0001/count-ty/command.json")).unwrap(),
     )
     .unwrap();
     let production_command: Value = serde_json::from_str(
-        &fs::read_to_string(output_dir.join("B/ty-trust_cg-production-run1/command.json")).unwrap(),
+        &fs::read_to_string(output_dir.join("B/run-0001/production-ty/command.json")).unwrap(),
     )
     .unwrap();
     for command in [&pinned_command, &production_command] {
-        assert!(command["env_overrides"].get("TY_AUTO_SYMMETRY").is_none());
-        assert!(command["env_overrides"].get("TY_AUTO_POR").is_none());
+        for key in [
+            "TY_AUTO_SYMMETRY",
+            "TY_AUTO_POR",
+            "TY_trust_cg",
+            "TY_TRUST_CG_BFS",
+            "TY_TRUST_CG_EXISTS",
+            "TY_BYTECODE_VM",
+        ] {
+            assert!(command["env_overrides"].get(key).is_none());
+        }
     }
     let pinned_argv: Vec<String> = pinned_command["argv"]
         .as_array()
@@ -333,21 +370,38 @@ exit 0
         pinned_argv.iter().any(|arg| arg == "--no-reduction"),
         "count-verify run must pass --no-reduction: {pinned_argv:?}"
     );
+    assert!(pinned_argv.iter().any(|arg| arg == "--bfs-only"));
+    assert!(pinned_argv
+        .windows(2)
+        .any(|args| args == ["--workers", "1"]));
     assert!(
-        production_argv.iter().all(|arg| arg != "--no-reduction"),
-        "production run must NOT pass --no-reduction: {production_argv:?}"
+        production_argv.iter().all(|arg| !matches!(
+            arg.as_str(),
+            "--no-reduction" | "--bfs-only" | "--workers" | "--backend"
+        )),
+        "production run must use AUTO defaults: {production_argv:?}"
     );
-    let pinned_without_flag: Vec<String> = pinned_argv
+    assert!(pinned_argv.iter().all(|arg| arg != "--backend"));
+    assert_eq!(
+        evidence["rows"][0]["tlc"]["samples"][0]["tool_order"],
+        json!("tlc_then_ty")
+    );
+    assert_eq!(
+        evidence["rows"][0]["tlc"]["samples"][1]["tool_order"],
+        json!("ty_then_tlc")
+    );
+    let artifact_dirs = evidence["rows"][0]["tlc"]["samples"]
+        .as_array()
+        .unwrap()
         .iter()
-        .filter(|arg| arg.as_str() != "--no-reduction")
-        .cloned()
-        .collect();
-    assert_eq!(pinned_without_flag, production_argv);
+        .map(|sample| sample["artifact_dir"].as_str().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(artifact_dirs.len(), 5);
 
     let command_paths = command_json_files(&output_dir);
     assert!(
-        command_paths.len() >= 3,
-        "expected preflight, TLC, and TY command artifacts under {}",
+        command_paths.len() >= 16,
+        "expected preflight plus five TLC/production/count triplets under {}",
         output_dir.display()
     );
     for command_path in command_paths {
@@ -370,13 +424,14 @@ exit 0
 #[cfg(unix)]
 #[test]
 fn matrix_runtime_evidence_complete_is_false_for_collection_error_rows() {
-    let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    let _guard = crate::env_guard::lock_env();
     let original_path = env::var_os("PATH");
     let _path_restore = PathRestore {
         original: original_path,
     };
     let dir = tempfile::tempdir().unwrap();
-    let bin_dir = dir.path().join("bin");
+    let java_home = dir.path().join("jdk");
+    let bin_dir = java_home.join("bin");
     let examples_dir = dir.path().join("examples");
     let output_dir = dir.path().join("runtime-output");
     fs::create_dir_all(&bin_dir).unwrap();
@@ -387,13 +442,33 @@ fn matrix_runtime_evidence_complete_is_false_for_collection_error_rows() {
     );
     write_file(&examples_dir.join("specs/C.cfg"), "INIT Init\nNEXT Next\n");
 
-    write_file(&bin_dir.join("java"), "not executable\n");
+    write_executable(
+        &bin_dir.join("java"),
+        &format!(
+            r#"#!/bin/sh
+if [ "$1" = "-XshowSettings:properties" ]; then
+  echo "    java.home = {}" >&2
+  exit 0
+fi
+if [ "$1" = "-version" ]; then
+  /bin/chmod 0644 "$0"
+  echo "fake java for matrix runtime CLI error test" >&2
+  exit 0
+fi
+echo "synthetic TLC launch failure" >&2
+exit 7
+"#,
+            java_home.display()
+        ),
+    );
     write_executable(
         &bin_dir.join("ty"),
         r#"#!/bin/sh
 echo "Model checking complete."
 echo "States found: 3"
 echo "Transitions: 2"
+echo "Initial states generated: 1"
+echo "States generated: 3"
 exit 0
 "#,
     );
@@ -427,6 +502,7 @@ exit 0
         runtime_limit: None,
         runtime_specs: vec!["C".to_string()],
         runtime_timeout: 5,
+        runtime_runs: 5,
         production_runtime: true,
         runtime_ty_bin: Some(bin_dir.join("ty")),
         allow_debug_runtime: true,
@@ -454,7 +530,11 @@ exit 0
     );
     assert_eq!(evidence["complete"], json!(false));
     assert_eq!(evidence["uncollected_selected_runtime_specs"], json!([]));
-    assert_eq!(evidence["incomplete_runtime_specs"], json!(["C"]));
+    assert_eq!(
+        evidence["incomplete_runtime_specs"],
+        json!(["C"]),
+        "unexpected collection-error evidence: {evidence:#}"
+    );
     assert_eq!(evidence["errors"][0]["spec"], json!("C"));
     assert_eq!(evidence["rows"][0]["refreshed"], json!(false));
 }

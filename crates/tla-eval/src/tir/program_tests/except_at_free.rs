@@ -5,7 +5,6 @@
 use tla_value::Rp;
 
 use super::*;
-use std::sync::Arc;
 
 struct VmOutcome {
     result: Result<Value, EvalError>,

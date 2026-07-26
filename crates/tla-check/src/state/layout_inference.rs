@@ -21,9 +21,9 @@
 //! Part of #3986.
 
 use super::array_state::ArrayState;
-use tla_value::Rp;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use tla_value::Rp;
 
 use super::state_layout::{
     flat_write_admission_enabled, ordered_dense_int_domain,
@@ -61,7 +61,7 @@ use tla_core::name_intern::{intern_name, NameId};
 /// enabled). It does NOT enable the single-value inference arm
 /// `infer_nested_set_bitmask_layout`, which has its own independent (inert) gate
 /// and would derive an unsound incomplete universe.
-pub(crate) const NESTED_SET_PROMOTION_ENABLED: bool = false;
+pub(crate) const NESTED_SET_PROMOTION_ENABLED: bool = true;
 
 /// Opt-in env gate (nested-set A6): set `TY_NESTED_SET=1` to enable the
 /// monitored nested-set discovery + promotion at runtime without recompiling.
@@ -5221,9 +5221,10 @@ pub(crate) fn apply_tuple_keyed_tagged_scalar_union_range_overrides(
         // A plain-i64 range is already structurally primary-flat with the raw
         // encoding; re-encoding it would change fingerprints for no admission
         // gain. Only promote a range that is currently fail-closed.
-        if value_types.iter().all(|ty| {
-            matches!(ty, SlotType::Int | SlotType::Bool)
-        }) {
+        if value_types
+            .iter()
+            .all(|ty| matches!(ty, SlotType::Int | SlotType::Bool))
+        {
             continue;
         }
         // The proof's enumerated domain must be EXACTLY the observed canonical
@@ -5253,9 +5254,9 @@ pub(crate) fn apply_tuple_keyed_tagged_scalar_union_range_overrides(
                     };
                     func.domain_len() == domain_keys.len()
                         && domain_keys.iter().all(|key| {
-                            func.apply(key).and_then(flat_scalar_from_value).is_some_and(
-                                |observed| proof.proof.universe().contains(&observed),
-                            )
+                            func.apply(key)
+                                .and_then(flat_scalar_from_value)
+                                .is_some_and(|observed| proof.proof.universe().contains(&observed))
                         })
                 })
             });
@@ -5607,9 +5608,7 @@ pub(crate) fn collect_scalar_tuple_union_var_writer_proofs(
 /// Thin wrapper over [`scalar_tuple_union_variants_from_arms`] so the arm
 /// FOLDING is unit-testable without the process-global `TY_TAGGED_SCALAR_UNION`
 /// gate that `TaggedUnionProof::new`'s per-variant finiteness check consults.
-fn scalar_tuple_union_proof_from_arms(
-    arms: &[ScalarTupleArmEvidence],
-) -> Option<TaggedUnionProof> {
+fn scalar_tuple_union_proof_from_arms(arms: &[ScalarTupleArmEvidence]) -> Option<TaggedUnionProof> {
     let variants = scalar_tuple_union_variants_from_arms(arms)?;
     TaggedUnionProof::new(variants, Arc::from("scalar-tuple-union:writer-coverage")).ok()
 }
@@ -5693,8 +5692,11 @@ fn scalar_position_layout(universe: Vec<FlatScalarValue>) -> Option<FlatValueLay
         return Some(FlatValueLayout::Scalar(slot_type));
     }
     Some(FlatValueLayout::TaggedScalarUnion {
-        proof: TaggedScalarUnionProof::new(universe, Arc::from("scalar-tuple-union:writer-coverage"))
-            .ok()?,
+        proof: TaggedScalarUnionProof::new(
+            universe,
+            Arc::from("scalar-tuple-union:writer-coverage"),
+        )
+        .ok()?,
     })
 }
 
@@ -5910,12 +5912,26 @@ fn collect_tagged_union_var_type_proofs_inner(
     match expr {
         Expr::And(left, right) => {
             collect_tagged_union_var_type_proofs_inner(
-                &left.node, invariant, registry, constants, op_defs, op_replacements, scope,
-                visiting, out,
+                &left.node,
+                invariant,
+                registry,
+                constants,
+                op_defs,
+                op_replacements,
+                scope,
+                visiting,
+                out,
             );
             collect_tagged_union_var_type_proofs_inner(
-                &right.node, invariant, registry, constants, op_defs, op_replacements, scope,
-                visiting, out,
+                &right.node,
+                invariant,
+                registry,
+                constants,
+                op_defs,
+                op_replacements,
+                scope,
+                visiting,
+                out,
             );
         }
         Expr::In(left, right) => {
@@ -5956,8 +5972,15 @@ fn collect_tagged_union_var_type_proofs_inner(
                 return;
             }
             collect_tagged_union_var_type_proofs_inner(
-                &def.body.node, invariant, registry, constants, op_defs, op_replacements, scope,
-                visiting, out,
+                &def.body.node,
+                invariant,
+                registry,
+                constants,
+                op_defs,
+                op_replacements,
+                scope,
+                visiting,
+                out,
             );
             visiting.remove(resolved_name);
         }
@@ -5992,9 +6015,7 @@ pub(crate) fn apply_tagged_union_var_overrides(
         // veto-demoted `Dynamic`. Never touch a proven primary-flat kind.
         if !matches!(
             var.kind,
-            VarLayoutKind::ScalarModelValue
-                | VarLayoutKind::ScalarString
-                | VarLayoutKind::Dynamic
+            VarLayoutKind::ScalarModelValue | VarLayoutKind::ScalarString | VarLayoutKind::Dynamic
         ) {
             continue;
         }
@@ -6160,7 +6181,8 @@ fn classify_tagged_union_write_variant(
     let context = LayoutInferenceContext::default();
     let root = SequencePath::root(usize::MAX);
     // A whole-RHS scalar constant (e.g. `args = NIL`, `x' = "get"`).
-    if let Some(value) = const_expr_to_value_with_replacements(rhs, constants, Some(op_replacements))
+    if let Some(value) =
+        const_expr_to_value_with_replacements(rhs, constants, Some(op_replacements))
     {
         let layout = infer_fixed_value_layout(&value, &context, &root)?;
         return matches!(layout, FlatValueLayout::Scalar(_)).then_some(layout);
@@ -6201,7 +6223,8 @@ fn classify_tagged_union_tuple_position(
     path: &SequencePath,
 ) -> Option<FlatValueLayout> {
     // A constant-valued position (a literal or a config-overridden model value).
-    if let Some(value) = const_expr_to_value_with_replacements(elem, constants, Some(op_replacements))
+    if let Some(value) =
+        const_expr_to_value_with_replacements(elem, constants, Some(op_replacements))
     {
         let layout = infer_fixed_value_layout(&value, context, path)?;
         return matches!(layout, FlatValueLayout::Scalar(_)).then_some(layout);
@@ -6214,8 +6237,11 @@ fn classify_tagged_union_tuple_position(
                 domain: Some(domain),
                 ..
             }) => {
-                let domain_value =
-                    const_expr_to_value_with_replacements(&domain, constants, Some(op_replacements))?;
+                let domain_value = const_expr_to_value_with_replacements(
+                    &domain,
+                    constants,
+                    Some(op_replacements),
+                )?;
                 let set = domain_value.to_sorted_set()?;
                 if set.is_empty() {
                     return None;
@@ -6263,18 +6289,46 @@ fn walk_tagged_union_writes(
     match expr {
         Expr::And(left, right) | Expr::Or(left, right) => {
             walk_tagged_union_writes(
-                &left.node, scope, primed, registry, op_defs, op_replacements, visiting, writes,
+                &left.node,
+                scope,
+                primed,
+                registry,
+                op_defs,
+                op_replacements,
+                visiting,
+                writes,
             );
             walk_tagged_union_writes(
-                &right.node, scope, primed, registry, op_defs, op_replacements, visiting, writes,
+                &right.node,
+                scope,
+                primed,
+                registry,
+                op_defs,
+                op_replacements,
+                visiting,
+                writes,
             );
         }
         Expr::If(_, then_expr, else_expr) => {
             walk_tagged_union_writes(
-                &then_expr.node, scope, primed, registry, op_defs, op_replacements, visiting, writes,
+                &then_expr.node,
+                scope,
+                primed,
+                registry,
+                op_defs,
+                op_replacements,
+                visiting,
+                writes,
             );
             walk_tagged_union_writes(
-                &else_expr.node, scope, primed, registry, op_defs, op_replacements, visiting, writes,
+                &else_expr.node,
+                scope,
+                primed,
+                registry,
+                op_defs,
+                op_replacements,
+                visiting,
+                writes,
             );
         }
         Expr::Exists(bounds, body) | Expr::Forall(bounds, body) => {
@@ -6292,7 +6346,14 @@ fn walk_tagged_union_writes(
                 }
             }
             walk_tagged_union_writes(
-                &body.node, scope, primed, registry, op_defs, op_replacements, visiting, writes,
+                &body.node,
+                scope,
+                primed,
+                registry,
+                op_defs,
+                op_replacements,
+                visiting,
+                writes,
             );
             for name in pushed.into_iter().rev() {
                 scope.pop(&name);
@@ -6318,7 +6379,14 @@ fn walk_tagged_union_writes(
                 pushed.push(def.name.node.clone());
             }
             walk_tagged_union_writes(
-                &body.node, scope, primed, registry, op_defs, op_replacements, visiting, writes,
+                &body.node,
+                scope,
+                primed,
+                registry,
+                op_defs,
+                op_replacements,
+                visiting,
+                writes,
             );
             for name in pushed.into_iter().rev() {
                 scope.pop(&name);
@@ -6541,12 +6609,26 @@ fn collect_tagged_scalar_union_function_var_type_proofs_inner(
     match expr {
         Expr::And(left, right) => {
             collect_tagged_scalar_union_function_var_type_proofs_inner(
-                &left.node, invariant, registry, constants, op_defs, op_replacements, scope,
-                visiting, out,
+                &left.node,
+                invariant,
+                registry,
+                constants,
+                op_defs,
+                op_replacements,
+                scope,
+                visiting,
+                out,
             );
             collect_tagged_scalar_union_function_var_type_proofs_inner(
-                &right.node, invariant, registry, constants, op_defs, op_replacements, scope,
-                visiting, out,
+                &right.node,
+                invariant,
+                registry,
+                constants,
+                op_defs,
+                op_replacements,
+                scope,
+                visiting,
+                out,
             );
         }
         Expr::In(left, right) => {
@@ -6596,8 +6678,15 @@ fn collect_tagged_scalar_union_function_var_type_proofs_inner(
                 return;
             }
             collect_tagged_scalar_union_function_var_type_proofs_inner(
-                &def.body.node, invariant, registry, constants, op_defs, op_replacements, scope,
-                visiting, out,
+                &def.body.node,
+                invariant,
+                registry,
+                constants,
+                op_defs,
+                op_replacements,
+                scope,
+                visiting,
+                out,
             );
             visiting.remove(resolved_name);
         }
@@ -6718,12 +6807,26 @@ fn collect_tagged_scalar_union_tuple_function_var_type_proofs_inner(
     match expr {
         Expr::And(left, right) => {
             collect_tagged_scalar_union_tuple_function_var_type_proofs_inner(
-                &left.node, invariant, registry, constants, op_defs, op_replacements, scope,
-                visiting, out,
+                &left.node,
+                invariant,
+                registry,
+                constants,
+                op_defs,
+                op_replacements,
+                scope,
+                visiting,
+                out,
             );
             collect_tagged_scalar_union_tuple_function_var_type_proofs_inner(
-                &right.node, invariant, registry, constants, op_defs, op_replacements, scope,
-                visiting, out,
+                &right.node,
+                invariant,
+                registry,
+                constants,
+                op_defs,
+                op_replacements,
+                scope,
+                visiting,
+                out,
             );
         }
         Expr::In(left, right) => {
@@ -6787,8 +6890,15 @@ fn collect_tagged_scalar_union_tuple_function_var_type_proofs_inner(
                 return;
             }
             collect_tagged_scalar_union_tuple_function_var_type_proofs_inner(
-                &def.body.node, invariant, registry, constants, op_defs, op_replacements, scope,
-                visiting, out,
+                &def.body.node,
+                invariant,
+                registry,
+                constants,
+                op_defs,
+                op_replacements,
+                scope,
+                visiting,
+                out,
             );
             visiting.remove(resolved_name);
         }
@@ -6882,15 +6992,32 @@ fn resolve_finite_scalar_set_universe(
 ) -> Option<Vec<FlatScalarValue>> {
     if let Expr::Union(left, right) = expr {
         let mut left_universe = resolve_finite_scalar_set_universe(
-            &left.node, constants, op_defs, op_replacements, scope, visiting,
+            &left.node,
+            constants,
+            op_defs,
+            op_replacements,
+            scope,
+            visiting,
         )?;
         let right_universe = resolve_finite_scalar_set_universe(
-            &right.node, constants, op_defs, op_replacements, scope, visiting,
+            &right.node,
+            constants,
+            op_defs,
+            op_replacements,
+            scope,
+            visiting,
         )?;
         left_universe.extend(right_universe);
         return normalize_flat_scalar_domain(left_universe);
     }
-    scalar_domain_from_type_set_expr_scoped(expr, constants, op_defs, op_replacements, scope, visiting)
+    scalar_domain_from_type_set_expr_scoped(
+        expr,
+        constants,
+        op_defs,
+        op_replacements,
+        scope,
+        visiting,
+    )
 }
 
 /// Evaluate a function-range type expression to its HOMOGENEOUS finite scalar
@@ -6961,12 +7088,26 @@ fn collect_fixed_scalar_range_tuple_function_var_type_proofs_inner(
     match expr {
         Expr::And(left, right) => {
             collect_fixed_scalar_range_tuple_function_var_type_proofs_inner(
-                &left.node, invariant, registry, constants, op_defs, op_replacements, scope,
-                visiting, out,
+                &left.node,
+                invariant,
+                registry,
+                constants,
+                op_defs,
+                op_replacements,
+                scope,
+                visiting,
+                out,
             );
             collect_fixed_scalar_range_tuple_function_var_type_proofs_inner(
-                &right.node, invariant, registry, constants, op_defs, op_replacements, scope,
-                visiting, out,
+                &right.node,
+                invariant,
+                registry,
+                constants,
+                op_defs,
+                op_replacements,
+                scope,
+                visiting,
+                out,
             );
         }
         Expr::In(left, right) => {
@@ -7034,8 +7175,15 @@ fn collect_fixed_scalar_range_tuple_function_var_type_proofs_inner(
                 return;
             }
             collect_fixed_scalar_range_tuple_function_var_type_proofs_inner(
-                &def.body.node, invariant, registry, constants, op_defs, op_replacements, scope,
-                visiting, out,
+                &def.body.node,
+                invariant,
+                registry,
+                constants,
+                op_defs,
+                op_replacements,
+                scope,
+                visiting,
+                out,
             );
             visiting.remove(resolved_name);
         }
@@ -14755,8 +14903,7 @@ fn merge_sequence_bound_evidence(
     // backstop guards the heuristic bound; `Observed` merely fails closed). A
     // DISAGREEING merge still collapses to `Observed`.
     if a == b
-        && (a.is_proven()
-            || matches!(a, SequenceBoundEvidence::HeuristicUniverseCapacity { .. }))
+        && (a.is_proven() || matches!(a, SequenceBoundEvidence::HeuristicUniverseCapacity { .. }))
     {
         a.clone()
     } else {
@@ -16438,10 +16585,8 @@ mod tests {
 
     fn wp15_int_seq_state() -> (VarRegistry, ArrayState) {
         let registry = VarRegistry::from_names(["nxt"]);
-        let state = ArrayState::from_values(vec![wp15_seq(vec![
-            Value::SmallInt(1),
-            Value::SmallInt(1),
-        ])]);
+        let state =
+            ArrayState::from_values(vec![wp15_seq(vec![Value::SmallInt(1), Value::SmallInt(1)])]);
         (registry, state)
     }
 
@@ -16623,8 +16768,12 @@ mod tests {
                  {bound:?} max_len={max_len}"
             );
 
-            let (bound, max_len) =
-                bound_of(&wp15_infer_with_proofs(&registry, &state, &disagreeing, &[]));
+            let (bound, max_len) = bound_of(&wp15_infer_with_proofs(
+                &registry,
+                &state,
+                &disagreeing,
+                &[],
+            ));
             assert!(
                 matches!(bound, SequenceBoundEvidence::Observed) && max_len == 2,
                 "gate ON: capacity proofs disagreeing on max_len must fail closed, got \
@@ -17283,11 +17432,7 @@ mod tests {
         ]));
         let nonempty = Value::Seq(Rp::new(SeqValue::from_vec(vec![msg])));
         let empty = || Value::Seq(Rp::new(SeqValue::from_vec(vec![])));
-        let row1 = Value::IntFunc(Rp::new(IntIntervalFunc::new(
-            1,
-            2,
-            vec![empty(), nonempty],
-        )));
+        let row1 = Value::IntFunc(Rp::new(IntIntervalFunc::new(1, 2, vec![empty(), nonempty])));
         let row2 = Value::IntFunc(Rp::new(IntIntervalFunc::new(1, 2, vec![empty(), empty()])));
         let network = Value::IntFunc(Rp::new(IntIntervalFunc::new(1, 2, vec![row1, row2])));
         let state = ArrayState::from_values(vec![network]);
@@ -17898,9 +18043,7 @@ mod tests {
                 (model_value("p1"), model_value("p1")),
                 (
                     model_value("p2"),
-                    Value::Set(Rp::new(SortedSet::from_sorted_vec(vec![model_value(
-                        "p1",
-                    )]))),
+                    Value::Set(Rp::new(SortedSet::from_sorted_vec(vec![model_value("p1")]))),
                 ),
             ]),
         ))]);
@@ -18210,9 +18353,9 @@ mod tests {
             "record-valued SUBSET universes must not be compacted by scalar SetBitmask proofs"
         );
 
-        let state = ArrayState::from_values(vec![Value::Set(Rp::new(
-            SortedSet::from_sorted_vec(vec![]),
-        ))]);
+        let state = ArrayState::from_values(vec![Value::Set(Rp::new(SortedSet::from_sorted_vec(
+            vec![],
+        )))]);
         let layout = infer_layout_with_sequence_layout_tagged_set_type_and_range_proofs(
             &state,
             &registry,
@@ -18377,9 +18520,9 @@ mod tests {
     #[test]
     fn test_empty_top_level_set_fails_closed_until_subset_type_proof() {
         let registry = VarRegistry::from_names(["tx"]);
-        let state = ArrayState::from_values(vec![Value::Set(Rp::new(
-            SortedSet::from_sorted_vec(vec![]),
-        ))]);
+        let state = ArrayState::from_values(vec![Value::Set(Rp::new(SortedSet::from_sorted_vec(
+            vec![],
+        )))]);
 
         let unproven = infer_layout(&state, &registry);
         assert!(
@@ -20914,9 +21057,9 @@ mod tests {
         // A non-scalar element (a set) fails closed.
         let with_set = vec![
             Value::String(Rp::from("get")),
-            Value::Set(Rp::new(tla_value::value::SortedSet::from_iter(
-                [Value::SmallInt(1)],
-            ))),
+            Value::Set(Rp::new(tla_value::value::SortedSet::from_iter([
+                Value::SmallInt(1),
+            ]))),
         ];
         assert!(tagged_scalar_union_layout_from_scalar_values(&with_set).is_none());
     }
@@ -20946,10 +21089,7 @@ mod tests {
             &registry,
             vec![VarLayoutKind::ScalarModelValue, VarLayoutKind::Scalar],
         );
-        let fits = vec![vec![
-            Value::ModelValue(Rp::from("nil")),
-            Value::SmallInt(1),
-        ]];
+        let fits = vec![vec![Value::ModelValue(Rp::from("nil")), Value::SmallInt(1)]];
         apply_tagged_scalar_union_var_overrides(&mut layout, &proofs, &fits);
         assert!(matches!(
             layout.var_layout(0).unwrap().kind,

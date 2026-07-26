@@ -2,10 +2,10 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
+use crate::rp::Rp as Arc;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::{OnceLock};
-use crate::rp::Rp as Arc;
+use std::sync::OnceLock;
 
 use super::{strings::intern_string, FuncValue, Value};
 use crate::error::EvalError;
@@ -58,6 +58,13 @@ pub fn get_or_assign_model_value_index(name: &Arc<str>) -> Result<u16, EvalError
 /// Returns None if the model value is not registered.
 #[inline]
 pub fn lookup_model_value_index(name: &Arc<str>) -> Option<u16> {
+    get_model_value_registry().get(name).map(|r| *r.value())
+}
+
+/// Look up a model value index by borrowed text without interning or assigning
+/// either a string token or a model-value index.
+#[inline]
+pub fn lookup_model_value_index_str(name: &str) -> Option<u16> {
     get_model_value_registry().get(name).map(|r| *r.value())
 }
 
@@ -119,7 +126,18 @@ pub struct MVPerm {
     /// value registered after construction, or a duplicate non-interned
     /// allocation) fall back to the registry path — never unsound, only slow.
     ptr_map: Vec<(usize, Arc<str>, Option<Arc<str>>)>,
+    /// Process-unique serial for permutation-memo keying (value-canon).
+    ///
+    /// Assigned once at construction from a global counter and NEVER reused,
+    /// so a memo entry keyed by `(value allocation, serial)` can only ever be
+    /// observed by lookups against this exact permutation content. `Clone`
+    /// copies the serial, which is sound: a cloned `MVPerm` has identical
+    /// content, so memoized results are interchangeable.
+    serial: u32,
 }
+
+/// Next MVPerm serial. Starts at 1; 0 is reserved as "no serial".
+static MVPERM_NEXT_SERIAL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
 impl MVPerm {
     /// Create an MVPerm from a FuncValue permutation.
@@ -159,7 +177,18 @@ impl MVPerm {
             .collect();
         ptr_map.sort_unstable_by_key(|e| e.0);
 
-        Ok(MVPerm { elems, ptr_map })
+        Ok(MVPerm {
+            elems,
+            ptr_map,
+            serial: MVPERM_NEXT_SERIAL.fetch_add(1, Ordering::Relaxed),
+        })
+    }
+
+    /// Process-unique serial identifying this permutation's content for the
+    /// permutation memo. See the field docs for the soundness contract.
+    #[inline]
+    pub fn memo_serial(&self) -> u32 {
+        self.serial
     }
 
     /// Apply the permutation to a model value.

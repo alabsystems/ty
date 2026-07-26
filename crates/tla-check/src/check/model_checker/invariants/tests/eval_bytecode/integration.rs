@@ -6,9 +6,9 @@
 //! via EXTENDS (#3585) and complex record-set packing (#3622).
 
 use super::*;
-use tla_value::Rp;
 use crate::test_support::parse_module_with_id;
 use tla_core::FileId;
+use tla_value::Rp;
 
 #[cfg_attr(test, ntest::timeout(10000))]
 #[test]
@@ -139,16 +139,15 @@ TypeInvariant ==
         }
     }
 
-    let pass_person_state = Value::Func(Rp::new(
-        tla_value::FuncValue::from_sorted_entries(vec![(
+    let pass_person_state =
+        Value::Func(Rp::new(tla_value::FuncValue::from_sorted_entries(vec![(
             Value::int(1),
             Value::record([
                 ("location", Value::int(1)),
                 ("destination", Value::int(1)),
                 ("waiting", Value::Bool(false)),
             ]),
-        )]),
-    ));
+        )])));
     let pass = ArrayState::from_state(
         &State::from_pairs([("personState", pass_person_state.clone())]),
         &registry,
@@ -156,16 +155,14 @@ TypeInvariant ==
     let fail = ArrayState::from_state(
         &State::from_pairs([(
             "personState",
-            Value::Func(Rp::new(
-                tla_value::FuncValue::from_sorted_entries(vec![(
-                    Value::int(1),
-                    Value::record([
-                        ("location", Value::int(3)),
-                        ("destination", Value::int(1)),
-                        ("waiting", Value::Bool(false)),
-                    ]),
-                )]),
-            )),
+            Value::Func(Rp::new(tla_value::FuncValue::from_sorted_entries(vec![(
+                Value::int(1),
+                Value::record([
+                    ("location", Value::int(3)),
+                    ("destination", Value::int(1)),
+                    ("waiting", Value::Bool(false)),
+                ]),
+            )]))),
         )]),
         &registry,
     );

@@ -142,6 +142,7 @@ pub(crate) fn reset_global_state_unchecked() {
     value::clear_string_intern_table();
     value::clear_set_intern_table();
     value::clear_int_func_intern_table();
+    value::clear_record_intern_table();
     value::clear_model_value_registry();
     // SKIP: tla_core::clear_global_name_interner() — unsafe with concurrent runs
     tla_eval::clear_for_run_reset();
@@ -175,6 +176,10 @@ fn reset_global_state_impl() {
 
     // Clear int-func intern table (tla-value: integer function dedup)
     value::clear_int_func_intern_table();
+
+    // Clear record intern table (tla-value: record hash-consing; NameId keys
+    // are run-scoped, so this must precede/accompany the name-interner clear)
+    value::clear_record_intern_table();
 
     // Clear model value registry (tla-value: model value name -> index)
     value::clear_model_value_registry();

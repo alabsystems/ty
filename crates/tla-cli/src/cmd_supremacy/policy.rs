@@ -521,7 +521,7 @@ pub(super) fn full_native_fused_protected_env() -> BTreeMap<String, String> {
         ("TY_BYTECODE_VM_STATS", "1"),
         ("TY_TRUST_CG_NATIVE_CALLOUT_SELFTEST", "strict"),
         ("TY_TRUST_CG_NATIVE_FUSED_STRICT", "1"),
-        ("TY_TRUST_CG_NATIVE_CALLOUT_COMPILE_JOBS", "27"),
+        ("TY_TRUST_CG_NATIVE_CALLOUT_COMPILE_JOBS", "1"),
         ("TY_TRUST_CG_NATIVE_FUSED_ENABLE_LOCAL_DEDUP", "1"),
         ("TY_DISABLE_ARTIFACT_CACHE", "1"),
     ]
@@ -606,7 +606,7 @@ mod tests {
             enforced
                 .get("TY_TRUST_CG_NATIVE_CALLOUT_COMPILE_JOBS")
                 .map(String::as_str),
-            Some("27")
+            Some("1")
         );
         assert_eq!(
             enforced
@@ -868,7 +868,7 @@ mod tests {
             required
                 .get("TY_TRUST_CG_NATIVE_CALLOUT_COMPILE_JOBS")
                 .map(String::as_str),
-            Some("27")
+            Some("1")
         );
         assert_eq!(
             required

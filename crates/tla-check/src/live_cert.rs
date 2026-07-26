@@ -293,8 +293,8 @@ pub fn certify_liveness_spec(
 /// Independently kernel-certify JUST the well-founded TERMINATION DESCENT of `(measure, Next)` — the
 /// affine disjunctive descent leg — WITHOUT requiring the five SMT obligations. Returns the
 /// kernel-checked descent term's byte size on success. This surfaces the descent honestly even when
-/// the full liveness certificate is blocked in the AY SMT layer (e.g. a record-set-membership
-/// invariant that BMC cannot translate). `measure_op` is the integer-measure operator name.
+/// the full liveness certificate is outside AY's scalar SMT lane (e.g. a measure over record-field
+/// projections). `measure_op` is the integer-measure operator name.
 ///
 /// What this proves: every non-stutter `Next` action strictly decreases the affine measure `m` by 1
 /// (a Clean-CIC-kernel-checked `Int.lt m' m` per disjunct). Combined with `m ≥ 0` (bounded below)
@@ -2041,33 +2041,72 @@ mod tests {
         );
     }
 
+    // Hermetic copy of the CoffeeCan corpus semantics and its 100-bean model. Keeping the fixture
+    // beside the regression means the default suite exercises the real record/set-filter/EXCEPT
+    // shapes without depending on a developer's `~/tlaplus-examples` checkout.
+    const COFFEECAN_CORPUS: &str = r#"---------------------------- MODULE CoffeeCan -------------------------------
+EXTENDS Naturals
+
+CONSTANT MaxBeanCount
+ASSUME MaxBeanCount \in Nat /\ MaxBeanCount >= 1
+
+VARIABLE can
+Can == [black : 0..MaxBeanCount, white : 0..MaxBeanCount]
+TypeInvariant == can \in Can
+Init == can \in {c \in Can : c.black + c.white \in 1..MaxBeanCount}
+BeanCount == can.black + can.white
+
+PickSameColorBlack ==
+    /\ BeanCount > 1
+    /\ can.black >= 2
+    /\ can' = [can EXCEPT !.black = @ - 1]
+PickSameColorWhite ==
+    /\ BeanCount > 1
+    /\ can.white >= 2
+    /\ can' = [can EXCEPT !.black = @ + 1, !.white = @ - 2]
+PickDifferentColor ==
+    /\ BeanCount > 1
+    /\ can.black >= 1
+    /\ can.white >= 1
+    /\ can' = [can EXCEPT !.black = @ - 1]
+Termination ==
+    /\ BeanCount = 1
+    /\ UNCHANGED can
+Next ==
+    \/ PickSameColorWhite
+    \/ PickSameColorBlack
+    \/ PickDifferentColor
+    \/ Termination
+
+EventuallyTerminates == <>(ENABLED Termination)
+Spec == Init /\ [][Next]_can /\ WF_can(Next)
+=============================================================================
+"#;
+
+    const COFFEECAN_100_CFG: &str = "CONSTANTS\n\
+        \x20   MaxBeanCount = 100\n\
+        SPECIFICATION Spec\n\
+        PROPERTY EventuallyTerminates\n\
+        INVARIANT TypeInvariant\n";
+
     /// THE CORPUS TARGET. CoffeeCan's TERMINATION descent — measure `can.black + can.white`, the
     /// three bean-removing actions (incl. the COUPLED `PickSameColorWhite`: black+1, white−2, net
     /// −1) and the guarded `Termination` stutter — KERNEL-CERTIFIES via the affine disjunctive
-    /// descent, over the REAL re-derived record ASTs. This is the substantive liveness content.
-    /// The FULL 5-obligation liveness certificate is separately blocked in the AY SMT layer: it
-    /// cannot translate the record-set membership `can \in [black:0..100, white:0..100]` of
-    /// `TypeInvariant`. Ignored by default (needs the external corpus at `~/tlaplus-examples`);
-    /// requires `clean-cic`.
+    /// descent over the real re-derived record ASTs. Cert normalization must remove the structural
+    /// record-set / `@` / `ENABLED` blockers and AY must translate the resulting flattened record
+    /// fields. The full certificate still declines honestly because `TypeInvariant` alone admits
+    /// unreachable states outside the stronger Init region, so it is neither inductive nor enough
+    /// to prove that `Next` is enabled away from termination.
     #[cfg(feature = "clean-cic")]
     #[test]
-    #[ignore]
     fn coffeecan_termination_descent_kernel_certifies() {
         use tla_core::ast::Expr;
-        let home = std::env::var("HOME").unwrap();
-        let src = std::fs::read_to_string(format!(
-            "{home}/tlaplus-examples/specifications/CoffeeCan/CoffeeCan.tla"
-        ))
-        .expect("read CoffeeCan.tla");
-        let cfg_src = std::fs::read_to_string(format!(
-            "{home}/tlaplus-examples/specifications/CoffeeCan/CoffeeCan100Beans.cfg"
-        ))
-        .expect("read cfg");
-        let mut cfg = Config::parse(&cfg_src).expect("parse cfg");
+        let src = COFFEECAN_CORPUS;
+        let mut cfg = Config::parse(COFFEECAN_100_CFG).expect("parse embedded CoffeeCan cfg");
         cfg.init = Some("Init".to_string());
         cfg.next = Some("Next".to_string());
         let mut ctx = crate::eval::EvalCtx::new();
-        let tree = tla_core::parse_to_syntax_tree(&src);
+        let tree = tla_core::parse_to_syntax_tree(src);
         let module = tla_core::lower(tla_core::FileId(0), &tree).module.unwrap();
         ctx.load_module(&module);
         let prop_body = crate::ay_shared::get_operator_body(&ctx, "EventuallyTerminates").unwrap();
@@ -2081,10 +2120,25 @@ mod tests {
                 .node,
         );
         let inp =
-            crate::ay_bmc::rederive_liveness_inputs(&src, &cfg, "TypeInvariant", &p_tla, &m_tla)
+            crate::ay_bmc::rederive_liveness_inputs(src, &cfg, "TypeInvariant", &p_tla, &m_tla)
                 .expect("CoffeeCan re-derives (terminator + disjunctive-Enabled fixes)");
+        let normalized_j = tla_core::pretty_expr(&inp.j.node);
+        let normalized_p = tla_core::pretty_expr(&inp.p.node);
+        let normalized_next = tla_core::pretty_expr(&inp.next.node);
         eprintln!("MEASURE: {}", tla_core::pretty_expr(&inp.m.node));
-        eprintln!("NEXT:    {}", tla_core::pretty_expr(&inp.next.node));
+        eprintln!("NEXT:    {normalized_next}");
+        assert!(
+            !normalized_j.contains("[black :"),
+            "record-set membership must be expanded before liveness translation: {normalized_j}"
+        );
+        assert_eq!(
+            normalized_p, "can.black + can.white = 1",
+            "ENABLED Termination must lower to its exact state guard"
+        );
+        assert!(
+            !normalized_next.contains('@'),
+            "EXCEPT @ must be replaced by exact old-field projections: {normalized_next}"
+        );
 
         // (1) The DESCENT kernel-certifies over CoffeeCan's real record ASTs, and re-checks.
         let dvars: Vec<&str> = inp.var_sorts.iter().map(|(n, _)| n.as_str()).collect();
@@ -2103,15 +2157,33 @@ mod tests {
             &dvars
         ));
 
-        // (2) The FULL cert is blocked in the AY SMT layer: record-set membership is untranslatable.
+        // (2) Normalization and record flattening now let AY translate all five obligations.
+        // Initiation, boundedness, and strict decrease prove. Consecution and enabledness remain
+        // genuinely SAT: TypeInvariant permits (100, 2), whose white-pick successor has black=101,
+        // and (0, 0), where P is false but no action is enabled. Lock in that semantic boundary so
+        // the independently kernel-certified descent is never mistaken for a full certificate.
         let timeout = crate::ay_bmc::BmcConfig::default().solve_timeout;
-        let discharged = crate::ay_bmc::discharge_liveness_obligations_with_proofs(&inp, timeout);
-        assert!(
-            discharged.is_err(),
-            "the AY SMT obligations must decline (record-set membership untranslatable), \
-             confirming the full-cert wall is in the SMT layer, not the descent"
+        let obligations = crate::ay_bmc::discharge_liveness_obligations_with_proofs(&inp, timeout)
+            .expect("flattened CoffeeCan record fields must translate");
+        let outcomes: Vec<(&str, bool, bool)> = obligations
+            .iter()
+            .map(|proof| (proof.name, proof.unsat, proof.strict_verified))
+            .collect();
+        assert_eq!(
+            outcomes,
+            vec![
+                ("initiation", true, true),
+                ("consecution", false, false),
+                ("live_bounded", true, true),
+                ("live_decrease", true, true),
+                ("live_enabled", false, false),
+            ],
+            "CoffeeCan must decline only at its two genuinely false obligations"
         );
-        eprintln!("SMT WALL (expected): {:?}", discharged.err());
+        assert!(
+            certify_liveness_spec(src, &cfg, "EventuallyTerminates", "BeanCount").is_none(),
+            "the public full-certificate producer must reject CoffeeCan's incomplete obligation set"
+        );
     }
 
     // A countdown: x descends 3 -> 0 and stops; <>(x < 1) (i.e. x reaches 0) holds

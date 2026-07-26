@@ -22,9 +22,9 @@
 
 mod common;
 
-use tla_check::{CheckResult, Config};
 #[cfg(feature = "testing")]
 use tla_check::ModelChecker;
+use tla_check::{CheckResult, Config};
 use tla_eval::clear_for_test_reset;
 
 /// `v \in Seq({7})` grows `<<>> -> <<7>> -> <<7,7>> -> <<7,7,7>>` (self-loop).

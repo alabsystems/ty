@@ -4,7 +4,6 @@
 
 extern crate autocfg;
 
-
 mod support;
 
 /// Tests that we can control the use of `#![no_std]`.

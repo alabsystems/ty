@@ -52,7 +52,9 @@ const ALLOWLIST_FILE_SUFFIXES: &[&str] = &[
     "cmd_supremacy/benchmark.rs",
     "cmd_supremacy/matrix.rs",
     "cmd_supremacy/mod.rs",
+    "cmd_supremacy/reproduce.rs",
     "cmd_supremacy/smoke.rs",
+    "cmd_tutorial.rs",
 ];
 struct SemanticLiteralAllowlist {
     literal: &'static str,
@@ -78,6 +80,7 @@ const SEMANTIC_LITERAL_ALLOWLIST: &[SemanticLiteralAllowlist] = &[
             "crates/tla-aiger/src/portfolio/config.rs",
             "crates/tla-aiger/src/portfolio/factory.rs",
             "crates/tla-aiger/src/portfolio/runner.rs",
+            "crates/tla-aiger/src/portfolio/safe_witness.rs",
             "crates/tla-aiger/src/sat_types/mod.rs",
             "crates/tla-value/src/value/set_ops/cached_bound_names.rs",
             "crates/tla-value/src/value/set_ops/set_pred/value.rs",
@@ -871,9 +874,23 @@ fn line_column(text: &str, byte_offset: usize) -> (usize, usize) {
 fn cfg_test_ranges(text: &str) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     let mut search_start = 0;
-    while let Some(relative) = text[search_start..].find("#[cfg(test)]") {
+    const CFG_PREFIX: &str = "#[cfg(";
+    while let Some(relative) = text[search_start..].find(CFG_PREFIX) {
         let attr_start = search_start + relative;
-        let after_attr = attr_start + "#[cfg(test)]".len();
+        let expression_start = attr_start + CFG_PREFIX.len();
+        let Some(expression_end) = matching_cfg_parenthesis(text.as_bytes(), expression_start)
+        else {
+            search_start = expression_start;
+            continue;
+        };
+        let after_expression = expression_end + 1;
+        if text.as_bytes().get(after_expression) != Some(&b']')
+            || !cfg_expression_requires_test(&text[expression_start..expression_end])
+        {
+            search_start = after_expression;
+            continue;
+        }
+        let after_attr = after_expression + 1;
         let Some(open_relative) = text[after_attr..].find('{') else {
             search_start = after_attr;
             continue;
@@ -887,6 +904,86 @@ fn cfg_test_ranges(text: &str) -> Vec<(usize, usize)> {
         search_start = end;
     }
     ranges
+}
+
+/// Return true only when satisfying this `cfg` expression necessarily means
+/// `cfg(test)` is active. In particular, `all(test, feature = "...")` is
+/// test-only, while `any(test, feature = "...")` is not.
+fn cfg_expression_requires_test(expression: &str) -> bool {
+    let expression = expression.trim();
+    if expression == "test" {
+        return true;
+    }
+    if let Some(arguments) = cfg_function_arguments(expression, "all") {
+        return split_cfg_arguments(arguments)
+            .into_iter()
+            .any(cfg_expression_requires_test);
+    }
+    if let Some(arguments) = cfg_function_arguments(expression, "any") {
+        let arguments = split_cfg_arguments(arguments);
+        return !arguments.is_empty() && arguments.into_iter().all(cfg_expression_requires_test);
+    }
+    false
+}
+
+fn cfg_function_arguments<'a>(expression: &'a str, name: &str) -> Option<&'a str> {
+    let expression = expression.trim();
+    let prefix = format!("{name}(");
+    expression
+        .strip_prefix(&prefix)
+        .and_then(|arguments| arguments.strip_suffix(')'))
+}
+
+fn split_cfg_arguments(arguments: &str) -> Vec<&str> {
+    let bytes = arguments.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut depth = 0usize;
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => {
+                let (_, token_end) = quoted_string_end(bytes, index + 1);
+                index = token_end;
+                continue;
+            }
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                parts.push(arguments[start..index].trim());
+                start = index + 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    if start < arguments.len() {
+        parts.push(arguments[start..].trim());
+    }
+    parts.retain(|part| !part.is_empty());
+    parts
+}
+
+/// `expression_start` is immediately after the opening parenthesis in
+/// `#[cfg(`. Return the matching closing parenthesis.
+fn matching_cfg_parenthesis(bytes: &[u8], expression_start: usize) -> Option<usize> {
+    let mut index = expression_start;
+    let mut nested_depth = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => {
+                let (_, token_end) = quoted_string_end(bytes, index + 1);
+                index = token_end;
+                continue;
+            }
+            b'(' => nested_depth += 1,
+            b')' if nested_depth == 0 => return Some(index),
+            b')' => nested_depth -= 1,
+            _ => {}
+        }
+        index += 1;
+    }
+    None
 }
 
 fn is_test_only_offset(ranges: &[(usize, usize)], offset: usize) -> bool {
@@ -1676,6 +1773,42 @@ mod tests {
 
         assert_eq!(report.status, "pass");
         assert!(report.findings.is_empty());
+    }
+
+    #[test]
+    fn scanner_handles_compound_cfg_test_without_exempting_cfg_any() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("src");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("runtime.rs"),
+            r#"
+                #[cfg(all(feature = "solver", test))]
+                mod test_only {
+                    const ALLOWED: &str = "MCLamportMutex";
+                }
+
+                #[cfg(any(test, feature = "production"))]
+                mod potentially_production {
+                    const FORBIDDEN: &str = "EWD998Small";
+                }
+            "#,
+        )
+        .unwrap();
+
+        let report = scan_policy(
+            Path::new("policy.json"),
+            Path::new("baseline.json"),
+            &policy_for_test(),
+            &baseline_for_test(),
+            std::slice::from_ref(&root),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(report.status, "fail");
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].matched, "EWD998Small");
     }
 
     #[test]

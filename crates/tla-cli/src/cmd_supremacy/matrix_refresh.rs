@@ -182,8 +182,14 @@ pub(super) fn plan_runtime_refresh_str(
         .with_context(|| format!("classify baseline {}", baseline_path.display()))?;
     let examples_dir = examples_dir_override
         .map(Path::to_path_buf)
-        .or_else(|| baseline.inputs.and_then(|inputs| inputs.examples_dir))
-        .context("matrix refresh requires an examples_dir from baseline inputs or override")?;
+        .unwrap_or_else(|| {
+            super::resolve_examples_dir(
+                baseline
+                    .inputs
+                    .as_ref()
+                    .and_then(|inputs| inputs.examples_dir.as_deref()),
+            )
+        });
 
     let mut rows = Vec::new();
     for row in summary

@@ -120,6 +120,7 @@ pub(in crate::parallel) struct SharedQueueTransport<T: BfsWorkItem> {
     pub(super) depth_limit_reached: Arc<AtomicBool>,
     pub(super) max_depth_atomic: Arc<AtomicUsize>,
     pub(super) total_transitions: Arc<AtomicUsize>,
+    pub(super) total_raw_successors_generated: Arc<AtomicUsize>,
     pub(super) states_at_stop: Arc<OnceLock<usize>>,
     pub(super) seen: Arc<FxDashMap<Fingerprint, ArrayState>>,
     pub(super) seen_fps: Arc<dyn FingerprintSet>,
@@ -208,6 +209,7 @@ impl<T: BfsWorkItem> SharedQueueTransport<T> {
             max_queue: _,      // no per-worker queue to track in shared mode
             max_depth_atomic,
             total_transitions,
+            total_raw_successors_generated,
             result_tx,
             first_violation,
             first_action_property_violation,
@@ -273,6 +275,7 @@ impl<T: BfsWorkItem> SharedQueueTransport<T> {
             depth_limit_reached,
             max_depth_atomic,
             total_transitions,
+            total_raw_successors_generated,
             states_at_stop,
             seen,
             seen_fps,
@@ -497,6 +500,7 @@ impl<T: BfsWorkItem> SharedQueueTransport<T> {
             work_remaining: &self.work_remaining,
             max_depth_atomic: &self.max_depth_atomic,
             total_transitions: &self.total_transitions,
+            total_raw_successors_generated: &self.total_raw_successors_generated,
             successors_cache: &self.successors_cache,
             successor_witnesses_cache: &self.successor_witnesses_cache,
             mvperms: &self.mvperms,
@@ -527,6 +531,7 @@ impl<T: BfsWorkItem> SharedQueueTransport<T> {
 
         if let Some((diffs, base_array, rebuilt_base_fp_cache)) = diff_result {
             wctx.stats.base_fp_cache_rebuilds += usize::from(rebuilt_base_fp_cache);
+            wctx.record_raw_successors_generated(diffs.len());
             let terminated =
                 wctx.process_diffs(&base_array, fp, succ_depth, succ_level, diffs, enqueue);
             frontier.push_batch(&mut enqueue_batch.borrow_mut());

@@ -19,9 +19,9 @@
 //! Part of #3986.
 
 use std::fmt;
-use tla_value::Rp;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use tla_value::Rp;
 
 use tla_value::CompactValue;
 
@@ -862,7 +862,9 @@ impl FlatState {
                     domain_keys,
                     value_types,
                     range_encoding,
-                } => reconstruct_tuple_keyed_array(domain_keys, value_types, range_encoding, slots)?,
+                } => {
+                    reconstruct_tuple_keyed_array(domain_keys, value_types, range_encoding, slots)?
+                }
                 VarLayoutKind::Recursive { layout } => try_reconstruct_flat_value(layout, slots)?,
                 VarLayoutKind::Bitmask { .. } => {
                     // Bitmask: use original for exact roundtrip.
@@ -1677,7 +1679,6 @@ fn reconstruct_int_array(
     element_types: Option<&[SlotType]>,
     slots: &[i64],
 ) -> Value {
-    use std::sync::Arc;
     use tla_value::value::IntIntervalFunc;
 
     let hi = lo + (len as i64) - 1;
@@ -1893,42 +1894,14 @@ fn value_fits_tuple_keyed_array_layout(
     if func.domain_len() != domain_keys.len() {
         return false;
     }
-    match range_encoding {
-        TupleKeyedArrayRangeEncoding::ScalarSlots => {
-            domain_keys
-                .iter()
-                .zip(value_types.iter())
-                .all(|(key, value_type)| {
-                    func.apply(key)
-                        .is_some_and(|val| value_fits_slot_type(val, *value_type))
-                })
-        }
-        // Union range: every present cell value must be a scalar inside the
-        // proven universe so its universe index encodes injectively. A cell
-        // outside the universe fails the roundtrip (fail-closed), exactly like
-        // the scalar-domain union range fit check.
-        TupleKeyedArrayRangeEncoding::TaggedScalarUnion(proof) => {
-            domain_keys.iter().all(|key| {
-                func.apply(key).is_some_and(|val| {
-                    flat_scalar_from_value(val)
-                        .is_some_and(|flat| proof.universe().contains(&flat))
-                })
+    domain_keys
+        .iter()
+        .zip(value_types.iter())
+        .all(|(key, value_type)| {
+            func.apply(key).is_some_and(|value| {
+                value_fits_tuple_keyed_range_slot(value, *value_type, range_encoding)
             })
-        }
-        // Homogeneous fixed-scalar range: every present cell must fit its per-slot
-        // scalar type AND be inside the proven universe (mirror of the 1-D
-        // `value_fits_string_keyed_range_slot` FixedScalar arm) — out-of-universe
-        // fails the fit, keeping the state off the flat fast path (sound fallback).
-        TupleKeyedArrayRangeEncoding::FixedScalar(proof) => {
-            domain_keys.iter().zip(value_types.iter()).all(|(key, value_type)| {
-                func.apply(key).is_some_and(|val| {
-                    value_fits_slot_type(val, *value_type)
-                        && flat_scalar_from_value(val)
-                            .is_some_and(|flat| proof.scalar_universe().contains(&flat))
-                })
-            })
-        }
-    }
+        })
 }
 
 fn value_fits_tuple_keyed_range_slot(
@@ -3020,8 +2993,7 @@ mod tests {
             Value::SmallInt(2),
             Value::SmallInt(3),
         ]);
-        let original =
-            ArrayState::from_values(vec![Value::SmallInt(99), Value::Set(Rp::new(set))]);
+        let original = ArrayState::from_values(vec![Value::SmallInt(99), Value::Set(Rp::new(set))]);
 
         let flat = FlatState::from_array_state(&original, Arc::clone(&layout));
         assert_eq!(flat.buffer()[0], 99); // scalar
@@ -3656,11 +3628,7 @@ mod tests {
         };
         let nil = || Value::ModelValue(Rp::from("nil"));
         let grown = ArrayState::from_values(vec![Value::Func(Rp::new(
-            FuncValue::from_sorted_entries(vec![
-                (key(1), nil()),
-                (key(2), nil()),
-                (key(3), nil()),
-            ]),
+            FuncValue::from_sorted_entries(vec![(key(1), nil()), (key(2), nil()), (key(3), nil())]),
         ))]);
         assert_eq!(
             FlatState::try_from_array_state(&grown, Arc::clone(&layout)).unwrap_err(),

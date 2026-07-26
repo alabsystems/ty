@@ -37,7 +37,9 @@ pub mod emit_cuda;
 mod kernel_template;
 mod nvrtc;
 
-pub use bfs_driver::{probe, run_bfs, GpuBfsConfig, GpuBfsOutcome, GpuBfsSpec};
+pub use bfs_driver::{
+    probe, projected_device_bytes, run_bfs, GpuBfsConfig, GpuBfsOutcome, GpuBfsSpec,
+};
 pub use circuit_exhaust::{
     exhaustive_sat_cpu, run_circuit_exhaust, CircuitExhaustConfig, CircuitExhaustSpec,
     ExhaustOutcome,
@@ -46,6 +48,7 @@ pub use circuit_sim::{
     run_circuit_sim, thread_rng_seed, xorshift64, CircuitSimConfig, CircuitSimHit, CircuitSimSpec,
 };
 pub use ctl_engine::{run_ctl, CtlOp, GpuCtlConfig, GpuCtlOutcome, GpuCtlSpec};
+pub use cuda::allocation_headroom_bytes;
 pub use emit_cuda::{
     emit_atom_adapters, emit_program, emit_program_with_constraints, GpuProgramSource,
 };

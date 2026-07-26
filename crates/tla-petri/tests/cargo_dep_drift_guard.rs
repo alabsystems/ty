@@ -8,7 +8,7 @@
 //! replacement for the legacy regex shell script
 //! `scripts/cargo_dep_drift_guard.sh`) and fails the build if any
 //! sibling package (trust-ir / trust-codegen / ay family) resolves to a different
-//! `(source, version)` pair across the four sibling repos.
+//! `(source, version)` pair across the five sibling repos.
 //!
 //! The binary in turn drives `cargo metadata --locked --all-features
 //! --format-version 1` for
@@ -16,7 +16,7 @@
 //! Cargo.toml regex.
 //!
 //! Skipped when no sibling repos are present (single-repo CI clones).
-//! Otherwise the default four-repository topology is fail-closed: a missing
+//! Otherwise the default five-repository topology is fail-closed: a missing
 //! configured repository, an existing manifest whose metadata fails, or an
 //! existing repository with no cross-repo contribution prevents a clean
 //! verdict. `--allow-missing` is available only for an explicitly partial
@@ -35,7 +35,10 @@ fn workspace_root() -> PathBuf {
 }
 
 fn sibling_root() -> PathBuf {
-    workspace_root().parent().expect("~/root parent of ty").to_path_buf()
+    workspace_root()
+        .parent()
+        .expect("~/root parent of ty")
+        .to_path_buf()
 }
 
 #[test]
@@ -44,9 +47,14 @@ fn cargo_dep_drift_guard_passes() {
     let root = sibling_root();
 
     // Skip if no sibling repos exist (single-repo CI environment).
-    let any_sibling = ["trust-ir", "trust-cg", "ay"].iter().any(|r| root.join(r).is_dir());
+    let any_sibling = ["trust-ir", "trust-cg", "clean", "ay"]
+        .iter()
+        .any(|r| root.join(r).is_dir());
     if !any_sibling {
-        eprintln!("ty-mcc-drift-guard: no sibling repos under {} — skipping.", root.display());
+        eprintln!(
+            "ty-mcc-drift-guard: no sibling repos under {} — skipping.",
+            root.display()
+        );
         return;
     }
 

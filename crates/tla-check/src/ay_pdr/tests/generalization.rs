@@ -9,7 +9,6 @@
 //! statistics are tracked accurately.
 
 use super::helpers::*;
-use super::*;
 use tla_ay::TlaSort;
 use tla_core::ast::Expr;
 use tla_core::Spanned;

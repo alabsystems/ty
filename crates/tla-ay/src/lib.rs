@@ -126,7 +126,7 @@ pub mod shared_engine;
 pub mod translate;
 
 pub use bmc::incremental::{IncrementalBmc, IncrementalBmcResult};
-pub use bmc::{BmcState, BmcTranslator, BmcValue};
+pub use bmc::{BmcScalarSymbol, BmcState, BmcTranslator, BmcValue};
 // Proof-artifact surface for certifying verification (AY's own re-checkable proof).
 pub use ay_dpll::api::{FarkasCertificate, ProofQuality, StrictProofVerdict, UnsatProofArtifact};
 // Leg D: the portable, checker-only proof bundle + store-independent canonical

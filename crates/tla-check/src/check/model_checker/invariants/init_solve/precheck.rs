@@ -17,6 +17,16 @@ use crate::enumerate::{
 };
 use crate::state::states_to_trace_value;
 
+fn record_additional_raw_initial_states_generated(
+    stats: &mut crate::check::CheckStats,
+    generated: usize,
+) {
+    stats.raw_initial_states_generated = stats
+        .raw_initial_states_generated
+        .checked_add(generated)
+        .expect("raw initial-state generation count overflowed usize");
+}
+
 /// Bundled configuration for init-state invariant pre-checking.
 ///
 /// Groups the check parameters passed through to [`precheck_streamed_initial_values`],
@@ -181,15 +191,6 @@ impl<'a> ModelChecker<'a> {
             spec_may_produce_lazy: self.compiled.spec_may_produce_lazy,
         };
 
-        // The scan filter checks invariants but always returns Ok(false) to skip
-        // storage. If an invariant is violated, the error propagates up immediately
-        // and stops enumeration.
-        let mut scan_filter = |values: &[Value], ctx: &mut crate::eval::EvalCtx| {
-            precheck_streamed_initial_values(ctx, values, &check_config)?;
-            // State passed invariants — don't store it, just move on.
-            Ok(false)
-        };
-
         self.ctx.set_tlc_level(1);
 
         // Direct constraint enumeration path.
@@ -198,20 +199,45 @@ impl<'a> ModelChecker<'a> {
                 let vars_len = self.ctx.var_registry().len();
                 // Capacity 0: no states will be stored since the filter always rejects.
                 let mut storage = BulkStateStorage::new(vars_len, 0);
+                let raw_initial_states_generated = std::cell::Cell::new(0usize);
                 let result = enumerate_constraints_to_bulk_with_stats_filter_error(
                     &mut self.ctx,
                     &self.module.vars,
                     branches,
                     &mut storage,
-                    &mut scan_filter,
+                    |values, ctx| {
+                        let generated = raw_initial_states_generated
+                            .get()
+                            .checked_add(1)
+                            .expect("raw initial-state generation count overflowed usize");
+                        raw_initial_states_generated.set(generated);
+                        precheck_streamed_initial_values(ctx, values, &check_config)?;
+                        // State passed invariants — don't store it, just move on.
+                        Ok::<bool, CheckResult>(false)
+                    },
                 );
+                let raw_initial_states_generated = raw_initial_states_generated.get();
                 return match result {
                     Ok(_) => Ok(()),
-                    Err(BulkConstraintEnumerationError::Eval(error)) => Err(check_error_to_result(
-                        EvalCheckError::Eval(error).into(),
-                        &self.stats,
-                    )),
-                    Err(BulkConstraintEnumerationError::Filter(result)) => Err(result),
+                    Err(BulkConstraintEnumerationError::Eval(error)) => {
+                        record_additional_raw_initial_states_generated(
+                            &mut self.stats,
+                            raw_initial_states_generated,
+                        );
+                        Err(check_error_to_result(
+                            EvalCheckError::Eval(error).into(),
+                            &self.stats,
+                        ))
+                    }
+                    Err(BulkConstraintEnumerationError::Filter(result)) => {
+                        record_additional_raw_initial_states_generated(
+                            &mut self.stats,
+                            raw_initial_states_generated,
+                        );
+                        Err(result.with_additional_raw_initial_states_generated(
+                            raw_initial_states_generated,
+                        ))
+                    }
                 };
             }
         }
@@ -227,6 +253,7 @@ impl<'a> ModelChecker<'a> {
 
             let vars_len = self.ctx.var_registry().len();
             let mut storage = BulkStateStorage::new(vars_len, 0);
+            let raw_initial_states_generated = std::cell::Cell::new(0usize);
             let result = enumerate_constraints_to_bulk_with_stats_filter_error(
                 &mut self.ctx,
                 &self.module.vars,
@@ -243,21 +270,40 @@ impl<'a> ModelChecker<'a> {
                         None => true,
                     };
                     if keep {
-                        scan_filter(values, ctx)
+                        let generated = raw_initial_states_generated
+                            .get()
+                            .checked_add(1)
+                            .expect("raw initial-state generation count overflowed usize");
+                        raw_initial_states_generated.set(generated);
+                        precheck_streamed_initial_values(ctx, values, &check_config)?;
+                        Ok::<bool, CheckResult>(false)
                     } else {
-                        Ok(false)
+                        Ok::<bool, CheckResult>(false)
                     }
                 },
             );
+            let raw_initial_states_generated = raw_initial_states_generated.get();
             match result {
                 Ok(_) => return Ok(()),
                 Err(BulkConstraintEnumerationError::Eval(error)) => {
+                    record_additional_raw_initial_states_generated(
+                        &mut self.stats,
+                        raw_initial_states_generated,
+                    );
                     return Err(check_error_to_result(
                         EvalCheckError::Eval(error).into(),
                         &self.stats,
                     ));
                 }
-                Err(BulkConstraintEnumerationError::Filter(result)) => return Err(result),
+                Err(BulkConstraintEnumerationError::Filter(result)) => {
+                    record_additional_raw_initial_states_generated(
+                        &mut self.stats,
+                        raw_initial_states_generated,
+                    );
+                    return Err(result.with_additional_raw_initial_states_generated(
+                        raw_initial_states_generated,
+                    ));
+                }
             }
         }
 
@@ -302,34 +348,57 @@ impl<'a> ModelChecker<'a> {
             spec_may_produce_lazy: self.compiled.spec_may_produce_lazy,
         };
 
-        let mut precheck_filter = |values: &[Value], ctx: &mut crate::eval::EvalCtx| {
-            precheck_streamed_initial_values(ctx, values, &check_config)
-        };
-
         self.ctx.set_tlc_level(1);
 
         if let Some(branches) = &resolved.extracted_branches {
             if resolved.unconstrained_vars.is_empty() {
                 let vars_len = self.ctx.var_registry().len();
                 let mut storage = BulkStateStorage::new(vars_len, 1000);
+                let mut raw_initial_states_generated = 0usize;
                 let count = enumerate_constraints_to_bulk_with_stats_filter_error(
                     &mut self.ctx,
                     &self.module.vars,
                     branches,
                     &mut storage,
-                    &mut precheck_filter,
+                    |values, ctx| {
+                        // The extracted branches are Init itself, so reaching
+                        // this callback is TLC's DoInitFunctor.addElement
+                        // boundary. Count before external state constraints
+                        // and invariant/property prechecks.
+                        raw_initial_states_generated = raw_initial_states_generated
+                            .checked_add(1)
+                            .expect("raw initial-state generation count overflowed usize");
+                        precheck_streamed_initial_values(ctx, values, &check_config)
+                    },
                 );
                 return match count {
-                    Ok(Some(enumeration)) => Ok(Some(BulkInitStates {
-                        storage,
-                        enumeration,
-                    })),
+                    Ok(Some(mut enumeration)) => {
+                        enumeration.generated = raw_initial_states_generated;
+                        Ok(Some(BulkInitStates {
+                            storage,
+                            enumeration,
+                        }))
+                    }
                     Ok(None) => Ok(None),
-                    Err(BulkConstraintEnumerationError::Eval(error)) => Err(check_error_to_result(
-                        EvalCheckError::Eval(error).into(),
-                        &self.stats,
-                    )),
-                    Err(BulkConstraintEnumerationError::Filter(result)) => Err(result),
+                    Err(BulkConstraintEnumerationError::Eval(error)) => {
+                        record_additional_raw_initial_states_generated(
+                            &mut self.stats,
+                            raw_initial_states_generated,
+                        );
+                        Err(check_error_to_result(
+                            EvalCheckError::Eval(error).into(),
+                            &self.stats,
+                        ))
+                    }
+                    Err(BulkConstraintEnumerationError::Filter(result)) => {
+                        record_additional_raw_initial_states_generated(
+                            &mut self.stats,
+                            raw_initial_states_generated,
+                        );
+                        Err(result.with_additional_raw_initial_states_generated(
+                            raw_initial_states_generated,
+                        ))
+                    }
                 };
             }
         }
@@ -344,6 +413,7 @@ impl<'a> ModelChecker<'a> {
 
             let vars_len = self.ctx.var_registry().len();
             let mut storage = BulkStateStorage::new(vars_len, 1000);
+            let mut raw_initial_states_generated = 0usize;
             let count = enumerate_constraints_to_bulk_with_stats_filter_error(
                 &mut self.ctx,
                 &self.module.vars,
@@ -360,14 +430,20 @@ impl<'a> ModelChecker<'a> {
                         None => true,
                     };
                     if keep {
-                        precheck_filter(values, ctx)
+                        // The candidate remainder establishes that this value
+                        // satisfies Init. Count it before external checks.
+                        raw_initial_states_generated = raw_initial_states_generated
+                            .checked_add(1)
+                            .expect("raw initial-state generation count overflowed usize");
+                        precheck_streamed_initial_values(ctx, values, &check_config)
                     } else {
                         Ok(false)
                     }
                 },
             );
             match count {
-                Ok(Some(enumeration)) => {
+                Ok(Some(mut enumeration)) => {
+                    enumeration.generated = raw_initial_states_generated;
                     return Ok(Some(BulkInitStates {
                         storage,
                         enumeration,
@@ -375,12 +451,24 @@ impl<'a> ModelChecker<'a> {
                 }
                 Ok(None) => {}
                 Err(BulkConstraintEnumerationError::Eval(error)) => {
+                    record_additional_raw_initial_states_generated(
+                        &mut self.stats,
+                        raw_initial_states_generated,
+                    );
                     return Err(check_error_to_result(
                         EvalCheckError::Eval(error).into(),
                         &self.stats,
                     ));
                 }
-                Err(BulkConstraintEnumerationError::Filter(result)) => return Err(result),
+                Err(BulkConstraintEnumerationError::Filter(result)) => {
+                    record_additional_raw_initial_states_generated(
+                        &mut self.stats,
+                        raw_initial_states_generated,
+                    );
+                    return Err(result.with_additional_raw_initial_states_generated(
+                        raw_initial_states_generated,
+                    ));
+                }
             }
         }
 

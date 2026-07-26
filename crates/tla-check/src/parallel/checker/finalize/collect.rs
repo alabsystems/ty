@@ -10,6 +10,22 @@ use super::super::terminal_outcome::{aggregate_stats, merge_worker_outcome, Term
 use super::super::*;
 use crossbeam_channel::RecvTimeoutError;
 
+/// Granularity at which the progress-reporter thread re-checks `stop_flag`
+/// while waiting out its `progress_interval_ms` cadence.
+///
+/// The progress reporter is cosmetic (it invokes the progress callback and
+/// runs capacity-warning / tier-promotion checks once per interval). It is
+/// spawned before BFS and `join()`ed during finalize AFTER `stop_flag` is set.
+/// A single `thread::sleep(interval)` made that join block for up to the full
+/// interval (default 10 s, `construction.rs`), so a run decided in
+/// milliseconds still paid ~10 s of teardown latency whenever the thread had
+/// already entered its sleep (systematically reproduced by finite specs with a
+/// temporal PROPERTY, whose extra liveness-graph setup pushes the timeline past
+/// the point where the reporter starts sleeping). Polling `stop_flag` in short
+/// steps lets the join return within one step. This is verdict-neutral: the
+/// reporter never contributes to the model-checking result.
+const PROGRESS_STOP_POLL_STEP: Duration = Duration::from_millis(50);
+
 /// Compact intermediate state returned by `collect_worker_results`.
 pub(super) struct CollectedFinalizeState {
     pub(super) total_stats: WorkerStats,
@@ -44,7 +60,22 @@ impl ParallelChecker {
 
                 Some(thread::spawn(move || {
                     while !stop_flag.load(Ordering::Relaxed) {
-                        thread::sleep(interval);
+                        // Interruptible interval wait: sleep in short steps so
+                        // that when finalize sets `stop_flag` and joins this
+                        // thread, the join returns within one step instead of
+                        // blocking for the remainder of the (up to 10 s)
+                        // progress interval. Only a full, uninterrupted
+                        // interval falls through to the reporting work below,
+                        // preserving the original once-per-interval cadence.
+                        let mut slept = Duration::ZERO;
+                        while slept < interval {
+                            if stop_flag.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            let step = PROGRESS_STOP_POLL_STEP.min(interval - slept);
+                            thread::sleep(step);
+                            slept += step;
+                        }
                         if stop_flag.load(Ordering::Relaxed) {
                             break;
                         }

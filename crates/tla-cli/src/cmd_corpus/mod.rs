@@ -29,6 +29,11 @@ use crate::cli_schema::CorpusAction;
 // over every `.cfg` in the corpus, as a self-service subcommand.
 pub(crate) mod sweep;
 
+// `ty corpus doctor`: the TY-vs-TLC comparability preflight — which eligible
+// rows TLC can parse, which can never reach exact parity, and which are
+// unmeasured. See `docs/perf/remaining-gaps-2026-07-24.md`.
+pub(crate) mod doctor;
+
 /// The release tag + asset published by `gh release create corpus-v1-05c7256`.
 const CORPUS_TAG: &str = "corpus-v1-05c7256";
 const CORPUS_ASSET: &str = "ty-corpus-examples-05c7256.tar.gz";
@@ -60,6 +65,33 @@ pub(crate) fn cmd_corpus(action: CorpusAction) -> Result<()> {
             format,
             out,
         } => sweep::cmd_sweep(dest, timeout, jobs, filter, format, out.as_deref()),
+        CorpusAction::Doctor {
+            dest,
+            manifest,
+            baseline,
+            tlc_jar,
+            community_modules,
+            tla_library,
+            format,
+            mode,
+            jobs,
+            filter,
+            skip_parse,
+            out,
+        } => doctor::cmd_doctor(
+            resolve_dest(dest),
+            manifest,
+            baseline,
+            tlc_jar,
+            community_modules,
+            tla_library,
+            format,
+            mode,
+            jobs,
+            filter,
+            skip_parse,
+            out.as_deref(),
+        ),
     }
 }
 

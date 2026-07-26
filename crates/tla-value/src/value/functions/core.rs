@@ -3,27 +3,36 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::super::Value;
-use super::{additive_cache_val, DenseTag, FuncTakeSource, FuncValue, FP_UNSET};
+use super::{additive_cache_val, FuncDomain, FuncTakeSource, FuncValue, FP_UNSET};
 use crate::dedup_fingerprint::additive_entry_hash;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{OnceLock};
 use crate::rp::Rp as Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::OnceLock;
 
 impl Clone for FuncValue {
     fn clone(&self) -> Self {
-        let tlc_cache = OnceLock::new();
-        if let Some(normalized) = self.tlc_normalized.get() {
-            let _ = tlc_cache.set(Arc::clone(normalized));
-        }
         FuncValue {
             domain: Arc::clone(&self.domain),
             values: Arc::clone(&self.values),
             overrides: self.overrides.clone(),
             additive_fp: AtomicU64::new(self.additive_fp.load(AtomicOrdering::Relaxed)),
-            tlc_normalized: tlc_cache,
-            // Depends only on the (shared) domain — carry it across unchanged.
-            dense: self.dense,
         }
+    }
+}
+
+impl FuncDomain {
+    /// Build a descriptor for strictly sorted, unique domain keys.
+    pub(in crate::value) fn from_sorted_keys(keys: Arc<[Value]>) -> Arc<Self> {
+        debug_assert!(
+            keys.windows(2).all(|w| w[0] < w[1]),
+            "FuncDomain requires strictly-sorted keys"
+        );
+        let dense = FuncValue::compute_dense_tag(&keys);
+        Arc::new(FuncDomain {
+            keys,
+            tlc_normalized: OnceLock::new(),
+            dense,
+        })
     }
 }
 
@@ -41,7 +50,7 @@ impl FuncValue {
         old_value: &Value,
         new_value: &Value,
     ) -> Option<u64> {
-        let key = &self.domain[idx];
+        let key = &self.domain.keys[idx];
         self.get_additive_fp().and_then(|fp| {
             let old_hash = additive_entry_hash(key, old_value).ok()?;
             let new_hash = additive_entry_hash(key, new_value).ok()?;
@@ -66,7 +75,7 @@ impl FuncValue {
     /// Part of #3168.
     #[inline]
     pub fn take_at(&mut self, arg: &Value) -> Option<(Value, usize, Option<u64>, FuncTakeSource)> {
-        let idx = self.domain.binary_search_by(|k| k.cmp(arg)).ok()?;
+        let idx = self.domain.keys.binary_search_by(|k| k.cmp(arg)).ok()?;
 
         // Part of #3386: Check overlay first — if the value comes from an
         // override, remove just that entry without materializing the base.
@@ -78,7 +87,7 @@ impl FuncValue {
                 }
                 let old_entry_hash = self
                     .get_additive_fp()
-                    .and_then(|_| additive_entry_hash(&self.domain[idx], &old_val).ok());
+                    .and_then(|_| additive_entry_hash(&self.domain.keys[idx], &old_val).ok());
                 return Some((old_val, idx, old_entry_hash, FuncTakeSource::Overlay));
             }
         }
@@ -88,7 +97,7 @@ impl FuncValue {
         self.materialize();
         let old_entry_hash = self
             .get_additive_fp()
-            .and_then(|_| additive_entry_hash(&self.domain[idx], &self.values[idx]).ok());
+            .and_then(|_| additive_entry_hash(&self.domain.keys[idx], &self.values[idx]).ok());
         // Part of #3964: Use Arc::get_mut (non-atomic check) when refcount == 1,
         // falling back to Arc::make_mut only when shared.
         let values = if let Some(v) = Arc::get_mut(&mut self.values) {
@@ -115,7 +124,7 @@ impl FuncValue {
     ) {
         let updated_additive = old_entry_hash.and_then(|old_hash| {
             self.get_additive_fp().and_then(|fp| {
-                let key = &self.domain[idx];
+                let key = &self.domain.keys[idx];
                 let new_hash = additive_entry_hash(key, &value).ok()?;
                 Some(fp.wrapping_sub(old_hash).wrapping_add(new_hash))
             })
@@ -143,12 +152,10 @@ impl FuncValue {
     fn empty() -> &'static FuncValue {
         static EMPTY: OnceLock<FuncValue> = OnceLock::new();
         EMPTY.get_or_init(|| FuncValue {
-            domain: Arc::<[Value]>::from([]),
+            domain: FuncDomain::from_sorted_keys(Arc::<[Value]>::from([])),
             values: Arc::new(Vec::new()),
             overrides: None,
             additive_fp: AtomicU64::new(FP_UNSET),
-            tlc_normalized: OnceLock::new(),
-            dense: DenseTag::Sparse,
         })
     }
 
@@ -162,19 +169,36 @@ impl FuncValue {
         if entries.is_empty() {
             return FuncValue::empty().clone();
         }
-        #[cfg(feature = "memory-stats")]
-        crate::value::memory_stats::inc_func_entries(entries.len());
 
         let (domain, values): (Vec<Value>, Vec<Value>) = entries.into_iter().unzip();
+        FuncValue::from_shared_domain_values(FuncDomain::from_sorted_keys(domain.into()), values)
+    }
 
-        let dense = FuncValue::compute_dense_tag(&domain);
+    /// Create a function whose immutable domain descriptor is shared with peers.
+    ///
+    /// `domain` must contain strictly sorted, unique keys in `Value::cmp` order,
+    /// and `values` must be positionally aligned with it.
+    pub(in crate::value) fn from_shared_domain_values(
+        domain: Arc<FuncDomain>,
+        values: Vec<Value>,
+    ) -> Self {
+        assert_eq!(
+            domain.keys.len(),
+            values.len(),
+            "function domain and values must have equal lengths"
+        );
+        debug_assert!(
+            domain.keys.windows(2).all(|w| w[0] < w[1]),
+            "from_shared_domain_values requires strictly-sorted keys"
+        );
+        #[cfg(feature = "memory-stats")]
+        crate::value::memory_stats::inc_func_entries(values.len());
+
         FuncValue {
-            domain: domain.into(),
+            domain,
             values: Arc::new(values),
             overrides: None,
             additive_fp: AtomicU64::new(FP_UNSET),
-            tlc_normalized: OnceLock::new(),
-            dense,
         }
     }
 

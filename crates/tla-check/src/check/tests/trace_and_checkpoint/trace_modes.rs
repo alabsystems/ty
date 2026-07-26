@@ -190,8 +190,8 @@ ViewX == x
     let mut checker_no_view = ModelChecker::new(&module, &config_no_view);
     checker_no_view.set_deadlock_check(false);
     checker_no_view.set_max_depth(5); // Limit depth to prevent infinite exploration
-    // This test measures BFS fingerprint deduplication; the inductive-safety
-    // certificate would prove this spec symbolically (states_found = 0).
+                                      // This test measures BFS fingerprint deduplication; the inductive-safety
+                                      // certificate would prove this spec symbolically (states_found = 0).
     checker_no_view.set_force_explicit_bfs(true);
     let result_no_view = checker_no_view.check();
 

@@ -16,7 +16,7 @@ ay = ["tla-check/ay", "dep:tla-btor2", "dep:tla-aiger", "dep:tla-zenon", "dep:tl
 clean-cic = ["tla-check/clean-cic"]
 memory-stats = ["tla-check/memory-stats"]
 dhat-heap = ["dep:dhat"]
-mimalloc = ["dep:mimalloc"]
+mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -59,6 +59,13 @@ notify = { workspace = true }
 tempfile = { workspace = true }
 dhat = { version = "0.3", optional = true }
 mimalloc = { version = "0.1", default-features = false, optional = true }
+# Direct handle on the same libmimalloc-sys build the `mimalloc` crate links,
+# with the `extended` bindings enabled so `main` can call `mi_option_set` to trim
+# the v3 default page-purge delay (1000 ms) down to a value that returns freed
+# pages to the OS within a short run. Cargo unifies this with the mimalloc
+# crate's own (default-features = false) libmimalloc-sys dependency into a single
+# build; `extended` only adds Rust bindings, it does not change the C library.
+libmimalloc-sys = { version = "0.1", default-features = false, features = ["extended"], optional = true }
 
 [dev-dependencies]
 ntest = "0.9"

@@ -582,14 +582,64 @@ fn resolve_identity_instance_wrapper(dir: &Path, main_src: &str) -> Result<Optio
     Ok(Some(Flattened { source, inlined }))
 }
 
+/// Remove TLA+ comments from one line while carrying nested block-comment depth across lines.
+/// The returned bytes are valid UTF-8 because non-comment bytes are copied verbatim. This is used
+/// only to classify module-header lines; the body itself retains its original text.
+fn header_code(line: &str, block_depth: &mut usize) -> String {
+    let bytes = line.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if *block_depth > 0 {
+            if bytes[i..].starts_with(b"(*") {
+                *block_depth += 1;
+                i += 2;
+            } else if bytes[i..].starts_with(b"*)") {
+                *block_depth -= 1;
+                i += 2;
+            } else {
+                i += 1;
+            }
+        } else if bytes[i..].starts_with(b"\\*") {
+            break;
+        } else if bytes[i..].starts_with(b"(*") {
+            *block_depth += 1;
+            i += 2;
+        } else if bytes[i] == b'"' {
+            // Comment delimiters inside a TLA+ string are ordinary bytes. Strings do not span
+            // lines, but honor backslash escapes so an escaped quote does not end the scan early.
+            out.push(bytes[i]);
+            i += 1;
+            while i < bytes.len() {
+                out.push(bytes[i]);
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    i += 1;
+                    out.push(bytes[i]);
+                } else if bytes[i] == b'"' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).expect("comment removal preserves UTF-8")
+}
+
 /// Parse a module's name and EXTENDS list from its header lines (textual — the header
 /// grammar is line-oriented and this must work on files the full parser may reject
-/// later; the flattened result still goes through the real parser).
+/// later; the flattened result still goes through the real parser). Comment-only lines
+/// are legal between `MODULE` and `EXTENDS` and must not terminate the header.
 fn module_header(src: &str) -> Option<(String, Vec<String>)> {
     let mut name = None;
     let mut extends = Vec::new();
+    let mut block_depth = 0usize;
     for line in src.lines() {
-        let t = line.trim();
+        let code = header_code(line, &mut block_depth);
+        let t = code.trim();
         if name.is_none() {
             if let Some(rest) = t
                 .strip_prefix("----")
@@ -620,8 +670,10 @@ fn module_body(src: &str, name: &str) -> Result<String> {
     let mut out = Vec::new();
     let mut in_body = false;
     let mut seen_header = false;
+    let mut block_depth = 0usize;
     for line in src.lines() {
-        let t = line.trim();
+        let code = header_code(line, &mut block_depth);
+        let t = code.trim();
         if !seen_header {
             if t.starts_with("----") && t.contains("MODULE") {
                 seen_header = true;
@@ -629,6 +681,9 @@ fn module_body(src: &str, name: &str) -> Result<String> {
             continue;
         }
         if !in_body {
+            // Header comments are semantically inert and deliberately omitted. Keeping their raw
+            // fragments while removing a later `EXTENDS` on the same block-comment line could
+            // produce an unterminated comment in the flattened source.
             if t.starts_with("EXTENDS") || t.is_empty() {
                 continue;
             }

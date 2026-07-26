@@ -30,6 +30,26 @@ pub(super) fn eval_tir_record_access(
     field: &tla_tir::nodes::TirFieldName,
     span: Option<tla_core::Span>,
 ) -> EvalResult<Value> {
+    // Deep-borrow the record when it is a read chain (`f[i].field`, `r.a.b`):
+    // borrow the base record in place and clone only the accessed field, rather
+    // than materializing the whole intermediate record owned first. The final
+    // `.cloned()` and every error path are identical to the owned path below.
+    if !super::dispatch_functions::no_deep_read_chain() {
+        let base = super::dispatch_functions::eval_tir_operand_deep(ctx, record)?;
+        let rv = base.as_value();
+        let rec = rv
+            .as_record()
+            .ok_or_else(|| EvalError::type_error("Record", rv, Some(record.span)))?;
+        return rec
+            .get_by_id(field.field_id)
+            .cloned()
+            .ok_or_else(|| EvalError::NoSuchField {
+                field: field.name.clone(),
+                record_display: Some(format!("{rv}")),
+                span,
+            });
+    }
+
     let record_value = eval_tir(ctx, record)?;
     let rec = record_value
         .as_record()

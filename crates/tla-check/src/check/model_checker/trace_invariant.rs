@@ -14,7 +14,6 @@
 //!
 //! Part of #3752: Apalache Gap 4.
 
-use std::sync::Arc;
 use tla_value::Rp;
 
 use crate::check::model_checker::ModelChecker;

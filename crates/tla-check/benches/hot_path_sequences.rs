@@ -5,26 +5,25 @@
 //! Sequence operation benchmarks: head, tail, append, IntIntervalFunc EXCEPT.
 
 use criterion::{black_box, BenchmarkId, Criterion};
-use std::sync::Arc;
 use tla_check::Value;
-use tla_value::SeqValue;
+use tla_value::{Rp, SeqValue};
 
 use crate::hot_path_fixtures::small_int;
 
 /// Create a sequence of integers <<1, 2, ..., n>>
 fn int_seq(n: usize) -> Value {
     let values: Vec<Value> = (1..=n as i64).map(Value::SmallInt).collect();
-    Value::Seq(Arc::new(values.into()))
+    Value::Seq(Rp::new(values.into()))
 }
 
 /// Simulate Tail operation using SeqValue's native O(log n) tail
 fn seq_tail(seq: &SeqValue) -> Value {
-    Value::Seq(Arc::new(seq.tail()))
+    Value::Seq(Rp::new(seq.tail()))
 }
 
 /// Simulate Append operation using SeqValue's native O(log n) append
 fn seq_append(seq: &SeqValue, elem: Value) -> Value {
-    Value::Seq(Arc::new(seq.append(elem)))
+    Value::Seq(Rp::new(seq.append(elem)))
 }
 
 pub fn bench_seq_operations(c: &mut Criterion) {

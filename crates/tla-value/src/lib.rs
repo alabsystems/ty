@@ -86,12 +86,16 @@ pub use value::{
     // Set builders
     big_union,
     boolean_set,
+    // Record hash-consing (post-EXCEPT canonicalization walk)
+    canonicalize_records_along_path,
+    canonicalize_records_along_paths,
     cartesian_product,
     // Utilities
     checked_interval_len,
     // Value constructors and interning
     clear_int_func_intern_table,
     clear_model_value_registry,
+    clear_record_intern_table,
     clear_set_intern_table,
     clear_string_intern_table,
     clear_tlc_string_tokens,
@@ -102,6 +106,8 @@ pub use value::{
     intern_string,
     interned_model_value,
     lookup_model_value_index,
+    lookup_model_value_index_str,
+    lookup_tlc_string_token,
     model_value_count,
     powerset,
     range_set,
@@ -130,6 +136,7 @@ pub use value::{
     LazyFuncValue,
     MVPerm,
     RecordBuilder,
+    RecordCanonPathElem,
     RecordSetValue,
     RecordValue,
     SeqSetValue,

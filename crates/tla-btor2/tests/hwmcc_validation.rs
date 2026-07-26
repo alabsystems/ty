@@ -862,7 +862,10 @@ fn test_hwmcc_array_mann_family_sweep() {
         let t = std::time::Instant::now();
         let ic3 = tla_btor2::check_array_ic3(
             &prog,
-            &tla_btor2::ArrayIc3Config { time_budget: Some(budget), ..Default::default() },
+            &tla_btor2::ArrayIc3Config {
+                time_budget: Some(budget),
+                ..Default::default()
+            },
         );
         let dt = t.elapsed().as_secs_f64();
         match ic3 {

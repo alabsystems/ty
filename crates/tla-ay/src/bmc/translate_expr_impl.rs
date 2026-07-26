@@ -225,6 +225,32 @@ impl TranslateExpr for BmcTranslator {
             return result;
         }
 
+        // TLA+ scalar kinds are disjoint even when their current SMT carriers
+        // are not.  In particular, scalar Strings are injectively interned as
+        // Int terms, so translating before checking kinds could make the first
+        // string literal equal the ordinary integer -1_000_000_007.  Decide a
+        // cross-kind equality before producing either carrier term.  `Neq`
+        // goes through this method and negates the returned FALSE in the shared
+        // dispatcher, so both operators inherit the same exact kind rule.
+        match (self.scalar_expr_sort(left), self.scalar_expr_sort(right)) {
+            (Some(left_sort), Some(right_sort)) => {
+                if left_sort.canonicalized() != right_sort.canonicalized() {
+                    return Ok(self.solver.bool_const(false));
+                }
+            }
+            _ => {
+                if let Some(name) = self
+                    .unknown_direct_scalar_name(left)
+                    .or_else(|| self.unknown_direct_scalar_name(right))
+                {
+                    return Err(AYError::UnknownVariable(name.to_string()));
+                }
+                return Err(AYError::UnsupportedOp(
+                    "BMC cannot compare scalar expressions without exact kind evidence".to_string(),
+                ));
+            }
+        }
+
         // STRING-SCALAR equality: `v = "lit"`, `v' = "lit"`, `v = w` where the
         // operands are string-sorted state variables and/or string literals.
         // `TlaSort::String` variables are declared as `Sort::Int` (the interned
@@ -473,6 +499,193 @@ impl TranslateExpr for BmcTranslator {
 }
 
 impl BmcTranslator {
+    /// Return a declared sequence's logical element sort.
+    fn seq_element_sort(&self, name: &str) -> AYResult<TlaSort> {
+        self.seq_vars
+            .get(name)
+            .map(|info| info.element_sort.clone().canonicalized())
+            .ok_or_else(|| AYError::UnknownVariable(format!("sequence {name}")))
+    }
+
+    /// Determine a scalar expression's TLA+ value kind without translating it.
+    /// Several BMC encodings use the same SMT `Int` carrier for TLA+ Int and
+    /// interned String values, so kind checks must happen before terms are
+    /// emitted. Unknown shapes fail closed at the caller when kind evidence is
+    /// required.
+    pub(super) fn scalar_expr_sort(&self, expr: &Spanned<Expr>) -> Option<TlaSort> {
+        match &expr.node {
+            Expr::Bool(_) => Some(TlaSort::Bool),
+            Expr::Int(_) => Some(TlaSort::Int),
+            Expr::String(_) => Some(TlaSort::String),
+            Expr::Ident(name, _) | Expr::StateVar(name, ..) => {
+                self.vars.get(name).and_then(|info| {
+                    info.sort
+                        .is_scalar()
+                        .then(|| info.sort.clone().canonicalized())
+                })
+            }
+            Expr::Prime(inner) | Expr::SubstIn(_, inner) => self.scalar_expr_sort(inner),
+            Expr::Label(label) => self.scalar_expr_sort(&label.body),
+            Expr::If(_, then_expr, else_expr) => {
+                let then_sort = self.scalar_expr_sort(then_expr)?.canonicalized();
+                let else_sort = self.scalar_expr_sort(else_expr)?.canonicalized();
+                (then_sort == else_sort).then_some(then_sort)
+            }
+            Expr::And(..)
+            | Expr::Or(..)
+            | Expr::Not(..)
+            | Expr::Implies(..)
+            | Expr::Equiv(..)
+            | Expr::Forall(..)
+            | Expr::Exists(..)
+            | Expr::In(..)
+            | Expr::NotIn(..)
+            | Expr::Subseteq(..)
+            | Expr::Eq(..)
+            | Expr::Neq(..)
+            | Expr::Lt(..)
+            | Expr::Leq(..)
+            | Expr::Gt(..)
+            | Expr::Geq(..)
+            | Expr::Enabled(..)
+            | Expr::Unchanged(..) => Some(TlaSort::Bool),
+            Expr::Add(..)
+            | Expr::Sub(..)
+            | Expr::Mul(..)
+            | Expr::Div(..)
+            | Expr::IntDiv(..)
+            | Expr::Mod(..)
+            | Expr::Pow(..)
+            | Expr::Neg(..) => Some(TlaSort::Int),
+            Expr::RecordAccess(record, field) => {
+                let name = match &record.node {
+                    Expr::Ident(name, _) | Expr::StateVar(name, ..) => name,
+                    Expr::Prime(inner) => match &inner.node {
+                        Expr::Ident(name, _) | Expr::StateVar(name, ..) => name,
+                        _ => return None,
+                    },
+                    _ => return None,
+                };
+                self.record_vars
+                    .get(name)?
+                    .field_sorts
+                    .iter()
+                    .find(|(candidate, _)| candidate == &field.name.node)
+                    .and_then(|(_, sort)| sort.is_scalar().then(|| sort.clone().canonicalized()))
+            }
+            Expr::FuncApply(container, _) if self.is_seq_var_expr(container) => {
+                let (name, _) = self.resolve_seq_var(container).ok()?;
+                self.seq_element_sort(&name).ok()
+            }
+            Expr::FuncApply(func, _) if self.is_func_var_expr(func) => {
+                let name = Self::func_expr_base_name(func)?;
+                self.func_vars.get(&name).and_then(|info| {
+                    info.range_sort
+                        .is_scalar()
+                        .then(|| info.range_sort.clone().canonicalized())
+                })
+            }
+            Expr::FuncApply(tuple, index) if self.is_tuple_var_expr(tuple) => {
+                let (name, _) = self.resolve_tuple_var(tuple).ok()?;
+                let index = Self::scalar_tuple_index(index)?;
+                self.tuple_vars
+                    .get(&name)?
+                    .element_sorts
+                    .get(index.checked_sub(1)?)
+                    .and_then(|sort| sort.is_scalar().then(|| sort.clone().canonicalized()))
+            }
+            // Every currently-supported CHOOSE encoding returns an Int-carrier
+            // witness, including the BOOLEAN-domain encoding.
+            Expr::Choose(..) => Some(TlaSort::Int),
+            Expr::Apply(op, args)
+                if args.len() == 1
+                    && matches!(&op.node, Expr::Ident(name, _) if name == "Head")
+                    && self.is_seq_var_expr(&args[0]) =>
+            {
+                let (name, _) = self.resolve_seq_var(&args[0]).ok()?;
+                self.seq_element_sort(&name).ok()
+            }
+            Expr::Apply(op, args)
+                if args.len() == 1
+                    && matches!(&op.node, Expr::Ident(name, _) if name == "Len" || name == "Cardinality") =>
+            {
+                Some(TlaSort::Int)
+            }
+            _ => None,
+        }
+    }
+
+    /// Recover a precise diagnostic when scalar-kind preflight encounters a
+    /// direct reference to an undeclared carrier.  Kind preflight must still
+    /// fail closed for genuinely ambiguous expressions, but it should not
+    /// hide an ordinary unknown-variable error behind that ambiguity.
+    fn unknown_direct_scalar_name<'a>(&self, expr: &'a Spanned<Expr>) -> Option<&'a str> {
+        match &expr.node {
+            Expr::Ident(name, _) | Expr::StateVar(name, ..)
+                if !self.vars.contains_key(name)
+                    && !self.func_vars.contains_key(name)
+                    && !self.seq_vars.contains_key(name)
+                    && !self.record_vars.contains_key(name)
+                    && !self.tuple_vars.contains_key(name) =>
+            {
+                Some(name)
+            }
+            Expr::Prime(inner) | Expr::SubstIn(_, inner) => self.unknown_direct_scalar_name(inner),
+            Expr::Label(label) => self.unknown_direct_scalar_name(&label.body),
+            _ => None,
+        }
+    }
+
+    /// Translate a scalar only after its TLA+ kind is proven to match the
+    /// expected function/sequence carrier. Bool must never flow through the Int
+    /// path, and interned String must never alias an ordinary Int.
+    pub(super) fn translate_scalar_as_sort(
+        &mut self,
+        expected: &TlaSort,
+        expr: &Spanned<Expr>,
+        context: &str,
+    ) -> AYResult<Term> {
+        let expected = expected.clone().canonicalized();
+        let actual = self.scalar_expr_sort(expr).ok_or_else(|| {
+            AYError::UnsupportedOp(format!("BMC cannot determine {context} scalar kind"))
+        })?;
+        let actual = actual.canonicalized();
+        if actual != expected {
+            return Err(AYError::UnsupportedOp(format!(
+                "BMC {context} scalar kind mismatch: expected {expected}, got {actual}"
+            )));
+        }
+        match expected {
+            TlaSort::Bool => dispatch_translate_bool(self, expr),
+            TlaSort::Int => dispatch_translate_int(self, expr),
+            TlaSort::String => self.string_scalar_term(expr),
+            compound => Err(AYError::UnsupportedOp(format!(
+                "BMC {context} has unsupported scalar kind {compound}"
+            ))),
+        }
+    }
+
+    fn scalar_tuple_index(expr: &Spanned<Expr>) -> Option<usize> {
+        let value = super::record_encoder::const_fold_int_index(expr)?;
+        usize::try_from(value).ok()
+    }
+
+    fn require_same_seq_element_sort(
+        &self,
+        context: &str,
+        left: &TlaSort,
+        right: &TlaSort,
+    ) -> AYResult<()> {
+        if left.clone().canonicalized() == right.clone().canonicalized() {
+            return Ok(());
+        }
+        Err(AYError::UnsupportedOp(format!(
+            "BMC cannot translate {context} with differing sequence element sorts {left} and \
+             {right}; empty sequences can cross this metadata boundary, so the comparison must \
+             fail closed"
+        )))
+    }
+
     /// Translate sequence indexing: `s[i]` -> `(select arr i)`.
     fn translate_seq_index_bmc(
         &mut self,
@@ -638,54 +851,71 @@ impl BmcTranslator {
         None
     }
 
-    /// Assert equality between two sequence variables: arr_l = arr_r /\ len_l = len_r
+    /// Assert equality between two sequence variables over their logical cells.
     fn assert_seq_eq_vars(
         &mut self,
         lhs: &(String, usize),
         rhs: &(String, usize),
     ) -> AYResult<Term> {
+        let l_sort = self.seq_element_sort(&lhs.0)?;
+        let r_sort = self.seq_element_sort(&rhs.0)?;
+        self.require_same_seq_element_sort("sequence-variable equality", &l_sort, &r_sort)?;
+
         let l_arr = self.get_seq_array_at_step(&lhs.0, lhs.1)?;
         let l_len = self.get_seq_length_at_step(&lhs.0, lhs.1)?;
         let r_arr = self.get_seq_array_at_step(&rhs.0, rhs.1)?;
         let r_len = self.get_seq_length_at_step(&rhs.0, rhs.1)?;
+        let l_max = self.get_seq_max_len(&lhs.0)?;
 
-        let arr_eq = self.solver.try_eq(l_arr, r_arr)?;
-        let len_eq = self.solver.try_eq(l_len, r_len)?;
-        Ok(self.solver.try_and(arr_eq, len_eq)?)
+        self.translate_seq_logical_eq(l_arr, l_len, l_max, r_arr, r_len)
     }
 
-    /// Translate `lhs = Tail(s)`: lhs_arr = tail_arr, lhs_len = len - 1
+    /// Translate `lhs = Tail(s)` over lhs's logical cells.
     fn translate_seq_eq_tail(
         &mut self,
         lhs: &(String, usize),
         seq_expr: &Spanned<Expr>,
     ) -> AYResult<Term> {
+        let (source_name, _) = self.resolve_seq_var(seq_expr)?;
+        let lhs_sort = self.seq_element_sort(&lhs.0)?;
+        let source_sort = self.seq_element_sort(&source_name)?;
+        self.require_same_seq_element_sort("Tail equality", &lhs_sort, &source_sort)?;
+
         let (tail_arr, tail_len) = self.translate_seq_tail_bmc(seq_expr)?;
         let l_arr = self.get_seq_array_at_step(&lhs.0, lhs.1)?;
         let l_len = self.get_seq_length_at_step(&lhs.0, lhs.1)?;
+        let l_max = self.get_seq_max_len(&lhs.0)?;
 
-        let arr_eq = self.solver.try_eq(l_arr, tail_arr)?;
-        let len_eq = self.solver.try_eq(l_len, tail_len)?;
-        Ok(self.solver.try_and(arr_eq, len_eq)?)
+        self.translate_seq_logical_eq(l_arr, l_len, l_max, tail_arr, tail_len)
     }
 
-    /// Translate `lhs = Append(s, e)`: lhs_arr = (store arr (len+1) e), lhs_len = len + 1
+    /// Translate `lhs = Append(s, e)` over lhs's logical cells.
     fn translate_seq_eq_append(
         &mut self,
         lhs: &(String, usize),
         seq_expr: &Spanned<Expr>,
         elem_expr: &Spanned<Expr>,
     ) -> AYResult<Term> {
+        let (source_name, _) = self.resolve_seq_var(seq_expr)?;
+        let lhs_sort = self.seq_element_sort(&lhs.0)?;
+        let source_sort = self.seq_element_sort(&source_name)?;
+        self.require_same_seq_element_sort("Append equality", &lhs_sort, &source_sort)?;
+        let appended_sort = self.scalar_expr_sort(elem_expr).ok_or_else(|| {
+            AYError::UnsupportedOp(
+                "BMC cannot determine the appended sequence element sort".to_string(),
+            )
+        })?;
+        self.require_same_seq_element_sort("Append element", &lhs_sort, &appended_sort)?;
+
         let (append_arr, append_len) = self.translate_seq_append_bmc(seq_expr, elem_expr)?;
         let l_arr = self.get_seq_array_at_step(&lhs.0, lhs.1)?;
         let l_len = self.get_seq_length_at_step(&lhs.0, lhs.1)?;
+        let l_max = self.get_seq_max_len(&lhs.0)?;
 
-        let arr_eq = self.solver.try_eq(l_arr, append_arr)?;
-        let len_eq = self.solver.try_eq(l_len, append_len)?;
-        Ok(self.solver.try_and(arr_eq, len_eq)?)
+        self.translate_seq_logical_eq(l_arr, l_len, l_max, append_arr, append_len)
     }
 
-    /// Translate `lhs = SubSeq(s, m, n)`: lhs_arr = subseq_arr, lhs_len = max(0, n-m+1)
+    /// Translate `lhs = SubSeq(s, m, n)` over lhs's logical cells.
     fn translate_seq_eq_subseq(
         &mut self,
         lhs: &(String, usize),
@@ -693,29 +923,80 @@ impl BmcTranslator {
         m_expr: &Spanned<Expr>,
         n_expr: &Spanned<Expr>,
     ) -> AYResult<Term> {
+        let (source_name, _) = self.resolve_seq_var(seq_expr)?;
+        let lhs_sort = self.seq_element_sort(&lhs.0)?;
+        let source_sort = self.seq_element_sort(&source_name)?;
+        self.require_same_seq_element_sort("SubSeq equality", &lhs_sort, &source_sort)?;
+
         let (subseq_arr, subseq_len) = self.translate_seq_subseq_bmc(seq_expr, m_expr, n_expr)?;
         let l_arr = self.get_seq_array_at_step(&lhs.0, lhs.1)?;
         let l_len = self.get_seq_length_at_step(&lhs.0, lhs.1)?;
+        let l_max = self.get_seq_max_len(&lhs.0)?;
 
-        let arr_eq = self.solver.try_eq(l_arr, subseq_arr)?;
-        let len_eq = self.solver.try_eq(l_len, subseq_len)?;
-        Ok(self.solver.try_and(arr_eq, len_eq)?)
+        self.translate_seq_logical_eq(l_arr, l_len, l_max, subseq_arr, subseq_len)
     }
 
-    /// Translate `lhs = s \o t`: lhs_arr = concat_arr, lhs_len = len_s + len_t
+    /// Translate `lhs = s \o t` over the logical sequence domains.
+    ///
+    /// Array cells past a sequence's length are representation-only ghosts and
+    /// must not participate in TLA+ sequence equality.  In particular, avoid a
+    /// whole-array equality between `lhs` and a concat witness: that would make
+    /// capacity slack observable and also asks the solver to reconstruct an
+    /// extensional model for irrelevant cells.  The two guarded copy regions
+    /// below are disjoint and cover exactly `1..=len_s + len_t`.
     fn translate_seq_eq_concat(
         &mut self,
         lhs: &(String, usize),
         s_expr: &Spanned<Expr>,
         t_expr: &Spanned<Expr>,
     ) -> AYResult<Term> {
-        let (concat_arr, concat_len) = self.translate_seq_concat_bmc(s_expr, t_expr)?;
+        let lhs_sort = self.seq_element_sort(&lhs.0)?;
+        let (s_name, s_step) = self.resolve_seq_var(s_expr)?;
+        let s_sort = self.seq_element_sort(&s_name)?;
+        self.require_same_seq_element_sort("concatenation left operand", &lhs_sort, &s_sort)?;
+        let (t_name, t_step) = self.resolve_seq_var(t_expr)?;
+        let t_sort = self.seq_element_sort(&t_name)?;
+        self.require_same_seq_element_sort("concatenation right operand", &lhs_sort, &t_sort)?;
+
         let l_arr = self.get_seq_array_at_step(&lhs.0, lhs.1)?;
         let l_len = self.get_seq_length_at_step(&lhs.0, lhs.1)?;
 
-        let arr_eq = self.solver.try_eq(l_arr, concat_arr)?;
+        let s_arr = self.get_seq_array_at_step(&s_name, s_step)?;
+        let s_len = self.get_seq_length_at_step(&s_name, s_step)?;
+        let s_max = self.get_seq_max_len(&s_name)?;
+
+        let t_arr = self.get_seq_array_at_step(&t_name, t_step)?;
+        let t_len = self.get_seq_length_at_step(&t_name, t_step)?;
+        let t_max = self.get_seq_max_len(&t_name)?;
+
+        let concat_len = self.solver.try_add(s_len, t_len)?;
         let len_eq = self.solver.try_eq(l_len, concat_len)?;
-        Ok(self.solver.try_and(arr_eq, len_eq)?)
+        let mut result = len_eq;
+
+        // Copy only s's logical cells to lhs[1..=len_s].
+        for i in 1..=s_max {
+            let i_term = self.solver.int_const(i as i64);
+            let is_live = self.solver.try_le(i_term, s_len)?;
+            let src = self.solver.try_select(s_arr, i_term)?;
+            let dst = self.solver.try_select(l_arr, i_term)?;
+            let values_eq = self.solver.try_eq(dst, src)?;
+            let copy_live = self.solver.try_implies(is_live, values_eq)?;
+            result = self.solver.try_and(result, copy_live)?;
+        }
+
+        // Copy only t's logical cells immediately after s's logical prefix.
+        for j in 1..=t_max {
+            let j_term = self.solver.int_const(j as i64);
+            let is_live = self.solver.try_le(j_term, t_len)?;
+            let dst_index = self.solver.try_add(s_len, j_term)?;
+            let src = self.solver.try_select(t_arr, j_term)?;
+            let dst = self.solver.try_select(l_arr, dst_index)?;
+            let values_eq = self.solver.try_eq(dst, src)?;
+            let copy_live = self.solver.try_implies(is_live, values_eq)?;
+            result = self.solver.try_and(result, copy_live)?;
+        }
+
+        Ok(result)
     }
 
     /// Translate `lhs = <<e1, e2, ...>>`: set length and elements
@@ -724,6 +1005,25 @@ impl BmcTranslator {
         lhs: &(String, usize),
         elements: &[Spanned<Expr>],
     ) -> AYResult<Term> {
+        let element_sort = self.seq_element_sort(&lhs.0)?;
+        // The empty tuple denotes the one empty sequence regardless of element
+        // metadata. For a nonempty literal every live element must match the
+        // declared homogeneous carrier; unknown/mixed values decline rather
+        // than aliasing String and Int through SMT Int.
+        for (index, element) in elements.iter().enumerate() {
+            let literal_sort = self.scalar_expr_sort(element).ok_or_else(|| {
+                AYError::UnsupportedOp(format!(
+                    "BMC cannot determine sequence literal element {} sort",
+                    index + 1
+                ))
+            })?;
+            self.require_same_seq_element_sort(
+                "nonempty sequence-literal equality",
+                &element_sort,
+                &literal_sort,
+            )?;
+        }
+
         let l_arr = self.get_seq_array_at_step(&lhs.0, lhs.1)?;
         let l_len = self.get_seq_length_at_step(&lhs.0, lhs.1)?;
 
@@ -735,7 +1035,15 @@ impl BmcTranslator {
         let mut conjuncts = vec![len_eq];
         for (i, elem) in elements.iter().enumerate() {
             let idx = self.solver.int_const((i + 1) as i64);
-            let elem_term = dispatch_translate_int(self, elem)?;
+            let elem_term = match &element_sort {
+                TlaSort::Bool => dispatch_translate_bool(self, elem)?,
+                TlaSort::Int | TlaSort::String => dispatch_translate_int(self, elem)?,
+                compound => {
+                    return Err(AYError::UnsupportedOp(format!(
+                        "BMC sequence literal has unsupported element sort {compound}"
+                    )))
+                }
+            };
             let selected = self.solver.try_select(l_arr, idx)?;
             let eq = self.solver.try_eq(selected, elem_term)?;
             conjuncts.push(eq);
@@ -823,10 +1131,33 @@ impl BmcTranslator {
             Err(e) => return Some(Err(e)),
         };
 
-        // Assert mapping equality: target_map = except_map
-        let map_eq = match self.solver.try_eq(target_mapping, except_mapping) {
+        let target_name = match Self::func_expr_base_name(lhs) {
+            Some(name) => name,
+            None => {
+                return Some(Err(AYError::UntranslatableExpr(
+                    "BMC EXCEPT equality target must be a function variable".to_string(),
+                )))
+            }
+        };
+        let source_name = match Self::func_expr_base_name(base) {
+            Some(name) => name,
+            None => {
+                return Some(Err(AYError::UntranslatableExpr(
+                    "BMC EXCEPT equality source must be a function variable".to_string(),
+                )))
+            }
+        };
+
+        // Compare only values at the exact source/target DOMAIN. The store term
+        // may differ from the target at arbitrary out-of-domain ghost cells.
+        let map_eq = match self.translate_func_logical_mapping_eq(
+            &target_name,
+            target_mapping,
+            &source_name,
+            except_mapping,
+        ) {
             Ok(t) => t,
-            Err(e) => return Some(Err(AYError::Solver(e))),
+            Err(e) => return Some(Err(e)),
         };
 
         // Also assert domain preservation: target_dom = source_dom
@@ -886,9 +1217,9 @@ impl BmcTranslator {
         // If the construction has string-literal keys, the target function
         // variable must be encoded with a native `String`-indexed domain so a
         // string key cannot alias an integer-literal key (#5). The
-        // `TlaSort::Function` declaration cannot record this (it stores keys as
-        // untyped strings), so the variable is declared `Int`-keyed by default
-        // and upgraded here, before its arrays are resolved/constrained.
+        // Exact `TlaSort::Function` declarations retain this kind directly.
+        // Only legacy generic declarations begin Int-keyed and need a one-time
+        // upgrade here, before their arrays are resolved or constrained.
         if Self::func_construct_keys_are_strings(bounds) {
             if let Some(fname) = func_var_base_name(lhs) {
                 if matches!(self.func_key_sort(&fname), Some(TlaSort::Int)) {
@@ -908,6 +1239,22 @@ impl BmcTranslator {
             Ok(t) => t,
             Err(e) => return Some(Err(e)),
         };
+        let target_name = match func_var_base_name(lhs) {
+            Some(name) => name,
+            None => {
+                return Some(Err(AYError::UntranslatableExpr(
+                    "BMC function construction target must be a variable".to_string(),
+                )))
+            }
+        };
+        let target_range_sort = match self.func_vars.get(&target_name) {
+            Some(info) => info.range_sort.clone(),
+            None => {
+                return Some(Err(AYError::UnknownVariable(format!(
+                    "function {target_name}"
+                ))))
+            }
+        };
 
         // Constrain the target's own mapping array *directly* with the
         // construction's per-element value constraints, and obtain the
@@ -918,11 +1265,15 @@ impl BmcTranslator {
         // (see `test_bmc_func_construct_eq_init`). Constraining the target in
         // place matches the always-SAT `test_bmc_assert_concrete_func_state`
         // encoding and needs only the domain equality returned below.
-        let construct_domain =
-            match self.translate_func_construct_bmc_into(bounds, body, target_mapping) {
-                Ok(d) => d,
-                Err(e) => return Some(Err(e)),
-            };
+        let construct_domain = match self.translate_func_construct_bmc_into(
+            bounds,
+            body,
+            target_mapping,
+            &target_range_sort,
+        ) {
+            Ok(d) => d,
+            Err(e) => return Some(Err(e)),
+        };
 
         // Assert domain equality: target_dom = construct_dom
         let dom_eq = match self.solver.try_eq(target_domain, construct_domain) {
@@ -957,12 +1308,11 @@ impl BmcTranslator {
     /// Whether `expr` refers to a (possibly primed) symbolic-domain (map-only)
     /// function variable.
     fn func_expr_is_symbolic_domain(&self, expr: &Spanned<Expr>) -> bool {
-        Self::func_expr_base_name(expr)
-            .is_some_and(|n| self.func_symbolic_domain(&n).is_some())
+        Self::func_expr_base_name(expr).is_some_and(|n| self.func_symbolic_domain(&n).is_some())
     }
 
     /// Resolve the domain array for a function expression.
-    fn resolve_func_domain(&self, expr: &Spanned<Expr>) -> AYResult<Term> {
+    fn resolve_func_domain(&mut self, expr: &Spanned<Expr>) -> AYResult<Term> {
         match &expr.node {
             Expr::Ident(name, _) | Expr::StateVar(name, ..) => {
                 self.get_func_domain_at_step(name, self.current_step)

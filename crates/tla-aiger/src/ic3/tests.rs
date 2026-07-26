@@ -12,11 +12,8 @@ use crate::sat_types::{AYSatCdclSolver, SatSolver};
 
 /// This crate's single blessed choke point for process-environment mutation.
 /// The one `env_mutation` item-level allow lives on `raw_env_write`.
+/// Mutations are serialized and restored when their scope ends.
 mod env_guard {
-    #![allow(dead_code)]
-    //! Serialized process-environment mutation — the crate's single blessed
-    //! choke point for `std::env::set_var` / `std::env::remove_var`.
-
     use std::ffi::{OsStr, OsString};
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -57,13 +54,6 @@ mod env_guard {
             raw_env_write(&key, Some(value.as_ref()));
             Self { key, previous }
         }
-
-        pub fn unset(key: impl AsRef<OsStr>) -> Self {
-            let key = key.as_ref().to_os_string();
-            let previous = std::env::var_os(&key);
-            raw_env_write(&key, None);
-            Self { key, previous }
-        }
     }
 
     impl Drop for ScopedEnvVar {
@@ -77,13 +67,6 @@ mod env_guard {
     pub fn with_serialized_env_vars<T>(vars: &[(&str, &str)], f: impl FnOnce() -> T) -> T {
         let _env_lock = lock_env();
         let _guards: Vec<_> = vars.iter().map(|(k, v)| ScopedEnvVar::set(k, v)).collect();
-        f()
-    }
-
-    /// Run `f` with `vars` removed, serialized behind the process-wide env lock.
-    pub fn with_serialized_env_vars_removed<T>(vars: &[&str], f: impl FnOnce() -> T) -> T {
-        let _env_lock = lock_env();
-        let _guards: Vec<_> = vars.iter().map(|k| ScopedEnvVar::unset(k)).collect();
         f()
     }
 }
@@ -2673,16 +2656,21 @@ aag 6 1 3 0 2 1
     let circuit = parse_aag(aag).unwrap();
     let ts = crate::transys::Transys::from_aiger(&circuit);
 
-    let (engine, result) =
-        env_guard::with_serialized_env_vars(&[("IC3_VERIFY_LEMMAS", "1")], || {
-            let config = Ic3Config {
-                solver_backend: crate::sat_types::SolverBackend::Simple,
-                ..Ic3Config::default()
-            };
-            let mut engine = Ic3Engine::with_config(ts, config);
-            let result = engine.check();
-            (engine, result)
-        });
+    let mut engine = env_guard::with_serialized_env_vars(&[("IC3_VERIFY_LEMMAS", "1")], || {
+        let config = Ic3Config {
+            solver_backend: crate::sat_types::SolverBackend::Simple,
+            ..Ic3Config::default()
+        };
+        Ic3Engine::with_config(ts, config)
+    });
+    assert!(
+        engine.verify_lemmas,
+        "IC3_VERIFY_LEMMAS should be captured when the engine is constructed"
+    );
+    // The serialized environment scope has ended. Verification must remain
+    // enabled for this engine so concurrent environment changes cannot alter
+    // the behavior of an in-flight run.
+    let result = engine.check();
 
     assert!(
         matches!(result, Ic3Result::Unsafe { .. }),
@@ -2696,7 +2684,7 @@ aag 6 1 3 0 2 1
     );
     let verify_total = stats.lemmas_rejected + stats.lemmas_verified;
     assert!(
-        verify_total > 0 || stats.total_queries > 0,
+        verify_total > 0,
         "expected verification path to be exercised"
     );
 }

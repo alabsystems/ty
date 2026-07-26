@@ -291,11 +291,29 @@ pub trait FingerprintSet: tla_mc_core::FingerprintSet<Fingerprint> {
         StorageStats::default()
     }
 
+    /// Release membership entries after exploration has become terminal.
+    ///
+    /// This is an opt-in memory-reclamation hook. Implementations returning
+    /// `Some` must discard their membership entries and reserved membership
+    /// capacity, return the number of entries that were present, and preserve
+    /// terminal error state such as [`tla_mc_core::FingerprintSet::has_errors`]
+    /// and [`tla_mc_core::FingerprintSet::dropped_count`]. The backend object
+    /// itself remains installed so those terminal probes stay authoritative.
+    ///
+    /// The caller provides exclusive access and must not perform any later
+    /// membership, reserve, or checkpoint operations after this succeeds.
+    /// Backends that cannot uphold that contract must retain their entries and
+    /// use the default `None` result.
+    fn release_terminal_entries(&mut self) -> Option<usize> {
+        None
+    }
+
     /// Whether liveness successor caching should prefer the disk-backed graph.
     ///
     /// Backends that already rely on disk tiers for large-state exploration can
-    /// request the bounded-memory successor graph so liveness caching does not
-    /// reintroduce an unbounded in-memory map on that same path.
+    /// request disk-backed successor edge lists. The graph still retains an
+    /// O(states) offset index, but avoids keeping O(edges) Vec payloads in the
+    /// in-memory map on that same path.
     fn prefers_disk_successor_graph(&self) -> bool {
         false
     }

@@ -86,7 +86,7 @@ pub(crate) fn read_next_fp(reader: &mut impl std::io::Read) -> io::Result<Option
     Ok(Some(u64::from_le_bytes(buf)))
 }
 
-/// RAII guard that clears the `evicting` flag and wakes waiting threads.
+/// RAII guard that clears the leader's `evicting` flag on an unpublished exit.
 ///
 /// On normal completion, the leader publishes the outcome (epoch + status)
 /// before this guard drops. On panic unwind, the epoch is unchanged and
@@ -95,15 +95,28 @@ pub(crate) fn read_next_fp(reader: &mut impl std::io::Read) -> io::Result<Option
 /// Fix for #1778 (original). Part of #2494 (Condvar notification on drop).
 pub(crate) struct EvictGuard<'a> {
     pub(crate) barrier: &'a EvictionBarrier,
+    /// Epoch at which this guard became the eviction leader.
+    pub(crate) leader_epoch: u64,
 }
 
 impl Drop for EvictGuard<'_> {
     fn drop(&mut self) {
+        let mut cleared = false;
         {
             let mut state = self.barrier.state.lock();
-            state.evicting = false;
+            // A completed leader publishes a new epoch before dropping this
+            // guard. Another thread may become the next leader in that small
+            // interval. Do not let the old guard clear the new leader's flag.
+            // If the epoch is unchanged, this guard is still the owner and is
+            // unwinding before it could publish an outcome.
+            if state.epoch == self.leader_epoch {
+                state.evicting = false;
+                cleared = true;
+            }
         }
-        self.barrier.condvar.notify_all();
+        if cleared {
+            self.barrier.condvar.notify_all();
+        }
     }
 }
 
@@ -237,12 +250,15 @@ impl DiskFingerprintSet {
             return self.await_peer_eviction(state);
         }
 
-        // This thread becomes the eviction leader.
+        // This thread becomes the eviction leader. Capture the epoch so the
+        // unwind guard cannot later clear a successor leader's `evicting` flag.
+        let leader_epoch = state.epoch;
         state.evicting = true;
         drop(state);
 
         let _guard = EvictGuard {
             barrier: &self.eviction_barrier,
+            leader_epoch,
         };
 
         let result = self.do_evict();
@@ -251,7 +267,7 @@ impl DiskFingerprintSet {
         // critical section. Setting evicting=false here prevents the race where
         // a new thread sees {evicting: true, epoch: NEW} and gets a spurious
         // "peer ended without publishing outcome" error when EvictGuard drops.
-        // EvictGuard.drop() is then a no-op (idempotent evicting=false).
+        // EvictGuard.drop() is then a no-op because the epoch has advanced.
         {
             let mut state = self.eviction_barrier.state.lock();
             state.epoch = state.epoch.wrapping_add(1);

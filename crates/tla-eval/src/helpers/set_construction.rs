@@ -6,7 +6,6 @@
 //! `count_set_filter_elements`. Split from `quantifiers.rs` as part of #3063.
 
 use super::super::{eval, EvalCtx, EvalError, EvalResult};
-use tla_value::Rp;
 use super::quantifiers::{enter_hoist_scope, push_bound_var_mut_preinterned, PreInternedBound};
 use super::set_semantics::eval_iter_set;
 use crate::value::{
@@ -15,6 +14,7 @@ use crate::value::{
 use std::sync::Arc;
 use tla_core::ast::{BoundPattern, BoundVar, Expr};
 use tla_core::{Span, Spanned};
+use tla_value::Rp;
 
 /// Evaluate {expr : x \in S, y \in T, ...}
 /// Clones ctx once at entry, uses O(1) mutable stack binding inside

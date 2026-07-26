@@ -3,10 +3,10 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::*;
-use tla_value::Rp;
 use std::sync::Arc;
 use tla_core::ast::{Expr, Substitution};
 use tla_core::{lower, parse_to_syntax_tree, FileId, Spanned};
+use tla_value::Rp;
 
 /// Verify that label selection returns the body's actual value, not a hardcoded
 /// true. The labeled expression `P0:: counter = 99` evaluates to FALSE because

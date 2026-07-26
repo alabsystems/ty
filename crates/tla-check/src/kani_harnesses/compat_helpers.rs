@@ -6,9 +6,8 @@
 //! Part of #3073 Step 3: migrate test code off deprecated tree-materialization APIs.
 
 use crate::value::{FuncValue, SortedSet, Value};
-use tla_value::Rp;
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use tla_value::Rp;
 
 /// Create a Value::Set from unsorted elements.
 pub(super) fn make_set(elems: Vec<Value>) -> Value {

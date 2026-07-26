@@ -105,6 +105,16 @@ pub(crate) fn bmc_value_to_value(bmc_val: &BmcValue) -> Option<Value> {
                 .collect();
             converted.map(|pairs| Value::Func(Rp::new(FuncValue::from_sorted_entries(pairs))))
         }
+        BmcValue::StringFunction(entries) => {
+            let converted: Option<Vec<(Value, Value)>> = entries
+                .iter()
+                .map(|(key, value)| {
+                    let key = Value::String(Rp::from(key.as_str()));
+                    bmc_value_to_value(value).map(|value| (key, value))
+                })
+                .collect();
+            converted.map(|pairs| Value::Func(Rp::new(FuncValue::from_sorted_entries(pairs))))
+        }
     }
 }
 
@@ -222,7 +232,10 @@ pub fn cross_validate_symbolic_trace(
         (Some(init), Some(next)) => {
             let init_name = ctx.resolve_op_name(init).to_string();
             let next_name = ctx.resolve_op_name(next).to_string();
-            match (ctx.get_op(&init_name).cloned(), ctx.get_op(&next_name).cloned()) {
+            match (
+                ctx.get_op(&init_name).cloned(),
+                ctx.get_op(&next_name).cloned(),
+            ) {
                 (Some(init_def), Some(next_def)) => Some((init_def, next_def)),
                 _ => {
                     return fail(format!(

@@ -34,8 +34,8 @@
 //! forces an explicit classification, so the cache admission predicate can
 //! never silently admit a future expression-bearing variant.
 
-use super::Value;
-use crate::rp::Rp;
+use super::{lookup_model_value_index, lookup_tlc_string_token, Value};
+use tla_core::resolve_name_id;
 
 impl Value {
     /// `true` iff this value is pure data (no stored expressions or captured
@@ -78,6 +78,85 @@ impl Value {
             Value::SeqSet(ss) => ss.base.is_concrete_data(),
 
             // --- Expression-bearing values: NOT pure data ---
+            Value::SetPred(_) | Value::LazyFunc(_) | Value::Closure(_) => false,
+        }
+    }
+
+    /// Whether every first-seen token that TLC ordering can demand while
+    /// consuming this concrete value has already been assigned.
+    ///
+    /// This is a read-only admission predicate: it never interns a string or
+    /// registers a model value. Besides explicit string/model leaves, record
+    /// field names matter because TLC's cross-kind function comparison turns a
+    /// record domain into string values before sorting it. A caller that may
+    /// reorder otherwise-pure evaluations can therefore use this together with
+    /// [`Self::is_concrete_data`] to prove that consuming a cached/config value
+    /// cannot mutate globally observable TLC ordering.
+    #[must_use]
+    pub fn has_preassigned_tlc_order_tokens(&self) -> bool {
+        match self {
+            Value::Bool(_)
+            | Value::SmallInt(_)
+            | Value::Int(_)
+            | Value::Interval(_)
+            | Value::StringSet
+            | Value::AnySet => true,
+            Value::String(value) => lookup_tlc_string_token(value).is_some(),
+            Value::ModelValue(value) => {
+                lookup_tlc_string_token(value).is_some()
+                    && lookup_model_value_index(value).is_some()
+            }
+
+            Value::Set(set) => set.iter().all(Self::has_preassigned_tlc_order_tokens),
+            Value::Func(func) => func.iter().all(|(key, value)| {
+                key.has_preassigned_tlc_order_tokens() && value.has_preassigned_tlc_order_tokens()
+            }),
+            Value::Bag(bag) => bag
+                .elems()
+                .iter()
+                .all(Self::has_preassigned_tlc_order_tokens),
+            Value::IntFunc(func) => func
+                .values()
+                .iter()
+                .all(Self::has_preassigned_tlc_order_tokens),
+            Value::Seq(seq) => seq.iter().all(Self::has_preassigned_tlc_order_tokens),
+            Value::Record(record) => record.iter().all(|(field, value)| {
+                lookup_tlc_string_token(resolve_name_id(field).as_ref()).is_some()
+                    && value.has_preassigned_tlc_order_tokens()
+            }),
+            Value::Tuple(values) => values.iter().all(Self::has_preassigned_tlc_order_tokens),
+
+            Value::Subset(subset) => subset.base.has_preassigned_tlc_order_tokens(),
+            Value::FuncSet(func_set) => {
+                func_set.domain.has_preassigned_tlc_order_tokens()
+                    && func_set.codomain.has_preassigned_tlc_order_tokens()
+            }
+            Value::RecordSet(record_set) => record_set.fields_iter().all(|(field, values)| {
+                lookup_tlc_string_token(field).is_some()
+                    && values.has_preassigned_tlc_order_tokens()
+            }),
+            Value::TupleSet(tuple_set) => tuple_set
+                .components
+                .iter()
+                .all(|value| value.has_preassigned_tlc_order_tokens()),
+            Value::SetCup(value) => {
+                value.set1.has_preassigned_tlc_order_tokens()
+                    && value.set2.has_preassigned_tlc_order_tokens()
+            }
+            Value::SetCap(value) => {
+                value.set1.has_preassigned_tlc_order_tokens()
+                    && value.set2.has_preassigned_tlc_order_tokens()
+            }
+            Value::SetDiff(value) => {
+                value.set1.has_preassigned_tlc_order_tokens()
+                    && value.set2.has_preassigned_tlc_order_tokens()
+            }
+            Value::KSubset(subsets) => subsets.base.has_preassigned_tlc_order_tokens(),
+            Value::BigUnion(union) => union.set.has_preassigned_tlc_order_tokens(),
+            Value::SeqSet(sequences) => sequences.base.has_preassigned_tlc_order_tokens(),
+
+            // These are rejected independently by `is_concrete_data`; keep the
+            // token predicate fail-closed when called on its own as well.
             Value::SetPred(_) | Value::LazyFunc(_) | Value::Closure(_) => false,
         }
     }
@@ -131,5 +210,27 @@ mod tests {
         assert!(!closure.is_concrete_data());
         let tuple: Value = Value::Tuple(Rp::from(vec![Value::SmallInt(1), closure]));
         assert!(!tuple.is_concrete_data());
+    }
+
+    #[test]
+    fn record_field_tokens_are_required_without_assigning_them() {
+        let _lock = crate::value::lock_intern_state();
+        crate::clear_string_intern_table();
+        crate::clear_tlc_string_tokens();
+
+        let field = "concrete_data_unseen_record_field";
+        let record = Value::Record(crate::RecordValue::from_entries(vec![(
+            tla_core::intern_name(field),
+            Value::SmallInt(1),
+        )]));
+        assert!(record.is_concrete_data());
+        assert!(!record.has_preassigned_tlc_order_tokens());
+        assert_eq!(crate::lookup_tlc_string_token(field), None);
+
+        let _field_value = Value::string(field);
+        assert!(record.has_preassigned_tlc_order_tokens());
+
+        crate::clear_string_intern_table();
+        crate::clear_tlc_string_tokens();
     }
 }

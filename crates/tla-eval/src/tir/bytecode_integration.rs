@@ -20,6 +20,7 @@ use crate::core::EvalCtx;
 use super::TirProgram;
 
 feature_flag!(no_vm_tuple2_set_in, "TY_NO_VM_TUPLE2_SET_IN");
+feature_flag!(no_edge_filter, "TY_NO_EDGE_FILTER");
 feature_flag!(no_vm_set_enum_subseteq, "TY_NO_VM_SET_ENUM_SUBSETEQ");
 feature_flag!(no_vm_tuple2_self_eq, "TY_NO_VM_TUPLE2_SELF_EQ");
 feature_flag!(no_vm_tuple2_self_subseteq, "TY_NO_VM_TUPLE2_SELF_SUBSETEQ");
@@ -40,6 +41,11 @@ fn new_vm_only_compiler(
     if tuple2_set_in {
         compiler.enable_tuple2_set_in();
         compiler.enable_set_filter_projection_hoist();
+        // Default-on (kill-switch `TY_NO_EDGE_FILTER=1`). Reuses the
+        // projection-hoist match, so it is additionally gated on `tuple2_set_in`.
+        if !no_edge_filter() {
+            compiler.enable_edge_filter();
+        }
     }
     if !no_vm_set_enum_subseteq() {
         compiler.enable_set_enum_subseteq();

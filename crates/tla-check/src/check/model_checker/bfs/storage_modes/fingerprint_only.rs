@@ -24,8 +24,24 @@ use crate::Value;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PayloadWitnessDomain {
     ArrayState,
+    /// Prefer the compact, lossless flat slots. A state that escapes the
+    /// inferred layout (for example an integer growing beyond `i64`) falls
+    /// back to an exact `ArrayState` witness for that fingerprint.
     FlatI64,
     View,
+    /// Nested-set promotion (gap 1): a promoted set-of-sets variable
+    /// (`SlidingPuzzles` `board`) encodes each board to an INJECTIVE,
+    /// monitor-guarded flat mask (one 64-bit slot for `SlidingPuzzles`). That
+    /// mask is a complete, collision-free duplicate witness — two distinct
+    /// in-universe boards have distinct masks — so it replaces the deep compound
+    /// `Value` ArrayState witness (~2.97 KB/state) with an ~8-byte mask, keyed
+    /// into the same `flat_refs` arena as [`Self::FlatI64`]. Fail-closed: a board
+    /// that escapes the frozen universe encodes to `None` and falls back to the
+    /// EXACT compound `ArrayState` witness for that state (the baseline path), so
+    /// an escaped board is still disambiguated losslessly — never a wrong merge.
+    /// `encode_board` is per-board deterministic, so each board maps to exactly
+    /// one witness domain (mask or compound) for the whole run.
+    NestedSetMask,
 }
 
 fn array_witness_frontier_enabled() -> bool {
@@ -190,6 +206,17 @@ impl FingerprintOnlyStorage {
     }
 
     fn compact_payload_witness_domain(mc: &ModelChecker) -> Option<PayloadWitnessDomain> {
+        // Nested-set promotion (gap 1): when a set-of-sets variable was promoted
+        // and its 1-slot injective mask is the whole state's dedup key, use the
+        // mask as the compact collision witness instead of the deep compound
+        // `Value` ArrayState. This is the memory win for `SlidingPuzzles`
+        // (~2.97 KB/state → ~8 B/state). `nested_set_mask_witness_active` gates it
+        // to exactly the monitored single-variable dedup path; every other
+        // configuration falls through to the unchanged logic below.
+        if mc.nested_set_mask_witness_active() {
+            return Some(PayloadWitnessDomain::NestedSetMask);
+        }
+
         // Keep the production slice narrow: liveness and flat-fp64 paths use
         // domains where ArrayState payload equality is not the canonical
         // duplicate witness.
@@ -300,6 +327,98 @@ impl FingerprintOnlyStorage {
         Some(flat.into_buffer())
     }
 
+    /// Nested-set promotion (gap 1): encode the candidate state into its
+    /// monitor-guarded flat MASK slots — the compact collision witness.
+    ///
+    /// Only reachable when [`ModelChecker::nested_set_mask_witness_active`] holds
+    /// (single-variable spec whose sole variable is the promoted board), so the
+    /// board mask injectively encodes the ENTIRE state. Returns:
+    ///
+    /// * `Some(slots)` — the board fit the frozen universe and losslessly encoded
+    ///   to its mask slots (one 64-bit slot for `SlidingPuzzles`). Two distinct
+    ///   in-universe boards have distinct masks, so byte-equal slots ⟺ equal
+    ///   board — exactly the duplicate relation the compound witness enforced.
+    /// * `None` — the board ESCAPED the frozen universe. The caller then falls
+    ///   back to the compound `ArrayState` witness for that state (lossless
+    ///   disambiguation, never a wrong merge). For `SlidingPuzzles` the static
+    ///   universe is complete (0 escapes), so this never triggers.
+    fn nested_set_mask_witness_slots(
+        candidate: &ArrayState,
+        mc: &ModelChecker,
+    ) -> Option<Box<[i64]>> {
+        let values = candidate.values();
+        let mut slots: Vec<i64> = Vec::new();
+        for (vi, compact) in values.iter().enumerate() {
+            let monitor = mc.nested_set_monitors.iter().find(|m| m.var_idx == vi)?;
+            // `encode_board` is deterministic and independent of the monitor's
+            // `bailed` latch: an in-universe board always encodes to its mask,
+            // an escaped board always returns `None` here (→ compound witness).
+            // So a given board maps to ONE witness domain for the whole run,
+            // even after some other board has bailed the monitor — no same-board
+            // cross-domain split.
+            let board = Value::from(compact);
+            match monitor.encode_board(&board) {
+                crate::state::NestedSetEncodeOutcome::Encoded { slots: mask, .. } => {
+                    slots.extend_from_slice(&mask);
+                }
+                crate::state::NestedSetEncodeOutcome::Escaped => return None,
+            }
+        }
+        Some(slots.into_boxed_slice())
+    }
+
+    fn duplicate_nested_set_mask_payload_confirmed(
+        &mut self,
+        fp: Fingerprint,
+        candidate: &ArrayState,
+        current: Option<(Fingerprint, &ArrayState)>,
+        mc: &mut ModelChecker,
+    ) -> bool {
+        let Some(candidate_slots) = Self::nested_set_mask_witness_slots(candidate, mc) else {
+            // Escape / bailed → fall back to the EXACT compound `ArrayState`
+            // witness for this state (the baseline collision-witness path), so an
+            // escaped board is still disambiguated losslessly — never a wrong
+            // dedup. Its full `Value` lands in `compact_direct`; a mask witness
+            // for the same fp lives in `flat_refs`, and `confirm_array_state`
+            // fail-closes across the two domains (a mask witness never confirms a
+            // compound candidate), so distinct boards can never be merged.
+            return self.duplicate_array_payload_confirmed(fp, candidate, current, mc);
+        };
+
+        if let Some(confirmed) = self
+            .payload_witnesses
+            .confirm_flat_i64_slots(fp, &candidate_slots)
+        {
+            return confirmed;
+        }
+
+        // Compare against the in-flight `current` parent (its witness may not be
+        // recorded yet) by encoding it the same way.
+        if let Some((_, current_state)) = current.filter(|(current_fp, _)| *current_fp == fp) {
+            if let Some(current_slots) = Self::nested_set_mask_witness_slots(current_state, mc) {
+                if current_slots.as_ref() == candidate_slots.as_ref() {
+                    return true;
+                }
+            }
+        }
+
+        // Backfill from a resident full state (present only in modes that retain
+        // `seen` payloads; fingerprint-only `seen` is empty, so this is inert).
+        if let Some(resident) = mc.state_storage.seen.get(&fp) {
+            let Some(resident_slots) = Self::nested_set_mask_witness_slots(resident, mc) else {
+                return false;
+            };
+            self.payload_witnesses
+                .record_flat_i64_slots_if_absent(fp, &resident_slots);
+            return self
+                .payload_witnesses
+                .confirm_flat_i64_slots(fp, &candidate_slots)
+                .unwrap_or(false);
+        }
+
+        false
+    }
+
     fn current_array_payload_confirms(
         fp: Fingerprint,
         candidate: &ArrayState,
@@ -354,10 +473,17 @@ impl FingerprintOnlyStorage {
         fp: Fingerprint,
         candidate: &ArrayState,
         current: Option<(Fingerprint, &ArrayState)>,
-        mc: &ModelChecker,
+        mc: &mut ModelChecker,
     ) -> bool {
         let Some(candidate_slots) = Self::flat_payload_slots(candidate, mc) else {
-            return false;
+            // `flat_state_primary` is established from the initial wavefront,
+            // but a later successor can still escape the fixed layout (most
+            // simply, an arbitrary-precision integer can cross `i64::MAX`).
+            // Such a state is not evidence of a fingerprint collision. Use the
+            // exact ArrayState witness for this exceptional fingerprint so an
+            // equal self-loop remains a duplicate while a genuinely different
+            // payload with the same fingerprint still fails closed.
+            return self.duplicate_array_payload_confirmed(fp, candidate, current, mc);
         };
 
         if let Some(confirmed) = self
@@ -400,6 +526,9 @@ impl FingerprintOnlyStorage {
             }
             PayloadWitnessDomain::FlatI64 => {
                 Ok(self.duplicate_flat_payload_confirmed(fp, candidate, current, mc))
+            }
+            PayloadWitnessDomain::NestedSetMask => {
+                Ok(self.duplicate_nested_set_mask_payload_confirmed(fp, candidate, current, mc))
             }
             PayloadWitnessDomain::View => Ok(self
                 .duplicate_view_payload_confirmed(fp, candidate, current, mc)?
@@ -491,6 +620,28 @@ impl FingerprintOnlyStorage {
                 if let Some(slots) = Self::flat_payload_slots(state, mc) {
                     self.payload_witnesses
                         .record_flat_i64_slots_if_absent(fp, &slots);
+                } else {
+                    // Preserve exact duplicate authorization when a reachable
+                    // state escapes the initial flat layout. This is a cold,
+                    // per-escaping-state fallback; in-layout states retain the
+                    // compact flat witness and its memory advantage.
+                    self.payload_witnesses
+                        .record_array_state_if_absent(fp, state);
+                }
+            }
+            PayloadWitnessDomain::NestedSetMask => {
+                // In-universe board → record its compact 1-slot mask (the memory
+                // win). Escape / bailed → fall back to the EXACT compound
+                // `ArrayState` witness (the baseline path), keeping full collision
+                // insurance for that state. For `SlidingPuzzles` the static
+                // universe is complete, so every board takes the mask path.
+                match Self::nested_set_mask_witness_slots(state, mc) {
+                    Some(slots) => self
+                        .payload_witnesses
+                        .record_flat_i64_slots_if_absent(fp, &slots),
+                    None => self
+                        .payload_witnesses
+                        .record_array_state_if_absent(fp, state),
                 }
             }
             PayloadWitnessDomain::View => {}
@@ -1397,6 +1548,45 @@ ContextConstraint == /\ x \in 0..1
             storage.payload_witnesses.confirm_array_state(fp, &state),
             Some(false),
             "compiled-flat admission must not authorize duplicates with ArrayState payload witnesses"
+        );
+    }
+
+    #[test]
+    fn flat_payload_witness_falls_back_exactly_for_oversized_integer() {
+        use num_bigint::BigInt;
+        use tla_value::Rp;
+
+        let module = minimal_module();
+        let config = minimal_config();
+        let mut mc = compiled_flat_checker(&module, &config);
+        let mut storage = FingerprintOnlyStorage::new(BulkStateStorage::empty(1), 1);
+        let fp = Fingerprint(78);
+        let oversized = Value::Int(Rp::new(BigInt::from(i64::MAX) + BigInt::from(1u8)));
+        let state = ArrayState::from_values(vec![oversized]);
+
+        let first = storage
+            .admit_successor(fp, state.clone(), None, None, 0, &mut mc)
+            .expect("first oversized state must be admitted");
+        assert!(first.is_some());
+        assert_eq!(
+            storage.payload_witnesses.confirm_array_state(fp, &state),
+            Some(true),
+            "an out-of-layout state must retain an exact fallback witness"
+        );
+
+        let duplicate = storage
+            .admit_successor(fp, state, Some(fp), None, 1, &mut mc)
+            .expect("an exact oversized self-loop must remain a duplicate");
+        assert!(duplicate.is_none());
+
+        let different = ArrayState::from_values(vec![Value::Int(Rp::new(
+            BigInt::from(i64::MAX) + BigInt::from(2u8),
+        ))]);
+        assert!(
+            storage
+                .admit_successor(fp, different, Some(fp), None, 1, &mut mc)
+                .is_err(),
+            "a different out-of-layout payload with the same fingerprint must fail closed"
         );
     }
 

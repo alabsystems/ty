@@ -6,11 +6,9 @@
 
 #[cfg(kani)]
 mod kani_proofs {
-    use tla_value::Rp;
     use super::super::kani_generators::*;
-use tla_value::Rp;
     use crate::value::{FuncValue, SortedSet, Value};
-    use std::sync::Arc;
+    use tla_value::Rp;
 
     fn collected_domain(func: &FuncValue) -> SortedSet {
         SortedSet::from_sorted_vec(func.domain_iter().cloned().collect())
@@ -215,9 +213,8 @@ use tla_value::Rp;
 
 #[cfg(test)]
 mod tests {
-    use tla_value::Rp;
     use crate::value::{FuncValue, SortedSet, Value};
-    use std::sync::Arc;
+    use tla_value::Rp;
 
     use super::super::test_helpers::{create_nested_func, make_func};
 

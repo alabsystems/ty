@@ -378,27 +378,8 @@ fn classify_verdict(
 }
 
 /// Expand a leading `~` (or `~/...`) against `home`. Mirrors the dev scripts'
-/// `os.path.expanduser` behavior for the base dir. Pure: the home dir is passed
-/// in so this is unit-testable without mutating the process environment.
-fn expand_home_with(path: &Path, home: &Path) -> PathBuf {
-    let s = path.to_string_lossy();
-    if s == "~" {
-        return home.to_path_buf();
-    }
-    if let Some(rest) = s.strip_prefix("~/") {
-        return home.join(rest);
-    }
-    path.to_path_buf()
-}
-
 fn expand_home(path: &Path) -> PathBuf {
-    expand_home_with(path, &home_dir())
-}
-
-fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
+    super::expand_home_with(path, &super::home_dir())
 }
 
 /// Resolve a baseline-relative tla/cfg path against the base dir. Absolute
@@ -1532,24 +1513,7 @@ Statistics:
     }
 
     // ----- Path helpers -----
-
-    #[test]
-    fn expand_home_handles_tilde_prefix() {
-        let home = Path::new("/home/test");
-        assert_eq!(
-            expand_home_with(Path::new("~"), home),
-            PathBuf::from("/home/test")
-        );
-        assert_eq!(
-            expand_home_with(Path::new("~/tlaplus-examples/specifications"), home),
-            PathBuf::from("/home/test/tlaplus-examples/specifications")
-        );
-        // Non-tilde paths pass through unchanged.
-        assert_eq!(
-            expand_home_with(Path::new("/abs/path"), home),
-            PathBuf::from("/abs/path")
-        );
-    }
+    // (expand_home_with lives in the parent module now, tested there.)
 
     #[test]
     fn resolve_path_respects_absolute_and_relative() {

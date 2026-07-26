@@ -27,6 +27,27 @@ fn is_cross_type_eligible(v: &Value) -> bool {
     )
 }
 
+/// Count a compound deep eq/cmp (diagnostic; no-op unless TY_CHURN_STATS).
+/// "Compound" = heap-backed collection/structure kinds where a deep walk is
+/// the expensive path a canonical-identity fast path would have avoided.
+#[inline(always)]
+fn count_compound_deep(site: crate::churn_stats::ChurnSite, v: &Value) {
+    if crate::churn_stats::churn_stats_enabled()
+        && matches!(
+            v,
+            Value::Set(_)
+                | Value::Func(_)
+                | Value::Record(_)
+                | Value::Seq(_)
+                | Value::Tuple(_)
+                | Value::IntFunc(_)
+                | Value::Bag(_)
+        )
+    {
+        crate::churn_stats::churn_count(site);
+    }
+}
+
 impl Ord for Value {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
@@ -48,6 +69,9 @@ impl Ord for Value {
             return ord;
         }
 
+        if crate::churn_stats::churn_stats_enabled() && !self.ptr_eq(other) {
+            count_compound_deep(crate::churn_stats::ChurnSite::CmpCompoundDeep, self);
+        }
         cmp_same_type(self, other)
     }
 }
@@ -89,6 +113,8 @@ impl PartialEq for Value {
         if std::mem::discriminant(self) == std::mem::discriminant(other) {
             // Same variant type: no cross-type coercion needed.
             // eq_same_type handles the remaining structural comparison.
+            // (ptr_eq already missed above — this is a genuine deep compare.)
+            count_compound_deep(crate::churn_stats::ChurnSite::EqCompoundDeep, self);
             return eq_same_type(self, other);
         }
         // Different discriminants. Most pairs are incompatible (e.g., Set vs

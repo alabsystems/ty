@@ -116,6 +116,7 @@ impl<'a> BytecodeVm<'a> {
                 | Opcode::SetDiff { .. }
                 | Opcode::Subseteq { .. }
                 | Opcode::RoundStepEq { .. }
+                | Opcode::EdgeFilter { .. }
                 | Opcode::Powerset { .. }
                 | Opcode::BigUnion { .. }
                 | Opcode::KSubset { .. }

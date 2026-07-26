@@ -26,11 +26,8 @@ use crate::Value;
 
 use super::action_validation::action_holds_in_next_state_array;
 use super::build_diff::build_successor_diffs_from_array_into;
-use super::expr_analysis::{
-    expr_is_action_level, flatten_and_spanned, is_operator_reference_guard_unsafe,
-    might_need_prime_binding,
-};
-use super::guard_check::check_and_guards;
+use super::expr_analysis::{expr_is_action_level, flatten_and_spanned, might_need_prime_binding};
+use super::guard_check::check_and_guards_precheck;
 use super::symbolic_assignments::{
     evaluate_symbolic_assignments, extract_symbolic_assignments_with_registry,
 };
@@ -60,30 +57,6 @@ pub(crate) fn clear_state_independent_branch_caches() {
     super::first_guard_sched::clear_first_guard_sched_cache();
     super::complete_action_filter::clear_complete_action_filter_cache();
     super::subset_constrained::clear_quorum_subset_syntax_cache();
-}
-
-/// Number of leading conjuncts that are pure, action-free guards which the
-/// whole-action [`check_and_guards`] precheck has already validated as true.
-///
-/// This is a *purely syntactic* count (no evaluation, no side effects): a
-/// conjunct counts only if it is not action-level and does not reference an
-/// operator whose body could hide action content. The successor enumerator can
-/// therefore start at this index and avoid re-evaluating these guards, which is
-/// a strict performance win and does not change which successors are produced.
-///
-/// Stops at the first conjunct that is action-level or operator-reference-unsafe,
-/// because everything from there on must flow through the ordered enumerator.
-fn leading_guard_prefix_len(ctx: &EvalCtx, conjuncts: &[&Spanned<Expr>]) -> usize {
-    let mut idx = 0;
-    while idx < conjuncts.len() {
-        let conjunct = conjuncts[idx];
-        if expr_is_action_level(ctx, conjunct) || is_operator_reference_guard_unsafe(ctx, conjunct)
-        {
-            break;
-        }
-        idx += 1;
-    }
-    idx
 }
 
 fn flatten_action_or_spanned<'a>(
@@ -577,12 +550,14 @@ fn enumerate_unified_inner_with_certificate(
 
             // Conjunction: flatten and process via continuation-based enumeration.
             Expr::And(_, _) => {
-                // Check guards before enumeration (TY-specific optimization, no TLC analog).
-                // Correctness depends on check_and_guards correctly identifying disabled
-                // actions. This runs on the whole action so that all error semantics —
-                // CASE-guard wrapping (#1425), action-level error propagation (#1467) —
-                // are preserved exactly as on the legacy path.
-                if and_guard_precheck() && !check_and_guards(ctx, expr, debug, p.tir_leaf)? {
+                // Optional, default-off TY optimization with no TLC analog.
+                // It is reject-only and defers branch/quantifier/operator
+                // structure, but an ordinary direct pure leaf that returns true
+                // can still be evaluated again by ordered enumeration. Thus the
+                // opt-in mode does not promise single-evaluation behavior for
+                // side-effectful or randomized leaf operators.
+                if and_guard_precheck() && !check_and_guards_precheck(ctx, expr, debug, p.tir_leaf)?
+                {
                     if debug {
                         eprintln!("enumerate_unified: AND guard check failed");
                     }
@@ -594,16 +569,13 @@ fn enumerate_unified_inner_with_certificate(
                 let mut conjuncts = SmallVec::new();
                 flatten_and_spanned(expr, &mut conjuncts);
 
-                // The leading run of pure (action-free, operator-safe) guard conjuncts was
-                // already validated by `check_and_guards` above, so the enumerator can start
-                // past them rather than re-evaluating them as trivially-true guards. This is
-                // a side-effect-free performance skip — it never changes which successors are
-                // produced. Only enabled when the guard precheck actually ran.
-                let start_idx = if and_guard_precheck() {
-                    leading_guard_prefix_len(ctx, &conjuncts)
-                } else {
-                    0
-                };
+                // `check_and_guards_precheck` is conservative: Ok(true) can mean
+                // either "proven true" or "defer to ordered enumeration" (notably
+                // OR/EXISTS/FORALL). Without a tri-state result, skipping a
+                // syntactically pure prefix can fabricate successors for a deferred
+                // false predicate and can erase TLC proof-path multiplicity. Always
+                // enumerate from the first conjunct.
+                let start_idx = 0;
 
                 // Check might_need_prime_binding BEFORE allocating buffers.
                 // This is cached per AST node pointer so it's O(1) after first call.
@@ -647,6 +619,7 @@ fn enumerate_unified_inner_with_certificate(
                             assigned_mask: 0,
                             has_complex: false,
                             certified_complete_action: false,
+                            allow_tlc_proof_dfs: false,
                         };
                         let cont = Cont {
                             conjuncts: &conjuncts,
@@ -724,6 +697,7 @@ fn enumerate_unified_inner_with_certificate(
                             assigned_mask: 0,
                             has_complex: false,
                             certified_complete_action,
+                            allow_tlc_proof_dfs: true,
                         };
                         let cont = Cont {
                             conjuncts: &conjuncts,
@@ -896,6 +870,7 @@ fn enumerate_unified_inner_with_certificate(
                     assigned_mask: 0,
                     has_complex: false,
                     certified_complete_action: false,
+                    allow_tlc_proof_dfs: true,
                 };
                 enumerate_exists(ctx, bounds, 0, body, p, &mut m)
             }
@@ -940,12 +915,13 @@ fn enumerate_unified_inner_with_certificate(
                 // Merged env is memoized on Arc identity of the ambient scope +
                 // the interned defs — no per-state HAMT clone/insert/id
                 // derivation (see tla-eval cache/openv_memo.rs).
-                let (merged, merged_id, merged_recursive) = tla_eval::merged_let_env_memoized(
-                    ctx.local_ops().as_ref(),
-                    defs,
-                    tla_eval::MergedLetSite::EnumDispatch,
-                    |_| true,
-                );
+                let (merged, merged_id, merged_recursive) =
+                    tla_eval::merged_let_env_memoized_with_ctx(
+                        ctx,
+                        defs,
+                        tla_eval::MergedLetSite::EnumDispatch,
+                        |_| true,
+                    );
                 let saved_local_ops = ctx.local_ops().clone();
                 // Enter the LET scope with the memoized scope id instead of
                 // INVALIDATED, so cache-key builds inside the body do not re-walk

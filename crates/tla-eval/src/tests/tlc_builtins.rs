@@ -5,11 +5,10 @@
 //! Tests for `builtin_tlc` and `builtin_tlcext` module operators.
 
 use super::eval_str;
-use tla_value::Rp;
 use crate::error::EvalError;
 use crate::Value;
-use std::sync::Arc;
 use tla_core::{lower, parse_to_syntax_tree, FileId};
+use tla_value::Rp;
 
 fn eval_op_with_ctx(module_src: &str, ctx: &crate::EvalCtx, op_name: &str) -> Value {
     let tree = parse_to_syntax_tree(module_src);

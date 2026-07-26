@@ -192,7 +192,10 @@ struct BenchmarkSpec {
     cfg_path: PathBuf,
     category: String,
     expected_states: Option<u64>,
-    expected_generated_states: Option<u64>,
+    /// Expected pre-constraint successor count (excludes initial states).
+    expected_raw_successors_generated: Option<u64>,
+    /// Expected TLC-style total generated count (raw Init + raw successors).
+    expected_states_generated: Option<u64>,
     timeout_seconds: u64,
     notes: String,
 }
@@ -249,7 +252,7 @@ fn catalog_spec(
     cfg_path: &str,
     category: &str,
     expected_states: Option<u64>,
-    expected_generated_states: Option<u64>,
+    expected_raw_successors_generated: Option<u64>,
     examples_dir: &Path,
 ) -> Result<BenchmarkSpec> {
     let tla_path = examples_dir.join(tla_path);
@@ -261,7 +264,8 @@ fn catalog_spec(
         cfg_path,
         category: category.to_string(),
         expected_states,
-        expected_generated_states,
+        expected_raw_successors_generated,
+        expected_states_generated: None,
         timeout_seconds: DEFAULT_SPEC_TIMEOUT_SECONDS,
         notes: String::new(),
     })
@@ -328,7 +332,8 @@ fn stage_coffecan_safety_spec(output_dir: &Path, examples_dir: &Path) -> Result<
         cfg_path: wrapper_cfg,
         category: "CoffeeCan".to_string(),
         expected_states: Some(501_500),
-        expected_generated_states: Some(1_498_502),
+        expected_raw_successors_generated: Some(1_498_502),
+        expected_states_generated: Some(1_499_503),
         timeout_seconds: DEFAULT_SPEC_TIMEOUT_SECONDS,
         notes: "Generated safety-only CoffeeCan1000 model: exact-1000-bean initial frontier, Next, TypeInvariant, no temporal properties or fairness.".to_string(),
     })
@@ -401,7 +406,8 @@ fn baseline_catalog_spec(
         cfg_path,
         category: entry.category.clone(),
         expected_states: entry.ty_expected_states.or(entry.tlc.states),
-        expected_generated_states: entry.tlc.states_generated.or(entry.tlc.generated_states),
+        expected_raw_successors_generated: None,
+        expected_states_generated: entry.tlc.states_generated.or(entry.tlc.generated_states),
         timeout_seconds: entry
             .diagnose_timeout_seconds
             .unwrap_or(DEFAULT_SPEC_TIMEOUT_SECONDS),
@@ -629,6 +635,11 @@ fn execute_tlc_run(
         &stderr,
         [
             (counts.states_found, "states_found"),
+            (
+                counts.raw_initial_states_generated,
+                "raw_initial_states_generated",
+            ),
+            (counts.raw_successors_generated, "raw_successors_generated"),
             (counts.states_generated, "states_generated"),
         ],
     );
@@ -642,6 +653,8 @@ fn execute_tlc_run(
         states_found: counts.states_found,
         distinct_states: counts.distinct_states,
         transitions: counts.transitions,
+        raw_initial_states_generated: counts.raw_initial_states_generated,
+        raw_successors_generated: counts.raw_successors_generated,
         states_generated: counts.states_generated,
         returncode: result.returncode,
         error,
@@ -665,7 +678,12 @@ fn execute_ty_run(
         &stderr,
         [
             (counts.states_found, "states_found"),
-            (counts.transitions, "transitions"),
+            (
+                counts.raw_initial_states_generated,
+                "raw_initial_states_generated",
+            ),
+            (counts.raw_successors_generated, "raw_successors_generated"),
+            (counts.states_generated, "states_generated"),
         ],
     );
     let trust_cg_telemetry = if mode == "trust-cg" {
@@ -684,6 +702,9 @@ fn execute_ty_run(
         peak_rss_bytes: result.peak_rss_bytes,
         states_found: counts.states_found,
         transitions: counts.transitions,
+        raw_initial_states_generated: counts.raw_initial_states_generated,
+        raw_successors_generated: counts.raw_successors_generated,
+        states_generated: counts.states_generated,
         returncode: result.returncode,
         error,
         artifact_dir: Some(repo_relative(repo_root, &result.artifact_dir)),
@@ -699,7 +720,12 @@ fn execute_planned_run(run: &PlannedRun, timeout_seconds: u64) -> Result<Command
         cwd: run.command.cwd.clone(),
         env_overrides: run.command.env_overrides.clone(),
         timeout_seconds,
+        capture_limits: None,
         artifact_dir: run.artifact_dir.clone(),
+        payload_dir: None,
+        observation_storage_contract: None,
+        observation_storage_binding: None,
+        tlc_metadir: None,
     })
 }
 
@@ -1200,7 +1226,8 @@ mod tests {
 
         assert_eq!(spec.name, COFFEECAN_SAFETY_SPEC_NAME);
         assert_eq!(spec.expected_states, Some(501_500));
-        assert_eq!(spec.expected_generated_states, Some(1_498_502));
+        assert_eq!(spec.expected_raw_successors_generated, Some(1_498_502));
+        assert_eq!(spec.expected_states_generated, Some(1_499_503));
         assert!(spec.tla_path.is_file());
         assert!(spec.cfg_path.is_file());
         assert!(spec.tla_path.with_file_name("CoffeeCan.tla").is_file());
@@ -1236,7 +1263,8 @@ mod tests {
         assert_eq!(spec.name, "EWD998Small");
         assert_eq!(spec.category, "ewd998");
         assert_eq!(spec.expected_states, Some(1_520_618));
-        assert_eq!(spec.expected_generated_states, Some(9_630_813));
+        assert_eq!(spec.expected_raw_successors_generated, Some(9_630_813));
+        assert_eq!(spec.expected_states_generated, None);
         assert_eq!(spec.timeout_seconds, DEFAULT_SPEC_TIMEOUT_SECONDS);
     }
 
@@ -1293,7 +1321,8 @@ mod tests {
             examples.join("SpecifyingSystems/TLC/ABCorrectness.cfg")
         );
         assert_eq!(spec.expected_states, Some(20));
-        assert_eq!(spec.expected_generated_states, Some(34));
+        assert_eq!(spec.expected_raw_successors_generated, None);
+        assert_eq!(spec.expected_states_generated, Some(34));
         assert_eq!(spec.timeout_seconds, 123);
         assert_eq!(spec.notes, "fixture baseline note");
     }
@@ -1444,7 +1473,8 @@ mod tests {
             cfg_path: dir.path().join("Example.cfg"),
             category: "example".to_string(),
             expected_states: Some(1),
-            expected_generated_states: Some(2),
+            expected_raw_successors_generated: Some(2),
+            expected_states_generated: None,
             timeout_seconds: 3,
             notes: String::new(),
         };
@@ -1494,7 +1524,8 @@ mod tests {
             cfg_path: PathBuf::from("reports/generated/Example.cfg"),
             category: "example".to_string(),
             expected_states: Some(1),
-            expected_generated_states: Some(2),
+            expected_raw_successors_generated: Some(2),
+            expected_states_generated: None,
             timeout_seconds: 3,
             notes: String::new(),
         };
@@ -1594,7 +1625,8 @@ mod tests {
             cfg_path: dir.path().join("Example.cfg"),
             category: "example".to_string(),
             expected_states: Some(1),
-            expected_generated_states: Some(2),
+            expected_raw_successors_generated: Some(2),
+            expected_states_generated: None,
             timeout_seconds: 3,
             notes: String::new(),
         };
@@ -1725,7 +1757,7 @@ mod tests {
             trust_cg
                 .get("TY_TRUST_CG_NATIVE_CALLOUT_COMPILE_JOBS")
                 .map(String::as_str),
-            Some("27")
+            Some("1")
         );
         assert_eq!(
             trust_cg

@@ -44,10 +44,12 @@ fn lower_module(src: &str) -> Module {
     lowered.module.expect("lowered module")
 }
 
-fn expect_and(expr: &Spanned<Expr>) -> (&Spanned<Expr>, &Spanned<Expr>) {
+fn expect_if(expr: &Spanned<Expr>) -> (&Spanned<Expr>, &Spanned<Expr>, &Spanned<Expr>) {
     match &expr.node {
-        Expr::And(left, right) => (left.as_ref(), right.as_ref()),
-        other => panic!("expected And expression, got {other:?}"),
+        Expr::If(cond, then_branch, else_branch) => {
+            (cond.as_ref(), then_branch.as_ref(), else_branch.as_ref())
+        }
+        other => panic!("expected IF expression, got {other:?}"),
     }
 }
 
@@ -91,13 +93,6 @@ fn assert_eq_name_int(expr: &Spanned<Expr>, expected_name: &str, expected_value:
     }
 }
 
-fn assert_not_eq_name_int(expr: &Spanned<Expr>, expected_name: &str, expected_value: i64) {
-    match &expr.node {
-        Expr::Not(inner) => assert_eq_name_int(inner, expected_name, expected_value),
-        other => panic!("expected negated equality guard, got {other:?}"),
-    }
-}
-
 fn successor_xs_by_action(
     ctx: &mut EvalCtx,
     next_def: &OperatorDef,
@@ -131,7 +126,7 @@ fn successor_xs_by_action(
 
 #[cfg_attr(test, ntest::timeout(10000))]
 #[test]
-fn test_split_if_branches_are_guarded_and_enforced() {
+fn test_split_if_branches_preserve_condition_and_are_enforced() {
     let src = r#"
 ---- MODULE Test ----
 VARIABLE x
@@ -148,12 +143,16 @@ Next == IF x = 0 THEN ThenAction ELSE ElseAction
     assert_eq!(actions.len(), 2);
 
     assert_eq!(actions[0].name.as_deref(), Some("ThenAction"));
-    let (then_guard, _) = expect_and(&actions[0].expr);
-    assert_eq_name_int(then_guard, "x", 0);
+    let (then_cond, then_branch, then_else) = expect_if(&actions[0].expr);
+    assert_eq_name_int(then_cond, "x", 0);
+    assert!(matches!(&then_branch.node, Expr::Eq(_, _)));
+    assert!(matches!(&then_else.node, Expr::Bool(false)));
 
     assert_eq!(actions[1].name.as_deref(), Some("ElseAction"));
-    let (else_guard, _) = expect_and(&actions[1].expr);
-    assert_not_eq_name_int(else_guard, "x", 0);
+    let (else_cond, else_then, else_branch) = expect_if(&actions[1].expr);
+    assert_eq_name_int(else_cond, "x", 0);
+    assert!(matches!(&else_then.node, Expr::Bool(false)));
+    assert!(matches!(&else_branch.node, Expr::Eq(_, _)));
 
     let at_zero = successor_xs_by_action(&mut ctx, &next_def, 0);
     assert_eq!(
@@ -176,7 +175,7 @@ Next == IF x = 0 THEN ThenAction ELSE ElseAction
 
 #[cfg_attr(test, ntest::timeout(10000))]
 #[test]
-fn test_split_if_preserves_lexical_let_order_around_branch_guards() {
+fn test_split_if_preserves_lexical_let_order_around_branch_condition() {
     let src = r#"
 ---- MODULE Test ----
 VARIABLE x
@@ -201,11 +200,12 @@ Next ==
     assert_eq!(actions.len(), 2);
 
     let outer_body = expect_let_named(&actions[0].expr, "Outer");
-    let branch_guard_body = expect_let_named(outer_body, "BranchGuard");
-    let (guard, guarded_body) = expect_and(branch_guard_body);
-    assert_name_ref(guard, "BranchGuard");
+    let branch_if = expect_let_named(outer_body, "BranchGuard");
+    let (cond, selected_body, unselected_body) = expect_if(branch_if);
+    assert_name_ref(cond, "BranchGuard");
+    assert!(matches!(&unselected_body.node, Expr::Bool(false)));
 
-    let inner_body = expect_let_named(guarded_body, "Inner");
+    let inner_body = expect_let_named(selected_body, "Inner");
     assert_name_ref(inner_body, "Inner");
 }
 
@@ -229,16 +229,47 @@ Next == IF x = 0 THEN ThenAction ELSE ElseAction
     assert_eq!(actions.len(), 2);
 
     assert_eq!(actions[0].name.as_deref(), Some("ThenAction"));
-    let (then_guard, then_body) = expect_and(&actions[0].expr);
-    assert_eq_name_int(then_guard, "x", 0);
+    let (then_cond, then_body, then_else) = expect_if(&actions[0].expr);
+    assert_eq_name_int(then_cond, "x", 0);
+    assert!(matches!(&then_else.node, Expr::Bool(false)));
     assert!(
         matches!(&then_body.node, Expr::Exists(_, _)),
-        "unsplittable EXISTS should remain a guarded leaf: {:?}",
+        "unsplittable EXISTS should remain a conditional leaf: {:?}",
         &then_body.node
     );
 
-    let (else_guard, _) = expect_and(&actions[1].expr);
-    assert_not_eq_name_int(else_guard, "x", 0);
+    let (else_cond, else_then, _) = expect_if(&actions[1].expr);
+    assert_eq_name_int(else_cond, "x", 0);
+    assert!(matches!(&else_then.node, Expr::Bool(false)));
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_split_if_existential_condition_is_boolean_not_witness_multiplicity() {
+    let src = r#"
+---- MODULE Test ----
+VARIABLE x
+
+HasWitness == \E i \in {1, 2, 3} : x = 0
+ThenAction == x' = 1
+ElseAction == x' = 2
+
+Next == IF HasWitness THEN ThenAction ELSE ElseAction
+====
+"#;
+
+    let (mut ctx, next_def) = load_and_find_op(src, "Next");
+    let actions = split_action_instances(&ctx, &next_def.body).unwrap();
+    assert_eq!(actions.len(), 2);
+
+    let at_zero = successor_xs_by_action(&mut ctx, &next_def, 0);
+    assert_eq!(
+        at_zero,
+        vec![
+            (Some("ThenAction".to_string()), vec![1]),
+            (Some("ElseAction".to_string()), vec![]),
+        ]
+    );
 }
 
 #[cfg_attr(test, ntest::timeout(10000))]

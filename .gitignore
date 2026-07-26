@@ -147,3 +147,4 @@ vendor/
 
 # Publish tool work area
 publish/.out/
+.claude/worktrees/

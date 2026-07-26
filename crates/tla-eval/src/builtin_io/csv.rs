@@ -4,7 +4,6 @@
 
 use std::borrow::Cow;
 use tla_value::Rp;
-use std::sync::Arc;
 
 use super::super::{
     check_arity, eval as eval_expr, EvalCtx, EvalError, EvalResult, Expr, Span, Spanned, Value,

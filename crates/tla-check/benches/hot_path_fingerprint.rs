@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tla_check::state::{value_fingerprint, value_fingerprint_ahash, value_fingerprint_xxh3};
 use tla_check::Value;
 use tla_check::VarRegistry;
+use tla_value::Rp;
 
 use crate::hot_path_fixtures::*;
 
@@ -29,7 +30,7 @@ pub fn bench_value_fingerprint(c: &mut Criterion) {
     });
 
     group.bench_function("bigint_large", |b| {
-        let v = Value::Int(Arc::new(BigInt::from(10).pow(50)));
+        let v = Value::Int(Rp::new(BigInt::from(10).pow(50)));
         b.iter(|| black_box(value_fingerprint(black_box(&v))));
     });
 
@@ -64,7 +65,7 @@ pub fn bench_value_fingerprint(c: &mut Criterion) {
         group.throughput(Throughput::Elements(size as u64));
         group.bench_with_input(BenchmarkId::new("func", size), &size, |b, &size| {
             let func = int_func(size);
-            let v = Value::Func(Arc::new(func));
+            let v = Value::Func(Rp::new(func));
             b.iter(|| {
                 // Clear cache to measure actual fingerprinting work
                 let v_clone = v.clone();
@@ -76,7 +77,7 @@ pub fn bench_value_fingerprint(c: &mut Criterion) {
     // Function fingerprinting with cache (measures cache lookup overhead)
     group.bench_function("func_cached", |b| {
         let func = int_func(100);
-        let v = Value::Func(Arc::new(func));
+        let v = Value::Func(Rp::new(func));
         // Warm the cache
         let _ = value_fingerprint(&v);
         b.iter(|| black_box(value_fingerprint(black_box(&v))));
@@ -148,7 +149,7 @@ pub fn bench_fnv_vs_xxh3(c: &mut Criterion) {
     {
         let func = int_func(100);
         group.bench_function("func_100/fnv", |b| {
-            let v = Value::Func(Arc::new(func.clone()));
+            let v = Value::Func(Rp::new(func.clone()));
             b.iter(|| {
                 let v_clone = v.clone();
                 black_box(value_fingerprint(black_box(&v_clone)))
@@ -156,7 +157,7 @@ pub fn bench_fnv_vs_xxh3(c: &mut Criterion) {
         });
         let func = int_func(100);
         group.bench_function("func_100/xxh3", |b| {
-            let v = Value::Func(Arc::new(func.clone()));
+            let v = Value::Func(Rp::new(func.clone()));
             b.iter(|| {
                 let v_clone = v.clone();
                 black_box(value_fingerprint_xxh3(black_box(&v_clone)))
@@ -164,7 +165,7 @@ pub fn bench_fnv_vs_xxh3(c: &mut Criterion) {
         });
         let func = int_func(100);
         group.bench_function("func_100/ahash", |b| {
-            let v = Value::Func(Arc::new(func.clone()));
+            let v = Value::Func(Rp::new(func.clone()));
             b.iter(|| {
                 let v_clone = v.clone();
                 black_box(value_fingerprint_ahash(black_box(&v_clone)))
@@ -176,7 +177,7 @@ pub fn bench_fnv_vs_xxh3(c: &mut Criterion) {
     {
         let func = int_func(1000);
         group.bench_function("func_1000/fnv", |b| {
-            let v = Value::Func(Arc::new(func.clone()));
+            let v = Value::Func(Rp::new(func.clone()));
             b.iter(|| {
                 let v_clone = v.clone();
                 black_box(value_fingerprint(black_box(&v_clone)))
@@ -184,7 +185,7 @@ pub fn bench_fnv_vs_xxh3(c: &mut Criterion) {
         });
         let func = int_func(1000);
         group.bench_function("func_1000/xxh3", |b| {
-            let v = Value::Func(Arc::new(func.clone()));
+            let v = Value::Func(Rp::new(func.clone()));
             b.iter(|| {
                 let v_clone = v.clone();
                 black_box(value_fingerprint_xxh3(black_box(&v_clone)))
@@ -192,7 +193,7 @@ pub fn bench_fnv_vs_xxh3(c: &mut Criterion) {
         });
         let func = int_func(1000);
         group.bench_function("func_1000/ahash", |b| {
-            let v = Value::Func(Arc::new(func.clone()));
+            let v = Value::Func(Rp::new(func.clone()));
             b.iter(|| {
                 let v_clone = v.clone();
                 black_box(value_fingerprint_ahash(black_box(&v_clone)))

@@ -198,10 +198,12 @@ impl<'a> ModelChecker<'a> {
         &mut self,
         prop_name: &str,
         parts: &PropertySafetyParts,
+        init_states: &[(Fingerprint, ArrayState)],
     ) -> Option<CheckResult> {
-        let init_states = self.liveness_cache.init_states.clone();
-        if let Some(result) = self.check_init_terms(prop_name, &parts.init_terms, &init_states) {
-            return Some(result);
+        if !parts.init_terms.is_empty() {
+            if let Some(result) = self.check_init_terms(prop_name, &parts.init_terms, init_states) {
+                return Some(result);
+            }
         }
         if parts.always_terms.is_empty() {
             return None;
@@ -210,7 +212,8 @@ impl<'a> ModelChecker<'a> {
         let registry = self.ctx.var_registry().clone();
         let mut seen = FxHashSet::default();
         let mut queue = VecDeque::new();
-        for state in self.build_on_the_fly_init_states() {
+        for (_, init_arr) in init_states {
+            let state = init_arr.to_state(&registry);
             let state_fp = match self.state_fingerprint(&state) {
                 Ok(fp) => fp,
                 Err(error) => return Some(check_error_to_result(error, &self.stats)),

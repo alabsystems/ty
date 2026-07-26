@@ -283,6 +283,7 @@ mod native {
                         formal_values: vec![action_idx as i64],
                         read_vars: (0..STATE_LEN as u16).collect(),
                         write_vars: vec![action_slot(action_idx) as u16],
+                        compound_read_vars: Vec::new(),
                     },
                     action_lib.clone(),
                     action_symbol(action_idx),

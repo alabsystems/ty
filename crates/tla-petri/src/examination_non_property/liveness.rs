@@ -642,14 +642,14 @@ pub(crate) fn liveness_verdict_with_groups(
             return Verdict::False;
         }
 
-            if let Some(false) = crate::structural::lp_dead_transition(
+        if let Some(false) = crate::structural::lp_dead_transition(
             net,
             structural_live_soft_deadline(config.deadline()),
         ) {
             eprintln!("Liveness: LP-proved dead transition on original net");
             return Verdict::False;
         }
-        }
+    }
 
     // --- Stutter-sensitive reduced net ---
     // Agglomeration is unsound for Liveness (#1503), but dead-transition,

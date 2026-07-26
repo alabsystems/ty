@@ -25,10 +25,10 @@
 //! successor buffer from the predecessor state before execution.
 
 use rustc_hash::FxHashSet;
-use tla_value::Rp;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
+use tla_value::Rp;
 
 use num_traits::ToPrimitive;
 use tla_core::{intern_name, NameId};
@@ -966,6 +966,14 @@ fn transform_action_to_next_state_impl(
     {
         return ActionTransformOutcome::Unsafe(
             "RoundStepEq is VM-only and cannot enter action/native transformation".to_string(),
+        );
+    }
+    if instructions
+        .iter()
+        .any(|op| matches!(op, Opcode::EdgeFilter { .. }))
+    {
+        return ActionTransformOutcome::Unsafe(
+            "EdgeFilter is VM-only and cannot enter action/native transformation".to_string(),
         );
     }
 
@@ -2167,6 +2175,9 @@ fn opcode_reads_tainted(op: &Opcode, tainted: &[bool; 256]) -> bool {
         Opcode::RoundStepEq { child, parent, .. } => {
             tainted[*child as usize] || tainted[*parent as usize]
         }
+        Opcode::EdgeFilter {
+            first, arg, domain, ..
+        } => tainted[*first as usize] || tainted[*arg as usize] || tainted[*domain as usize],
         Opcode::FuncApply { func, arg, .. } => tainted[*func as usize] || tainted[*arg as usize],
         Opcode::FuncSet { domain, range, .. } => {
             tainted[*domain as usize] || tainted[*range as usize]
@@ -2281,6 +2292,7 @@ fn opcode_reads_tainted(op: &Opcode, tainted: &[bool; 256]) -> bool {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use tla_value::Rp;
 
     fn model_value(name: &str) -> Value {
         Value::ModelValue(Rp::from(name))

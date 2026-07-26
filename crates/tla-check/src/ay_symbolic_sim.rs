@@ -38,7 +38,7 @@
 //! Part of #3757 (Apalache Gap 9).
 
 use rustc_hash::FxHashMap;
-use std::collections::HashMap;
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use tla_ay::{AYError, BmcState, BmcTranslator, BmcValue, Model, SolveResult, TlaSort};
@@ -176,55 +176,41 @@ fn extract_state_at_step(
     model: &Model,
     var_sorts: &[(String, TlaSort)],
     step: usize,
-) -> BmcState {
+) -> Result<BmcState, SymbolicSimError> {
     let trace = translator.extract_trace(model);
-    // extract_trace returns states for all steps 0..=bound_k.
-    // We need only the state at `step`.
-    if step < trace.len() {
-        trace.into_iter().nth(step).unwrap_or(BmcState {
-            step,
-            assignments: HashMap::new(),
-        })
-    } else {
-        // Fallback: manually read from model using var_sorts.
-        let mut assignments = HashMap::new();
-        for (name, sort) in var_sorts {
-            let step_name = format!("{name}__{step}");
-            match sort {
-                TlaSort::Bool => {
-                    if let Some(val) = model.bool_val(&step_name) {
-                        assignments.insert(name.clone(), BmcValue::Bool(val));
-                    } else {
-                        eprintln!(
-                            "Warning: symbolic sim fallback: Bool variable '{name}' \
-                             not found in model at step {step}"
-                        );
-                    }
-                }
-                TlaSort::Int | TlaSort::String => {
-                    if let Some(val) = model.int_val(&step_name) {
-                        if let Ok(v) = i64::try_from(val) {
-                            assignments.insert(name.clone(), BmcValue::Int(v));
-                        } else {
-                            assignments.insert(name.clone(), BmcValue::BigInt(val.clone()));
-                        }
-                    } else {
-                        eprintln!(
-                            "Warning: symbolic sim fallback: Int variable '{name}' \
-                             not found in model at step {step}"
-                        );
-                    }
-                }
-                _ => {
-                    eprintln!(
-                        "Warning: symbolic sim fallback: variable '{name}' has \
-                         compound sort {sort} which is not yet supported (step {step})"
-                    );
-                }
-            }
-        }
-        BmcState { step, assignments }
+    let state = trace
+        .into_iter()
+        .find(|state| state.step == step)
+        .ok_or_else(|| {
+            SymbolicSimError::SolverFailed(format!(
+                "model trace has no state at requested step {step}"
+            ))
+        })?;
+
+    let expected: BTreeSet<&str> = var_sorts.iter().map(|(name, _)| name.as_str()).collect();
+    if expected.len() != var_sorts.len() {
+        return Err(SymbolicSimError::TranslationError(
+            "symbolic simulation variable-sort declarations contain duplicate names".to_string(),
+        ));
     }
+    let actual: BTreeSet<&str> = state.assignments.keys().map(String::as_str).collect();
+    if actual != expected {
+        let missing = expected
+            .difference(&actual)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let unexpected = actual
+            .difference(&expected)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(SymbolicSimError::SolverFailed(format!(
+            "incomplete typed model state at step {step}: missing [{missing}], unexpected [{unexpected}]"
+        )));
+    }
+
+    Ok(state)
 }
 
 // ---------------------------------------------------------------------------
@@ -279,7 +265,7 @@ fn run_single_simulation(
         match translator.try_check_sat()? {
             SolveResult::Sat => {
                 let model = translator.try_get_model()?;
-                extract_state_at_step(&translator, &model, var_sorts, 0)
+                extract_state_at_step(&translator, &model, var_sorts, 0)?
             }
             SolveResult::Unsat(_) => {
                 return Ok(SingleRunResult::SolverInconclusive {
@@ -353,7 +339,7 @@ fn run_single_simulation(
         match translator.try_check_sat()? {
             SolveResult::Sat => {
                 let model = translator.try_get_model()?;
-                let mut next_state = extract_state_at_step(&translator, &model, var_sorts, 1);
+                let mut next_state = extract_state_at_step(&translator, &model, var_sorts, 1)?;
                 next_state.step = depth + 1;
                 trace.push(next_state);
             }
@@ -668,6 +654,52 @@ mod tests {
             session_timeout: Some(Duration::from_secs(30)),
             debug: false,
         }
+    }
+
+    #[test]
+    fn typed_state_extraction_rejects_uninterned_string_projection() {
+        let mut translator = BmcTranslator::new(0).expect("translator");
+        translator
+            .declare_var("name", TlaSort::String)
+            .expect("declare String variable");
+        assert_eq!(
+            translator.try_check_sat().expect("solver result"),
+            SolveResult::Sat
+        );
+        let model = translator.try_get_model().expect("model");
+
+        assert!(matches!(
+            extract_state_at_step(
+                &translator,
+                &model,
+                &[("name".to_string(), TlaSort::String)],
+                0,
+            ),
+            Err(SymbolicSimError::SolverFailed(message))
+                if message.contains("missing [name]")
+        ));
+    }
+
+    #[test]
+    fn typed_state_extraction_rejects_partial_compound_projection() {
+        let sort = TlaSort::Record {
+            field_sorts: vec![("name".to_string(), TlaSort::String)],
+        };
+        let mut translator = BmcTranslator::new_with_arrays(0).expect("translator");
+        translator
+            .declare_var("record", sort.clone())
+            .expect("declare record variable");
+        assert_eq!(
+            translator.try_check_sat().expect("solver result"),
+            SolveResult::Sat
+        );
+        let model = translator.try_get_model().expect("model");
+
+        assert!(matches!(
+            extract_state_at_step(&translator, &model, &[("record".to_string(), sort)], 0),
+            Err(SymbolicSimError::SolverFailed(message))
+                if message.contains("missing [record]")
+        ));
     }
 
     #[test]

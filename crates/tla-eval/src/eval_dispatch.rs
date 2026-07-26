@@ -12,15 +12,15 @@
 use super::profile_eval;
 use super::EVAL_CALL_COUNT;
 use super::{
-    build_lazy_subst_bindings, eval_and, eval_apply, eval_arith, eval_big_union, eval_case,
-    eval_choose, eval_comparison, eval_div, eval_domain, eval_enabled_op, eval_eq, eval_equiv,
-    eval_except, eval_exists, eval_forall, eval_func_apply, eval_func_def, eval_func_set,
-    eval_ident, eval_if, eval_implies, eval_in, eval_int_literal, eval_intersect, eval_lambda,
-    eval_let, eval_mod, eval_module_ref_target, eval_neg, eval_neq, eval_not, eval_not_in, eval_or,
-    eval_pow, eval_powerset, eval_prime, eval_range, eval_real_div, eval_record,
-    eval_record_access, eval_record_set, eval_set_builder, eval_set_enum, eval_set_filter,
-    eval_set_minus, eval_state_var, eval_string_literal, eval_subseteq, eval_times, eval_tuple,
-    eval_unchanged, eval_union, stack_safe, EvalCtx, EvalError, EvalResult,
+    eval_and, eval_apply, eval_arith, eval_big_union, eval_case, eval_choose, eval_comparison,
+    eval_div, eval_domain, eval_enabled_op, eval_eq, eval_equiv, eval_except, eval_exists,
+    eval_forall, eval_func_apply, eval_func_def, eval_func_set, eval_ident, eval_if, eval_implies,
+    eval_in, eval_int_literal, eval_intersect, eval_lambda, eval_let, eval_mod,
+    eval_module_ref_target, eval_neg, eval_neq, eval_not, eval_not_in, eval_or, eval_pow,
+    eval_powerset, eval_prime, eval_range, eval_real_div, eval_record, eval_record_access,
+    eval_record_set, eval_set_builder, eval_set_enum, eval_set_filter, eval_set_minus,
+    eval_state_var, eval_string_literal, eval_subseteq, eval_times, eval_tuple, eval_unchanged,
+    eval_union, stack_safe, EvalCtx, EvalError, EvalResult,
 };
 use crate::value::{val_false, val_true, Value};
 use num_integer::Integer;
@@ -462,7 +462,17 @@ fn eval_subst_in(
             .insert(scope_key, (arc.clone(), scope_id));
         (arc, scope_id)
     });
-    let new_bindings = build_lazy_subst_bindings(&ctx.bindings, &subs_arc);
+    // Memoized: the SubstIn node's AST address is the run-stable site
+    // identity; its substitution list is a pure clone of that node's subs
+    // (see cache::subst_chain_memo).
+    let new_bindings = crate::cache::subst_chain_memo::subst_chain_memoized(
+        ctx,
+        &ctx.bindings,
+        None,
+        &subs_arc,
+        crate::cache::subst_chain_memo::SITE_SUBST_IN,
+        subs_ptr as u64,
+    );
     let mut sub_ctx = ctx.clone();
     sub_ctx.bindings = new_bindings;
     let s = sub_ctx.stable_mut();

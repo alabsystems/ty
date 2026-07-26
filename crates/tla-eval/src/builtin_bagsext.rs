@@ -3,11 +3,10 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::{check_arity, eval, EvalCtx, EvalError, EvalResult, Expr, Span, Spanned, Value};
-use tla_value::Rp;
 use crate::builtin_bags::bag_from_sorted_entries;
 use num_bigint::BigInt;
 use num_traits::{One, ToPrimitive, Zero};
-use std::sync::Arc;
+use tla_value::Rp;
 
 // BagsExt module operators — BagAdd, BagRemove, BagRemoveAll, FoldBag, SumBag, ProductBag
 

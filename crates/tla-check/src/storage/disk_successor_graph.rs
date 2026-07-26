@@ -7,8 +7,9 @@
 //! Stores `parent_fp -> [child_fps]` relationships in an append-only disk
 //! file with an in-memory offset index. BFS appends successor records during
 //! exploration; post-BFS liveness checking reads them back through an mmap view
-//! plus a bounded direct-mapped cache so SCC analysis does not rebuild the
-//! graph in RAM.
+//! plus a fixed-slot direct-mapped cache so SCC analysis does not rebuild every
+//! decoded payload. The offset index remains O(states), cached Vec bytes depend
+//! on fanout, and mapped-page residency is OS-dependent.
 //!
 //! Part of #3176.
 //!
@@ -21,13 +22,15 @@
 //! ## Index
 //!
 //! `FxHashMap<Fingerprint, u64>` maps parent fingerprint to file byte offset.
-//! Memory cost: ~16 bytes per state (8-byte key + 8-byte offset).
+//! The logical key + offset payload is 16 bytes per state before HashMap control
+//! bytes, spare capacity, and allocator overhead.
 //!
 //! ## Cache
 //!
-//! Bounded direct-mapped cache (default 64K entries) avoids repeated mmap
-//! parsing during SCC DFS traversal while keeping memory usage independent of
-//! state count. Collisions evict one slot; the mmap/index remain authoritative.
+//! Fixed-slot direct-mapped cache (default 64K entries) avoids repeated mmap
+//! parsing during SCC traversal. Slot count is independent of state count, but
+//! cached successor-Vec bytes depend on fanout. Collisions evict one slot; the
+//! mmap/index remain authoritative.
 
 use crate::state::Fingerprint;
 use memmap2::Mmap;
@@ -66,8 +69,9 @@ struct ReadState {
 /// Disk-backed successor graph.
 ///
 /// Append-only file stores successor lists; an in-memory index provides O(1)
-/// lookup by parent fingerprint; mmap-backed reads plus a bounded direct-mapped cache
-/// keep post-BFS SCC traversal memory-bounded.
+/// lookup by parent fingerprint; mmap-backed reads plus a fixed-slot direct
+/// cache retain decoded successors. The index remains O(states), and cache
+/// payload bytes depend on fanout.
 ///
 /// Uses `RefCell` for interior mutability on the read path so that `get()`
 /// can take `&self`, matching the immutable borrow pattern of the liveness
@@ -121,6 +125,21 @@ impl DiskSuccessorGraph {
             total_successors: 0,
             backing_file: backing,
         })
+    }
+
+    /// Shrink the direct-mapped read cache to at most `max_slots` empty slots.
+    ///
+    /// Changing the modulus invalidates every existing slot, so this drops the
+    /// old cache rather than attempting to rehash it. The file and O(states)
+    /// parent-offset index remain authoritative and unchanged.
+    pub(crate) fn shrink_cache_to(&mut self, max_slots: usize) {
+        assert!(max_slots > 0, "cache_slots must be non-zero");
+        if self.cache_capacity <= max_slots {
+            return;
+        }
+        let replacement = (0..max_slots).map(|_| None).collect();
+        self.read_state.get_mut().cache = replacement;
+        self.cache_capacity = max_slots;
     }
 
     /// Insert a parent fingerprint and its successor list.
@@ -369,6 +388,11 @@ impl DiskSuccessorGraph {
     }
 
     #[cfg(test)]
+    pub(crate) fn cache_slots(&self) -> usize {
+        self.cache_capacity
+    }
+
+    #[cfg(test)]
     fn clear_cache_for_test(&self) {
         self.clear_cache_slots(&mut self.read_state.borrow_mut());
     }
@@ -387,6 +411,14 @@ impl DiskSuccessorGraph {
     /// Number of distinct parent entries.
     pub(crate) fn len(&self) -> usize {
         self.entry_count
+    }
+
+    /// Whether the resident offset index contains a parent entry.
+    ///
+    /// This does not flush the writer, map the backing file, or populate the
+    /// read cache.
+    pub(super) fn contains_parent(&self, fp: &Fingerprint) -> bool {
+        self.index.contains_key(fp)
     }
 
     /// Total successor fingerprints stored (for diagnostics).

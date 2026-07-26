@@ -5,11 +5,10 @@
 //! Readonly-cache mode tests: verify that fingerprint reads do not write
 //! cached state when parallel readonly caches are enabled.
 
+use crate::rp::Rp;
 use crate::value::FuncValue;
 use crate::{IntIntervalFunc, Value};
 use std::sync::{Mutex, MutexGuard};
-use crate::rp::Rp as Arc;
-use crate::rp::Rp;
 
 use super::state_value_fingerprint_unwrap;
 
@@ -119,6 +118,12 @@ fn parallel_readonly_value_cache_additive_seq_preserves_result_without_cache_wri
 #[test]
 fn parallel_readonly_value_cache_additive_record_preserves_result_without_cache_write() {
     let _guard = ReadonlyValueCacheGuard::new();
+    // Build OUTSIDE the record intern table: interning seeds the additive-fp
+    // cache at CONSTRUCTION (safe: the fresh record is exclusively owned and
+    // not yet shared across threads), which would make the final None
+    // assertion vacuous. This test verifies state_value_fingerprint itself
+    // performs no cache write in readonly mode.
+    let _skip = crate::value::InterningSkipGuard::new();
     let value = Value::record([("x", Value::Bool(true)), ("y", Value::Bool(false))]);
     let Value::Record(record) = &value else {
         panic!("expected record");

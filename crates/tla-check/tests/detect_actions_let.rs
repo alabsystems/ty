@@ -62,7 +62,7 @@ Next ==
 
 #[cfg_attr(test, ntest::timeout(10000))]
 #[test]
-fn test_detect_actions_let_preserves_guards_inside_wrapper() {
+fn test_detect_actions_let_preserves_branch_conditions_inside_wrapper() {
     let src = r#"
 ---- MODULE LetIfActions ----
 VARIABLE x
@@ -98,20 +98,35 @@ Next ==
                 assert_eq!(defs.len(), 1);
                 assert_eq!(defs[0].name.node, "D");
                 match &body.node {
-                    Expr::And(g, inner) => match (action.name.as_str(), &g.node, &inner.node) {
-                        ("D", Expr::Ident(c, NameId::INVALID), Expr::Ident(d, NameId::INVALID)) => {
+                    Expr::If(c, then_branch, else_branch) => match (
+                        action.name.as_str(),
+                        &c.node,
+                        &then_branch.node,
+                        &else_branch.node,
+                    ) {
+                        (
+                            "D",
+                            Expr::Ident(c, NameId::INVALID),
+                            Expr::Ident(d, NameId::INVALID),
+                            Expr::Bool(false),
+                        ) => {
                             assert_eq!(c, "c");
                             assert_eq!(d, "D");
                             saw_then = true;
                         }
-                        ("B", Expr::Not(c), Expr::Ident(b, NameId::INVALID)) => {
-                            assert!(matches!(&c.node, Expr::Ident(name, _) if name == "c"));
+                        (
+                            "B",
+                            Expr::Ident(c, NameId::INVALID),
+                            Expr::Bool(false),
+                            Expr::Ident(b, NameId::INVALID),
+                        ) => {
+                            assert_eq!(c, "c");
                             assert_eq!(b, "B");
                             saw_else = true;
                         }
-                        _ => panic!("unexpected guarded LET action: {action:?}"),
+                        _ => panic!("unexpected conditional LET action: {action:?}"),
                     },
-                    other => panic!("expected LET body to be And guard, got {other:?}"),
+                    other => panic!("expected LET body to preserve IF, got {other:?}"),
                 }
             }
             other => panic!("expected LET wrapper, got {other:?}"),

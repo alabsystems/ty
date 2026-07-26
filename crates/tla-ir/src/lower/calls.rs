@@ -80,12 +80,14 @@ impl<'cp> Ctx<'cp> {
             if self_recursive_callee {
                 raw.into_iter()
                     .enumerate()
-                    .map(|(i, shape)| match expected_arg_shapes.get(i).cloned().flatten() {
-                        Some(declared @ super::AggregateShape::TaggedScalarUnion { .. }) => {
-                            Some(declared)
-                        }
-                        _ => super::decoded_self_recursive_callsite_arg_shape(shape),
-                    })
+                    .map(
+                        |(i, shape)| match expected_arg_shapes.get(i).cloned().flatten() {
+                            Some(declared @ super::AggregateShape::TaggedScalarUnion { .. }) => {
+                                Some(declared)
+                            }
+                            _ => super::decoded_self_recursive_callsite_arg_shape(shape),
+                        },
+                    )
                     .collect()
             } else {
                 raw
@@ -343,8 +345,7 @@ impl<'cp> Ctx<'cp> {
                         "self-recursive callee {op_idx} is being lowered without a depth parameter"
                     ))
                 })?;
-                let limit =
-                    self.emit_i64_const(current_block, super::SELF_RECURSION_DEPTH_LIMIT);
+                let limit = self.emit_i64_const(current_block, super::SELF_RECURSION_DEPTH_LIMIT);
                 let below_limit = self.emit_with_result(
                     current_block,
                     Inst::ICmp {
@@ -663,6 +664,7 @@ impl<'cp> Ctx<'cp> {
             | Opcode::Tuple2SelfEq { rd, .. }
             | Opcode::Tuple2SelfSubseteq { rd, .. }
             | Opcode::RoundStepEq { rd, .. }
+            | Opcode::EdgeFilter { rd, .. }
             | Opcode::Subseteq { rd, .. }
             | Opcode::Powerset { rd, .. }
             | Opcode::BigUnion { rd, .. }

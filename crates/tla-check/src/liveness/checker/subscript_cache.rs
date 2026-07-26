@@ -241,10 +241,23 @@ pub(super) fn eval_subscript_changed(
     let val1 = if let Some(h) = cache_tag.and_then(|tag| get_subscript_fp_cached(fp1, tag)) {
         h
     } else {
-        // Fix #2780: Clear SUBST_CACHE before evaluating val1 via with_explicit_env
-        // (state_env=None, pointer 0). A prior call's val2 evaluation may have left
-        // entries keyed on the same pointer 0, causing stale hits here.
+        // Fix #2780 + #ewd998-refine-fix: `with_explicit_env` sets `state_env = None`,
+        // so EVERY per-state cache that keys on the state pointer collapses to
+        // `state_identity = 0` for BOTH the current (val1) and successor (val2)
+        // subscript evaluations. Fix #2780 cleared only SUBST_CACHE, but the same
+        // identity-0 collision also leaks the CHOOSE caches: a refinement mapping's
+        // `tpos == CHOOSE i \in Node : ... inbox[i] ...` computed for s1 (token at one
+        // node) is served STALE to s2 (token at another node), producing a wrong
+        // subscript value or a spurious "CHOOSE failed: no value satisfies predicate"
+        // (EWD998Chan's `EWD998!vars` subscript inside `WF_EWD998!vars(EWD998!System)`).
+        // `invalidate_state_identity_tracking()` clears choose_cache/choose_deep_cache
+        // and advances the state-generation counter — the CHOOSE-cache analogue of the
+        // SUBST_CACHE clear. (The complementary root fix in `eval_choose` keeps the
+        // refinement mapping's zero-arg operators from being mis-cached as constants
+        // during ENABLED scope, so this per-state cache boundary need not also clear the
+        // zero-arg partitions — keeping the post-BFS liveness pass cheap.)
         crate::eval::clear_subst_cache();
+        crate::eval::invalidate_state_identity_tracking();
         // Build environment from s1 (current state).
         //
         // Preserve base env bindings (constants/config overrides like `Node`) and
@@ -268,13 +281,12 @@ pub(super) fn eval_subscript_changed(
     let val2 = if let Some(h) = cache_tag.and_then(|tag| get_subscript_fp_cached(fp2, tag)) {
         h
     } else {
-        // Clear SUBST_CACHE before evaluating val2 via with_explicit_env (state_env=None).
-        // Required when val1 was also evaluated via with_explicit_env (both have pointer
-        // identity 0, so eval_entry's pointer-based invalidation sees "same state").
-        // Also clear defensively when val1 was cached but val2 is not: the SUBST_CACHE
-        // may contain entries from a prior with_explicit_env call (same pointer 0),
-        // and the pre-population invariant (all fps cached) is not enforced here.
+        // Fix #2780 + #ewd998-refine-fix: SUBST + CHOOSE cache boundary before val2's
+        // with_explicit_env (state_env=None, identity 0) evaluation — see the val1
+        // branch above. Prevents val1's CHOOSE results (computed against s1's `inbox`)
+        // from being served to val2 (s2's `inbox`), whose token sits at a different node.
         crate::eval::clear_subst_cache();
+        crate::eval::invalidate_state_identity_tracking();
         // Build environment from s2 (next state) with the same base-env preservation.
         let mut env2 = ctx.env().clone();
         for (name, value) in s2.vars() {

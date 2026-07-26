@@ -66,6 +66,15 @@ pub(super) fn check_cache_hit(ctx: &CacheLookupCtx<'_>) -> Result<bool> {
         check_report::format_guard_suppression_suffix(stats.suppressed_guard_errors as usize)
     );
     println!("  Initial states: {}", stats.initial_states);
+    println!(
+        "  Initial states generated: {}",
+        stats.raw_initial_states_generated
+    );
+    let states_generated = stats
+        .raw_initial_states_generated
+        .checked_add(stats.raw_successors_generated)
+        .expect("cached raw generated-state total overflowed u64");
+    println!("  States generated: {}", states_generated);
     println!("  Transitions: {}", stats.transitions);
     println!("  Max queue depth: {}", stats.max_queue_depth);
     println!("  Time: {:.3}s", 0.0);
@@ -119,6 +128,10 @@ pub(super) fn update_check_cache(ctx: CacheUpdateCtx<'_>) {
             stats: Some(cache::CacheStats {
                 states_found: stats.states_found as u64,
                 initial_states: stats.initial_states as u64,
+                raw_initial_states_generated: u64::try_from(stats.raw_initial_states_generated)
+                    .expect("raw initial-state generation count does not fit u64"),
+                raw_successors_generated: u64::try_from(stats.raw_successors_generated)
+                    .expect("raw successor generation count does not fit u64"),
                 max_queue_depth: stats.max_queue_depth as u64,
                 transitions: stats.transitions as u64,
                 max_depth: stats.max_depth as u64,

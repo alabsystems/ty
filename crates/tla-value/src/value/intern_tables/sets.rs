@@ -6,11 +6,11 @@
 use super::super::memory_stats;
 use super::super::{parallel_intern, Value};
 use super::shared::{record_counted_insert, reset_counted_table, MAX_INTERN_TABLE_ENTRIES};
+use crate::rp::Rp as Arc;
 use dashmap::DashMap;
 use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{OnceLock};
-use crate::rp::Rp as Arc;
+use std::sync::OnceLock;
 
 /// Global set intern table for deduplicating small sets.
 ///
@@ -150,6 +150,7 @@ pub(crate) fn intern_set_array(elements: Vec<Value>) -> Arc<[Value]> {
 /// Clear the set intern table.
 /// Call between model checking runs to free memory.
 pub fn clear_set_intern_table() {
+    crate::value::set_ops::clear_set_cup_membership_cache();
     if let Some(table) = SET_INTERN_TABLE.get() {
         reset_counted_table(table, &SET_INTERN_TABLE_ENTRY_COUNT);
     } else {

@@ -24,7 +24,6 @@ def _manifest(name: str, git: str, selector: str) -> str:
 
 def _valid_tree(root: Path) -> None:
     package_blocks = []
-    metadata_lines = []
     for pin in pins.PINS:
         selector = f'rev = "{pin.rev}"'
         for relative in pin.manifests:
@@ -37,11 +36,7 @@ def _valid_tree(root: Path) -> None:
             f'version = "{pin.version}"\n'
             f'source = "{pin.lock_source}"\n'
         )
-        metadata_lines.append(
-            f'"checksum {pin.name} {pin.version} ({pin.lock_source_base})" = "<none>"'
-        )
     lock = "version = 3\n\n" + "\n".join(package_blocks)
-    lock += "\n[metadata]\n" + "\n".join(metadata_lines) + "\n"
     (root / "Cargo.lock").write_text(lock, encoding="utf-8")
 
 

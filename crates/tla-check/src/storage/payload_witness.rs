@@ -6,7 +6,9 @@
 
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
-use tla_value::{CompactValue, Rp};
+use tla_value::CompactValue;
+#[cfg(test)]
+use tla_value::Rp;
 
 use crate::state::{compact_value_fingerprint, fp_hashmap, ArrayState, Fingerprint, FpHashMap};
 
@@ -443,6 +445,7 @@ impl FingerprintPayloadWitnesses {
         *self = Self::new();
     }
 
+    #[cfg(test)]
     fn with_array_witness_value_pool(use_compact_pool: bool) -> Self {
         Self::with_array_witness_value_pool_config(use_compact_pool, false)
     }

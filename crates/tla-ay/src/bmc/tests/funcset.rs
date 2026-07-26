@@ -90,6 +90,38 @@ fn test_bmc_funcset_exists_unsat() {
     assert!(matches!(trans.check_sat(), SolveResult::Unsat(_)));
 }
 
+/// Direct membership introduces an internal existential function witness. Its
+/// source-level spelling must be fresh: otherwise a user variable named like
+/// the old `__fs_member_0` placeholder is captured and `x = witness` folds to
+/// the tautology `witness = witness`.
+#[cfg_attr(test, ntest::timeout(20000))]
+#[test]
+fn test_bmc_funcset_direct_membership_witness_is_ast_hygienic() {
+    let mut trans = BmcTranslator::new_with_arrays(0).unwrap();
+    trans
+        .declare_tuple_var("__fs_member_0", vec![TlaSort::Int])
+        .unwrap();
+
+    let user_cell = trans
+        .get_tuple_element_at_step("__fs_member_0", 1, 0)
+        .unwrap();
+    let two = trans.solver.int_const(2);
+    let user_is_two = trans.solver.try_eq(user_cell, two).unwrap();
+    trans.assert(user_is_two);
+
+    // <<2>> is not a member of [1..1 -> {1}]. The result must therefore be
+    // UNSAT even though the adversarial user name matches the first historical
+    // witness spelling.
+    let singleton_one = spanned(Expr::SetEnum(vec![int(1)]));
+    let membership = spanned(Expr::In(
+        Box::new(ident("__fs_member_0")),
+        Box::new(func_set(1, 1, singleton_one)),
+    ));
+    let term = trans.translate_init(&membership).unwrap();
+    trans.assert(term);
+    assert!(matches!(trans.check_sat(), SolveResult::Unsat(_)));
+}
+
 /// `\A f \in [1..2 -> 1..2] : f[1] >= 1` — SAT (every value is >= 1).
 #[cfg_attr(test, ntest::timeout(20000))]
 #[test]

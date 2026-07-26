@@ -8,12 +8,12 @@
 //! the 500 LOC policy threshold.
 
 use super::super::super::debug::liveness_profile;
-use crate::liveness::debug::liveness_otf_compact_cache_enabled;
+use super::super::super::fingerprint::BfsFingerprintDomain;
 use super::super::super::{
     check_error_to_result, Arc, ArrayState, CheckError, CheckResult, Fingerprint, LivenessChecker,
     ModelChecker, State,
 };
-use super::{GroupResolution, LivenessPropertyCtx};
+use super::{GroupResolution, LivenessPropertyCtx, OtfExactRawCacheSession, OtfRetainedSuccessors};
 use crate::error::EvalError;
 use crate::liveness::GroupedLivenessPlan;
 use crate::{ConfigCheckError, EvalCheckError, LivenessCheckError};
@@ -48,15 +48,69 @@ impl ModelChecker<'_> {
         Ok(filtered)
     }
 
-    pub(in crate::check::model_checker::liveness) fn build_on_the_fly_init_states(
-        &self,
-    ) -> Vec<State> {
+    /// Resolve one complete successor list from BFS-retained adjacency.
+    ///
+    /// Retained keys live in the frozen BFS fingerprint domain, while the
+    /// on-the-fly behavior graph deliberately uses exact raw fingerprints.
+    /// `array_state_fingerprint` performs the source-domain translation.
+    /// Destination payloads are borrowed from the BFS-keyed wide-Init index; if even one is
+    /// unavailable, return `None` so the caller evaluates Next for the whole
+    /// source rather than constructing a partial edge set.
+    pub(in crate::check::model_checker::liveness) fn replay_liveness_successors_from_retained(
+        &mut self,
+        state: &State,
+        retained: &OtfRetainedSuccessors<'_>,
+    ) -> Result<Option<Vec<State>>, CheckError> {
         let registry = self.ctx.var_registry().clone();
-        self.liveness_cache
-            .init_states
-            .iter()
-            .map(|(_, arr)| arr.to_state(&registry))
-            .collect()
+        let source_fp = match self.bfs_fingerprint_domain() {
+            BfsFingerprintDomain::CompiledFlat => {
+                let mut source_array = ArrayState::from_state(state, &registry);
+                self.array_state_fingerprint(&mut source_array)?
+            }
+            BfsFingerprintDomain::FullStateFp64 | BfsFingerprintDomain::ArrayFp64
+                if !self.nested_set_monitors_active() =>
+            {
+                let mut source_array = ArrayState::from_state(state, &registry);
+                self.array_state_fingerprint(&mut source_array)?
+            }
+            BfsFingerprintDomain::FullStateFp64
+            | BfsFingerprintDomain::ArrayFp64
+            | BfsFingerprintDomain::View
+            | BfsFingerprintDomain::SymmetryCanonical
+            | BfsFingerprintDomain::FlatSymmetryCanonical => return Ok(None),
+        };
+        let Some(successor_fps) = retained.successor_fps(&source_fp) else {
+            return Ok(None);
+        };
+        let mut successors = Vec::with_capacity(
+            successor_fps.len() + usize::from(self.exploration.stuttering_allowed),
+        );
+        for successor_fp in successor_fps {
+            let Some(successor) = retained.init_state(&successor_fp) else {
+                return Ok(None);
+            };
+            successors.push(successor.to_state(&registry));
+        }
+        if self.exploration.stuttering_allowed {
+            successors.push(state.clone());
+        }
+        Ok(Some(successors))
+    }
+
+    fn generate_liveness_successors_reusing_retained(
+        &mut self,
+        state: &State,
+        retained: Option<&OtfRetainedSuccessors<'_>>,
+    ) -> Result<(Vec<State>, bool), CheckError> {
+        if let Some(retained) = retained {
+            if let Some(successors) =
+                self.replay_liveness_successors_from_retained(state, retained)?
+            {
+                return Ok((successors, true));
+            }
+        }
+        self.generate_liveness_successors_on_the_fly(state)
+            .map(|successors| (successors, false))
     }
 
     pub(in crate::check::model_checker::liveness) fn explore_grouped_liveness_plan_on_the_fly(
@@ -64,7 +118,11 @@ impl ModelChecker<'_> {
         group_idx: usize,
         grouped_plan_count: usize,
         plan: &GroupedLivenessPlan,
+        init_states: &[(Fingerprint, ArrayState)],
+        retained_successors: Option<&OtfRetainedSuccessors<'_>>,
         tir: Option<&TirProgram>,
+        exact_raw_cache: &mut OtfExactRawCacheSession,
+        use_owned_compact_cache: bool,
     ) -> Result<LivenessChecker, CheckResult> {
         if liveness_profile() {
             eprintln!(
@@ -98,26 +156,56 @@ impl ModelChecker<'_> {
                 ));
             }
         };
-        let init_states = self.build_on_the_fly_init_states();
+        checker.set_exact_raw_fp_leaf_fast_path_allowed(
+            self.liveness_exact_raw_fp_leaf_fast_path_allowed(),
+        );
         let stats = self.stats.clone();
         let needs_canonical_fp =
             self.compiled.cached_view_name.is_some() || !self.symmetry.perms.is_empty();
-        let use_owned_compact_cache = !needs_canonical_fp && liveness_otf_compact_cache_enabled();
+        debug_assert!(!use_owned_compact_cache || !needs_canonical_fp);
+        let registry = self.ctx.var_registry().clone();
+        let materialized_init_states = (!use_owned_compact_cache).then(|| {
+            init_states
+                .iter()
+                .map(|(_, arr)| arr.to_state(&registry))
+                .collect::<Vec<_>>()
+        });
         if use_owned_compact_cache {
             // VIEW/symmetry need canonical fingerprints and concrete witnesses,
             // so only exact raw fingerprints use the owned compact cache.
-            checker.enable_owned_behavior_graph_state_cache();
+            if let Some(cache) = exact_raw_cache.take() {
+                checker.install_exact_raw_state_graph_cache(cache);
+            } else {
+                checker.enable_owned_behavior_graph_state_cache();
+            }
+        } else {
+            // Do not retain an exact-raw cache while a canonical/legacy checker
+            // allocates a separate state representation.
+            exact_raw_cache.disable();
         }
         let checker_ref = std::cell::RefCell::new(self);
         let mut state_fp_to_canon_fp: Option<FxHashMap<Fingerprint, Fingerprint>> =
             needs_canonical_fp.then(FxHashMap::default);
         let explore_start = std::time::Instant::now();
+        let mut retained_source_hits = 0usize;
+        let mut retained_source_fallbacks = 0usize;
         let explore_result = {
             let mut get_successors = |state: &State| {
-                checker_ref
+                let result = checker_ref
                     .borrow_mut()
-                    .generate_liveness_successors_on_the_fly(state)
-                    .map_err(|error| match error {
+                    .generate_liveness_successors_reusing_retained(state, retained_successors);
+                match result {
+                    Ok((successors, true)) => {
+                        retained_source_hits += 1;
+                        Ok(successors)
+                    }
+                    Ok((successors, false)) => {
+                        if retained_successors.is_some() {
+                            retained_source_fallbacks += 1;
+                        }
+                        Ok(successors)
+                    }
+                    Err(error) => Err(match error {
                         CheckError::Eval(EvalCheckError::Eval(inner)) => inner,
                         other => EvalError::Internal {
                             message: format!(
@@ -125,7 +213,8 @@ impl ModelChecker<'_> {
                             ),
                             span: None,
                         },
-                    })
+                    }),
+                }
             };
             let mut state_fp_of = |state: &State| -> Result<Fingerprint, EvalError> {
                 if let Some(fp_map) = state_fp_to_canon_fp.as_mut() {
@@ -154,18 +243,39 @@ impl ModelChecker<'_> {
             };
 
             if matches!(&plan.tf, crate::liveness::LiveExpr::Bool(true)) {
-                checker.explore_state_graph_direct_with_state_fp(
-                    &init_states,
-                    &mut get_successors,
-                    &mut state_fp_of,
-                )
+                if use_owned_compact_cache {
+                    checker.explore_state_graph_direct_with_raw_array_init_states(
+                        init_states.iter().map(|(_, arr)| arr),
+                        &registry,
+                        &mut get_successors,
+                    )
+                } else {
+                    checker.explore_state_graph_direct_with_state_fp(
+                        materialized_init_states
+                            .as_deref()
+                            .expect("legacy direct exploration requires materialized roots"),
+                        &mut get_successors,
+                        &mut state_fp_of,
+                    )
+                }
             } else {
-                checker.explore_bfs_with_state_fp(
-                    &init_states,
-                    &mut get_successors,
-                    tir,
-                    &mut state_fp_of,
-                )
+                if use_owned_compact_cache {
+                    checker.explore_bfs_with_raw_array_init_states(
+                        init_states.iter().map(|(_, arr)| arr),
+                        &registry,
+                        &mut get_successors,
+                        tir,
+                    )
+                } else {
+                    checker.explore_bfs_with_state_fp(
+                        materialized_init_states
+                            .as_deref()
+                            .expect("legacy tableau exploration requires materialized roots"),
+                        &mut get_successors,
+                        tir,
+                        &mut state_fp_of,
+                    )
+                }
             }
         };
         if let Err(error) = explore_result {
@@ -173,6 +283,12 @@ impl ModelChecker<'_> {
                 EvalCheckError::Eval(error).into(),
                 &stats,
             ));
+        }
+        if liveness_profile() && retained_successors.is_some() {
+            eprintln!(
+                "[liveness] retained adjacency: {retained_source_hits} source hits, \
+                 {retained_source_fallbacks} Next fallbacks"
+            );
         }
         if let Some(fp_map) = state_fp_to_canon_fp.filter(|map| !map.is_empty()) {
             checker.set_successor_maps(Arc::new(fp_map), None);
@@ -264,6 +380,9 @@ impl ModelChecker<'_> {
                 ));
             }
         };
+        checker.set_exact_raw_fp_leaf_fast_path_allowed(
+            self.liveness_exact_raw_fp_leaf_fast_path_allowed(),
+        );
         if let Some(start) = ctx_start {
             eprintln!(
                 "[liveness] group {}: checker created (ctx.clone) in {:.3}s",

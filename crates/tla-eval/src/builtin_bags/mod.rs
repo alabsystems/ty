@@ -15,10 +15,9 @@ use super::{
     Span, Spanned, Value,
 };
 use num_bigint::BigInt;
-use tla_value::Rp;
 use num_traits::Zero;
-use std::sync::Arc;
 use tla_value::BagValue;
+use tla_value::Rp;
 
 /// Build a bag value from sorted `(elem, count)` entries: the compact `Bag`
 /// representation when eligible (positive i64 counts, fingerprintable keys,

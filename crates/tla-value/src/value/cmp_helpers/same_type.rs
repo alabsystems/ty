@@ -5,9 +5,9 @@
 use super::super::Value;
 use super::primitives::type_order;
 use super::set_like::cmp_set_like;
+use crate::rp::Rp as Arc;
 use num_traits::ToPrimitive;
 use std::cmp::Ordering;
-use crate::rp::Rp as Arc;
 fn cmp_interval_with_set(interval: &Value, set: &Value) -> Ordering {
     let (Value::Interval(iv), Value::Set(s)) = (interval, set) else {
         unreachable!("cmp_interval_with_set requires Interval and Set operands");

@@ -301,6 +301,51 @@ pub(crate) fn exact_reuse_projection_for_expr(
     Some(analysis.all_vars)
 }
 
+/// Whether evaluating an action body is safe to replay after splitting a
+/// quantified/disjunctive `Next` into per-action batches.
+///
+/// Splitting can reorder evaluations even when it preserves the relational
+/// successor multiset. AUTO routing therefore admits only expressions whose
+/// expanded body is context-free, deterministic, free of side effects, and
+/// whose state-variable slots are exact. Primed references are expected in an
+/// action and are intentionally allowed. Pure recursive definitions are walked
+/// once with call-graph cycle cutting; unresolved/higher-order calls,
+/// `TLCGet`/`TLCSet`, randomization, unsafe config values, and future unknown
+/// builtins all fail closed through the shared dependency analyzer.
+#[cfg(test)]
+pub(crate) fn action_expr_is_replay_safe(ctx: &EvalCtx, expr: &Spanned<Expr>) -> bool {
+    let (raw_slots, expanded_slots, raw_context, expanded_context) =
+        action_expr_replay_safety_components(ctx, expr);
+    raw_slots && expanded_slots && raw_context && expanded_context
+}
+
+/// Component verdicts for the router's opt-in admission diagnostic.
+pub(crate) fn action_expr_replay_safety_components(
+    ctx: &EvalCtx,
+    expr: &Spanned<Expr>,
+) -> (bool, bool, bool, bool) {
+    let expanded = expand_operators_with_primes(ctx, expr);
+    (
+        state_var_slots_are_exact(ctx, expr),
+        state_var_slots_are_exact(ctx, &expanded),
+        crate::por::replay_expr_is_context_free(ctx, &expr.node),
+        crate::por::replay_expr_is_context_free(ctx, &expanded.node),
+    )
+}
+
+/// First raw and expanded context-safety rejection reasons, for opt-in router
+/// diagnostics after admission has already failed.
+pub(crate) fn action_expr_replay_context_rejections(
+    ctx: &EvalCtx,
+    expr: &Spanned<Expr>,
+) -> (Option<String>, Option<String>) {
+    let expanded = expand_operators_with_primes(ctx, expr);
+    (
+        crate::por::replay_expr_context_rejection(ctx, &expr.node),
+        crate::por::replay_expr_context_rejection(ctx, &expanded.node),
+    )
+}
+
 /// Require every lowered StateVar(name, idx, name_id) to identify one slot by
 /// all three components. This mirrors the evaluator fast-path condition and
 /// prevents a repaired runtime slot from disagreeing with the cached plan.
@@ -329,29 +374,8 @@ fn state_var_slots_are_exact(ctx: &EvalCtx, expr: &Spanned<Expr>) -> bool {
 /// Positive list of residual name-dispatched builtins whose result is a pure
 /// function of their fully walked arguments. Unknown future builtins fail
 /// closed because exact verdict reuse needs an allowlist, not an impurity list.
-fn is_exact_reuse_pure_named_builtin(name: &str) -> bool {
-    matches!(
-        name,
-        "Append"
-            | "Cardinality"
-            | "Front"
-            | "Head"
-            | "IsFiniteSet"
-            | "Last"
-            | "Len"
-            | "Max"
-            | "Mean"
-            | "Min"
-            | "Permutations"
-            | "Product"
-            | "Reverse"
-            | "Seq"
-            | "SetToSeq"
-            | "SubSeq"
-            | "Sum"
-            | "Tail"
-            | "TLCModelValue"
-    )
+fn is_exact_reuse_pure_named_builtin(name: &str, arity: usize) -> bool {
+    crate::enumerate::is_replay_stable_named_builtin(name, arity)
 }
 
 /// `Seq(S)` is pure when it reaches the genuine builtin, but the spelling can
@@ -485,9 +509,9 @@ fn contains_non_analyzable(expr: &Expr) -> bool {
     use crate::check::{expr_contains, ScanDecision};
 
     expr_contains(expr, &|e| match e {
-        Expr::Apply(op, _) => match &op.node {
+        Expr::Apply(op, args) => match &op.node {
             Expr::OpRef(_) => ScanDecision::Continue,
-            Expr::Ident(name, _) if is_exact_reuse_pure_named_builtin(name) => {
+            Expr::Ident(name, _) if is_exact_reuse_pure_named_builtin(name, args.len()) => {
                 ScanDecision::Continue
             }
             _ => ScanDecision::Found,
@@ -587,6 +611,7 @@ mod tests {
 
     #[test]
     fn analysis_extracts_reads_and_writes() {
+        let _serial = crate::test_utils::acquire_interner_lock();
         let src = r#"
 ---- MODULE AnalysisTest ----
 EXTENDS Integers
@@ -611,6 +636,7 @@ OnlyIncrease == x' > x
 
     #[test]
     fn skip_optimization_disabled_for_soundness() {
+        let _serial = crate::test_utils::acquire_interner_lock();
         // The skip optimization was unsound: it assumed constraints pass when
         // no referenced variables changed, but constraints like x' > x FAIL
         // on stuttering steps (where x' == x). See the DISABLED comment on
@@ -650,6 +676,7 @@ OnlyIncreaseX == x' > x
 
     #[test]
     fn no_skip_for_must_always_eval() {
+        let _serial = crate::test_utils::acquire_interner_lock();
         let src = r#"
 ---- MODULE TlcGetTest ----
 EXTENDS Integers, TLC
@@ -667,6 +694,7 @@ LevelBound == TLCGet("level") < 10
 
     #[test]
     fn exact_seen_state_reuse_certifies_pure_state_constraint() {
+        let _serial = crate::test_utils::acquire_interner_lock();
         let src = r#"
 ---- MODULE PureStateConstraintTest ----
 EXTENDS Integers
@@ -701,6 +729,7 @@ Bound == \A n \in N \ F : round[n] \in 0..Max(R)
 
     #[test]
     fn exact_reuse_rejects_configured_root_replacement_across_backends() {
+        let _serial = crate::test_utils::acquire_interner_lock();
         let src = r#"
 ---- MODULE RawNamedConstraintRootTest ----
 EXTENDS Integers
@@ -732,6 +761,7 @@ MCSafety == y = 0
 
     #[test]
     fn exact_reuse_rejects_forged_or_stale_state_var_metadata() {
+        let _serial = crate::test_utils::acquire_interner_lock();
         let src = r#"
 ---- MODULE ExactStateVarSlotTest ----
 EXTENDS Integers
@@ -826,13 +856,14 @@ Constraint == x = 0
 
     #[test]
     fn exact_projection_certifies_genuine_seq_builtin() {
+        let _serial = crate::test_utils::acquire_interner_lock();
         let src = r#"
 ---- MODULE PureSeqProjectionTest ----
 EXTENDS Integers, Sequences
 VARIABLE consumed
 Init == consumed = <<>>
 Next == consumed' = consumed
-Constraint == consumed \in Seq(Nat)
+Constraint == consumed \in Seq({TRUE, FALSE})
 ====
 "#;
         let (ctx, _, analysis) = make_test_ctx_and_analysis(src, &["Constraint"]);
@@ -845,7 +876,6 @@ Constraint == consumed \in Seq(Nat)
             .var_registry()
             .get("consumed")
             .expect("consumed should be registered");
-
         assert!(analysis.supports_exact_seen_state_reuse());
         assert_eq!(
             exact_reuse_projection_for_expr(&ctx, &body),
@@ -856,6 +886,7 @@ Constraint == consumed \in Seq(Nat)
 
     #[test]
     fn exact_projection_rejects_replaced_or_shadowed_seq() {
+        let _serial = crate::test_utils::acquire_interner_lock();
         let replaced_src = r#"
 ---- MODULE ReplacedSeqProjectionTest ----
 EXTENDS Integers, Sequences
@@ -965,6 +996,7 @@ Constraint == consumed \in Seq({0})
 
     #[test]
     fn exact_reuse_rejects_state_dependent_operator_named_like_builtin_constant() {
+        let _serial = crate::test_utils::acquire_interner_lock();
         let src = r#"
 ---- MODULE ShadowedNatProjectionTest ----
 VARIABLE x
@@ -992,6 +1024,7 @@ Constraint == Nat[1] = 0
 
     #[test]
     fn exact_reuse_follows_shadowed_builtin_inside_residual_funcdef() {
+        let _serial = crate::test_utils::acquire_interner_lock();
         let src = r#"
 ---- MODULE NestedShadowedNatProjectionTest ----
 VARIABLE x
@@ -1022,6 +1055,7 @@ Constraint == Wrapper[1] = 0
 
     #[test]
     fn exact_seen_state_reuse_rejects_context_io_and_opaque_residue() {
+        let _serial = crate::test_utils::acquire_interner_lock();
         let cases = [
             (
                 r#"
@@ -1117,6 +1151,7 @@ Constraint == MissingValue = x
 
     #[test]
     fn exact_seen_state_reuse_rejects_primed_state_constraint() {
+        let _serial = crate::test_utils::acquire_interner_lock();
         let src = r#"
 ---- MODULE PrimedStateConstraintTest ----
 EXTENDS Integers
@@ -1134,6 +1169,7 @@ Constraint == x' = x
 
     #[test]
     fn optimized_eval_matches_baseline() {
+        let _serial = crate::test_utils::acquire_interner_lock();
         let src = r#"
 ---- MODULE EvalMatchTest ----
 EXTENDS Integers
@@ -1202,6 +1238,7 @@ OnlyIncrease == x' >= x
 
     #[test]
     fn empty_constraints_always_pass() {
+        let _serial = crate::test_utils::acquire_interner_lock();
         let src = r#"
 ---- MODULE EmptyTest ----
 EXTENDS Integers
@@ -1226,6 +1263,7 @@ Next == x' = x + 1
 
     #[test]
     fn exact_reuse_projection_certifies_only_pure_unprimed_state_reads() {
+        let _serial = crate::test_utils::acquire_interner_lock();
         let src = r#"
 ---- MODULE ExactProjectionTest ----
 EXTENDS Integers, TLC
@@ -1252,6 +1290,7 @@ Contextual == TLCGet("level") >= 0
 
     #[test]
     fn exact_reuse_projection_rejects_configured_root_replacement() {
+        let _serial = crate::test_utils::acquire_interner_lock();
         let src = r#"
 ---- MODULE ExactProjectionRootReplacement ----
 EXTENDS Integers
@@ -1266,5 +1305,225 @@ MCSafety == y = 0
         ctx.add_op_replacement("Safety".to_string(), "MCSafety".to_string());
         let analysis = ActionConstraintAnalysis::build(&ctx, &names);
         assert!(analysis.exact_reuse_projection(0).is_none());
+    }
+
+    #[test]
+    fn action_routing_replay_gate_accepts_pure_recursion_and_rejects_effects() {
+        let _serial = crate::test_utils::acquire_interner_lock();
+        let identity_src = r#"
+---- MODULE ActionReplayIdentitySafety ----
+VARIABLE router_replay_unique_identity_state_4053
+IdentityAction ==
+    router_replay_unique_identity_state_4053' =
+        router_replay_unique_identity_state_4053
+====
+"#;
+        let (identity_ctx, _, _) = make_test_ctx_and_analysis(identity_src, &[]);
+        let identity = &identity_ctx
+            .get_op("IdentityAction")
+            .expect("operator exists")
+            .body;
+        // Even the identity-write shortcut must inspect the prime expression:
+        // partial-state fallback can expose the state-variable spelling as a
+        // TLC string, so replay cannot begin before its token is fixed.
+        assert!(!action_expr_is_replay_safe(&identity_ctx, identity));
+        let _identity_state_var_name = Value::string("router_replay_unique_identity_state_4053");
+        assert!(action_expr_is_replay_safe(&identity_ctx, identity));
+
+        let src = r#"
+---- MODULE ActionReplaySafety ----
+EXTENDS Integers, TLC, FiniteSets, Sequences
+VARIABLE x, f
+Init == /\ x = 0 /\ f = [i \in {0} |-> 0]
+PureAction == /\ x = 0 /\ x' = x + 1
+PureBuiltinAction == /\ Cardinality({x}) = 1
+                     /\ Head(<<x>>) = x
+                     /\ x' = x + 1
+PureConcatAction == /\ x = 0
+                    /\ x' = Head(<<x>> \o <<x + 1>>)
+StringConcatAction == /\ x = 0
+                      /\ x' = "router_replay_" \o "fresh_concat"
+StringSubSeqAction == /\ x = 0
+                      /\ x' = SubSeq("router_replay_fresh_subseq", 2, 8)
+ModelValueAction == /\ x = 0
+                    /\ x' = TLCModelValue("router_replay_fresh_model_value")
+SetToSeqAction == /\ x = 0
+                  /\ x' = SetToSeq({"router_set_b", "router_set_a"})
+DomainRecordAction == /\ x = 0
+                      /\ Cardinality(DOMAIN [fresh_field |-> x]) = 1
+                      /\ x' = x + 1
+RecordSetAction == /\ x = 0
+                   /\ [fresh_set_field : {x}] = [fresh_set_field : {x}]
+                   /\ x' = x + 1
+FreshStringWriteAction == x' = "router_replay_fresh_constant_write"
+FreshRecordWriteAction == x' = [router_replay_fresh_record_field |-> 0]
+FreshRecordSetWriteAction == x' = [router_replay_fresh_record_set_field : {0}]
+FreshExceptIdentityAction ==
+    f' = [f EXCEPT !["router_replay_fresh_except_key"] =
+                      f["router_replay_fresh_except_key"]]
+FreshLetIdentityAction ==
+    x' = LET router_replay_fresh_identity_let == 0 IN x
+ConcatClosure == LAMBDA a, b : TLCGet("level")
+RECURSIVE PureCountdown(_)
+PureCountdown(router_replay_countdown_n) ==
+    IF router_replay_countdown_n = 0
+    THEN 0
+    ELSE PureCountdown(router_replay_countdown_n - 1)
+PureRecursiveAction == /\ x = 0 /\ x' = PureCountdown(x + 1)
+PureChooseAction == /\ x = 0
+                    /\ x' = CHOOSE router_replay_choice_n \in 0..1 :
+                                  router_replay_choice_n = 1
+ContextualAction == /\ x = 0 /\ TLCGet("level") >= 0 /\ x' = x + 1
+SideEffectAction == /\ x = 0 /\ TLCSet(0, x) /\ x' = x + 1
+PrintAction == /\ x = 0 /\ PrintT(x) /\ x' = x + 1
+TimeAction == /\ x = 0 /\ x' = JavaTime
+RandomAction == /\ x = 0 /\ x' = RandomElement({0, 1})
+WrongArityAction == /\ x = 0 /\ Head(<<x>>, x) = x /\ x' = x + 1
+ShadowedRandomAction == LET RandomElement(S) == CHOOSE e \in S : TRUE
+                        IN /\ x = 0
+                           /\ x' = RandomElement({0, 1})
+RandomSubset(k, S) == TRUE
+PlaceholderRandomAction == /\ x = 0
+                           /\ x' = RandomSubset(1, {0, 1})
+UnknownAction == /\ x = 0 /\ MysteryBuiltin(x) /\ x' = x + 1
+Next == PureAction \/ ContextualAction \/ SideEffectAction
+====
+"#;
+        let (ctx, _, _) = make_test_ctx_and_analysis(src, &[]);
+        let pure = &ctx.get_op("PureAction").expect("operator exists").body;
+        let pure_builtin = &ctx
+            .get_op("PureBuiltinAction")
+            .expect("operator exists")
+            .body;
+        let pure_recursive = &ctx
+            .get_op("PureRecursiveAction")
+            .expect("operator exists")
+            .body;
+        let pure_concat = &ctx
+            .get_op("PureConcatAction")
+            .expect("operator exists")
+            .body;
+        let string_concat = &ctx
+            .get_op("StringConcatAction")
+            .expect("operator exists")
+            .body;
+        let string_subseq = &ctx
+            .get_op("StringSubSeqAction")
+            .expect("operator exists")
+            .body;
+        let model_value = &ctx
+            .get_op("ModelValueAction")
+            .expect("operator exists")
+            .body;
+        let set_to_seq = &ctx.get_op("SetToSeqAction").expect("operator exists").body;
+        let domain_record = &ctx
+            .get_op("DomainRecordAction")
+            .expect("operator exists")
+            .body;
+        let record_set = &ctx.get_op("RecordSetAction").expect("operator exists").body;
+        let fresh_string_write = &ctx
+            .get_op("FreshStringWriteAction")
+            .expect("operator exists")
+            .body;
+        let fresh_record_write = &ctx
+            .get_op("FreshRecordWriteAction")
+            .expect("operator exists")
+            .body;
+        let fresh_record_set_write = &ctx
+            .get_op("FreshRecordSetWriteAction")
+            .expect("operator exists")
+            .body;
+        let fresh_except_identity = &ctx
+            .get_op("FreshExceptIdentityAction")
+            .expect("operator exists")
+            .body;
+        let fresh_let_identity = &ctx
+            .get_op("FreshLetIdentityAction")
+            .expect("operator exists")
+            .body;
+        let pure_choose = &ctx
+            .get_op("PureChooseAction")
+            .expect("operator exists")
+            .body;
+        let contextual = &ctx
+            .get_op("ContextualAction")
+            .expect("operator exists")
+            .body;
+        let side_effect = &ctx
+            .get_op("SideEffectAction")
+            .expect("operator exists")
+            .body;
+        let print = &ctx.get_op("PrintAction").expect("operator exists").body;
+        let time = &ctx.get_op("TimeAction").expect("operator exists").body;
+        let random = &ctx.get_op("RandomAction").expect("operator exists").body;
+        let wrong_arity = &ctx
+            .get_op("WrongArityAction")
+            .expect("operator exists")
+            .body;
+        let shadowed_random = &ctx
+            .get_op("ShadowedRandomAction")
+            .expect("operator exists")
+            .body;
+        let placeholder_random = &ctx
+            .get_op("PlaceholderRandomAction")
+            .expect("operator exists")
+            .body;
+        let unknown = &ctx.get_op("UnknownAction").expect("operator exists").body;
+
+        let random_subset = ctx.get_op("RandomSubset").expect("operator exists");
+        assert!(crate::eval::should_prefer_builtin_override(
+            "RandomSubset",
+            random_subset.as_ref(),
+            2,
+            &ctx,
+        ));
+
+        let concat_closure = ctx
+            .eval_op("ConcatClosure")
+            .expect("ConcatClosure should evaluate");
+        assert!(matches!(concat_closure, Value::Closure(_)));
+        let shadowed_concat_ctx = ctx.bind_local("\\o", concat_closure);
+
+        // Primed partial-state fallback can expose the state-variable spelling
+        // as a TLC string. Model the canonical prefix that fixed it before
+        // router admission.
+        let _state_var_name = Value::string("x");
+        let _function_state_var_name = Value::string("f");
+        assert!(action_expr_is_replay_safe(&ctx, pure));
+        assert!(action_expr_is_replay_safe(&ctx, pure_builtin));
+        assert!(action_expr_is_replay_safe(&ctx, pure_concat));
+        assert!(!action_expr_is_replay_safe(
+            &shadowed_concat_ctx,
+            pure_concat
+        ));
+        assert!(!action_expr_is_replay_safe(&ctx, string_concat));
+        assert!(!action_expr_is_replay_safe(&ctx, string_subseq));
+        assert!(!action_expr_is_replay_safe(&ctx, model_value));
+        assert!(!action_expr_is_replay_safe(&ctx, set_to_seq));
+        assert!(!action_expr_is_replay_safe(&ctx, domain_record));
+        assert!(!action_expr_is_replay_safe(&ctx, record_set));
+        assert!(!action_expr_is_replay_safe(&ctx, fresh_string_write));
+        assert!(!action_expr_is_replay_safe(&ctx, fresh_record_write));
+        assert!(!action_expr_is_replay_safe(&ctx, fresh_record_set_write));
+        assert!(!action_expr_is_replay_safe(&ctx, fresh_except_identity));
+        assert!(!action_expr_is_replay_safe(&ctx, fresh_let_identity));
+        // The evaluator interns formals and bound names into the same
+        // first-seen table as semantic strings. Admission is read-only and
+        // must wait until the canonical prefix has fixed those tokens.
+        assert!(!action_expr_is_replay_safe(&ctx, pure_recursive));
+        assert!(!action_expr_is_replay_safe(&ctx, pure_choose));
+        let _countdown_name = Value::string("router_replay_countdown_n");
+        let _choice_name = Value::string("router_replay_choice_n");
+        assert!(action_expr_is_replay_safe(&ctx, pure_recursive));
+        assert!(action_expr_is_replay_safe(&ctx, pure_choose));
+        assert!(!action_expr_is_replay_safe(&ctx, contextual));
+        assert!(!action_expr_is_replay_safe(&ctx, side_effect));
+        assert!(!action_expr_is_replay_safe(&ctx, print));
+        assert!(!action_expr_is_replay_safe(&ctx, time));
+        assert!(!action_expr_is_replay_safe(&ctx, random));
+        assert!(!action_expr_is_replay_safe(&ctx, wrong_arity));
+        assert!(!action_expr_is_replay_safe(&ctx, shadowed_random));
+        assert!(!action_expr_is_replay_safe(&ctx, placeholder_random));
+        assert!(!action_expr_is_replay_safe(&ctx, unknown));
     }
 }

@@ -12,18 +12,20 @@
 //!
 //! Extracted from unified.rs as part of #2360.
 
+use std::rc::Rc;
 use std::sync::Arc;
 
+use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
-use tla_core::ast::{CaseArm, Expr};
+use tla_core::ast::{BoundPattern, BoundVar, CaseArm, Expr, OperatorDef};
 use tla_core::Spanned;
 
 use crate::error::EvalError;
-use crate::eval::{eval_iter_set_tlc_normalized, EvalCtx};
+use crate::eval::{eval_iter_set_tlc_normalized, push_bound_var_mut, EvalCtx};
 use crate::Value;
 
 use super::const_domain_cache::eval_domain_cached;
-use super::expr_analysis::flatten_and_spanned;
+use super::expr_analysis::{expr_contains_prime_ctx, flatten_and_spanned};
 use super::tir_leaf::eval_leaf;
 use super::unified::{enumerate_conjuncts, trace_expr_tag};
 use super::unified_emit::process_conjunct_guard_or_assignment;
@@ -32,7 +34,7 @@ use super::unified_exists::{
     try_collect_constrained_subset_values, BoundName, PreparedSubsetExists,
 };
 use super::unified_types::{Cont, EnumMut, EnumParams};
-use super::{case_guard_error, debug_enum_trace, SymbolicAssignment};
+use super::{case_guard_error, debug_enum_trace, enabled_early_exit, SymbolicAssignment};
 
 // ─── Conjunct dispatch helpers ───────────────────────────────────────────────
 
@@ -188,7 +190,7 @@ pub(super) fn conjunct_exists(
                     conjunct.span
                 ),
                 span: Some(conjunct.span),
-            })
+            });
         }
     };
 
@@ -198,6 +200,765 @@ pub(super) fn conjunct_exists(
     let domain_iter =
         eval_iter_set_tlc_normalized(ctx, &domain, bound.domain.as_ref().map(|d| d.span))?;
     iterate_exists_values_in_conjuncts(ctx, var_name, domain_iter, Some(body), c, p, m)
+}
+
+/// One predicate plus the lexical context TLC stores in its ActionItemList.
+///
+/// This deliberately models only the certified, action-free predicate subset
+/// below. The real action continuation remains in TY's ordinary `Cont`.
+#[derive(Clone)]
+struct ProofItem<'a> {
+    expr: &'a Spanned<Expr>,
+    ctx: EvalCtx,
+    next: Option<Rc<ProofItem<'a>>>,
+}
+
+#[derive(Clone, Copy)]
+struct ProofStateMark {
+    accumulated_len: usize,
+    undo_len: usize,
+    assigned_mask: u64,
+    has_complex: bool,
+}
+
+impl ProofStateMark {
+    fn capture(m: &EnumMut<'_>) -> Self {
+        Self {
+            accumulated_len: m.accumulated.len(),
+            undo_len: m.rec.undo.len(),
+            assigned_mask: m.assigned_mask,
+            has_complex: m.has_complex,
+        }
+    }
+
+    fn restore(self, m: &mut EnumMut<'_>) {
+        m.accumulated.truncate(self.accumulated_len);
+        m.rec
+            .working
+            .unbind_to_no_invalidate(m.rec.undo, self.undo_len);
+        m.assigned_mask = self.assigned_mask;
+        m.has_complex = self.has_complex;
+    }
+}
+
+/// FORALL within a certified action-free predicate: preserve TLC's exact
+/// ActionItemList proof-path enumeration.
+///
+/// TLC queues one body/context pair per universal instance. A nested OR or
+/// EXISTS then reaches the remaining bodies and the real action continuation
+/// once per successful proof path. We mirror that DFS directly instead of
+/// computing a multiplicity up front. Besides raw-generation parity, direct
+/// DFS preserves TLC's proof-continuation order and sink early-stop behavior.
+/// Certified user-operator leaves use a positive, side-effect-free value
+/// grammar, so evaluator result caching cannot suppress observable calls.
+///
+/// Certification is deliberately conservative. Unsupported scope, higher-order,
+/// multi-bound, or action-level forms retain the legacy one-Boolean guard path;
+/// importantly, preflight is evaluation-free, so fallback never sees a partly
+/// evaluated predicate.
+pub(super) fn conjunct_forall<'a>(
+    ctx: &mut EvalCtx,
+    _bounds: &'a [BoundVar],
+    _body: &'a Spanned<Expr>,
+    conjunct: &'a Spanned<Expr>,
+    c: &Cont<'a>,
+    p: &EnumParams<'_>,
+    m: &mut EnumMut<'_>,
+) -> Result<(), EvalError> {
+    if !tlc_proof_dfs_supported(ctx, conjunct, m.allow_tlc_proof_dfs, p.full_mask) {
+        return process_conjunct_guard_or_assignment(ctx, conjunct, c, p, m);
+    }
+
+    let resume_ctx = ctx.clone();
+    let mark = ProofStateMark::capture(m);
+    let result = enumerate_tlc_proof(ctx.clone(), conjunct, None, &resume_ctx, c, p, m);
+    mark.restore(m);
+    result
+}
+
+fn tlc_proof_dfs_supported(
+    ctx: &EvalCtx,
+    conjunct: &Spanned<Expr>,
+    allow_tlc_proof_dfs: bool,
+    full_mask: u64,
+) -> bool {
+    // Hidden-prime action validation currently buffers provisional successors
+    // in an uncapped Vec, so its caller passes false here. That route
+    // deliberately retains the legacy one-Boolean FORALL behavior: exact TLC
+    // raw proof-path parity there remains a full-corpus blocker until the
+    // validation buffer can stream or enforce the outer sink's early stop.
+    // A zero full_mask means either no state variables or more than 64. In
+    // both cases TY cannot prove via assigned_mask that the real action tail
+    // is already complete. Disable proof DFS so a trailing FORALL retains the
+    // legacy single-Boolean behavior instead of expanding after TLC would
+    // already have emitted the completed successor.
+    allow_tlc_proof_dfs
+        && full_mask != 0
+        && !expr_contains_prime_ctx(ctx, &conjunct.node)
+        && tlc_proof_formula_supported(
+            ctx,
+            conjunct,
+            &FxHashSet::default(),
+            &mut FxHashSet::default(),
+        )
+}
+
+/// Evaluation-free certification for the TLC proof DFS subset.
+///
+/// Quantifiers are limited to one bound group because TY's lowered `BoundVar`
+/// list no longer records TLC's comma-grouping. Supporting multiple entries
+/// without that information could evaluate a shared domain too many times.
+fn tlc_proof_formula_supported(
+    ctx: &EvalCtx,
+    expr: &Spanned<Expr>,
+    lexical_names: &FxHashSet<String>,
+    visiting_domain_ops: &mut FxHashSet<usize>,
+) -> bool {
+    match &expr.node {
+        Expr::And(a, b) | Expr::Or(a, b) => {
+            tlc_proof_formula_supported(ctx, a, lexical_names, visiting_domain_ops)
+                && tlc_proof_formula_supported(ctx, b, lexical_names, visiting_domain_ops)
+        }
+        Expr::Exists(bounds, body) | Expr::Forall(bounds, body) => {
+            if bounds.len() != 1 {
+                return false;
+            }
+            let Some(domain) = bounds[0].domain.as_deref() else {
+                return false;
+            };
+            if !tlc_pure_domain_supported(ctx, domain, lexical_names, visiting_domain_ops) {
+                return false;
+            }
+            let mut body_names = lexical_names.clone();
+            insert_bound_names(&bounds[0], &mut body_names);
+            tlc_proof_formula_supported(ctx, body, &body_names, visiting_domain_ops)
+        }
+        Expr::Label(label) => {
+            tlc_proof_formula_supported(ctx, &label.body, lexical_names, visiting_domain_ops)
+        }
+        Expr::Apply(op_expr, args) => {
+            let Expr::Ident(name, _) = &op_expr.node else {
+                return false;
+            };
+            if lexical_names.contains(name)
+                || ctx.name_in_local_scope(name)
+                || ctx.is_config_constant(name)
+            {
+                return false;
+            }
+            let resolved = ctx.resolve_op_name(name);
+            if resolved != name {
+                return false;
+            }
+            let Some(def) = ctx.get_op(name) else {
+                return false;
+            };
+            tlc_leaf_operator_supported(def, args, lexical_names)
+        }
+        Expr::Bool(_) => true,
+        Expr::Eq(left, right) | Expr::Neq(left, right) | Expr::In(left, right) => {
+            tlc_pure_leaf_value_supported(left, &|name| lexical_names.contains(name))
+                && tlc_pure_leaf_value_supported(right, &|name| lexical_names.contains(name))
+        }
+        // Target-only certification: every other form retains the legacy
+        // one-Boolean FORALL path. In particular, wholesale evaluation of
+        // IF/CASE/Implies conditions or arbitrary leaves could interact with
+        // user-operator result caching and change observable call counts.
+        _ => false,
+    }
+}
+
+fn insert_bound_names(bound: &BoundVar, names: &mut FxHashSet<String>) {
+    match &bound.pattern {
+        Some(BoundPattern::Var(name)) => {
+            names.insert(name.node.clone());
+        }
+        Some(BoundPattern::Tuple(tuple_names)) => {
+            names.extend(tuple_names.iter().map(|name| name.node.clone()));
+        }
+        None => {
+            names.insert(bound.name.node.clone());
+        }
+    }
+}
+
+/// A user predicate call is safe to leave as one evaluator leaf only when its
+/// body itself is one TLC leaf and call-by-name cannot expose a proof generator.
+fn tlc_leaf_operator_supported(
+    def: &Arc<OperatorDef>,
+    args: &[Spanned<Expr>],
+    lexical_names: &FxHashSet<String>,
+) -> bool {
+    if def.is_recursive
+        || def.contains_prime
+        || def.has_primed_param
+        || def.params.len() != args.len()
+        || def.params.iter().any(|param| param.arity != 0)
+        || !args
+            .iter()
+            .all(|arg| tlc_proof_safe_value_atom(arg, lexical_names))
+    {
+        return false;
+    }
+
+    let formal_is_scalar = |name: &str| {
+        def.params
+            .iter()
+            .any(|param| param.arity == 0 && param.name.node == name)
+    };
+    match &def.body.node {
+        Expr::Eq(left, right) | Expr::Neq(left, right) | Expr::In(left, right) => {
+            tlc_pure_leaf_value_supported(left, &formal_is_scalar)
+                && tlc_pure_leaf_value_supported(right, &formal_is_scalar)
+        }
+        _ => false,
+    }
+}
+
+fn tlc_proof_safe_value_atom(expr: &Spanned<Expr>, lexical_names: &FxHashSet<String>) -> bool {
+    match &expr.node {
+        Expr::Bool(_) | Expr::Int(_) | Expr::String(_) | Expr::StateVar(_, _, _) => true,
+        Expr::Ident(name, _) => lexical_names.contains(name),
+        _ => false,
+    }
+}
+
+/// Positive purity grammar for values nested inside a certified evaluator leaf.
+///
+/// This intentionally admits only the 2PC predicate shape (for example,
+/// `rmState[rm] = "prepared"`). Any builtin/user call, non-formal Ident,
+/// scope/control node, or lazy function source fails closed so proof DFS cannot
+/// change observable call counts through evaluator caching.
+fn tlc_pure_leaf_value_supported(
+    expr: &Spanned<Expr>,
+    ident_is_scalar: &impl Fn(&str) -> bool,
+) -> bool {
+    match &expr.node {
+        Expr::Bool(_) | Expr::Int(_) | Expr::String(_) | Expr::StateVar(_, _, _) => true,
+        Expr::Ident(name, _) => ident_is_scalar(name),
+        Expr::FuncApply(function, index) => {
+            matches!(&function.node, Expr::StateVar(_, _, _))
+                && tlc_pure_leaf_value_supported(index, ident_is_scalar)
+        }
+        Expr::SetEnum(elements) => elements
+            .iter()
+            .all(|element| tlc_pure_leaf_value_supported(element, ident_is_scalar)),
+        _ => false,
+    }
+}
+
+/// Evaluation-free domain grammar for the target TLC proof-path subset.
+///
+/// It admits materialized configured domains (such as `RM`), literal
+/// SetEnum/Range domains, and zero-argument constant aliases like
+/// `S == {"a", "b", "c"}`. Calls, binders, lazy values, and every other
+/// expression fail closed.
+fn tlc_pure_domain_supported(
+    ctx: &EvalCtx,
+    expr: &Spanned<Expr>,
+    lexical_names: &FxHashSet<String>,
+    visiting_domain_ops: &mut FxHashSet<usize>,
+) -> bool {
+    match &expr.node {
+        Expr::Ident(name, name_id) => {
+            if lexical_names.contains(name) {
+                return true;
+            }
+            if let Some(value) = ctx.lookup_binding(name) {
+                return tlc_materialized_domain_value(&value);
+            }
+            if ctx.name_in_local_scope(name) {
+                return false;
+            }
+            let resolved = ctx.resolve_op_name(name);
+            if resolved != name {
+                return false;
+            }
+            if let Some(value) = ctx.precomputed_constants().get(name_id) {
+                return tlc_materialized_domain_value(value);
+            }
+
+            let Some(def) = ctx.get_op(name) else {
+                return false;
+            };
+            if def.is_recursive
+                || def.contains_prime
+                || def.has_primed_param
+                || !def.params.is_empty()
+            {
+                return false;
+            }
+            let ptr = Arc::as_ptr(def) as usize;
+            if !visiting_domain_ops.insert(ptr) {
+                return false;
+            }
+            let supported = tlc_pure_domain_supported(
+                ctx,
+                &def.body,
+                &FxHashSet::default(),
+                visiting_domain_ops,
+            );
+            visiting_domain_ops.remove(&ptr);
+            supported
+        }
+        Expr::SetEnum(elements) => elements
+            .iter()
+            .all(|element| tlc_pure_domain_element_supported(element, lexical_names)),
+        Expr::Range(start, end) => {
+            tlc_pure_domain_element_supported(start, lexical_names)
+                && tlc_pure_domain_element_supported(end, lexical_names)
+        }
+        _ => false,
+    }
+}
+
+fn tlc_pure_domain_element_supported(
+    expr: &Spanned<Expr>,
+    lexical_names: &FxHashSet<String>,
+) -> bool {
+    match &expr.node {
+        Expr::Bool(_) | Expr::Int(_) | Expr::String(_) => true,
+        Expr::Ident(name, _) => lexical_names.contains(name),
+        _ => false,
+    }
+}
+
+fn tlc_materialized_domain_value(value: &Value) -> bool {
+    matches!(value, Value::Set(_) | Value::Interval(_))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enumerate_tlc_proof<'a>(
+    ctx: EvalCtx,
+    expr: &'a Spanned<Expr>,
+    tail: Option<Rc<ProofItem<'a>>>,
+    resume_ctx: &EvalCtx,
+    continuation: &Cont<'_>,
+    p: &EnumParams<'_>,
+    m: &mut EnumMut<'_>,
+) -> Result<(), EvalError> {
+    crate::eval::stack_safe(|| {
+        enumerate_tlc_proof_inner(ctx, expr, tail, resume_ctx, continuation, p, m)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enumerate_tlc_proof_inner<'a>(
+    mut ctx: EvalCtx,
+    expr: &'a Spanned<Expr>,
+    tail: Option<Rc<ProofItem<'a>>>,
+    resume_ctx: &EvalCtx,
+    continuation: &Cont<'_>,
+    p: &EnumParams<'_>,
+    m: &mut EnumMut<'_>,
+) -> Result<(), EvalError> {
+    if m.rec.results.is_stopped() {
+        return Ok(());
+    }
+
+    match &expr.node {
+        Expr::And(left, right) => {
+            let next = Some(Rc::new(ProofItem {
+                expr: right,
+                ctx: ctx.clone(),
+                next: tail,
+            }));
+            enumerate_tlc_proof(ctx, left, next, resume_ctx, continuation, p, m)
+        }
+        Expr::Or(left, right) => {
+            let mark = ProofStateMark::capture(m);
+            let left_result = enumerate_tlc_proof(
+                ctx.clone(),
+                left,
+                tail.clone(),
+                resume_ctx,
+                continuation,
+                p,
+                m,
+            );
+            mark.restore(m);
+            left_result?;
+            if proof_should_stop(m) {
+                return Ok(());
+            }
+            let right_result =
+                enumerate_tlc_proof(ctx, right, tail, resume_ctx, continuation, p, m);
+            mark.restore(m);
+            right_result
+        }
+        Expr::Implies(antecedent, consequent) => {
+            if eval_tlc_proof_bool(&mut ctx, antecedent, p, m)? {
+                enumerate_tlc_proof(ctx, consequent, tail, resume_ctx, continuation, p, m)
+            } else {
+                enumerate_tlc_proof_tail(tail, resume_ctx, continuation, p, m)
+            }
+        }
+        Expr::Exists(bounds, body) => enumerate_tlc_exists_proof(
+            ctx,
+            &bounds[0],
+            body,
+            tail,
+            resume_ctx,
+            continuation,
+            p,
+            m,
+            expr.span,
+        ),
+        Expr::Forall(bounds, body) => enumerate_tlc_forall_proof(
+            ctx,
+            &bounds[0],
+            body,
+            tail,
+            resume_ctx,
+            continuation,
+            p,
+            m,
+            expr.span,
+        ),
+        Expr::If(condition, then_branch, else_branch) => {
+            let selected = if eval_tlc_proof_bool(&mut ctx, condition, p, m)? {
+                then_branch
+            } else {
+                else_branch
+            };
+            enumerate_tlc_proof(ctx, selected, tail, resume_ctx, continuation, p, m)
+        }
+        Expr::Case(arms, other) => {
+            for arm in arms {
+                match eval_tlc_proof_bool(&mut ctx, &arm.guard, p, m) {
+                    Ok(true) => {
+                        return enumerate_tlc_proof(
+                            ctx,
+                            &arm.body,
+                            tail,
+                            resume_ctx,
+                            continuation,
+                            p,
+                            m,
+                        );
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        return Err(case_guard_error(error, arm.guard.span));
+                    }
+                }
+            }
+            match other.as_deref() {
+                Some(other) => {
+                    enumerate_tlc_proof(ctx, other, tail, resume_ctx, continuation, p, m)
+                }
+                None => Err(EvalError::CaseNoMatch {
+                    span: Some(expr.span),
+                }),
+            }
+        }
+        Expr::Label(label) => {
+            enumerate_tlc_proof(ctx, &label.body, tail, resume_ctx, continuation, p, m)
+        }
+        _ => {
+            if eval_tlc_proof_bool(&mut ctx, expr, p, m)? {
+                enumerate_tlc_proof_tail(tail, resume_ctx, continuation, p, m)
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enumerate_tlc_proof_tail<'a>(
+    tail: Option<Rc<ProofItem<'a>>>,
+    resume_ctx: &EvalCtx,
+    continuation: &Cont<'_>,
+    p: &EnumParams<'_>,
+    m: &mut EnumMut<'_>,
+) -> Result<(), EvalError> {
+    if m.rec.results.is_stopped() {
+        return Ok(());
+    }
+    match tail {
+        Some(item) => enumerate_tlc_proof(
+            item.ctx.clone(),
+            item.expr,
+            item.next.clone(),
+            resume_ctx,
+            continuation,
+            p,
+            m,
+        ),
+        None => {
+            let mut ctx = resume_ctx.clone();
+            enumerate_conjuncts(&mut ctx, continuation, None, p, m)
+        }
+    }
+}
+
+fn eval_tlc_proof_bool(
+    ctx: &mut EvalCtx,
+    expr: &Spanned<Expr>,
+    p: &EnumParams<'_>,
+    m: &EnumMut<'_>,
+) -> Result<bool, EvalError> {
+    let value = {
+        let _env = ctx.bind_next_state_env_guard(m.rec.working.env_ref());
+        eval_leaf(ctx, expr, p.tir_leaf)?
+    };
+    value.as_bool().ok_or(EvalError::TypeError {
+        expected: "BOOLEAN",
+        got: value.type_name(),
+        span: Some(expr.span),
+    })
+}
+
+fn eval_tlc_proof_domain(
+    ctx: &mut EvalCtx,
+    domain: &Spanned<Expr>,
+    p: &EnumParams<'_>,
+    m: &EnumMut<'_>,
+) -> Result<Value, EvalError> {
+    let _env = ctx.bind_next_state_env_guard(m.rec.working.env_ref());
+    eval_leaf(ctx, domain, p.tir_leaf)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enumerate_tlc_exists_proof<'a>(
+    mut ctx: EvalCtx,
+    bound: &BoundVar,
+    body: &'a Spanned<Expr>,
+    tail: Option<Rc<ProofItem<'a>>>,
+    resume_ctx: &EvalCtx,
+    continuation: &Cont<'_>,
+    p: &EnumParams<'_>,
+    m: &mut EnumMut<'_>,
+    span: tla_core::Span,
+) -> Result<(), EvalError> {
+    let domain_expr = bound.domain.as_deref().ok_or_else(|| EvalError::Internal {
+        message: "EXISTS requires bounded quantification".into(),
+        span: Some(span),
+    })?;
+    // TLC's contexts(...) evaluates each quantifier domain once in the
+    // quantifier's original context before visiting any candidate.
+    let domain = eval_tlc_proof_domain(&mut ctx, domain_expr, p, m)?;
+    let values = eval_iter_set_tlc_normalized(&ctx, &domain, Some(domain_expr.span))?;
+    let mark = ProofStateMark::capture(m);
+
+    for value in values {
+        let mut body_ctx = ctx.clone();
+        push_bound_var_mut(&mut body_ctx, bound, &value, Some(span))?;
+        let result =
+            enumerate_tlc_proof(body_ctx, body, tail.clone(), resume_ctx, continuation, p, m);
+        mark.restore(m);
+        result?;
+        if proof_should_stop(m) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enumerate_tlc_forall_proof<'a>(
+    mut ctx: EvalCtx,
+    bound: &BoundVar,
+    body: &'a Spanned<Expr>,
+    tail: Option<Rc<ProofItem<'a>>>,
+    resume_ctx: &EvalCtx,
+    continuation: &Cont<'_>,
+    p: &EnumParams<'_>,
+    m: &mut EnumMut<'_>,
+    span: tla_core::Span,
+) -> Result<(), EvalError> {
+    let domain_expr = bound.domain.as_deref().ok_or_else(|| EvalError::Internal {
+        message: "FORALL requires bounded quantification".into(),
+        span: Some(span),
+    })?;
+    let domain = eval_tlc_proof_domain(&mut ctx, domain_expr, p, m)?;
+    let values = eval_iter_set_tlc_normalized(&ctx, &domain, Some(domain_expr.span))?;
+
+    // TLC consumes all contexts before evaluating the first body: c1 is
+    // processed first; c2..cn are consed, so the remaining order is cn..c2.
+    let mut contexts = Vec::new();
+    for value in values {
+        let mut body_ctx = ctx.clone();
+        push_bound_var_mut(&mut body_ctx, bound, &value, Some(span))?;
+        contexts.push(body_ctx);
+    }
+    let Some(first_ctx) = contexts.first().cloned() else {
+        return enumerate_tlc_proof_tail(tail, resume_ctx, continuation, p, m);
+    };
+
+    let mut body_tail = tail;
+    for body_ctx in contexts.into_iter().skip(1) {
+        body_tail = Some(Rc::new(ProofItem {
+            expr: body,
+            ctx: body_ctx,
+            next: body_tail,
+        }));
+    }
+    enumerate_tlc_proof(first_ctx, body, body_tail, resume_ctx, continuation, p, m)
+}
+
+#[inline]
+fn proof_should_stop(m: &EnumMut<'_>) -> bool {
+    m.rec.results.is_stopped() || (enabled_early_exit() && m.rec.results.has_results())
+}
+
+#[cfg(test)]
+mod tlc_proof_dfs_tests {
+    use super::*;
+    use tla_core::ast::Unit;
+    use tla_core::{lower, parse_to_syntax_tree, FileId};
+
+    #[test]
+    fn proof_dfs_policy_declines_hidden_buffer_and_unrepresentable_var_mask() {
+        let tree = parse_to_syntax_tree(
+            r#"
+---- MODULE TlcForallHiddenPrimeBufferPolicy ----
+VARIABLE x
+Inner == x' = 1
+Outer == Inner
+Init == x = 0
+Next ==
+    /\ x = 0
+    /\ \A i \in {1, 2} : TRUE \/ TRUE
+    /\ Outer
+====
+"#,
+        );
+        let lowered = lower(FileId(0), &tree);
+        assert!(lowered.errors.is_empty(), "{:?}", lowered.errors);
+        let module = lowered.module.expect("test module should lower");
+        let next = module
+            .units
+            .iter()
+            .find_map(|unit| match &unit.node {
+                Unit::Operator(def) if def.name.node == "Next" => Some(def),
+                _ => None,
+            })
+            .expect("Next definition");
+
+        let mut ctx = EvalCtx::new();
+        ctx.load_module(&module);
+        assert!(
+            expr_contains_prime_ctx(&ctx, &next.body.node),
+            "the full action must take hidden-prime validation"
+        );
+
+        let mut conjuncts = SmallVec::<[&Spanned<Expr>; 8]>::new();
+        flatten_and_spanned(&next.body, &mut conjuncts);
+        let forall = conjuncts
+            .into_iter()
+            .find(|expr| matches!(expr.node, Expr::Forall(_, _)))
+            .expect("test action should contain a FORALL conjunct");
+
+        assert!(
+            tlc_proof_dfs_supported(&ctx, forall, true, 1),
+            "the predicate itself is in the certified proof-DFS subset"
+        );
+        assert!(
+            !tlc_proof_dfs_supported(&ctx, forall, false, 1),
+            "the uncapped hidden-prime validation buffer must disable proof DFS"
+        );
+        assert!(
+            !tlc_proof_dfs_supported(&ctx, forall, true, 0),
+            "an unrepresentable assigned-variable mask must disable proof DFS"
+        );
+    }
+
+    #[test]
+    fn proof_dfs_certification_accepts_only_pure_state_function_predicates() {
+        let tree = parse_to_syntax_tree(
+            r#"
+---- MODULE TlcForallLocalBindingPolicy ----
+EXTENDS TLC
+CONSTANT RM
+VARIABLE f
+Leaf(v) == v = TRUE
+Direct(local) == \A i \in {1} : local
+Actual(local) == \A i \in {1} : Leaf(local)
+Function(local) == \A i \in {1} : local[i]
+Map == [i \in {1} |-> TRUE]
+MapAlias == Map
+AliasFunction == \A i \in {1} : MapAlias[i]
+NestedPrint(v) == PrintT("must not be cached") = TRUE
+NestedUser(v) == Leaf(v) = TRUE
+NestedPrintProof == \A i \in {1} : NestedPrint(i)
+NestedUserProof == \A i \in {1} : NestedUser(i)
+Effect == PrintT("must not run during proof certification")
+EffectDomain == \A i \in Effect : TRUE
+ScalarDomain == \A i \in 1 : TRUE
+EffectImplies == \A i \in {1} : Effect => TRUE
+EffectIf == \A i \in {1} : IF Effect THEN TRUE ELSE TRUE
+EffectCase == \A i \in {1} : CASE Effect -> TRUE [] OTHER -> TRUE
+EffectAtomic == \A i \in {1} : Effect = TRUE
+Prepared(i) == f[i] \in {TRUE}
+SafeStateFunctionProof == \A i \in {1} : Prepared(i)
+ConfiguredDomainProof == \A i \in RM : TRUE
+====
+"#,
+        );
+        let lowered = lower(FileId(0), &tree);
+        assert!(lowered.errors.is_empty(), "{:?}", lowered.errors);
+        let module = lowered.module.expect("test module should lower");
+        let mut ctx = EvalCtx::new();
+        ctx.load_module(&module);
+        ctx.register_var(Arc::from("f"));
+        ctx.resolve_state_vars_in_loaded_ops();
+        Arc::make_mut(ctx.shared_arc_mut())
+            .precomputed_constants_mut()
+            .insert(
+                tla_core::intern_name("RM"),
+                Value::set([Value::string("rm1")]),
+            );
+        ctx.push_binding(Arc::from("local"), Value::Bool(true));
+
+        for name in [
+            "Direct",
+            "Actual",
+            "Function",
+            "AliasFunction",
+            "NestedPrintProof",
+            "NestedUserProof",
+            "EffectDomain",
+            "ScalarDomain",
+            "EffectImplies",
+            "EffectIf",
+            "EffectCase",
+            "EffectAtomic",
+        ] {
+            let body = &ctx.get_op(name).expect("test operator should exist").body;
+            assert!(
+                !tlc_proof_dfs_supported(&ctx, body, true, 1),
+                "{name} must retain legacy evaluation for local bindings/thunks"
+            );
+        }
+
+        let safe = ctx
+            .get_op("SafeStateFunctionProof")
+            .expect("safe proof operator should exist")
+            .body
+            .clone();
+        assert!(
+            tlc_proof_dfs_supported(&ctx, &safe, true, 1),
+            "direct state-function lookup with a scalar formal must remain certified"
+        );
+
+        let configured = ctx
+            .get_op("ConfiguredDomainProof")
+            .expect("configured-domain proof operator should exist")
+            .body
+            .clone();
+        assert!(
+            tlc_proof_dfs_supported(&ctx, &configured, true, 1),
+            "a materialized configured domain must remain certified"
+        );
+
+        ctx.push_binding(Arc::from("Prepared"), Value::Bool(true));
+        assert!(
+            !tlc_proof_dfs_supported(&ctx, &safe, true, 1),
+            "a locally shadowed predicate name must disable proof DFS"
+        );
+    }
 }
 
 /// IF within conjuncts: evaluate condition, process chosen branch as pending.

@@ -19,13 +19,14 @@
 //!
 //! # Variable Unrolling
 //!
-//! Each state variable `x` becomes k+1 SMT variables: `x__0`, `x__1`, ..., `x__k`.
+//! Each state variable `x` becomes k+1 collision-free SMT symbols produced by
+//! [`BmcTranslator::state_step_symbol`].
 //!
 //! | TLA+ | BMC encoding at step i |
 //! |------|------------------------|
-//! | `x` | `x__i` |
-//! | `x'` | `x__i+1` |
-//! | `UNCHANGED x` | `x__i+1 = x__i` |
+//! | `x` | `state_step_symbol("x", i)` |
+//! | `x'` | `state_step_symbol("x", i + 1)` |
+//! | `UNCHANGED x` | equality between the symbols at `i + 1` and `i` |
 //!
 //! # Division and Modulo Restrictions (#556)
 //!
@@ -64,7 +65,7 @@ mod record_encoder;
 mod translate_bmc;
 mod translate_expr_impl;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // Re-exported for tests.rs (which uses `use super::*`)
 use ay_dpll::api::{
@@ -87,6 +88,53 @@ struct BmcVarInfo {
     sort: TlaSort,
     /// ay terms for each step: index i has variable at step i
     terms: Vec<Term>,
+}
+
+/// A decoded scalar/set SMT symbol emitted by [`BmcTranslator`].
+///
+/// Consumers that inspect rendered proofs or models must use
+/// [`BmcTranslator::parse_scalar_symbol`] instead of reconstructing the symbol
+/// spelling. Source names are length-delimited and hex encoded so adversarial
+/// TLA+ identifiers cannot collide with carrier or step delimiters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BmcScalarSymbol {
+    /// A step-indexed state variable (scalar or set carrier).
+    State {
+        /// Original TLA+ source name.
+        name: String,
+        /// BMC unrolling step.
+        step: usize,
+    },
+    /// A rigid scalar constant shared by every BMC step.
+    Rigid {
+        /// Original TLA+ source name.
+        name: String,
+    },
+}
+
+/// The mutually exclusive solver-carrier families used by public BMC
+/// declarations. A source-level name must belong to exactly one family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BmcCarrierKind {
+    ScalarState,
+    RigidScalar,
+    Function,
+    Sequence,
+    Record,
+    Tuple,
+}
+
+impl BmcCarrierKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ScalarState => "scalar/set state variable",
+            Self::RigidScalar => "rigid scalar constant",
+            Self::Function => "function variable",
+            Self::Sequence => "sequence variable",
+            Self::Record => "record variable",
+            Self::Tuple => "tuple variable",
+        }
+    }
 }
 
 /// A single state in a BMC trace
@@ -132,6 +180,13 @@ pub enum BmcValue {
     /// Stores the mapping as a sorted list of (key, value) pairs.
     /// The domain is the set of keys.
     Function(Vec<(i64, BmcValue)>),
+    /// Function value with native TLA+ string keys.
+    ///
+    /// String-keyed BMC functions use SMT `String` array indices rather than
+    /// the integer interning used for String-valued scalar carriers. Keeping a
+    /// distinct variant prevents trace extraction from silently presenting
+    /// native string keys as TLA+ integers.
+    StringFunction(Vec<(String, BmcValue)>),
     /// Record value (finite mapping from field names to values)
     ///
     /// Part of #3787: Record encoding in BMC translator.
@@ -146,9 +201,9 @@ pub enum BmcValue {
 
 /// Information about a function variable across all BMC steps.
 ///
-/// Each function is encoded as two SMT arrays per step:
-/// - `domain_terms[step]`: `(Array Int Bool)` — the domain membership set
-/// - `mapping_terms[step]`: `(Array Int RangeSort)` — the value mapping
+/// Each finite-domain function is encoded as two SMT arrays per step:
+/// - `domain_terms[step]`: `(Array KeySort Bool)` — domain membership
+/// - `mapping_terms[step]`: `(Array KeySort RangeSort)` — value mapping
 ///
 /// Part of #3786: Function encoding in BMC translator.
 #[derive(Debug)]
@@ -162,6 +217,15 @@ struct BmcFuncVarInfo {
     /// string key can never alias an integer-literal key in the shared array
     /// encoding (soundness — see `declare_func_var_with_key_sort`).
     key_sort: TlaSort,
+    /// Exact finite domain keys when the public declaration carried a complete
+    /// `TlaSort::Function::domain_keys` shape. `None` means the domain array is
+    /// genuinely symbolic/unknown and whole-function equality must fail closed:
+    /// QF_AUFLIA cannot quantify over every live key without a finite cover.
+    finite_domain_keys: Option<Vec<BmcFunctionKey>>,
+    /// Whether any translated term or caller has observed this function's
+    /// current domain/mapping carriers. An Int->String key upgrade replaces the
+    /// arrays, so it is sound only while this remains false.
+    carrier_referenced: bool,
     /// Domain set terms per step: `(Array KeySort Bool)`.
     ///
     /// EMPTY for symbolic-domain (map-only) functions — their domain is the
@@ -175,6 +239,13 @@ struct BmcFuncVarInfo {
     /// (which carry a `domain_terms` membership array instead). When present,
     /// `x \in DOMAIN f` is translated as the arithmetic bound `lo <= x <= hi`.
     symbolic_domain: Option<(i64, String, i64)>,
+}
+
+/// A statically exact finite function-domain key.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum BmcFunctionKey {
+    Int(i64),
+    String(String),
 }
 
 /// Information about a sequence variable across all BMC steps.
@@ -206,6 +277,8 @@ pub struct BmcTranslator {
     bound_k: usize,
     /// Variable info: name -> BmcVarInfo (with terms for all steps)
     vars: HashMap<String, BmcVarInfo>,
+    /// Names in `vars` whose one SMT carrier is shared across every step.
+    rigid_const_names: HashSet<String>,
     /// Function variable info: name -> BmcFuncVarInfo (with domain+mapping per step)
     ///
     /// Part of #3786: Function encoding in BMC translator.
@@ -285,6 +358,7 @@ impl BmcTranslator {
             solver: Solver::try_new(Logic::QfLia)?,
             bound_k: k,
             vars: HashMap::new(),
+            rigid_const_names: HashSet::new(),
             func_vars: HashMap::new(),
             seq_vars: HashMap::new(),
             record_vars: HashMap::new(),
@@ -326,6 +400,7 @@ impl BmcTranslator {
             solver,
             bound_k: k,
             vars: HashMap::new(),
+            rigid_const_names: HashSet::new(),
             func_vars: HashMap::new(),
             seq_vars: HashMap::new(),
             record_vars: HashMap::new(),
@@ -343,23 +418,229 @@ impl BmcTranslator {
     ///
     /// `TlaSort::String` variables are declared as `Sort::Int` (the interned
     /// representation), so string literals and string-sorted terms must share
-    /// one consistent id namespace for equality to be sound. Ids are negative
-    /// to keep them disjoint from the small non-negative integers commonly used
-    /// as concrete domain/range values, so a string literal can never alias an
-    /// ordinary integer constant.
+    /// one consistent id namespace for same-kind equality. The numeric ids can
+    /// coincide with legal TLA+ integers, so every comparison and model decode
+    /// must also retain the declared TLA+ value kind; the id alone is not a type
+    /// discriminator.
     pub(super) fn bmc_intern_string(&mut self, s: &str) -> i64 {
         if let Some(&id) = self.string_intern.get(s) {
             return id;
         }
-        // Base far below any plausible literal int to avoid collision.
+        // A stable sparse-looking base keeps rendered terms recognizable. Type
+        // safety comes from the TLA-kind gates, not from numeric disjointness.
         let id = -1_000_000_007 - self.string_intern.len() as i64;
         self.string_intern.insert(s.to_string(), id);
         id
     }
 
+    /// Reject a public declaration when `name` already belongs to another
+    /// solver-carrier family. Keeping the per-kind maps mutually exclusive is
+    /// required because expression dispatch probes those maps independently;
+    /// one name in two maps can silently route an expression to the wrong
+    /// carrier.
+    pub(super) fn ensure_declaration_carrier(
+        &self,
+        name: &str,
+        requested: BmcCarrierKind,
+    ) -> AYResult<()> {
+        let mut existing = Vec::with_capacity(2);
+        if self.vars.contains_key(name) {
+            existing.push(if self.rigid_const_names.contains(name) {
+                BmcCarrierKind::RigidScalar
+            } else {
+                BmcCarrierKind::ScalarState
+            });
+        }
+        if self.func_vars.contains_key(name) {
+            existing.push(BmcCarrierKind::Function);
+        }
+        if self.seq_vars.contains_key(name) {
+            existing.push(BmcCarrierKind::Sequence);
+        }
+        if self.record_vars.contains_key(name) {
+            existing.push(BmcCarrierKind::Record);
+        }
+        if self.tuple_vars.contains_key(name) {
+            existing.push(BmcCarrierKind::Tuple);
+        }
+
+        if existing.is_empty() || (existing.len() == 1 && existing[0] == requested) {
+            return Ok(());
+        }
+        let actual = existing
+            .iter()
+            .map(|kind| kind.label())
+            .collect::<Vec<_>>()
+            .join(" + ");
+        Err(AYError::TypeMismatch {
+            name: name.to_string(),
+            expected: actual,
+            actual: requested.label().to_string(),
+        })
+    }
+
+    fn register_base_var_name(&mut self, name: &str) {
+        if !self.base_var_names.iter().any(|existing| existing == name) {
+            self.base_var_names.push(name.to_string());
+        }
+    }
+
+    /// Injectively encode one source component inside an SMT symbol. The byte
+    /// length makes boundaries unambiguous even for adversarial identifiers
+    /// containing this module's separators.
+    fn symbol_component(value: &str) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut encoded = String::with_capacity(value.len().saturating_mul(2).saturating_add(24));
+        encoded.push_str(&value.len().to_string());
+        encoded.push('_');
+        for byte in value.bytes() {
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        encoded
+    }
+
+    fn parse_symbol_component(encoded: &str) -> Option<String> {
+        let (length, hex) = encoded.split_once('_')?;
+        let byte_len: usize = length.parse().ok()?;
+        if byte_len.to_string() != length || hex.len() != byte_len.checked_mul(2)? {
+            return None;
+        }
+        let mut bytes = Vec::with_capacity(byte_len);
+        for pair in hex.as_bytes().chunks_exact(2) {
+            let nibble = |byte: u8| match byte {
+                b'0'..=b'9' => Some(byte - b'0'),
+                b'a'..=b'f' => Some(byte - b'a' + 10),
+                _ => None,
+            };
+            bytes.push((nibble(pair[0])? << 4) | nibble(pair[1])?);
+        }
+        let decoded = String::from_utf8(bytes).ok()?;
+        (Self::symbol_component(&decoded) == encoded).then_some(decoded)
+    }
+
+    /// Return the canonical collision-free SMT symbol for a state variable at
+    /// one BMC unrolling step.
+    #[must_use]
+    pub fn state_step_symbol(name: &str, step: usize) -> String {
+        format!(
+            "__ty_bmc_state_{}_step_{step}",
+            Self::symbol_component(name)
+        )
+    }
+
+    /// Return the canonical collision-free SMT symbol for a rigid constant.
+    #[must_use]
+    pub fn rigid_const_symbol(name: &str) -> String {
+        format!("__ty_bmc_rigid_{}", Self::symbol_component(name))
+    }
+
+    /// Decode a canonical state-variable or rigid-constant SMT symbol.
+    ///
+    /// Returns `None` for auxiliary/compound carrier symbols, malformed input,
+    /// and non-canonical spellings such as a step with leading zeroes.
+    #[must_use]
+    pub fn parse_scalar_symbol(symbol: &str) -> Option<BmcScalarSymbol> {
+        if let Some(encoded) = symbol.strip_prefix("__ty_bmc_rigid_") {
+            return Self::parse_symbol_component(encoded)
+                .map(|name| BmcScalarSymbol::Rigid { name });
+        }
+
+        let rest = symbol.strip_prefix("__ty_bmc_state_")?;
+        let (encoded, step_text) = rest.rsplit_once("_step_")?;
+        let step: usize = step_text.parse().ok()?;
+        if step.to_string() != step_text {
+            return None;
+        }
+        let name = Self::parse_symbol_component(encoded)?;
+        (Self::state_step_symbol(&name, step) == symbol)
+            .then_some(BmcScalarSymbol::State { name, step })
+    }
+
+    pub(super) fn function_domain_symbol(name: &str, string_keys: bool, step: usize) -> String {
+        let key_tag = if string_keys { "string" } else { "int" };
+        format!(
+            "__ty_bmc_function_{key_tag}_domain_{}_step_{step}",
+            Self::symbol_component(name)
+        )
+    }
+
+    pub(super) fn function_mapping_symbol(name: &str, string_keys: bool, step: usize) -> String {
+        let key_tag = if string_keys { "string" } else { "int" };
+        format!(
+            "__ty_bmc_function_{key_tag}_mapping_{}_step_{step}",
+            Self::symbol_component(name)
+        )
+    }
+
+    pub(super) fn symbolic_function_mapping_symbol(name: &str, step: usize) -> String {
+        format!(
+            "__ty_bmc_function_symbolic_mapping_{}_step_{step}",
+            Self::symbol_component(name)
+        )
+    }
+
+    pub(super) fn sequence_array_symbol(name: &str, step: usize) -> String {
+        format!(
+            "__ty_bmc_sequence_array_{}_step_{step}",
+            Self::symbol_component(name)
+        )
+    }
+
+    pub(super) fn sequence_length_symbol(name: &str, step: usize) -> String {
+        format!(
+            "__ty_bmc_sequence_length_{}_step_{step}",
+            Self::symbol_component(name)
+        )
+    }
+
+    pub(super) fn record_field_symbol(name: &str, field: &str, step: usize) -> String {
+        format!(
+            "__ty_bmc_record_{}_field_{}_step_{step}",
+            Self::symbol_component(name),
+            Self::symbol_component(field)
+        )
+    }
+
+    pub(super) fn tuple_element_symbol(name: &str, index: usize, step: usize) -> String {
+        format!(
+            "__ty_bmc_tuple_{}_element_{index}_step_{step}",
+            Self::symbol_component(name)
+        )
+    }
+
+    /// Declare an auxiliary SMT constant in a namespace disjoint from every
+    /// source carrier. The global monotonic id makes names deterministic and
+    /// unique across scopes; the encoded purpose is diagnostic only. A caller
+    /// may also use the returned name as a temporary translator binding, so
+    /// skip any adversarial source name already present in a carrier map.
+    pub(super) fn declare_internal_const(&mut self, purpose: &str, sort: Sort) -> (String, Term) {
+        loop {
+            let id = self.aux_var_counter;
+            self.aux_var_counter = self
+                .aux_var_counter
+                .checked_add(1)
+                .expect("BMC auxiliary symbol counter overflow");
+            let name = format!(
+                "__ty_bmc_aux_{id}_purpose_{}",
+                Self::symbol_component(purpose)
+            );
+            if self.vars.contains_key(&name)
+                || self.func_vars.contains_key(&name)
+                || self.seq_vars.contains_key(&name)
+                || self.record_vars.contains_key(&name)
+                || self.tuple_vars.contains_key(&name)
+            {
+                continue;
+            }
+            let term = self.solver.declare_const(&name, sort);
+            return (name, term);
+        }
+    }
+
     /// Declare a state variable for all k+1 steps
     ///
-    /// Creates variables x__0, x__1, ..., x__k for the state variable x.
+    /// Creates one canonical [`Self::state_step_symbol`] for every step 0..=k.
     /// Supports scalar types (Bool, Int, String), Set types, Function types,
     /// Record types, and Tuple types. Function, Sequence, Record, and Tuple sorts
     /// are delegated to their dedicated `declare_*` methods.
@@ -369,13 +650,25 @@ impl BmcTranslator {
     /// a propagated error (e.g. [`AYError::Solver`]) from the delegated declaration
     /// or sort conversion.
     pub fn declare_var(&mut self, name: &str, sort: TlaSort) -> AYResult<()> {
-        // Record this as a base state variable so clear_temporary_vars knows
-        // to preserve it. Part of #4006.
-        self.base_var_names.push(name.to_string());
+        // Set arrays use Int carrier indices. Until a coherent Bool-to-Int
+        // index encoding exists across declaration, membership, equality, and
+        // model extraction, reject Set(Bool) before registering a carrier or
+        // declaring any solver symbol.
+        if matches!(
+            &sort,
+            TlaSort::Set { element_sort }
+                if (**element_sort).clone().canonicalized() == TlaSort::Bool
+        ) {
+            return Err(AYError::UnsupportedOp(format!(
+                "BMC variable {name} cannot use Set(Bool): no Bool-index encoding is defined"
+            )));
+        }
 
         // Delegate Function sort to dedicated method
-        if let TlaSort::Function { range, .. } = &sort {
-            return self.declare_func_var(name, (**range).clone());
+        if let TlaSort::Function { domain_keys, range } = &sort {
+            self.declare_func_var_with_exact_domain(name, domain_keys, (**range).clone())?;
+            self.register_base_var_name(name);
+            return Ok(());
         }
 
         // Delegate symbolic-domain Function sort to the MAP-ONLY declaration
@@ -388,13 +681,15 @@ impl BmcTranslator {
             range,
         } = &sort
         {
-            return self.declare_funcsym_var(
+            self.declare_funcsym_var(
                 name,
                 *domain_lo,
                 domain_hi_const.clone(),
                 *domain_hi_offset,
                 (**range).clone(),
-            );
+            )?;
+            self.register_base_var_name(name);
+            return Ok(());
         }
 
         // Delegate Sequence sort to dedicated method
@@ -403,17 +698,23 @@ impl BmcTranslator {
             max_len,
         } = &sort
         {
-            return self.declare_seq_var(name, (**element_sort).clone(), *max_len);
+            self.declare_seq_var(name, (**element_sort).clone(), *max_len)?;
+            self.register_base_var_name(name);
+            return Ok(());
         }
 
         // Delegate Record sort to dedicated method (Part of #3787)
         if let TlaSort::Record { field_sorts } = &sort {
-            return self.declare_record_var(name, field_sorts.clone());
+            self.declare_record_var(name, field_sorts.clone())?;
+            self.register_base_var_name(name);
+            return Ok(());
         }
 
         // Delegate Tuple sort to dedicated method (Part of #3787)
         if let TlaSort::Tuple { element_sorts } = &sort {
-            return self.declare_tuple_var(name, element_sorts.clone());
+            self.declare_tuple_var(name, element_sorts.clone())?;
+            self.register_base_var_name(name);
+            return Ok(());
         }
 
         if !sort.is_scalar() && !matches!(sort, TlaSort::Set { .. }) {
@@ -423,17 +724,33 @@ impl BmcTranslator {
             )));
         }
 
+        self.ensure_declaration_carrier(name, BmcCarrierKind::ScalarState)?;
+        if let Some(existing) = self.vars.get(name) {
+            if existing.sort.clone().canonicalized() == sort.clone().canonicalized() {
+                self.register_base_var_name(name);
+                return Ok(());
+            }
+            return Err(AYError::TypeMismatch {
+                name: name.to_string(),
+                expected: existing.sort.to_string(),
+                actual: sort.to_string(),
+            });
+        }
+
+        let ay_sort = sort.to_ay()?;
+
         let mut terms = Vec::with_capacity(self.bound_k + 1);
 
-        // Create k+1 variables: x__0, x__1, ..., x__k
+        // Create one collision-free carrier for every BMC step.
         for step in 0..=self.bound_k {
-            let step_name = format!("{name}__{step}");
-            let term = self.solver.declare_const(&step_name, sort.to_ay()?);
+            let step_name = Self::state_step_symbol(name, step);
+            let term = self.solver.declare_const(&step_name, ay_sort.clone());
             terms.push(term);
         }
 
         self.vars
             .insert(name.to_string(), BmcVarInfo { sort, terms });
+        self.register_base_var_name(name);
         Ok(())
     }
 
@@ -446,7 +763,7 @@ impl BmcTranslator {
     /// checker demotes to a trust step). The constant is a free variable, so a
     /// proof that holds for it holds for ALL its values.
     ///
-    /// Idempotent: re-declaring an existing name is a no-op.
+    /// Idempotent only when re-declared as the same rigid scalar sort.
     ///
     /// # Errors
     /// Returns [`AYError::UnsupportedOp`] if `sort` is not scalar, or a propagated
@@ -457,22 +774,34 @@ impl BmcTranslator {
                 "rigid constant must be scalar, got {sort} for {name}"
             )));
         }
-        if self.vars.contains_key(name) {
-            return Ok(());
+        self.ensure_declaration_carrier(name, BmcCarrierKind::RigidScalar)?;
+        if let Some(existing) = self.vars.get(name) {
+            if existing.sort.clone().canonicalized() == sort.clone().canonicalized() {
+                self.register_base_var_name(name);
+                return Ok(());
+            }
+            return Err(AYError::TypeMismatch {
+                name: name.to_string(),
+                expected: existing.sort.to_string(),
+                actual: sort.to_string(),
+            });
         }
-        self.base_var_names.push(name.to_string());
-        let term = self.solver.declare_const(name, sort.to_ay()?);
+        let ay_sort = sort.to_ay()?;
+        let symbol = Self::rigid_const_symbol(name);
+        let term = self.solver.declare_const(&symbol, ay_sort);
         let terms = vec![term; self.bound_k + 1];
         self.vars
             .insert(name.to_string(), BmcVarInfo { sort, terms });
+        self.rigid_const_names.insert(name.to_string());
+        self.register_base_var_name(name);
         Ok(())
     }
 
     /// Declare a function state variable for all k+1 steps.
     ///
-    /// Each function is encoded as two SMT arrays per step:
-    /// - `{name}__dom__{step}`: `(Array Int Bool)` — domain membership set
-    /// - `{name}__map__{step}`: `(Array Int RangeSort)` — value mapping
+    /// Each function is encoded as two canonically named SMT arrays per step,
+    /// produced by [`Self::function_domain_symbol`] and
+    /// [`Self::function_mapping_symbol`].
     ///
     /// The range sort must be scalar (Bool, Int, or String). Defaults to an
     /// integer-keyed domain; see
@@ -484,10 +813,23 @@ impl BmcTranslator {
     /// Returns [`AYError::UnsupportedOp`] if `range_sort` is not scalar, or a
     /// propagated [`AYError::Solver`] from the sort conversion.
     pub fn declare_func_var(&mut self, name: &str, range_sort: TlaSort) -> AYResult<()> {
-        // Default to an integer-keyed domain. String-keyed functions are
-        // upgraded in place (see `upgrade_func_key_sort_to_string`) once a
-        // construction reveals the domain is string-typed, which the lossy
-        // `TlaSort::Function { domain_keys }` cannot record on its own.
+        // A generic declaration has an unknown, integer-keyed domain. Legacy
+        // callers that later assign a String-domain construction can upgrade
+        // this unused carrier once; declarations with `TlaSort::Function`
+        // should instead preserve their exact typed domain from the outset.
+        if !range_sort.is_scalar() {
+            return Err(AYError::UnsupportedOp(format!(
+                "BMC function range must be scalar, got {range_sort} for function {name}"
+            )));
+        }
+        self.ensure_declaration_carrier(name, BmcCarrierKind::Function)?;
+        if let Some(existing) = self.func_vars.get(name) {
+            if existing.symbolic_domain.is_none()
+                && existing.range_sort.clone().canonicalized() == range_sort.clone().canonicalized()
+            {
+                return Ok(());
+            }
+        }
         self.declare_func_var_with_key_sort(name, TlaSort::Int, range_sort)
     }
 
@@ -501,7 +843,8 @@ impl BmcTranslator {
     /// disjoint sorts, so no string constant can ever equal an integer literal
     /// key. (Part of #5 — string-keyed BMC function domains.)
     ///
-    /// Idempotent: re-declaring an existing function name is a no-op.
+    /// Idempotent only for the same finite function key/range shape. Generic
+    /// declarations preserve an existing one-way String-key upgrade.
     ///
     /// # Errors
     /// Returns [`AYError::UnsupportedOp`] if `range_sort` is not scalar or
@@ -513,10 +856,6 @@ impl BmcTranslator {
         key_sort: TlaSort,
         range_sort: TlaSort,
     ) -> AYResult<()> {
-        if self.func_vars.contains_key(name) {
-            return Ok(()); // Already declared
-        }
-
         if !range_sort.is_scalar() {
             return Err(AYError::UnsupportedOp(format!(
                 "BMC function range must be scalar, got {range_sort} for function {name}"
@@ -527,25 +866,46 @@ impl BmcTranslator {
                 "BMC function domain key sort must be Int or String, got {key_sort} for function {name}"
             )));
         }
+        let range_ay = range_sort.to_ay()?;
+        self.ensure_declaration_carrier(name, BmcCarrierKind::Function)?;
+        if let Some(existing) = self.func_vars.get(name) {
+            if existing.symbolic_domain.is_none()
+                && existing.key_sort.clone().canonicalized() == key_sort.clone().canonicalized()
+                && existing.range_sort.clone().canonicalized() == range_sort.clone().canonicalized()
+            {
+                return Ok(());
+            }
+            let existing_kind = if existing.symbolic_domain.is_some() {
+                "symbolic-domain function".to_string()
+            } else {
+                format!("[{} -> {}]", existing.key_sort, existing.range_sort)
+            };
+            return Err(AYError::TypeMismatch {
+                name: name.to_string(),
+                expected: existing_kind,
+                actual: format!("[{key_sort} -> {range_sort}]"),
+            });
+        }
 
         // NOTE: do NOT route the key sort through `TlaSort::to_ay()` — that maps
         // `String -> Sort::Int` (the interned-string representation), which is
         // exactly the aliasing we must avoid. Map the index sort explicitly so a
         // `String` key domain yields a genuine `(Array String _)`.
-        let key_ay = match key_sort {
+        let string_keys = matches!(&key_sort, TlaSort::String);
+        let key_ay = match &key_sort {
             TlaSort::Int => Sort::Int,
             TlaSort::String => Sort::String,
             _ => unreachable!("guarded above"),
         };
         let dom_sort = Sort::array(key_ay.clone(), Sort::Bool);
-        let map_sort = Sort::array(key_ay, range_sort.to_ay()?);
+        let map_sort = Sort::array(key_ay, range_ay);
 
         let mut domain_terms = Vec::with_capacity(self.bound_k + 1);
         let mut mapping_terms = Vec::with_capacity(self.bound_k + 1);
 
         for step in 0..=self.bound_k {
-            let dom_name = format!("{name}__dom__{step}");
-            let map_name = format!("{name}__map__{step}");
+            let dom_name = Self::function_domain_symbol(name, string_keys, step);
+            let map_name = Self::function_mapping_symbol(name, string_keys, step);
             domain_terms.push(self.solver.declare_const(&dom_name, dom_sort.clone()));
             mapping_terms.push(self.solver.declare_const(&map_name, map_sort.clone()));
         }
@@ -555,6 +915,8 @@ impl BmcTranslator {
             BmcFuncVarInfo {
                 range_sort,
                 key_sort,
+                finite_domain_keys: None,
+                carrier_referenced: false,
                 domain_terms,
                 mapping_terms,
                 symbolic_domain: None,
@@ -563,14 +925,145 @@ impl BmcTranslator {
         Ok(())
     }
 
+    /// Declare a finite function whose complete domain is part of its TLA sort.
+    /// Unlike [`Self::declare_func_var`], this gives equality/UNCHANGED a finite
+    /// and exact key cover, and pins every domain array to precisely those keys.
+    fn declare_func_var_with_exact_domain(
+        &mut self,
+        name: &str,
+        encoded_keys: &[String],
+        range_sort: TlaSort,
+    ) -> AYResult<()> {
+        let (key_sort, keys) = Self::decode_finite_function_domain_keys(encoded_keys)?;
+        self.ensure_declaration_carrier(name, BmcCarrierKind::Function)?;
+
+        if let Some(existing) = self.func_vars.get(name) {
+            if existing.symbolic_domain.is_none()
+                && existing.key_sort.clone().canonicalized() == key_sort.clone().canonicalized()
+                && existing.range_sort.clone().canonicalized() == range_sort.clone().canonicalized()
+                && existing.finite_domain_keys.as_ref() == Some(&keys)
+            {
+                return Ok(());
+            }
+            return Err(AYError::TypeMismatch {
+                name: name.to_string(),
+                expected: format!(
+                    "finite function [{:?} -> {}]",
+                    existing.finite_domain_keys, existing.range_sort
+                ),
+                actual: format!("finite function [{keys:?} -> {range_sort}]"),
+            });
+        }
+
+        self.declare_func_var_with_key_sort(name, key_sort.clone(), range_sort)?;
+        let domain_terms = self
+            .func_vars
+            .get(name)
+            .expect("function was just declared")
+            .domain_terms
+            .clone();
+
+        for domain_term in domain_terms {
+            let false_default = if matches!(key_sort, TlaSort::String) {
+                // AY currently interns const-arrays by the default value alone.
+                // Give native-String domains a distinct false term so an earlier
+                // `(Array Int Bool)` const-array cannot be reused at the wrong sort.
+                let (_, fresh_false) =
+                    self.declare_internal_const("exact string function domain false", Sort::Bool);
+                let false_term = self.solver.bool_const(false);
+                let pinned = self.solver.try_eq(fresh_false, false_term)?;
+                self.solver
+                    .try_assert_term(pinned)
+                    .expect("invariant: equality is Bool-sorted");
+                fresh_false
+            } else {
+                self.solver.bool_const(false)
+            };
+            let key_ay = if matches!(key_sort, TlaSort::String) {
+                Sort::String
+            } else {
+                Sort::Int
+            };
+            let mut exact_domain = self.solver.try_const_array(key_ay, false_default)?;
+            let present = self.solver.bool_const(true);
+            for key in &keys {
+                let key_term = match key {
+                    BmcFunctionKey::Int(value) => self.solver.int_const(*value),
+                    BmcFunctionKey::String(value) => self.solver.string_const(value),
+                };
+                exact_domain = self.solver.try_store(exact_domain, key_term, present)?;
+            }
+            let exact = self.solver.try_eq(domain_term, exact_domain)?;
+            self.solver
+                .try_assert_term(exact)
+                .expect("invariant: equality is Bool-sorted");
+        }
+
+        let info = self
+            .func_vars
+            .get_mut(name)
+            .expect("function was just declared");
+        info.finite_domain_keys = Some(keys);
+        info.carrier_referenced = true;
+        Ok(())
+    }
+
+    /// Decode the typed domain-key spelling emitted by tla-check's sort
+    /// inference. Legacy raw integer/string spellings remain accepted for the
+    /// public `TlaSort` API, but mixed key kinds and unsupported Bool/model-value
+    /// keys fail before any solver mutation.
+    fn decode_finite_function_domain_keys(
+        encoded_keys: &[String],
+    ) -> AYResult<(TlaSort, Vec<BmcFunctionKey>)> {
+        let mut keys = Vec::with_capacity(encoded_keys.len());
+        for encoded in encoded_keys {
+            let key = if let Some(value) = encoded.strip_prefix("int:") {
+                BmcFunctionKey::Int(value.parse::<i64>().map_err(|_| {
+                    AYError::UnsupportedOp(format!(
+                        "BMC function domain has non-i64 integer key '{encoded}'"
+                    ))
+                })?)
+            } else if let Some(value) = encoded.strip_prefix("str:") {
+                BmcFunctionKey::String(value.to_string())
+            } else if encoded.starts_with("bool:") || encoded.starts_with("id:") {
+                return Err(AYError::UnsupportedOp(format!(
+                    "BMC finite function domain key '{encoded}' is not an Int or String literal"
+                )));
+            } else if let Ok(value) = encoded.parse::<i64>() {
+                BmcFunctionKey::Int(value)
+            } else {
+                BmcFunctionKey::String(encoded.clone())
+            };
+            keys.push(key);
+        }
+        keys.sort();
+        keys.dedup();
+        let has_int = keys.iter().any(|key| matches!(key, BmcFunctionKey::Int(_)));
+        let has_string = keys
+            .iter()
+            .any(|key| matches!(key, BmcFunctionKey::String(_)));
+        if has_int && has_string {
+            return Err(AYError::UnsupportedOp(
+                "BMC finite function domain mixes Int and String keys".to_string(),
+            ));
+        }
+        let key_sort = if has_string {
+            TlaSort::String
+        } else {
+            // The empty function has no observable key kind. Use the existing
+            // Int carrier; logical equality special-cases its empty domain.
+            TlaSort::Int
+        };
+        Ok((key_sort, keys))
+    }
+
     /// Declare a symbolic-domain (map-only) function variable for all k+1 steps.
     ///
     /// The domain is the contiguous integer range `domain_lo ..
     /// (domain_hi_const + domain_hi_offset)` over an unbound symbolic
-    /// `CONSTANT`. Only the mapping array `{name}__map__{step}` (an `(Array Int
-    /// RangeSort)`) is declared — there is NO `{name}__dom__{step}` membership
-    /// array, because the domain is the ARITHMETIC fact `lo <= x <= hi`, not an
-    /// enumerable set. `x \in DOMAIN f` is translated to that bound
+    /// `CONSTANT`. Only the canonically named mapping array is declared — there
+    /// is no domain-membership array, because the domain is the arithmetic fact
+    /// `lo <= x <= hi`, not an enumerable set. `x \in DOMAIN f` is translated to that bound
     /// (see `symbolic_func_domain_bound`).
     ///
     /// Part of the function-state all-N encoding
@@ -587,19 +1080,47 @@ impl BmcTranslator {
         domain_hi_offset: i64,
         range_sort: TlaSort,
     ) -> AYResult<()> {
-        if self.func_vars.contains_key(name) {
-            return Ok(()); // Already declared
-        }
         if !range_sort.is_scalar() {
             return Err(AYError::UnsupportedOp(format!(
                 "BMC symbolic-domain function range must be scalar, got {range_sort} for {name}"
             )));
         }
-        self.base_var_names.push(name.to_string());
-        let map_sort = Sort::array(Sort::Int, range_sort.to_ay()?);
+        let range_ay = range_sort.to_ay()?;
+        self.ensure_declaration_carrier(name, BmcCarrierKind::Function)?;
+        if let Some(existing) = self.func_vars.get(name) {
+            let requested_domain = (domain_lo, domain_hi_const.clone(), domain_hi_offset);
+            if existing.symbolic_domain.as_ref() == Some(&requested_domain)
+                && existing.key_sort == TlaSort::Int
+                && existing.range_sort.clone().canonicalized() == range_sort.clone().canonicalized()
+            {
+                self.register_base_var_name(name);
+                return Ok(());
+            }
+            let expected = match &existing.symbolic_domain {
+                Some((lo, hi, offset)) => {
+                    format!(
+                        "symbolic function [{lo}..{hi}{offset:+} -> {}]",
+                        existing.range_sort
+                    )
+                }
+                None => format!(
+                    "finite function [{} -> {}]",
+                    existing.key_sort, existing.range_sort
+                ),
+            };
+            return Err(AYError::TypeMismatch {
+                name: name.to_string(),
+                expected,
+                actual: format!(
+                    "symbolic function [{domain_lo}..{domain_hi_const}{domain_hi_offset:+} -> \
+                     {range_sort}]"
+                ),
+            });
+        }
+        let map_sort = Sort::array(Sort::Int, range_ay);
         let mut mapping_terms = Vec::with_capacity(self.bound_k + 1);
         for step in 0..=self.bound_k {
-            let map_name = format!("{name}__map__{step}");
+            let map_name = Self::symbolic_function_mapping_symbol(name, step);
             mapping_terms.push(self.solver.declare_const(&map_name, map_sort.clone()));
         }
         self.func_vars.insert(
@@ -607,11 +1128,14 @@ impl BmcTranslator {
             BmcFuncVarInfo {
                 range_sort,
                 key_sort: TlaSort::Int,
+                finite_domain_keys: None,
+                carrier_referenced: false,
                 domain_terms: Vec::new(),
                 mapping_terms,
                 symbolic_domain: Some((domain_lo, domain_hi_const, domain_hi_offset)),
             },
         );
+        self.register_base_var_name(name);
         Ok(())
     }
 
@@ -628,6 +1152,64 @@ impl BmcTranslator {
             .and_then(|i| i.symbolic_domain.clone())
     }
 
+    /// Compare two function mapping representations only at their exact live
+    /// finite domain keys. Mapping-array cells outside DOMAIN are ghosts and
+    /// cannot participate in TLA+ function equality or UNCHANGED.
+    pub(super) fn translate_func_logical_mapping_eq(
+        &mut self,
+        left_name: &str,
+        left_mapping: Term,
+        right_name: &str,
+        right_mapping: Term,
+    ) -> AYResult<Term> {
+        let left = self
+            .func_vars
+            .get(left_name)
+            .ok_or_else(|| AYError::UnknownVariable(format!("function {left_name}")))?;
+        let right = self
+            .func_vars
+            .get(right_name)
+            .ok_or_else(|| AYError::UnknownVariable(format!("function {right_name}")))?;
+        let left_keys = left.finite_domain_keys.clone().ok_or_else(|| {
+            AYError::UnsupportedOp(format!(
+                "BMC whole-function equality for {left_name} requires an exact finite domain"
+            ))
+        })?;
+        let right_keys = right.finite_domain_keys.clone().ok_or_else(|| {
+            AYError::UnsupportedOp(format!(
+                "BMC whole-function equality for {right_name} requires an exact finite domain"
+            ))
+        })?;
+        let left_range = left.range_sort.clone().canonicalized();
+        let right_range = right.range_sort.clone().canonicalized();
+
+        if left_keys != right_keys {
+            return Ok(self.solver.bool_const(false));
+        }
+        if left_keys.is_empty() {
+            // There is exactly one empty function, independent of inferred key
+            // or range metadata, and no mapping cell is observable.
+            return Ok(self.solver.bool_const(true));
+        }
+        if left_range != right_range {
+            // Every live scalar value has a disjoint TLA+ kind.
+            return Ok(self.solver.bool_const(false));
+        }
+
+        let mut result = self.solver.bool_const(true);
+        for key in left_keys {
+            let key_term = match key {
+                BmcFunctionKey::Int(value) => self.solver.int_const(value),
+                BmcFunctionKey::String(value) => self.solver.string_const(&value),
+            };
+            let left_value = self.solver.try_select(left_mapping, key_term)?;
+            let right_value = self.solver.try_select(right_mapping, key_term)?;
+            let value_eq = self.solver.try_eq(left_value, right_value)?;
+            result = self.solver.try_and(result, value_eq)?;
+        }
+        Ok(result)
+    }
+
     /// Upgrade an already-declared, still-Int-keyed function variable to a
     /// `String`-keyed encoding by re-declaring its domain/mapping arrays with a
     /// `String` index sort.
@@ -635,22 +1217,33 @@ impl BmcTranslator {
     /// This is only safe to call before any constraint has referenced the
     /// function's arrays (e.g. at the first `f = [k \in {"a"} |-> ...]`
     /// construction in `Init`/`Next`), because it replaces the array terms. We
-    /// therefore refuse the upgrade if the function is already `String`-keyed
-    /// (idempotent no-op) and never downgrade. Fresh `String`-sorted array
+    /// therefore make an already-`String` function an idempotent no-op, reject
+    /// any referenced or symbolic carrier, and never downgrade. Fresh `String`-sorted array
     /// constants are introduced with distinct names so prior `Int`-indexed
     /// constants (if somehow referenced) remain well-sorted but unconstrained.
     /// (Part of #5.)
     pub(crate) fn upgrade_func_key_sort_to_string(&mut self, name: &str) -> AYResult<()> {
-        let already_string = match self.func_vars.get(name) {
-            Some(info) => matches!(info.key_sort, TlaSort::String),
+        match self.func_vars.get(name) {
+            Some(info) => {
+                if matches!(info.key_sort, TlaSort::String) {
+                    return Ok(());
+                }
+                if info.symbolic_domain.is_some() {
+                    return Err(AYError::UnsupportedOp(format!(
+                        "cannot replace symbolic-domain function {name} with a String-keyed carrier"
+                    )));
+                }
+                if info.carrier_referenced {
+                    return Err(AYError::UnsupportedOp(format!(
+                        "cannot upgrade function {name} to String keys after its Int carrier was referenced"
+                    )));
+                }
+            }
             None => {
                 return Err(AYError::UnknownVariable(format!(
                     "function {name} (upgrade to string-keyed)"
                 )))
             }
-        };
-        if already_string {
-            return Ok(());
         }
         let range_sort = self
             .func_vars
@@ -664,28 +1257,27 @@ impl BmcTranslator {
         let mut domain_terms = Vec::with_capacity(self.bound_k + 1);
         let mut mapping_terms = Vec::with_capacity(self.bound_k + 1);
         for step in 0..=self.bound_k {
-            let dom_name = format!("{name}__dom__str__{step}");
-            let map_name = format!("{name}__map__str__{step}");
+            let dom_name = Self::function_domain_symbol(name, true, step);
+            let map_name = Self::function_mapping_symbol(name, true, step);
             domain_terms.push(self.solver.declare_const(&dom_name, dom_sort.clone()));
             mapping_terms.push(self.solver.declare_const(&map_name, map_sort.clone()));
         }
 
         let info = self.func_vars.get_mut(name).expect("checked above");
         info.key_sort = TlaSort::String;
+        info.finite_domain_keys = None;
         info.domain_terms = domain_terms;
         info.mapping_terms = mapping_terms;
-        // String-keyed upgrade never applies to symbolic-domain functions.
-        info.symbolic_domain = None;
         Ok(())
     }
 
     /// Get the mapping array term for a function variable at a specific step.
     ///
     /// Part of #3786.
-    pub(crate) fn get_func_mapping_at_step(&self, name: &str, step: usize) -> AYResult<Term> {
+    pub(crate) fn get_func_mapping_at_step(&mut self, name: &str, step: usize) -> AYResult<Term> {
         let info = self
             .func_vars
-            .get(name)
+            .get_mut(name)
             .ok_or_else(|| AYError::UnknownVariable(format!("function {name} (at step {step})")))?;
         if step > self.bound_k {
             return Err(AYError::UntranslatableExpr(format!(
@@ -693,16 +1285,17 @@ impl BmcTranslator {
                 self.bound_k
             )));
         }
+        info.carrier_referenced = true;
         Ok(info.mapping_terms[step])
     }
 
     /// Get the domain set term for a function variable at a specific step.
     ///
     /// Part of #3786.
-    pub(crate) fn get_func_domain_at_step(&self, name: &str, step: usize) -> AYResult<Term> {
+    pub(crate) fn get_func_domain_at_step(&mut self, name: &str, step: usize) -> AYResult<Term> {
         let info = self
             .func_vars
-            .get(name)
+            .get_mut(name)
             .ok_or_else(|| AYError::UnknownVariable(format!("function {name} (at step {step})")))?;
         if step > self.bound_k {
             return Err(AYError::UntranslatableExpr(format!(
@@ -719,19 +1312,20 @@ impl BmcTranslator {
                 "function {name} has a symbolic (map-only) domain with no domain array"
             )));
         }
+        info.carrier_referenced = true;
         Ok(info.domain_terms[step])
     }
 
     /// Declare a sequence state variable for all k+1 steps.
     ///
-    /// Each sequence is encoded as an SMT array + length per step:
-    /// - `{name}__arr__{step}`: `(Array Int ElemSort)` — 1-indexed element storage
-    /// - `{name}__len__{step}`: `Int` — current length
+    /// Each sequence is encoded as a canonically named SMT array plus length per
+    /// step, produced by [`Self::sequence_array_symbol`] and
+    /// [`Self::sequence_length_symbol`].
     ///
     /// The element sort must be scalar (Bool, Int, or String).
     /// Length is constrained to `0 <= len <= max_len` at each step.
     ///
-    /// Idempotent: re-declaring an existing sequence name is a no-op.
+    /// Idempotent only for the same element sort and maximum length.
     ///
     /// Part of #3793: Sequence encoding in BMC translator.
     ///
@@ -745,10 +1339,6 @@ impl BmcTranslator {
         element_sort: TlaSort,
         max_len: usize,
     ) -> AYResult<()> {
-        if self.seq_vars.contains_key(name) {
-            return Ok(()); // Already declared
-        }
-
         if !element_sort.is_scalar() {
             return Err(AYError::UnsupportedOp(format!(
                 "BMC sequence element must be scalar, got {element_sort} for sequence {name}"
@@ -756,19 +1346,37 @@ impl BmcTranslator {
         }
 
         let arr_sort = Sort::array(Sort::Int, element_sort.to_ay()?);
+        let max_len_i64 = i64::try_from(max_len).map_err(|_| {
+            AYError::UnsupportedOp(format!(
+                "BMC sequence maximum length {max_len} exceeds the SMT integer bound"
+            ))
+        })?;
+        self.ensure_declaration_carrier(name, BmcCarrierKind::Sequence)?;
+        if let Some(existing) = self.seq_vars.get(name) {
+            if existing.element_sort.clone().canonicalized() == element_sort.clone().canonicalized()
+                && existing.max_len == max_len
+            {
+                return Ok(());
+            }
+            return Err(AYError::TypeMismatch {
+                name: name.to_string(),
+                expected: format!("Seq({}, max={})", existing.element_sort, existing.max_len),
+                actual: format!("Seq({element_sort}, max={max_len})"),
+            });
+        }
 
         let mut array_terms = Vec::with_capacity(self.bound_k + 1);
         let mut length_terms = Vec::with_capacity(self.bound_k + 1);
 
         for step in 0..=self.bound_k {
-            let arr_name = format!("{name}__arr__{step}");
-            let len_name = format!("{name}__len__{step}");
+            let arr_name = Self::sequence_array_symbol(name, step);
+            let len_name = Self::sequence_length_symbol(name, step);
             let arr = self.solver.declare_const(&arr_name, arr_sort.clone());
             let len = self.solver.declare_const(&len_name, Sort::Int);
 
             // Constrain: 0 <= len <= max_len
             let zero = self.solver.int_const(0);
-            let max = self.solver.int_const(max_len as i64);
+            let max = self.solver.int_const(max_len_i64);
             let ge_zero = self.solver.try_ge(len, zero)?;
             let le_max = self.solver.try_le(len, max)?;
             self.solver
@@ -850,14 +1458,9 @@ impl BmcTranslator {
     ///
     /// Returns (q_term, r_term) where q is the quotient and r is the remainder.
     fn linearize_div_mod(&mut self, x_term: Term, k: i64) -> AYResult<(Term, Term)> {
-        let id = self.aux_var_counter;
-        self.aux_var_counter += 1;
-
         // Declare fresh auxiliary variables
-        let q_name = format!("__div_q_{id}");
-        let r_name = format!("__div_r_{id}");
-        let q = self.solver.declare_const(&q_name, Sort::Int);
-        let r = self.solver.declare_const(&r_name, Sort::Int);
+        let (_, q) = self.declare_internal_const("division quotient", Sort::Int);
+        let (_, r) = self.declare_internal_const("division remainder", Sort::Int);
 
         // Assert: x = k*q + r
         let k_term = self.solver.int_const(k);
@@ -1137,194 +1740,11 @@ impl BmcTranslator {
         step: usize,
     ) -> AYResult<()> {
         for (name, value) in assignments {
-            match value {
-                BmcValue::Bool(b) => {
-                    let var_term = self.get_var_at_step(name, step)?;
-                    let val_term = self.solver.bool_const(*b);
-                    let eq = self.solver.try_eq(var_term, val_term)?;
-                    self.assert(eq);
-                }
-                BmcValue::Int(i) => {
-                    let var_term = self.get_var_at_step(name, step)?;
-                    let val_term = self.solver.int_const(*i);
-                    let eq = self.solver.try_eq(var_term, val_term)?;
-                    self.assert(eq);
-                }
-                BmcValue::BigInt(n) => {
-                    use num_traits::ToPrimitive;
-                    let var_term = self.get_var_at_step(name, step)?;
-                    let i = n.to_i64().ok_or_else(|| {
-                        AYError::IntegerOverflow(format!(
-                            "BigInt value {n} for variable '{name}' too large for solver"
-                        ))
-                    })?;
-                    let val_term = self.solver.int_const(i);
-                    let eq = self.solver.try_eq(var_term, val_term)?;
-                    self.assert(eq);
-                }
-                BmcValue::Set(members) => {
-                    let var_term = self.get_var_at_step(name, step)?;
-                    // Encode a concrete set: build (store ... (const false) ... true)
-                    // then assert equality with the variable.
-                    let false_val = self.solver.bool_const(false);
-                    let true_val = self.solver.bool_const(true);
-                    let mut arr = self.solver.try_const_array(Sort::Int, false_val)?;
-                    for member in members {
-                        let member_int = match member {
-                            BmcValue::Int(i) => *i,
-                            _ => {
-                                return Err(AYError::UnsupportedOp(
-                                    "BMC set members must be integers".to_string(),
-                                ));
-                            }
-                        };
-                        // Track concretely-stored set members so subset/membership
-                        // encodings include them in the finite universe.
-                        self.tracked_universe_ints.insert(member_int);
-                        let member_term = self.solver.int_const(member_int);
-                        arr = self.solver.try_store(arr, member_term, true_val)?;
-                    }
-                    let eq = self.solver.try_eq(var_term, arr)?;
-                    self.assert(eq);
-                }
-                BmcValue::Sequence(elements) => {
-                    // Encode a concrete sequence: store elements at 1-based indices,
-                    // constrain length.
-                    let arr_term = self.get_seq_array_at_step(name, step)?;
-                    let len_term = self.get_seq_length_at_step(name, step)?;
-
-                    // Assert length
-                    let len_val = self.solver.int_const(elements.len() as i64);
-                    let len_eq = self.solver.try_eq(len_term, len_val)?;
-                    self.assert(len_eq);
-
-                    // Assert each element at its 1-based index
-                    for (i, elem) in elements.iter().enumerate() {
-                        let idx = self.solver.int_const((i + 1) as i64);
-                        let elem_term = match elem {
-                            BmcValue::Int(v) => self.solver.int_const(*v),
-                            BmcValue::Bool(b) => {
-                                // Bool encoded as Int: true=1, false=0
-                                self.solver.int_const(if *b { 1i64 } else { 0i64 })
-                            }
-                            BmcValue::String(s) => {
-                                let id = self.bmc_intern_string(s);
-                                self.solver.int_const(id)
-                            }
-                            _ => {
-                                return Err(AYError::UnsupportedOp(
-                                    "BMC sequence elements must be scalars".to_string(),
-                                ));
-                            }
-                        };
-                        let selected = self.solver.try_select(arr_term, idx)?;
-                        let eq = self.solver.try_eq(selected, elem_term)?;
-                        self.assert(eq);
-                    }
-                }
-                BmcValue::Function(entries) => {
-                    // Encode a concrete function: constrain domain membership and
-                    // mapping values. Part of #3786.
-                    let dom_term = self.get_func_domain_at_step(name, step)?;
-                    let map_term = self.get_func_mapping_at_step(name, step)?;
-
-                    let false_val = self.solver.bool_const(false);
-                    let true_val = self.solver.bool_const(true);
-
-                    // Build domain: (store ... (const false) ... true)
-                    let mut expected_dom = self.solver.try_const_array(Sort::Int, false_val)?;
-                    for &(key, _) in entries {
-                        let key_term = self.solver.int_const(key);
-                        expected_dom = self.solver.try_store(expected_dom, key_term, true_val)?;
-                    }
-                    let dom_eq = self.solver.try_eq(dom_term, expected_dom)?;
-                    self.assert(dom_eq);
-
-                    // Constrain mapping values at each key
-                    for (key, value) in entries {
-                        let key_term = self.solver.int_const(*key);
-                        let val_term = match value {
-                            BmcValue::Int(v) => self.solver.int_const(*v),
-                            BmcValue::Bool(b) => {
-                                self.solver.int_const(if *b { 1i64 } else { 0i64 })
-                            }
-                            BmcValue::String(s) => {
-                                let id = self.bmc_intern_string(s);
-                                self.solver.int_const(id)
-                            }
-                            _ => {
-                                return Err(AYError::UnsupportedOp(
-                                    "BMC function values must be scalars".to_string(),
-                                ));
-                            }
-                        };
-                        let selected = self.solver.try_select(map_term, key_term)?;
-                        let eq = self.solver.try_eq(selected, val_term)?;
-                        self.assert(eq);
-                    }
-                }
-                BmcValue::Record(fields) => {
-                    // Encode a concrete record: constrain per-field variables.
-                    // Part of #3787: Record encoding in BMC translator.
-                    for (field_name, value) in fields {
-                        let val_term = match value {
-                            BmcValue::Int(v) => self.solver.int_const(*v),
-                            BmcValue::Bool(b) => {
-                                self.solver.int_const(if *b { 1i64 } else { 0i64 })
-                            }
-                            BmcValue::String(s) => {
-                                let id = self.bmc_intern_string(s);
-                                self.solver.int_const(id)
-                            }
-                            _ => {
-                                return Err(AYError::UnsupportedOp(
-                                    "BMC record field values must be scalars".to_string(),
-                                ));
-                            }
-                        };
-                        let field_term = self.get_record_field_at_step(name, field_name, step)?;
-                        let eq = self.solver.try_eq(field_term, val_term)?;
-                        self.assert(eq);
-                    }
-                }
-                BmcValue::Tuple(elements) => {
-                    // Encode a concrete tuple: constrain per-element variables.
-                    // Part of #3787: Tuple encoding in BMC translator.
-                    for (i, elem) in elements.iter().enumerate() {
-                        let val_term = match elem {
-                            BmcValue::Int(v) => self.solver.int_const(*v),
-                            BmcValue::Bool(b) => {
-                                self.solver.int_const(if *b { 1i64 } else { 0i64 })
-                            }
-                            BmcValue::String(s) => {
-                                let id = self.bmc_intern_string(s);
-                                self.solver.int_const(id)
-                            }
-                            _ => {
-                                return Err(AYError::UnsupportedOp(
-                                    "BMC tuple element values must be scalars".to_string(),
-                                ));
-                            }
-                        };
-                        let elem_term = self.get_tuple_element_at_step(name, i + 1, step)?;
-                        let eq = self.solver.try_eq(elem_term, val_term)?;
-                        self.assert(eq);
-                    }
-                }
-                BmcValue::String(s) => {
-                    // Strings are interned to integers (see `bmc_intern_string`);
-                    // pin the variable to the interned id.
-                    let var_term = self.get_var_at_step(name, step)?;
-                    let id = self.bmc_intern_string(s);
-                    let val_term = self.solver.int_const(id);
-                    let eq = self.solver.try_eq(var_term, val_term)?;
-                    self.assert(eq);
-                }
-            }
+            let equality = self.make_value_eq(name, value, step)?;
+            self.assert(equality);
         }
         Ok(())
     }
-
     /// Assert a blocking clause excluding a concrete state at its BMC step.
     ///
     /// Encodes `NOT(var1 = value1 AND var2 = value2 AND ...)` using the same
@@ -1341,6 +1761,36 @@ impl BmcTranslator {
             return Err(AYError::UntranslatableExpr(format!(
                 "cannot block empty concrete state at step {}",
                 state.step
+            )));
+        }
+
+        // Blocking a projection would exclude every full state sharing that
+        // projection and can silently skip reachable models. Require exactly
+        // the public base carrier set; temporary Skolem bindings are not state
+        // variables, while direct compound declarations are base carriers even
+        // when they did not pass through `declare_var`.
+        let mut expected = std::collections::BTreeSet::new();
+        expected.extend(self.base_var_names.iter().map(String::as_str));
+        expected.extend(self.func_vars.keys().map(String::as_str));
+        expected.extend(self.seq_vars.keys().map(String::as_str));
+        expected.extend(self.record_vars.keys().map(String::as_str));
+        expected.extend(self.tuple_vars.keys().map(String::as_str));
+        let actual: std::collections::BTreeSet<&str> =
+            state.assignments.keys().map(String::as_str).collect();
+        if actual != expected {
+            let missing = expected
+                .difference(&actual)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ");
+            let unexpected = actual
+                .difference(&expected)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(AYError::UntranslatableExpr(format!(
+                "cannot block partial concrete state at step {}: missing [{}], unexpected [{}]",
+                state.step, missing, unexpected
             )));
         }
 
@@ -1445,197 +1895,397 @@ impl BmcTranslator {
         Ok(())
     }
 
-    /// Build an equality term `var_at_step = value` for a BmcValue.
-    ///
-    /// Helper for [`assert_wavefront_formula`] — handles Bool, Int, BigInt,
-    /// Set, Sequence, Function, Record, and Tuple.
-    ///
-    /// For compound types, builds a conjunction of per-element equalities
-    /// following the same encoding patterns used in [`assert_concrete_state`].
-    ///
-    /// Part of #3794, extended for compound types.
+    /// Stable diagnostic name for a concrete BMC value kind.
+    fn bmc_value_kind(value: &BmcValue) -> &'static str {
+        match value {
+            BmcValue::Bool(_) => "Bool",
+            BmcValue::Int(_) | BmcValue::BigInt(_) => "Int",
+            BmcValue::String(_) => "String",
+            BmcValue::Set(_) => "Set",
+            BmcValue::Sequence(_) => "Sequence",
+            BmcValue::Function(_) => "Int-keyed Function",
+            BmcValue::StringFunction(_) => "String-keyed Function",
+            BmcValue::Record(_) => "Record",
+            BmcValue::Tuple(_) => "Tuple",
+        }
+    }
+
+    fn value_type_mismatch(name: &str, expected: &TlaSort, value: &BmcValue) -> AYError {
+        AYError::TypeMismatch {
+            name: name.to_string(),
+            expected: expected.to_string(),
+            actual: Self::bmc_value_kind(value).to_string(),
+        }
+    }
+
+    fn scalar_value_term(
+        &mut self,
+        name: &str,
+        value: &BmcValue,
+        sort: &TlaSort,
+    ) -> AYResult<Term> {
+        match (sort, value) {
+            (TlaSort::Bool, BmcValue::Bool(value)) => Ok(self.solver.bool_const(*value)),
+            (TlaSort::Int, BmcValue::Int(value)) => Ok(self.solver.int_const(*value)),
+            (TlaSort::Int, BmcValue::BigInt(value)) => Ok(self.solver.int_const_bigint(value)),
+            (TlaSort::String, BmcValue::String(value)) => {
+                let id = self.bmc_intern_string(value);
+                Ok(self.solver.int_const(id))
+            }
+            _ => Err(Self::value_type_mismatch(name, sort, value)),
+        }
+    }
+
+    fn set_value_term(
+        &mut self,
+        name: &str,
+        members: &[BmcValue],
+        element_sort: &TlaSort,
+    ) -> AYResult<Term> {
+        let false_value = self.solver.bool_const(false);
+        let true_value = self.solver.bool_const(true);
+        let mut array = self.solver.try_const_array(Sort::Int, false_value)?;
+        for member in members {
+            let key_term = match (element_sort, member) {
+                (TlaSort::Int, BmcValue::Int(value)) => {
+                    self.tracked_universe_ints.insert(*value);
+                    self.solver.int_const(*value)
+                }
+                (TlaSort::Int, BmcValue::BigInt(value)) => {
+                    use num_traits::ToPrimitive;
+                    if let Some(value) = value.to_i64() {
+                        self.tracked_universe_ints.insert(value);
+                        self.solver.int_const(value)
+                    } else {
+                        self.solver.int_const_bigint(value)
+                    }
+                }
+                (TlaSort::String, BmcValue::String(value)) => {
+                    let key = self.bmc_intern_string(value);
+                    self.tracked_universe_ints.insert(key);
+                    self.solver.int_const(key)
+                }
+                _ => {
+                    return Err(AYError::TypeMismatch {
+                        name: name.to_string(),
+                        expected: format!("set member of sort {element_sort}"),
+                        actual: Self::bmc_value_kind(member).to_string(),
+                    });
+                }
+            };
+            array = self.solver.try_store(array, key_term, true_value)?;
+        }
+        Ok(array)
+    }
+
+    fn value_term_for_sort(
+        &mut self,
+        name: &str,
+        value: &BmcValue,
+        sort: &TlaSort,
+    ) -> AYResult<Term> {
+        match (sort, value) {
+            (TlaSort::Set { element_sort }, BmcValue::Set(members)) => {
+                self.set_value_term(name, members, element_sort)
+            }
+            _ => self.scalar_value_term(name, value, sort),
+        }
+    }
+
+    fn conjunction(&mut self, mut terms: Vec<Term>) -> AYResult<Term> {
+        let Some(mut result) = terms.pop() else {
+            return Ok(self.solver.bool_const(true));
+        };
+        for term in terms.into_iter().rev() {
+            result = self.solver.try_and(term, result)?;
+        }
+        Ok(result)
+    }
+
+    fn make_int_function_value_eq(
+        &mut self,
+        name: &str,
+        entries: &[(i64, BmcValue)],
+        step: usize,
+    ) -> AYResult<Term> {
+        let (key_sort, range_sort, symbolic_domain) = {
+            let info = self
+                .func_vars
+                .get(name)
+                .ok_or_else(|| AYError::UnknownVariable(format!("function {name}")))?;
+            (
+                info.key_sort.clone(),
+                info.range_sort.clone(),
+                info.symbolic_domain.clone(),
+            )
+        };
+        if key_sort != TlaSort::Int {
+            return Err(AYError::TypeMismatch {
+                name: name.to_string(),
+                expected: format!("{key_sort}-keyed function"),
+                actual: "Int-keyed Function".to_string(),
+            });
+        }
+
+        let map_term = self.get_func_mapping_at_step(name, step)?;
+        let mut conjuncts = Vec::with_capacity(entries.len() + 1);
+        let mut seen = std::collections::BTreeSet::new();
+        for (key, _) in entries {
+            if !seen.insert(*key) {
+                return Err(AYError::UnsupportedOp(format!(
+                    "concrete function '{name}' repeats key {key}"
+                )));
+            }
+        }
+        if let Some((domain_lo, domain_hi_const, domain_hi_offset)) = symbolic_domain {
+            let hi_info = self.vars.get(&domain_hi_const).ok_or_else(|| {
+                AYError::UnknownVariable(format!(
+                    "rigid upper-bound constant {domain_hi_const} for symbolic function {name}"
+                ))
+            })?;
+            if !self.rigid_const_names.contains(&domain_hi_const) || hi_info.sort != TlaSort::Int {
+                return Err(AYError::TypeMismatch {
+                    name: domain_hi_const,
+                    expected: "rigid Int constant".to_string(),
+                    actual: hi_info.sort.to_string(),
+                });
+            }
+
+            // A map-only symbolic function has the exact logical domain
+            // `domain_lo..(N + offset)`. Constraining only the listed map cells
+            // would accept a partial concrete function. Prove that the supplied
+            // keys cover that entire interval by checking their static shape and
+            // tying its upper endpoint to the rigid bound.
+            if let Some((first, _)) = entries.first() {
+                if *first != domain_lo
+                    || entries
+                        .windows(2)
+                        .any(|pair| pair[0].0.checked_add(1) != Some(pair[1].0))
+                {
+                    return Err(AYError::UnsupportedOp(format!(
+                        "concrete symbolic-domain function '{name}' keys must be exactly contiguous from {domain_lo}"
+                    )));
+                }
+            }
+
+            let hi_base = self.get_var_at_step(&domain_hi_const, step)?;
+            let offset = self.solver.int_const(domain_hi_offset);
+            let symbolic_hi = self.solver.try_add(hi_base, offset)?;
+            if let Some((last, _)) = entries.last() {
+                let concrete_hi = self.solver.int_const(*last);
+                conjuncts.push(self.solver.try_eq(symbolic_hi, concrete_hi)?);
+            } else {
+                let concrete_lo = self.solver.int_const(domain_lo);
+                conjuncts.push(self.solver.try_lt(symbolic_hi, concrete_lo)?);
+            }
+        } else {
+            let domain_term = self.get_func_domain_at_step(name, step)?;
+            let false_value = self.solver.bool_const(false);
+            let true_value = self.solver.bool_const(true);
+            let mut expected_domain = self.solver.try_const_array(Sort::Int, false_value)?;
+            for (key, _) in entries {
+                let key_term = self.solver.int_const(*key);
+                expected_domain = self
+                    .solver
+                    .try_store(expected_domain, key_term, true_value)?;
+            }
+            conjuncts.push(self.solver.try_eq(domain_term, expected_domain)?);
+        }
+
+        for (key, value) in entries {
+            let key_term = self.solver.int_const(*key);
+            let selected = self.solver.try_select(map_term, key_term)?;
+            let value_term = self.scalar_value_term(name, value, &range_sort)?;
+            conjuncts.push(self.solver.try_eq(selected, value_term)?);
+        }
+        self.conjunction(conjuncts)
+    }
+
+    fn make_string_function_value_eq(
+        &mut self,
+        name: &str,
+        entries: &[(String, BmcValue)],
+        step: usize,
+    ) -> AYResult<Term> {
+        let (key_sort, range_sort, symbolic) = {
+            let info = self
+                .func_vars
+                .get(name)
+                .ok_or_else(|| AYError::UnknownVariable(format!("function {name}")))?;
+            (
+                info.key_sort.clone(),
+                info.range_sort.clone(),
+                info.symbolic_domain.is_some(),
+            )
+        };
+        if symbolic || key_sort != TlaSort::String {
+            return Err(AYError::TypeMismatch {
+                name: name.to_string(),
+                expected: format!("{key_sort}-keyed function"),
+                actual: "String-keyed Function".to_string(),
+            });
+        }
+
+        let domain_term = self.get_func_domain_at_step(name, step)?;
+        let map_term = self.get_func_mapping_at_step(name, step)?;
+        // AY currently interns const-arrays by the default value alone. A
+        // shared `false` default can therefore alias an earlier Int-indexed
+        // domain array. Give this String-indexed array a fresh Bool carrier and
+        // pin it to false, matching native String-domain declaration.
+        let (_, false_value) =
+            self.declare_internal_const("concrete string function domain false", Sort::Bool);
+        let shared_false = self.solver.bool_const(false);
+        let false_value_is_false = self.solver.try_eq(false_value, shared_false)?;
+        self.solver.try_assert_term(false_value_is_false)?;
+        let true_value = self.solver.bool_const(true);
+        let mut expected_domain = self.solver.try_const_array(Sort::String, false_value)?;
+        let mut conjuncts = Vec::with_capacity(entries.len() + 1);
+        let mut seen = std::collections::BTreeSet::new();
+        for (key, _) in entries {
+            if !seen.insert(key.as_str()) {
+                return Err(AYError::UnsupportedOp(format!(
+                    "concrete function '{name}' repeats key {key:?}"
+                )));
+            }
+            let key_term = self.solver.string_const(key);
+            expected_domain = self
+                .solver
+                .try_store(expected_domain, key_term, true_value)?;
+        }
+        conjuncts.push(self.solver.try_eq(domain_term, expected_domain)?);
+
+        for (key, value) in entries {
+            let key_term = self.solver.string_const(key);
+            let selected = self.solver.try_select(map_term, key_term)?;
+            let value_term = self.scalar_value_term(name, value, &range_sort)?;
+            conjuncts.push(self.solver.try_eq(selected, value_term)?);
+        }
+        self.conjunction(conjuncts)
+    }
+
+    /// Build an equality term between one declared carrier and a concrete value.
+    /// Every compound component is encoded according to declaration metadata;
+    /// Bool carriers never pass through an Int 0/1 surrogate.
     fn make_value_eq(&mut self, name: &str, value: &BmcValue, step: usize) -> AYResult<Term> {
         match value {
-            BmcValue::Bool(b) => {
-                let var_term = self.get_var_at_step(name, step)?;
-                let val_term = self.solver.bool_const(*b);
-                Ok(self.solver.try_eq(var_term, val_term)?)
-            }
-            BmcValue::Int(i) => {
-                let var_term = self.get_var_at_step(name, step)?;
-                let val_term = self.solver.int_const(*i);
-                Ok(self.solver.try_eq(var_term, val_term)?)
-            }
-            BmcValue::String(s) => {
-                let var_term = self.get_var_at_step(name, step)?;
-                let id = self.bmc_intern_string(s);
-                let val_term = self.solver.int_const(id);
-                Ok(self.solver.try_eq(var_term, val_term)?)
-            }
-            BmcValue::BigInt(n) => {
-                use num_traits::ToPrimitive;
-                let var_term = self.get_var_at_step(name, step)?;
-                if let Some(i) = n.to_i64() {
-                    let val_term = self.solver.int_const(i);
-                    Ok(self.solver.try_eq(var_term, val_term)?)
-                } else {
-                    Err(AYError::IntegerOverflow(format!(
-                        "BigInt value {n} for variable '{name}' too large for wavefront encoding"
-                    )))
-                }
+            BmcValue::Bool(_) | BmcValue::Int(_) | BmcValue::BigInt(_) | BmcValue::String(_) => {
+                let sort = self
+                    .vars
+                    .get(name)
+                    .ok_or_else(|| AYError::UnknownVariable(name.to_string()))?
+                    .sort
+                    .clone();
+                let variable = self.get_var_at_step(name, step)?;
+                let concrete = self.scalar_value_term(name, value, &sort)?;
+                Ok(self.solver.try_eq(variable, concrete)?)
             }
             BmcValue::Set(members) => {
-                // Build (store ... (const false) ... true) and assert equality
-                let var_term = self.get_var_at_step(name, step)?;
-                let false_val = self.solver.bool_const(false);
-                let true_val = self.solver.bool_const(true);
-                let mut arr = self.solver.try_const_array(Sort::Int, false_val)?;
-                for member in members {
-                    let member_term = match member {
-                        BmcValue::Int(i) => self.solver.int_const(*i),
-                        _ => {
-                            return Err(AYError::UnsupportedOp(
-                                "wavefront set members must be integers".to_string(),
-                            ));
-                        }
-                    };
-                    arr = self.solver.try_store(arr, member_term, true_val)?;
-                }
-                Ok(self.solver.try_eq(var_term, arr)?)
+                let sort = self
+                    .vars
+                    .get(name)
+                    .ok_or_else(|| AYError::UnknownVariable(name.to_string()))?
+                    .sort
+                    .clone();
+                let TlaSort::Set { element_sort } = sort else {
+                    return Err(Self::value_type_mismatch(name, &sort, value));
+                };
+                let variable = self.get_var_at_step(name, step)?;
+                let concrete = self.set_value_term(name, members, &element_sort)?;
+                Ok(self.solver.try_eq(variable, concrete)?)
             }
             BmcValue::Sequence(elements) => {
-                // Constrain array elements and length
-                let arr_term = self.get_seq_array_at_step(name, step)?;
-                let len_term = self.get_seq_length_at_step(name, step)?;
-
-                let len_val = self.solver.int_const(elements.len() as i64);
-                let mut conjuncts = vec![self.solver.try_eq(len_term, len_val)?];
-
-                for (i, elem) in elements.iter().enumerate() {
-                    let idx = self.solver.int_const((i + 1) as i64);
-                    let elem_term = match elem {
-                        BmcValue::Int(v) => self.solver.int_const(*v),
-                        BmcValue::Bool(b) => self.solver.int_const(if *b { 1i64 } else { 0i64 }),
-                        BmcValue::String(s) => {
-                            let id = self.bmc_intern_string(s);
-                            self.solver.int_const(id)
-                        }
-                        _ => {
-                            return Err(AYError::UnsupportedOp(
-                                "wavefront sequence elements must be scalars".to_string(),
-                            ));
-                        }
-                    };
-                    let selected = self.solver.try_select(arr_term, idx)?;
-                    conjuncts.push(self.solver.try_eq(selected, elem_term)?);
+                let (element_sort, max_len) = {
+                    let info = self
+                        .seq_vars
+                        .get(name)
+                        .ok_or_else(|| AYError::UnknownVariable(format!("sequence {name}")))?;
+                    (info.element_sort.clone(), info.max_len)
+                };
+                if elements.len() > max_len {
+                    return Err(AYError::UnsupportedOp(format!(
+                        "concrete sequence '{name}' length {} exceeds declared maximum {max_len}",
+                        elements.len()
+                    )));
                 }
-
-                // Fold into conjunction
-                let mut result = conjuncts.pop().expect("invariant: at least length eq");
-                for c in conjuncts.into_iter().rev() {
-                    result = self.solver.try_and(c, result)?;
+                let length = i64::try_from(elements.len()).map_err(|_| {
+                    AYError::UnsupportedOp(format!(
+                        "concrete sequence '{name}' length cannot be encoded as SMT Int"
+                    ))
+                })?;
+                let array = self.get_seq_array_at_step(name, step)?;
+                let length_term = self.get_seq_length_at_step(name, step)?;
+                let length_value = self.solver.int_const(length);
+                let mut conjuncts = vec![self.solver.try_eq(length_term, length_value)?];
+                for (offset, value) in elements.iter().enumerate() {
+                    let index = self.solver.int_const((offset + 1) as i64);
+                    let selected = self.solver.try_select(array, index)?;
+                    let concrete = self.scalar_value_term(name, value, &element_sort)?;
+                    conjuncts.push(self.solver.try_eq(selected, concrete)?);
                 }
-                Ok(result)
+                self.conjunction(conjuncts)
             }
-            BmcValue::Function(entries) => {
-                // Constrain domain and mapping
-                let dom_term = self.get_func_domain_at_step(name, step)?;
-                let map_term = self.get_func_mapping_at_step(name, step)?;
-
-                let false_val = self.solver.bool_const(false);
-                let true_val = self.solver.bool_const(true);
-
-                let mut expected_dom = self.solver.try_const_array(Sort::Int, false_val)?;
-                for &(key, _) in entries {
-                    let key_term = self.solver.int_const(key);
-                    expected_dom = self.solver.try_store(expected_dom, key_term, true_val)?;
-                }
-                let mut conjuncts = vec![self.solver.try_eq(dom_term, expected_dom)?];
-
-                for (key, value) in entries {
-                    let key_term = self.solver.int_const(*key);
-                    let val_term = match value {
-                        BmcValue::Int(v) => self.solver.int_const(*v),
-                        BmcValue::Bool(b) => self.solver.int_const(if *b { 1i64 } else { 0i64 }),
-                        BmcValue::String(s) => {
-                            let id = self.bmc_intern_string(s);
-                            self.solver.int_const(id)
-                        }
-                        _ => {
-                            return Err(AYError::UnsupportedOp(
-                                "wavefront function values must be scalars".to_string(),
-                            ));
-                        }
-                    };
-                    let selected = self.solver.try_select(map_term, key_term)?;
-                    conjuncts.push(self.solver.try_eq(selected, val_term)?);
-                }
-
-                let mut result = conjuncts.pop().expect("invariant: at least domain eq");
-                for c in conjuncts.into_iter().rev() {
-                    result = self.solver.try_and(c, result)?;
-                }
-                Ok(result)
+            BmcValue::Function(entries) => self.make_int_function_value_eq(name, entries, step),
+            BmcValue::StringFunction(entries) => {
+                self.make_string_function_value_eq(name, entries, step)
             }
             BmcValue::Record(fields) => {
-                // Constrain per-field variables using record encoder
+                let field_sorts = self
+                    .record_vars
+                    .get(name)
+                    .ok_or_else(|| AYError::UnknownVariable(format!("record {name}")))?
+                    .field_sorts
+                    .clone();
+                if fields.len() != field_sorts.len() {
+                    return Err(AYError::TypeMismatch {
+                        name: name.to_string(),
+                        expected: format!("record with {} fields", field_sorts.len()),
+                        actual: format!("record with {} fields", fields.len()),
+                    });
+                }
+                let mut seen = std::collections::HashSet::with_capacity(fields.len());
                 let mut conjuncts = Vec::with_capacity(fields.len());
                 for (field_name, value) in fields {
-                    let val_term = match value {
-                        BmcValue::Int(v) => self.solver.int_const(*v),
-                        BmcValue::Bool(b) => self.solver.int_const(if *b { 1i64 } else { 0i64 }),
-                        BmcValue::String(s) => {
-                            let id = self.bmc_intern_string(s);
-                            self.solver.int_const(id)
-                        }
-                        _ => {
-                            return Err(AYError::UnsupportedOp(
-                                "wavefront record field values must be scalars".to_string(),
-                            ));
-                        }
-                    };
-                    let field_term = self.get_record_field_at_step(name, field_name, step)?;
-                    conjuncts.push(self.solver.try_eq(field_term, val_term)?);
-                }
-                if conjuncts.is_empty() {
-                    Ok(self.solver.bool_const(true))
-                } else {
-                    let mut result = conjuncts.pop().expect("invariant: non-empty");
-                    for c in conjuncts.into_iter().rev() {
-                        result = self.solver.try_and(c, result)?;
+                    if !seen.insert(field_name.as_str()) {
+                        return Err(AYError::UnsupportedOp(format!(
+                            "concrete record '{name}' repeats field '{field_name}'"
+                        )));
                     }
-                    Ok(result)
+                    let sort = field_sorts
+                        .iter()
+                        .find(|(candidate, _)| candidate == field_name)
+                        .map(|(_, sort)| sort)
+                        .ok_or_else(|| {
+                            AYError::UnsupportedOp(format!(
+                                "concrete record '{name}' has unknown field '{field_name}'"
+                            ))
+                        })?;
+                    let field = self.get_record_field_at_step(name, field_name, step)?;
+                    let concrete = self.value_term_for_sort(name, value, sort)?;
+                    conjuncts.push(self.solver.try_eq(field, concrete)?);
                 }
+                self.conjunction(conjuncts)
             }
             BmcValue::Tuple(elements) => {
-                // Constrain per-element variables (1-indexed) using tuple encoder
+                let element_sorts = self
+                    .tuple_vars
+                    .get(name)
+                    .ok_or_else(|| AYError::UnknownVariable(format!("tuple {name}")))?
+                    .element_sorts
+                    .clone();
+                if elements.len() != element_sorts.len() {
+                    return Err(AYError::TypeMismatch {
+                        name: name.to_string(),
+                        expected: format!("tuple with {} elements", element_sorts.len()),
+                        actual: format!("tuple with {} elements", elements.len()),
+                    });
+                }
                 let mut conjuncts = Vec::with_capacity(elements.len());
-                for (i, elem) in elements.iter().enumerate() {
-                    let val_term = match elem {
-                        BmcValue::Int(v) => self.solver.int_const(*v),
-                        BmcValue::Bool(b) => self.solver.int_const(if *b { 1i64 } else { 0i64 }),
-                        BmcValue::String(s) => {
-                            let id = self.bmc_intern_string(s);
-                            self.solver.int_const(id)
-                        }
-                        _ => {
-                            return Err(AYError::UnsupportedOp(
-                                "wavefront tuple element values must be scalars".to_string(),
-                            ));
-                        }
-                    };
-                    let elem_term = self.get_tuple_element_at_step(name, i + 1, step)?;
-                    conjuncts.push(self.solver.try_eq(elem_term, val_term)?);
+                for (offset, (value, sort)) in elements.iter().zip(&element_sorts).enumerate() {
+                    let element = self.get_tuple_element_at_step(name, offset + 1, step)?;
+                    let concrete = self.scalar_value_term(name, value, sort)?;
+                    conjuncts.push(self.solver.try_eq(element, concrete)?);
                 }
-                if conjuncts.is_empty() {
-                    Ok(self.solver.bool_const(true))
-                } else {
-                    let mut result = conjuncts.pop().expect("invariant: non-empty");
-                    for c in conjuncts.into_iter().rev() {
-                        result = self.solver.try_and(c, result)?;
-                    }
-                    Ok(result)
-                }
+                self.conjunction(conjuncts)
             }
         }
     }
@@ -1720,8 +2370,9 @@ mod concrete_state_blocking_tests {
             .try_get_model()
             .expect("BMC translator should consume AY consumer model");
 
-        assert_eq!(direct.int_val("x__0").cloned(), Some(3.into()));
-        assert_eq!(wrapped.int_val("x__0").cloned(), Some(3.into()));
+        let step_symbol = BmcTranslator::state_step_symbol("x", 0);
+        assert_eq!(direct.int_val(&step_symbol).cloned(), Some(3.into()));
+        assert_eq!(wrapped.int_val(&step_symbol).cloned(), Some(3.into()));
         assert!(translator.get_model().is_some());
     }
 
@@ -1738,5 +2389,189 @@ mod concrete_state_blocking_tests {
             Err(AYError::UntranslatableExpr(message))
                 if message == "cannot block empty concrete state at step 0"
         ));
+    }
+
+    #[test]
+    fn block_concrete_state_rejects_partial_base_carrier_projection() {
+        let mut translator = BmcTranslator::new(0).expect("translator");
+        translator
+            .declare_var("x", TlaSort::Int)
+            .expect("declare x");
+        translator
+            .declare_var("ready", TlaSort::Bool)
+            .expect("declare ready");
+        let state = BmcState {
+            step: 0,
+            assignments: HashMap::from([("x".to_string(), BmcValue::Int(1))]),
+        };
+
+        assert!(matches!(
+            translator.block_concrete_state(&state),
+            Err(AYError::UntranslatableExpr(message))
+                if message.contains("missing [ready]") && message.contains("unexpected []")
+        ));
+    }
+
+    #[test]
+    fn arbitrary_precision_int_round_trips_and_can_be_blocked() {
+        let mut translator = BmcTranslator::new(0).expect("translator");
+        translator
+            .declare_var("x", TlaSort::Int)
+            .expect("declare x");
+        let large = num_bigint::BigInt::from(i64::MAX) + 1u8;
+        translator
+            .assert_concrete_state(&[("x".to_string(), BmcValue::BigInt(large.clone()))], 0)
+            .expect("assert arbitrary-precision state");
+
+        assert_eq!(
+            translator.try_check_sat().expect("solver result"),
+            SolveResult::Sat
+        );
+        let model = translator.try_get_model().expect("model");
+        let state = translator
+            .extract_trace(&model)
+            .into_iter()
+            .next()
+            .expect("step zero");
+        assert_eq!(state.assignments.get("x"), Some(&BmcValue::BigInt(large)));
+
+        translator
+            .block_concrete_state(&state)
+            .expect("block arbitrary-precision state");
+        assert!(matches!(
+            translator
+                .try_check_sat()
+                .expect("solver result after block"),
+            SolveResult::Unsat(_)
+        ));
+    }
+
+    #[test]
+    fn arbitrary_precision_set_member_round_trips_and_can_be_blocked() {
+        let mut translator = BmcTranslator::new_with_arrays(0).expect("translator");
+        translator
+            .declare_var(
+                "set",
+                TlaSort::Set {
+                    element_sort: Box::new(TlaSort::Int),
+                },
+            )
+            .expect("declare Int set");
+        let large = num_bigint::BigInt::from(i64::MAX) + 1u8;
+        let value = BmcValue::Set(vec![BmcValue::BigInt(large)]);
+        translator
+            .assert_concrete_state(&[("set".to_string(), value.clone())], 0)
+            .expect("assert arbitrary-precision set");
+
+        assert_eq!(
+            translator.try_check_sat().expect("solver result"),
+            SolveResult::Sat
+        );
+        let model = translator.try_get_model().expect("model");
+        let state = translator
+            .extract_trace(&model)
+            .into_iter()
+            .next()
+            .expect("step zero");
+        assert_eq!(state.assignments.get("set"), Some(&value));
+
+        translator
+            .block_concrete_state(&state)
+            .expect("block arbitrary-precision set state");
+        assert!(matches!(
+            translator
+                .try_check_sat()
+                .expect("solver result after block"),
+            SolveResult::Unsat(_)
+        ));
+    }
+
+    #[test]
+    fn symbolic_function_concrete_value_rejects_partial_domain() {
+        let mut translator = BmcTranslator::new_with_arrays(0).expect("translator");
+        translator
+            .declare_rigid_const("N", TlaSort::Int)
+            .expect("declare rigid bound");
+        translator
+            .declare_funcsym_var("f", 1, "N".to_string(), 0, TlaSort::Bool)
+            .expect("declare symbolic-domain function");
+        translator
+            .assert_concrete_state(
+                &[
+                    ("N".to_string(), BmcValue::Int(2)),
+                    (
+                        "f".to_string(),
+                        BmcValue::Function(vec![(1, BmcValue::Bool(true))]),
+                    ),
+                ],
+                0,
+            )
+            .expect("encode partial concrete function");
+
+        assert!(matches!(
+            translator.try_check_sat().expect("solver result"),
+            SolveResult::Unsat(_)
+        ));
+    }
+
+    #[test]
+    fn symbolic_function_concrete_value_rejects_gapped_keys_before_solving() {
+        let mut translator = BmcTranslator::new_with_arrays(0).expect("translator");
+        translator
+            .declare_rigid_const("N", TlaSort::Int)
+            .expect("declare rigid bound");
+        translator
+            .declare_funcsym_var("f", 1, "N".to_string(), 0, TlaSort::Int)
+            .expect("declare symbolic-domain function");
+
+        assert!(matches!(
+            translator.assert_concrete_state(
+                &[(
+                    "f".to_string(),
+                    BmcValue::Function(vec![
+                        (1, BmcValue::Int(10)),
+                        (3, BmcValue::Int(30)),
+                    ]),
+                )],
+                0,
+            ),
+            Err(AYError::UnsupportedOp(message))
+                if message.contains("keys must be exactly contiguous from 1")
+        ));
+    }
+
+    #[test]
+    fn string_function_concrete_domain_stays_disjoint_from_int_const_array_cache() {
+        let mut translator = BmcTranslator::new_with_arrays(0).expect("translator");
+        translator
+            .declare_func_var_with_key_sort("ints", TlaSort::Int, TlaSort::Bool)
+            .expect("declare Int-keyed function");
+        translator
+            .declare_func_var_with_key_sort("strings", TlaSort::String, TlaSort::Bool)
+            .expect("declare String-keyed function");
+        let ints = BmcValue::Function(vec![(1, BmcValue::Bool(true))]);
+        let strings = BmcValue::StringFunction(vec![("one".to_string(), BmcValue::Bool(false))]);
+        translator
+            .assert_concrete_state(
+                &[
+                    ("ints".to_string(), ints.clone()),
+                    ("strings".to_string(), strings.clone()),
+                ],
+                0,
+            )
+            .expect("encode both index sorts");
+
+        assert_eq!(
+            translator.try_check_sat().expect("solver result"),
+            SolveResult::Sat
+        );
+        let model = translator.try_get_model().expect("model");
+        let state = translator
+            .extract_trace(&model)
+            .into_iter()
+            .next()
+            .expect("step zero");
+        assert_eq!(state.assignments.get("ints"), Some(&ints));
+        assert_eq!(state.assignments.get("strings"), Some(&strings));
     }
 }

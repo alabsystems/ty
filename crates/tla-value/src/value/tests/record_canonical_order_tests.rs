@@ -13,12 +13,12 @@
 //! All tests intern the LATER-alphabetical name FIRST to force
 //! NameId-order != string-order (the order that used to break).
 
+use crate::rp::Rp;
 use crate::value::{RecordBuilder, RecordValue, Value};
 use std::cmp::Ordering;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use crate::rp::Rp;
 use tla_core::intern_name;
 
 /// Intern `zz` before `aa` so NameId numeric order REVERSES string order.

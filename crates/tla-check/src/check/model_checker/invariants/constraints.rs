@@ -86,8 +86,11 @@ impl<'a> ModelChecker<'a> {
                 }
                 let result = self.check_state_constraints_array_uncached(array_state);
                 if let Ok(verdict) = &result {
-                    self.state_constraint_verdict_cache
-                        .commit_verdict(pending, *verdict, array_state);
+                    self.state_constraint_verdict_cache.commit_verdict(
+                        pending,
+                        *verdict,
+                        array_state,
+                    );
                 }
                 return result;
             }

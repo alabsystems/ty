@@ -111,7 +111,7 @@ impl LivenessChecker {
                     .ok_or_else(|| Self::missing_graph_node_error("build_scc_edges: state", from))?
                     .clone();
                 let valid_successors: Vec<_> = from_info
-                    .successors
+                    .successors()
                     .iter()
                     .filter(|to| {
                         scc_set.contains(*to)
@@ -161,7 +161,7 @@ impl LivenessChecker {
                 } else {
                     true
                 };
-                info.successors.contains(&node) && edge_allowed
+                info.successors().contains(&node) && edge_allowed
             };
             return Ok(has_self_loop.then_some(vec![node, node]));
         }
@@ -204,7 +204,7 @@ impl LivenessChecker {
                 let info = self.graph.try_get_node_info(node)?.ok_or_else(|| {
                     Self::missing_graph_node_error("build_witness_cycle: AE action", node)
                 })?;
-                for (succ_idx, succ) in info.successors.iter().enumerate() {
+                for (succ_idx, succ) in info.successors().iter().enumerate() {
                     if !scc_set.contains(succ) {
                         continue;
                     }
@@ -296,7 +296,8 @@ impl LivenessChecker {
                 let Some(state) = self.authoritative_fallback_state_by_fp(
                     node.state_fp,
                     "authoritative AE-state source",
-                )? else {
+                )?
+                else {
                     continue;
                 };
                 if self.eval_live_check_expr(&check, &state, None, None)? {
@@ -320,23 +321,21 @@ impl LivenessChecker {
                 let Some(from_state) = self.authoritative_fallback_state_by_fp(
                     node.state_fp,
                     "authoritative AE-action source",
-                )? else {
+                )?
+                else {
                     continue;
                 };
                 let succ_list: Vec<BehaviorGraphNode> = self
                     .graph
                     .try_get_node_info(node)?
                     .ok_or_else(|| {
-                        Self::missing_graph_node_error(
-                            "authoritative AE-action source info",
-                            node,
-                        )
+                        Self::missing_graph_node_error("authoritative AE-action source info", node)
                     })?
-                        .successors
-                        .iter()
-                        .copied()
-                        .filter(|s| scc_set.contains(s))
-                        .collect();
+                    .successors()
+                    .iter()
+                    .copied()
+                    .filter(|s| scc_set.contains(s))
+                    .collect();
                 for succ in succ_list {
                     if let Some(ec) = ea_check {
                         if !ec.try_allows_edge_pair(&self.graph, node, &succ)? {
@@ -346,7 +345,8 @@ impl LivenessChecker {
                     let Some(to_state) = self.authoritative_fallback_state_by_fp(
                         succ.state_fp,
                         "authoritative AE-action destination",
-                    )? else {
+                    )?
+                    else {
                         continue;
                     };
                     crate::eval::clear_for_run_reset();
@@ -486,7 +486,7 @@ impl LivenessChecker {
             } else {
                 true
             };
-            let has_self_loop = start_info.successors.contains(&start) && edge_allowed;
+            let has_self_loop = start_info.successors().contains(&start) && edge_allowed;
             if has_self_loop {
                 return Ok(Some(vec![start]));
             }
@@ -511,7 +511,7 @@ impl LivenessChecker {
                 Self::missing_graph_node_error("find_path_within_scc: BFS node info", &node)
             })?;
 
-            for succ in &info.successors {
+            for succ in info.successors() {
                 if !scc_set.contains(succ) {
                     continue;
                 }
@@ -584,7 +584,7 @@ impl LivenessChecker {
         } else {
             true
         };
-        let has_self_loop = info.successors.contains(&node) && edge_allowed;
+        let has_self_loop = info.successors().contains(&node) && edge_allowed;
         Ok(!has_self_loop)
     }
 

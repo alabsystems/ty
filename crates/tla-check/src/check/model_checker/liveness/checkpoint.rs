@@ -32,6 +32,15 @@ impl<'a> ModelChecker<'a> {
     ) -> Result<crate::checkpoint::Checkpoint, CheckError> {
         use crate::checkpoint::{Checkpoint, CheckpointStats};
 
+        if self.symmetry.yield_cutoff_active {
+            return Err(ConfigCheckError::Setup(
+                "Checkpoint creation refused after the adaptive symmetry \
+                 cutoff entered a mixed fingerprint domain"
+                    .to_string(),
+            )
+            .into());
+        }
+
         let mut checkpoint = Checkpoint::new().with_paths(spec_path, config_path);
 
         // Populate content hashes from the pre-computed values in CheckpointState.
@@ -135,6 +144,26 @@ impl<'a> ModelChecker<'a> {
         &mut self,
         checkpoint: crate::checkpoint::Checkpoint,
     ) -> Result<VecDeque<State>, CheckError> {
+        // A public resume call may reuse a checker whose completed exact-OTF
+        // pass retired terminal membership entries. That backend must not be
+        // repopulated: the retirement contract allows only final error probes.
+        // Install a fresh backend with the same semantics before restoring and
+        // clear the associated logical-count tombstone atomically with the
+        // replacement.
+        if self.state_storage.retired_seen_fps_len.is_some() {
+            let fresh_seen_fps =
+                self.state_storage
+                    .seen_fps
+                    .fresh_empty_clone()
+                    .map_err(|fault| {
+                        crate::checker_ops::storage_fault_to_check_error(
+                            &*self.state_storage.seen_fps,
+                            &fault,
+                        )
+                    })?;
+            self.state_storage.replace_seen_fps(fresh_seen_fps);
+        }
+
         // Clear in-memory state maps (checkpoint restores these).
         self.state_storage.seen.clear();
         self.trace.depths.clear();
@@ -259,7 +288,10 @@ impl<'a> ModelChecker<'a> {
         // Restore statistics
         self.stats.states_found = checkpoint.metadata.stats.states_found;
         self.stats.initial_states = checkpoint.metadata.stats.initial_states;
+        self.stats.raw_initial_states_generated =
+            checkpoint.metadata.stats.raw_initial_states_generated;
         self.stats.transitions = checkpoint.metadata.stats.transitions;
+        self.stats.raw_successors_generated = checkpoint.metadata.stats.raw_successors_generated;
         self.stats.max_depth = checkpoint.metadata.stats.max_depth;
 
         // If configured to store full states, keep the frontier states in memory.

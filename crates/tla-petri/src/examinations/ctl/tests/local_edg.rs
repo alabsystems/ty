@@ -456,7 +456,7 @@ fn test_local_edg_matches_full_graph_engine_on_small_net() {
     ];
 
     // Build the full-graph oracle once.
-    let mut full = explore_full(&net, &config().refitted_for_full_graph(&net));
+    let full = explore_full(&net, &config().refitted_for_full_graph(&net));
     assert!(full.graph.completed, "test net must explore fully");
     // The Petri-net checker expects the markings to already be in the original-net
     // place space; explore_full produces them directly when no reduction/slice is

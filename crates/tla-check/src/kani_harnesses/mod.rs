@@ -67,11 +67,11 @@ pub(super) mod kani_generators {
     pub use super::compat_helpers::*;
 
     use crate::value::{FuncValue, IntervalValue, Value};
-use tla_value::Rp;
     use num_bigint::BigInt;
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
     use std::sync::Arc;
+    use tla_value::Rp;
 
     /// Generate an arbitrary boolean value
     pub fn any_bool_value() -> Value {
@@ -339,11 +339,10 @@ use tla_value::Rp;
 
 #[cfg(test)]
 pub(super) mod test_helpers {
-    use tla_value::Rp;
     pub(super) use super::compat_helpers::*;
+    use tla_value::Rp;
 
     use crate::value::{FuncValue, Value};
-    use std::sync::Arc;
 
     /// Helper: Create nested function f where f[1] is a function {1 -> true, 2 -> false}
     pub fn create_nested_func() -> FuncValue {

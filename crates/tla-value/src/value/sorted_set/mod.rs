@@ -21,14 +21,17 @@ pub use builder::{val_false, val_int, val_true, SetBuilder};
 #[cfg(feature = "memory-stats")]
 use super::memory_stats;
 use super::Value;
+use crate::rp::Rp as Arc;
 use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{OnceLock};
-use crate::rp::Rp as Arc;
+use std::sync::OnceLock;
 
-use super::cmp_helpers::{cmp_tuple_elements_with_value, eq_tuple_elements_with_value};
+use super::cmp_helpers::{
+    cmp_tuple2_refs_with_value, cmp_tuple_elements_with_value, eq_tuple2_refs_with_value,
+    eq_tuple_elements_with_value, type_order,
+};
 use super::intern_tables::intern_set_array;
 
 // ============================================================================
@@ -84,6 +87,103 @@ const DEDUP_LEN_UNSET: usize = usize::MAX;
 
 /// Empty set singleton for reuse
 static EMPTY_SET: std::sync::OnceLock<SortedSet> = std::sync::OnceLock::new();
+
+/// `type_order` bucket of `Value::Tuple`, the reference point the edge-filter
+/// range scan uses to place non-tuple values relative to the `<<v, *>>` block.
+const TUPLE_TYPE_ORDER: u8 = 4;
+
+/// Outcome of inspecting one element of the sorted edge set for the
+/// [`SortedSet::edge_children`] range scan.
+enum EdgeProbe<'a> {
+    /// The element is the 2-tuple `<<v, c>>`; `c` is its second component.
+    Second(&'a Value),
+    /// The element is not a 2-tuple `<<v, _>>` (wrong first component, wrong
+    /// arity, or a value that can never equal a tuple) — it contributes nothing.
+    Skip,
+    /// The element is an alternate tuple representation that could equal some
+    /// `<<v, c>>`; the fast path cannot place it, so the caller must fall back
+    /// to the naive membership scan.
+    Abort,
+}
+
+/// Ordering of `e`'s first component relative to `v`, consistent with
+/// `Value::cmp` over a sorted set, or `None` to abort on an alternate tuple
+/// representation this fast path cannot place.
+///
+/// `Value::cmp` compares `Tuple`/`Seq` values by content, so their sort key is
+/// their first component; every other value that could equal a tuple
+/// (`Func`/`IntFunc`/`Record`/`Bag`) interleaves with tuples by content and is
+/// refused; and everything else can never equal a tuple, so it orders purely by
+/// its type bucket relative to the tuple bucket.
+#[inline]
+fn first_component_cmp(e: &Value, v: &Value) -> Option<Ordering> {
+    match e {
+        Value::Tuple(elements) => Some(elements.first().map_or(Ordering::Less, |f| f.cmp(v))),
+        Value::Seq(seq) => Some(
+            seq.flat_slice()
+                .first()
+                .map_or(Ordering::Less, |f| f.cmp(v)),
+        ),
+        Value::Func(_) | Value::IntFunc(_) | Value::Record(_) | Value::Bag(_) => None,
+        other => Some(type_order(other).cmp(&TUPLE_TYPE_ORDER)),
+    }
+}
+
+/// First index `i` of `slice` with `first_component_cmp(slice[i], v) != Less`
+/// (the start of the `<<v, *>>` block), or `None` if a probe must abort.
+#[inline]
+fn lower_bound_first_component(slice: &[Value], v: &Value) -> Option<usize> {
+    let (mut lo, mut hi) = (0usize, slice.len());
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        match first_component_cmp(&slice[mid], v)? {
+            Ordering::Less => lo = mid + 1,
+            Ordering::Equal | Ordering::Greater => hi = mid,
+        }
+    }
+    Some(lo)
+}
+
+/// First index `i` of `slice` with `first_component_cmp(slice[i], v) == Greater`
+/// (one past the end of the `<<v, *>>` block), or `None` if a probe must abort.
+#[inline]
+fn upper_bound_first_component(slice: &[Value], v: &Value) -> Option<usize> {
+    let (mut lo, mut hi) = (0usize, slice.len());
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        match first_component_cmp(&slice[mid], v)? {
+            Ordering::Less | Ordering::Equal => lo = mid + 1,
+            Ordering::Greater => hi = mid,
+        }
+    }
+    Some(lo)
+}
+
+/// Classify a sorted-edge-set element for the `<<v, *>>` range scan: extract the
+/// second component of a genuine 2-tuple `<<v, c>>`, skip non-matching Tuple/Seq
+/// and non-tuple values, or abort on an alternate tuple representation.
+#[inline]
+fn edge_second_if_first_eq<'a>(e: &'a Value, v: &Value) -> EdgeProbe<'a> {
+    match e {
+        Value::Tuple(elements) => {
+            if elements.len() == 2 && elements[0] == *v {
+                EdgeProbe::Second(&elements[1])
+            } else {
+                EdgeProbe::Skip
+            }
+        }
+        Value::Seq(seq) => {
+            let elements = seq.flat_slice();
+            if elements.len() == 2 && elements[0] == *v {
+                EdgeProbe::Second(&elements[1])
+            } else {
+                EdgeProbe::Skip
+            }
+        }
+        Value::Func(_) | Value::IntFunc(_) | Value::Record(_) | Value::Bag(_) => EdgeProbe::Abort,
+        _ => EdgeProbe::Skip,
+    }
+}
 
 impl SortedSet {
     #[inline]
@@ -412,6 +512,81 @@ impl SortedSet {
                 |set| contains_normalized(set),
             ),
         }
+    }
+
+    /// Clone-free membership test for the virtual 2-tuple `<<first, second>>`.
+    ///
+    /// Semantically identical to
+    /// `contains_tuple_elements(&[first.clone(), second.clone()])` but never
+    /// materializes the owned `[Value; 2]`. This is the hot `<<a,b>> \in S`
+    /// path (`Tuple2SetIn`), where `first`/`second` are heap-backed tuple
+    /// values whose clone is pure Arc-refcount churn — the callee only reads
+    /// them to drive the binary search / equality scan.
+    pub fn contains_tuple2_refs(&self, first: &Value, second: &Value) -> bool {
+        let contains_normalized = |elements: &[Value]| {
+            elements
+                .binary_search_by(|candidate| {
+                    cmp_tuple2_refs_with_value(first, second, candidate).reverse()
+                })
+                .is_ok()
+        };
+        match &self.storage {
+            SetStorage::Normalized(elements) => contains_normalized(elements),
+            SetStorage::Unnormalized {
+                elements,
+                normalized,
+            } => normalized.get().map_or_else(
+                || {
+                    elements
+                        .iter()
+                        .any(|candidate| eq_tuple2_refs_with_value(first, second, candidate))
+                },
+                |set| contains_normalized(set),
+            ),
+        }
+    }
+
+    /// Fast evaluation of the SetFilter comprehension
+    ///
+    /// `{ c \in domain : <<v, c>> \in self }`   (where `self` is the edge set `E`)
+    ///
+    /// by range-scanning `self`'s sorted view for the `<<v, *>>` prefix and
+    /// keeping each matching edge's second component that also lies in `domain`,
+    /// instead of iterating the whole `domain` and probing `<<v, c>> \in self`
+    /// per element. Returns the collected `c` values (strictly ascending), or
+    /// `None` ("abort") when the scanned region contains an alternate tuple
+    /// representation (`Func`/`IntFunc`/`Record`/`Bag`) this fast path cannot
+    /// place; the caller must then fall back to the naive membership scan.
+    ///
+    /// Soundness. `self`'s normalized view is sorted by `Value::cmp`, under
+    /// which every 2-tuple `<<v, c>>` (any `c`) shares first component `v` and is
+    /// therefore contiguous. [`first_component_cmp`] is a monotone key over that
+    /// order (`Less`/`Equal`/`Greater` relative to the `<<v, *>>` block), so the
+    /// two binary-search bounds bracket a super-range of exactly the block of
+    /// elements whose first component equals `v`. Scanning that block and
+    /// keeping `edge` iff `edge == <<v, c>>` with `c \in domain` reproduces
+    /// `{c \in domain : <<v, c>> \in self}` exactly: any Tuple/Seq `<<v, c>>` is
+    /// in the block and extracted; any alternate-rep value equal to some
+    /// `<<v, c>>` sorts to that same block and forces an abort (never a missed
+    /// edge — see the fused-vs-naive differential tests); and a value that
+    /// cannot equal any tuple never contributes to the naive result either.
+    pub fn edge_children(&self, v: &Value, domain: &SortedSet) -> Option<Vec<Value>> {
+        let slice = self.normalized_slice();
+        let lo = lower_bound_first_component(slice, v)?;
+        let hi = upper_bound_first_component(slice, v)?;
+        let mut collected: Vec<Value> = Vec::new();
+        for edge in &slice[lo..hi] {
+            match edge_second_if_first_eq(edge, v) {
+                EdgeProbe::Second(c) => {
+                    if domain.contains(c) {
+                        collected.push(c.clone());
+                    }
+                }
+                EdgeProbe::Skip => {}
+                EdgeProbe::Abort => return None,
+            }
+        }
+        Some(collected)
     }
 
     /// Iterate over elements in sorted order.

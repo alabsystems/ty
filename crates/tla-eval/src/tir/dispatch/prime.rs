@@ -34,7 +34,9 @@ pub(super) fn eval_tir_prime(
                     let idx = *index as usize;
                     debug_assert!(idx < next_env.env_len());
                     // SAFETY: index from TIR lowering bounded by VarRegistry.
-                    tla_value::churn_stats::churn_count(tla_value::churn_stats::ChurnSite::StateVarReadPrime);
+                    tla_value::churn_stats::churn_count(
+                        tla_value::churn_stats::ChurnSite::StateVarReadPrime,
+                    );
                     let value = unsafe { next_env.get_value(idx) };
                     return Ok(value);
                 }
@@ -62,7 +64,9 @@ pub(super) fn eval_tir_prime(
                     if let Some(idx) = ctx.var_registry().get(&name_ref.name) {
                         debug_assert!(idx.as_usize() < next_env.env_len());
                         // SAFETY: `idx` comes from the current runtime var registry.
-                        tla_value::churn_stats::churn_count(tla_value::churn_stats::ChurnSite::StateVarReadPrime);
+                        tla_value::churn_stats::churn_count(
+                            tla_value::churn_stats::ChurnSite::StateVarReadPrime,
+                        );
                         let value = unsafe { next_env.get_value(idx.as_usize()) };
                         return Ok(value);
                     }
@@ -158,7 +162,9 @@ fn eval_tir_prime_complex(
                 debug_assert!(idx.as_usize() < state_env.env_len());
                 // SAFETY: `idx` originates from this context's `VarRegistry`, which
                 // defines the layout for the bound `state_env` array.
-                tla_value::churn_stats::churn_count(tla_value::churn_stats::ChurnSite::StateVarReadPrime);
+                tla_value::churn_stats::churn_count(
+                    tla_value::churn_stats::ChurnSite::StateVarReadPrime,
+                );
                 let value = unsafe { state_env.get_value(idx.as_usize()) };
                 env.insert(Arc::clone(name), value);
             }

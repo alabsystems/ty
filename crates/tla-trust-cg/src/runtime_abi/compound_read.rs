@@ -912,7 +912,10 @@ mod tests {
         assert_eq!(call_apply1(0, id, CR_KIND_MODEL_VALUE, CR_KIND_INT), Ok(10));
         {
             let _inner_guard = publish_compound_read_context(&inner);
-            assert_eq!(call_apply1(0, id, CR_KIND_MODEL_VALUE, CR_KIND_INT), Ok(999));
+            assert_eq!(
+                call_apply1(0, id, CR_KIND_MODEL_VALUE, CR_KIND_INT),
+                Ok(999)
+            );
         }
         // The outer publication is live again — and NOT stale.
         assert!(compound_read_context_published());
@@ -946,7 +949,10 @@ mod tests {
                 call_apply2(0, node, CR_KIND_MODEL_VALUE, key, CR_KIND_INT, CR_KIND_INT),
                 Ok(expected),
             );
-            assert_eq!(call_apply1(1, node, CR_KIND_MODEL_VALUE, CR_KIND_INT).is_ok(), true);
+            assert_eq!(
+                call_apply1(1, node, CR_KIND_MODEL_VALUE, CR_KIND_INT).is_ok(),
+                true
+            );
         }
         assert_eq!(
             arena_len(),

@@ -62,7 +62,8 @@ struct SplitCtx {
 #[derive(Debug, Clone)]
 enum SplitWrapper {
     Let(Vec<OperatorDef>),
-    Guard(Spanned<Expr>),
+    IfThen(Spanned<Expr>),
+    IfElse(Spanned<Expr>),
 }
 
 /// Splits an action expression into its TLC-style action instances.

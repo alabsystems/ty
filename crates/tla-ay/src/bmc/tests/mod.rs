@@ -11,6 +11,7 @@ fn spanned<T>(node: T) -> Spanned<T> {
 
 mod choose;
 mod compound_e2e;
+mod declaration_safety;
 mod div_mod_basics;
 mod div_mod_linearization;
 mod errors;
@@ -26,4 +27,5 @@ mod quantifiers;
 mod record_tuple_e2e;
 mod seq_encoding;
 mod set_encoding;
+mod trace_extraction;
 mod var_accumulation;

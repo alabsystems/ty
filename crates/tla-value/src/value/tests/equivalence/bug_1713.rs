@@ -5,7 +5,6 @@
 //! Bug #1713 regression: SET_INTERN_TABLE variant substitution.
 
 use super::super::super::*;
-use crate::rp::Rp as Arc;
 use crate::rp::Rp;
 /// #1713: When the intern table substitutes Func(empty) for Tuple([]),
 /// as_seq() must still return the empty sequence.

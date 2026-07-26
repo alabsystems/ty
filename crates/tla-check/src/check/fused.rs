@@ -572,7 +572,21 @@ impl<'a> FusedOrchestrator<'a> {
             .config
             .next
             .as_ref()
-            .and_then(|next_name| find_operator_def(self.module, next_name))
+            .and_then(|next_name| {
+                // Resolve `Next` through the EXTENDS chain, not just the top
+                // module: an MC-wrapper spec (e.g. SlidingPuzzles_anim EXTENDS
+                // SlidingPuzzles) inherits its `Next` from an extended module, so
+                // a top-module-only lookup returns 0 actions — leaving the
+                // wasted-lane gate (which keys on per-action SMT compatibility)
+                // blind to it. The symbolic lanes already resolve Next through
+                // the full module set, so mirror that here for detection parity.
+                find_operator_def(self.module, next_name).or_else(|| {
+                    self.checker_modules
+                        .iter()
+                        .copied()
+                        .find_map(|m| find_operator_def(m, next_name))
+                })
+            })
             .map(|next_def| crate::coverage::detect_actions(&next_def))
             .unwrap_or_default();
         let action_count = detected_actions.len();
@@ -623,6 +637,59 @@ impl<'a> FusedOrchestrator<'a> {
                     telemetry_eprintln!("[fused]   incompatible: {}", action.name);
                 }
             }
+        }
+
+        // ------------------------------------------------------------------
+        // WASTED-LANE GATE (memory reclamation): skip spawning the three
+        // symbolic lanes (BMC / PDR / k-Induction) + the wavefront compressor
+        // when they PROVABLY cannot contribute a verdict — running BFS alone.
+        //
+        // Every symbolic lane must translate the `Next` relation to SMT/CHC.
+        // `is_expr_smt_compatible` (smt_compat.rs) is an OVER-approximation of
+        // ay's translator: it accepts a SUPERSET of what the BMC/PDR/k-Induction
+        // translators actually handle (e.g. GameOfLife's action passes the coarse
+        // check yet PDR/k-Induction still reject `Discriminant(20)` deeper). So
+        // when NOT EVEN ONE action passes the coarse check (`smt_count == 0`
+        // with actions detected), the strictly-narrower real translators reject
+        // every action too — all three lanes are guaranteed to return
+        // TranslationError and publish NO verdict. Spawning them (each builds an
+        // EvalCtx, clones the module, allocates an ay solver context + SMT
+        // translation buffers — ~19MB resident for a small spec) is therefore
+        // pure waste on exactly these specs (e.g. SlidingPuzzles: 0/1 actions
+        // compatible → all lanes "translation failed").
+        //
+        // SOUNDNESS: the fused verdict is unchanged. A lane that fails
+        // translation produces no Satisfied/Violated result (it returns Err,
+        // classified as degraded), so it can never be the source of the
+        // published verdict. The explicit-state BFS lane — the correctness
+        // oracle — runs identically and produces the exact same verdict, state
+        // count, and counterexample trace whether or not the doomed lanes were
+        // spawned alongside it. Freeing (here: never allocating) a
+        // provably-failed lane cannot change the result.
+        //
+        // `TY_FUSED_NO_SYMBOLIC=1` forces this BFS-only path unconditionally
+        // (diagnosis + an escape hatch for pure explicit-state workloads).
+        let force_no_symbolic = fused_symbolic_lanes_disabled();
+        let all_translation_infeasible = action_count > 0 && smt_count == 0;
+        // `TY_FUSED_FORCE_SYMBOLIC=1` bypasses the automatic (smt_count==0) gate,
+        // forcing the symbolic lanes to spawn even when they will fail
+        // translation — an A/B control for measuring the gate's memory reclaim,
+        // and a safety escape hatch. It does NOT override the explicit
+        // `TY_FUSED_NO_SYMBOLIC` disable.
+        if force_no_symbolic || (all_translation_infeasible && !fused_force_symbolic_lanes()) {
+            let reason = if force_no_symbolic {
+                "symbolic lanes disabled via TY_FUSED_NO_SYMBOLIC".to_string()
+            } else {
+                format!(
+                    "no SMT-translatable actions ({smt_count}/{action_count}); \
+                     all symbolic lanes would fail translation"
+                )
+            };
+            telemetry_eprintln!(
+                "[fused] skipping symbolic lanes (BMC/PDR/k-Induction) — {reason}; \
+                 running explicit-state BFS only"
+            );
+            return self.run_bfs_only_skip(&smt_flags, &detected_actions, &reason);
         }
 
         // Part of #3826: detect exponential state space patterns (e.g., nested
@@ -1186,9 +1253,7 @@ impl<'a> FusedOrchestrator<'a> {
                                 ) || matches!(
                                     kind_slot,
                                     Some(Some(Ok(
-                                        crate::ay_kinduction::KInductionResult::Counterexample {
-                                            ..
-                                        }
+                                        crate::ay_kinduction::KInductionResult::Counterexample { .. }
                                     )))
                                 ) || matches!(
                                     &pdr_slot,
@@ -1408,6 +1473,93 @@ impl<'a> FusedOrchestrator<'a> {
         })
     }
 
+    /// BFS-only fast path for the wasted-lane gate: runs the explicit-state
+    /// checker WITHOUT spawning any symbolic lane, reclaiming their setup memory
+    /// on specs where the lanes provably cannot contribute a verdict (all
+    /// actions SMT-untranslatable, or `TY_FUSED_NO_SYMBOLIC=1`).
+    ///
+    /// The checker is configured identically to the fused BFS lane
+    /// ([`run`](Self::run)'s Lane 1) — same `checker_config` mirroring and
+    /// dead-action coverage — MINUS the cooperative wiring (`set_cooperative_state`
+    /// / `set_portfolio_verdict`), which only exists to race against the symbolic
+    /// lanes that are not present here. The produced `bfs_result` (verdict, state
+    /// count, counterexample trace) is therefore identical to the fused BFS
+    /// lane's, so skipping the doomed symbolic lanes cannot change the verdict.
+    #[cfg(feature = "ay")]
+    fn run_bfs_only_skip(
+        &self,
+        smt_flags: &[bool],
+        detected_actions: &[crate::coverage::DetectedAction],
+        reason: &str,
+    ) -> FusedResult {
+        let mut checker =
+            ModelChecker::new_with_extends(self.module, &self.checker_modules, self.config);
+        for (file_id, path) in &self.checker_config.file_paths {
+            checker.register_file_path(*file_id, path.clone());
+        }
+        if let Some(ref storage) = self.checker_config.fingerprint_storage {
+            checker.set_fingerprint_storage(storage.clone());
+        }
+        if self.checker_config.max_states > 0 {
+            checker.set_max_states(self.checker_config.max_states);
+        }
+        if self.checker_config.max_depth > 0 {
+            checker.set_max_depth(self.checker_config.max_depth);
+        }
+        if self.checker_config.memory_limit_bytes > 0 {
+            checker.set_memory_limit(self.checker_config.memory_limit_bytes);
+        }
+        if self.checker_config.disk_limit_bytes > 0 {
+            checker.set_disk_limit(self.checker_config.disk_limit_bytes);
+        }
+        checker.set_continue_on_error(self.checker_config.continue_on_error);
+        checker.set_store_states(self.checker_config.store_states);
+        checker.set_default_dead_action_coverage();
+        let bfs_result = checker.check();
+
+        // Honest degradation: report all three symbolic lanes as skipped, with
+        // the per-action SMT-compatibility data the CLI surfaces in its report.
+        let action_names: Vec<String> = detected_actions.iter().map(|a| a.name.clone()).collect();
+        let actions_total = smt_flags.len();
+        let actions_smt_compatible = smt_flags.iter().filter(|&&f| f).count();
+        let unsupported_action_names: Vec<String> = smt_flags
+            .iter()
+            .zip(action_names.iter())
+            .filter(|(&compatible, _)| !compatible)
+            .map(|(_, name)| name.clone())
+            .collect();
+        let lane_reason = format!("skipped: {reason}");
+        let degradation = SymbolicDegradation {
+            bmc_degraded: true,
+            bmc_reason: Some(lane_reason.clone()),
+            pdr_degraded: true,
+            pdr_reason: Some(lane_reason.clone()),
+            kinduction_degraded: true,
+            kinduction_reason: Some(lane_reason),
+            actions_total,
+            actions_smt_compatible,
+            unsupported_action_names,
+            ..Default::default()
+        };
+        let symbolic_coverage = degradation.action_coverage();
+
+        FusedResult {
+            winner: FusedWinner::Bfs,
+            bfs_result,
+            bmc_result: None,
+            pdr_result: None,
+            pdr_proof_replay_evidence: None,
+            ay_shared_engine_evidence: Vec::new(),
+            kinduction_result: None,
+            symbolic_summary: Some(format!(
+                "Winner: BFS (explicit-state). Symbolic lanes skipped ({reason})"
+            )),
+            degradation,
+            symbolic_coverage,
+            cross_validation: None,
+        }
+    }
+
     /// Non-ay fallback: runs BFS only (BMC/PDR/k-Induction require ay feature).
     #[cfg(not(feature = "ay"))]
     pub(crate) fn run(&self) -> FusedResult {
@@ -1447,6 +1599,46 @@ fn fused_lane_grace() -> std::time::Duration {
             .unwrap_or(1000)
     });
     std::time::Duration::from_millis(ms)
+}
+
+/// Hard override for the wasted-lane gate: when `TY_FUSED_NO_SYMBOLIC` is set to
+/// a truthy value (`1`/`true`/`yes`/`on`), the fused orchestrator skips the
+/// BMC / PDR / k-Induction symbolic lanes unconditionally and runs explicit-state
+/// BFS only. Sound for any spec (BFS is the correctness oracle); intended for
+/// diagnosis and for pure explicit-state workloads that never benefit from the
+/// symbolic lanes. Default (unset) leaves the automatic `smt_count == 0` gate in
+/// charge, which only skips lanes that provably cannot translate.
+#[cfg(feature = "ay")]
+fn fused_symbolic_lanes_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var("TY_FUSED_NO_SYMBOLIC")
+            .ok()
+            .map(|s| {
+                let v = s.trim().to_ascii_lowercase();
+                matches!(v.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Escape hatch / measurement control for the automatic wasted-lane gate: when
+/// `TY_FUSED_FORCE_SYMBOLIC` is truthy, the `smt_count == 0` gate is bypassed and
+/// the symbolic lanes spawn even though they will fail translation. Lets an A/B
+/// harness measure the gate's memory reclaim on the SAME binary, and restores
+/// the pre-gate behavior if ever needed. Does not affect `TY_FUSED_NO_SYMBOLIC`.
+#[cfg(feature = "ay")]
+fn fused_force_symbolic_lanes() -> bool {
+    static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCED.get_or_init(|| {
+        std::env::var("TY_FUSED_FORCE_SYMBOLIC")
+            .ok()
+            .map(|s| {
+                let v = s.trim().to_ascii_lowercase();
+                matches!(v.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(false)
+    })
 }
 
 /// Classify a BMC error as a translation/degradation failure. Part of #3837.
@@ -1689,7 +1881,12 @@ fn perform_cross_validation(
             } else if let Some(Ok(crate::ay_pdr::PdrResult::Unsafe { trace })) = pdr_result {
                 let trace = pdr_trace_to_bmc_states(trace);
                 Some(safe_validate(Box::new(move || {
-                    cross_validate_symbolic_trace(module, config, &trace, CrossValidationSource::Pdr)
+                    cross_validate_symbolic_trace(
+                        module,
+                        config,
+                        &trace,
+                        CrossValidationSource::Pdr,
+                    )
                 })))
             } else {
                 None
@@ -1801,8 +1998,10 @@ fn determine_fused_winner(
                     Some(Ok(crate::ay_bmc::BmcResult::Violation { .. }))
                 ) {
                     FusedWinner::Bmc
-                } else if matches!(pdr_result, Some(Ok(crate::ay_pdr::PdrResult::Unsafe { .. })))
-                {
+                } else if matches!(
+                    pdr_result,
+                    Some(Ok(crate::ay_pdr::PdrResult::Unsafe { .. }))
+                ) {
                     FusedWinner::Pdr
                 } else {
                     FusedWinner::Bmc
@@ -2859,12 +3058,11 @@ Safety == /\ c.c1 >= 0 /\ c.c1 <= 100
             ..Default::default()
         };
 
-        let orchestrator = FusedOrchestrator::new(&module, &[], &config).with_checker_config(
-            FusedCheckerConfig {
+        let orchestrator =
+            FusedOrchestrator::new(&module, &[], &config).with_checker_config(FusedCheckerConfig {
                 max_states: 1000,
                 ..Default::default()
-            },
-        );
+            });
         let result = orchestrator.run();
 
         // The spec is safe — regardless of which lane wins, there must be no

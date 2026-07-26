@@ -92,7 +92,9 @@ impl Value {
     }
 
     /// Create a lazy record set from field-name/set pairs.
-    pub fn record_set(fields: impl IntoIterator<Item = (impl Into<std::sync::Arc<str>>, Value)>) -> Self {
+    pub fn record_set(
+        fields: impl IntoIterator<Item = (impl Into<std::sync::Arc<str>>, Value)>,
+    ) -> Self {
         Value::RecordSet(Rp::new(RecordSetValue::new(
             fields.into_iter().map(|(k, v)| (k.into(), v)),
         )))

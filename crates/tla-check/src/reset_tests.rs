@@ -10,7 +10,6 @@ use super::reset_global_state_unchecked;
 use crate::intern::{get_interner, wait_for_no_active_runs};
 use crate::{guard_error_stats, intern, value, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
 static RESET_GLOBAL_STATE_TEST_ID: AtomicU64 = AtomicU64::new(1);
 

@@ -15,8 +15,9 @@
 //! Part of #3753, #3781.
 
 use serde_json::{json, Value as JsonValue};
-use tla_value::Rp;
 use tla_value::value_to_itf;
+#[cfg(test)]
+use tla_value::Rp;
 
 use crate::{State, Trace};
 
@@ -137,7 +138,6 @@ pub fn liveness_trace_to_itf(prefix: &Trace, cycle: &Trace) -> JsonValue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use tla_value::Value;
 
     /// Shorthand for creating a `Value::SmallInt` in tests.

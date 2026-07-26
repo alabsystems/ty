@@ -68,8 +68,7 @@ impl LivenessChecker {
         if self.graph.has_owned_state_cache() {
             let succ_fps = self
                 .state_successor_fps
-                .get(&from_fp)
-                .cloned()
+                .get_owned(&from_fp)
                 .ok_or_else(|| {
                     Self::behavior_graph_invariant_error(format!(
                         "owned compact cache is missing successor adjacency for ENABLED source {from_fp}"
@@ -78,7 +77,7 @@ impl LivenessChecker {
             self.eval_enabled_array_fast_from_fps(info, from_state, from_fp, &succ_fps, registry)
         } else if let Some(succs) = self.state_successors.get(&from_fp).cloned() {
             self.eval_enabled_array_fast_lazy_envs(info, from_state, from_fp, &succs, registry)
-        } else if let Some(succ_fps) = self.state_successor_fps.get(&from_fp).cloned() {
+        } else if let Some(succ_fps) = self.state_successor_fps.get_owned(&from_fp) {
             self.eval_enabled_array_fast_from_fps(info, from_state, from_fp, &succ_fps, registry)
         } else {
             Ok(false)

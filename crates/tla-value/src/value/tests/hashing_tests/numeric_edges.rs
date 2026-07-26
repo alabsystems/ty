@@ -6,7 +6,6 @@
 
 use super::super::super::*;
 use super::hash_value;
-use crate::rp::Rp as Arc;
 use crate::rp::Rp;
 // === hash_i64_as_bigint edge cases ===
 

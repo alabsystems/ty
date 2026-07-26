@@ -22,12 +22,13 @@
 //! record entries pairwise against string-sorted func entries, so the verdict
 //! flipped with the per-run interning order of the field names.
 
+pub(in crate::value) mod intern;
 mod lookup;
 mod mutation;
 
 use super::functions::FP_UNSET;
-use crate::rp::Rp;
 use super::Value;
+use crate::rp::Rp;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use tla_core::{intern_name, name_id_str_cmp, NameId};
@@ -111,20 +112,22 @@ impl RecordValue {
             );
             entries.sort_by(|a, b| name_id_str_cmp(a.0, b.0));
         }
-        RecordValue {
+        // Hash-cons through the per-thread record intern table (see
+        // record/intern.rs): equal records SHARE one entries allocation.
+        intern::intern_record(RecordValue {
             entries: crate::rp::Rp::new(entries),
             additive_fp: AtomicU64::new(FP_UNSET),
-        }
+        })
     }
 
     /// Create a record from field-value pairs in ANY order (NameId keys),
     /// sorting them into the canonical record field order (field-name string).
     pub fn from_entries(mut entries: Vec<(NameId, Value)>) -> Self {
         entries.sort_by(|a, b| name_id_str_cmp(a.0, b.0));
-        RecordValue {
+        intern::intern_record(RecordValue {
             entries: crate::rp::Rp::new(entries),
             additive_fp: AtomicU64::new(FP_UNSET),
-        }
+        })
     }
 
     /// Create a record from pre-sorted field-value pairs (string keys, interned)
@@ -143,10 +146,10 @@ impl RecordValue {
             .into_iter()
             .map(|(k, v)| (intern_name(&k), v))
             .collect();
-        RecordValue {
+        intern::intern_record(RecordValue {
             entries: crate::rp::Rp::new(id_entries),
             additive_fp: AtomicU64::new(FP_UNSET),
-        }
+        })
     }
 
     /// Get the number of fields
@@ -180,6 +183,19 @@ impl RecordValue {
             AtomicOrdering::Relaxed,
         );
         fp
+    }
+
+    /// Route a COMPLETED record through the intern table (record
+    /// hash-consing): returns a record sharing the canonical allocation when
+    /// a structurally equal record was interned earlier on this thread.
+    /// No-op under `TY_NO_RECORD_INTERN=1` / the `InterningSkipGuard`.
+    ///
+    /// Call only at completion points (a record that will not be further
+    /// mutated in this expression): interning pins the allocation, so a
+    /// later in-place mutation attempt forces copy-on-write.
+    #[inline]
+    pub fn canonicalized(self) -> Self {
+        intern::intern_record(self)
     }
 
     /// Check if two RecordValues share the same underlying storage (pointer equality)

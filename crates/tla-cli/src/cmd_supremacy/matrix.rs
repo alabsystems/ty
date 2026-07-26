@@ -6,13 +6,22 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::fs;
+use std::io::{Read, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(target_os = "linux")]
+use std::process::Stdio;
+#[cfg(target_os = "linux")]
+use std::thread;
+#[cfg(target_os = "linux")]
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::de::{MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
@@ -20,11 +29,24 @@ use super::anti_overfit;
 use super::matrix_refresh;
 use super::parse;
 use super::policy::{MatrixPolicy, SupremacyPolicy};
-use super::runner::{run_command, CommandSpec};
-#[cfg(test)]
-use super::tlc_java_single_thread_args;
+#[cfg(target_os = "linux")]
+use super::runner::{linux_project_directory_attributes, validate_live_cgroup2_mount_binding};
+use super::runner::{
+    run_command_with_envelope, ArtifactRetentionEvidence, CommandResult, CommandSpec,
+    CpuConfinementMethod, ExecutionEnvelope, ObservationStorageBinding, ObservationStorageContract,
+    PeakMemoryMethod, PeakMemoryMetric, PeakMemoryScope, StorageLimitTrigger,
+    COMMAND_SCRATCH_DIR_NAME, OBSERVATION_PAYLOAD_DIRECTORY_NAME,
+};
 use super::tlc_java_single_thread_base_argv;
-use crate::cli_schema::{SupremacyMatrixArgs, SupremacyMatrixRuntimeScope, SupremacyMode};
+use super::work_equivalence::{
+    WorkEquivalenceEvidence, WorkEquivalencePolicyV1, WorkEquivalenceVerdict,
+};
+#[cfg(test)]
+use super::{runner::StorageLimitTriggerKind, tlc_java_single_thread_args};
+use crate::cli_schema::{
+    SupremacyMatrixArgs, SupremacyMatrixCampaignPlanArgs, SupremacyMatrixMergeArgs,
+    SupremacyMatrixRuntimeScope, SupremacyMatrixSegmentArgs, SupremacyMode,
+};
 
 #[derive(Clone, Debug, Deserialize)]
 struct SpecBaseline {
@@ -47,6 +69,16 @@ struct SpecBaseline {
 struct BaselineInputs {
     #[serde(default)]
     examples_dir: Option<PathBuf>,
+    #[serde(default)]
+    examples_git: Option<BaselineGitCheckout>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct BaselineGitCheckout {
+    #[serde(default)]
+    head: Option<String>,
+    #[serde(default)]
+    is_dirty: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -55,10 +87,118 @@ struct BaselineSpec {
     ty: BaselineMode,
     #[serde(default)]
     verified_match: bool,
+    /// Strict rows require the exact typed schema-v1 exhaustive-work rule.
+    /// Invalid/legacy declarations remain deserializable in warning mode but
+    /// never qualify evidence or get copied into matrix output.
+    #[serde(default)]
+    work_equivalence: Option<BaselineWorkEquivalenceDeclaration>,
+    #[serde(default = "default_eligible")]
+    eligibility: String,
+    #[serde(default)]
+    exclusion: Option<BaselineExclusion>,
     #[serde(default)]
     source: Option<BaselineSource>,
     #[serde(flatten)]
     metadata: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum BaselineWorkEquivalenceDeclaration {
+    Typed(WorkEquivalenceEvidence),
+    Invalid(#[allow(dead_code)] Value),
+}
+
+impl BaselineWorkEquivalenceDeclaration {
+    fn exact_evidence(&self) -> Option<&WorkEquivalenceEvidence> {
+        match self {
+            Self::Typed(evidence) if evidence.is_exact_exhaustive_holds_rule() => Some(evidence),
+            Self::Typed(_) | Self::Invalid(_) => None,
+        }
+    }
+}
+
+fn default_eligible() -> String {
+    "eligible".to_string()
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct BaselineExclusion {
+    reason_code: String,
+    #[allow(dead_code)]
+    #[serde(default)]
+    detail: Option<String>,
+}
+
+/// One raw scored or warmup observation retained by the matrix evidence schema.
+///
+/// `process_tree_peak_memory_bytes` deliberately does not say RSS: qualifying
+/// Linux evidence comes from cgroup v2 `memory.peak`, which includes all
+/// cgroup-accounted memory. Direct-child `ru_maxrss` and sampled process-group
+/// RSS remain diagnostic only.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub(super) struct SupremacyMatrixPerformanceSample {
+    #[serde(default)]
+    pub(super) run_index: usize,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "elapsed_seconds"
+    )]
+    pub(super) runtime_seconds: Option<f64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "peak_process_tree_rss_bytes",
+        alias = "process_tree_peak_rss_bytes"
+    )]
+    pub(super) process_tree_peak_memory_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) error_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) violated_obligation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) states: Option<u64>,
+    /// Diagnostic/internal transition count retained for compatibility. Strict
+    /// work parity is bound to the three raw generated-work counters below.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) transitions: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) raw_initial_states_generated: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) raw_successors_generated: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) states_generated: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) tool_order: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) artifact_dir: Option<PathBuf>,
+    /// Order of the two independent timing blocks in this repetition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) pair_block_order: Option<String>,
+    /// Final execution-tier diagnostic reported by TY for this run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) engine_tier: Option<String>,
+    /// True only for inherited one-logical-CPU Linux affinity.
+    #[serde(default)]
+    pub(super) strict_cpu_qualified: bool,
+    /// True only for complete process-tree cgroup v2 `memory.peak` evidence.
+    #[serde(default)]
+    pub(super) strict_memory_qualified: bool,
+    /// Runner-level conjunction of the strict CPU and memory envelope checks.
+    #[serde(default)]
+    pub(super) strict_qualified: bool,
+    /// Full requested runner envelope, retained for auditability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) requested_execution_envelope: Option<Value>,
+    /// Full runner resource evidence, including methods and failure reasons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) resource_evidence: Option<Value>,
+    /// Stable launcher qualification identity retained by the command runner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) machine_provenance: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -68,8 +208,57 @@ struct BaselineMode {
     error_type: Option<String>,
     #[serde(default)]
     runtime_seconds: Option<f64>,
+    #[serde(
+        default,
+        alias = "peak_process_tree_rss_bytes",
+        alias = "process_tree_peak_rss_bytes",
+        alias = "peak_rss_bytes"
+    )]
+    process_tree_peak_memory_bytes: Option<u64>,
+    #[serde(default, alias = "runs")]
+    samples: Vec<SupremacyMatrixPerformanceSample>,
+    /// Retained but unscored warmup observations for this mode's primary arm.
+    #[serde(default)]
+    cache_warmup_samples: Vec<SupremacyMatrixPerformanceSample>,
     #[serde(default)]
     states: Option<u64>,
+    /// Admitted/internal transition diagnostic; not strict work evidence.
+    #[serde(default)]
+    transitions: Option<u64>,
+    #[serde(default)]
+    raw_initial_states_generated: Option<u64>,
+    #[serde(default)]
+    raw_successors_generated: Option<u64>,
+    #[serde(default)]
+    states_generated: Option<u64>,
+    /// TLC observation paired directly with the pinned count-verification TY
+    /// observation. The primary TLC fields above remain the production pair.
+    #[serde(default)]
+    count_verification_status: Option<String>,
+    #[serde(default)]
+    count_verification_error_type: Option<String>,
+    #[serde(default)]
+    count_verification_runtime_seconds: Option<f64>,
+    #[serde(
+        default,
+        alias = "count_verification_peak_process_tree_rss_bytes",
+        alias = "count_verification_process_tree_peak_rss_bytes"
+    )]
+    count_verification_process_tree_peak_memory_bytes: Option<u64>,
+    #[serde(default)]
+    count_verification_samples: Vec<SupremacyMatrixPerformanceSample>,
+    #[serde(default)]
+    count_verification_cache_warmup_samples: Vec<SupremacyMatrixPerformanceSample>,
+    #[serde(default)]
+    count_verification_states: Option<u64>,
+    #[serde(default)]
+    count_verification_transitions: Option<u64>,
+    #[serde(default)]
+    count_verification_raw_initial_states_generated: Option<u64>,
+    #[serde(default)]
+    count_verification_raw_successors_generated: Option<u64>,
+    #[serde(default)]
+    count_verification_states_generated: Option<u64>,
     /// Production-default measurement axis (auto-POR/auto-symmetry free to engage),
     /// recorded alongside the pinned count-verify run by `--refresh-runtime
     /// --production-runtime true`. Backward-compatible: absent in older baselines.
@@ -80,12 +269,30 @@ struct BaselineMode {
     production_error_type: Option<String>,
     #[serde(default)]
     production_runtime_seconds: Option<f64>,
+    #[serde(
+        default,
+        alias = "production_peak_process_tree_rss_bytes",
+        alias = "production_process_tree_peak_rss_bytes",
+        alias = "production_peak_rss_bytes"
+    )]
+    production_process_tree_peak_memory_bytes: Option<u64>,
+    #[serde(default, alias = "production_runs")]
+    production_samples: Vec<SupremacyMatrixPerformanceSample>,
+    #[serde(default)]
+    production_cache_warmup_samples: Vec<SupremacyMatrixPerformanceSample>,
     /// Informational only: production-default state counts are reduced by
     /// auto-POR/auto-symmetry and are never compared against TLC; the pinned
     /// `states` field owns count parity.
     #[serde(default)]
-    #[allow(dead_code)]
     production_states: Option<u64>,
+    #[serde(default)]
+    production_transitions: Option<u64>,
+    #[serde(default)]
+    production_raw_initial_states_generated: Option<u64>,
+    #[serde(default)]
+    production_raw_successors_generated: Option<u64>,
+    #[serde(default)]
+    production_states_generated: Option<u64>,
     #[serde(flatten)]
     metadata: BTreeMap<String, Value>,
 }
@@ -112,6 +319,51 @@ struct BaselineTyRefresh {
     binary_sha256: Option<String>,
     #[serde(default)]
     allow_debug_runtime: bool,
+    #[serde(default)]
+    evidence_set_id: Option<String>,
+    #[serde(default)]
+    runtime_evidence_path: Option<PathBuf>,
+    #[serde(default)]
+    refreshed_specs_jcs_sha256: Option<String>,
+    #[serde(default)]
+    machine_provenance_path: Option<PathBuf>,
+    #[serde(default)]
+    machine_provenance_id: Option<String>,
+    #[serde(default)]
+    final_receipt_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StrictCorpusManifest {
+    schema_version: u64,
+    claim: String,
+    source: StrictCorpusSource,
+    eligibility: StrictCorpusEligibility,
+    work_equivalence_policy: WorkEquivalencePolicyV1,
+    rows: Vec<StrictCorpusRow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StrictCorpusSource {
+    commit: String,
+    expected_cfg_count: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct StrictCorpusEligibility {
+    exclusions: BTreeMap<String, StrictCorpusExclusion>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StrictCorpusExclusion {
+    reason_code: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct StrictCorpusRow {
+    name: String,
+    cfg_path: String,
+    tla_path: String,
 }
 
 const DEFAULT_TLC_JAR: &str = "tlaplus/tytools.jar";
@@ -119,14 +371,101 @@ const DEFAULT_COMMUNITY_MODULES_JAR: &str = "tlaplus/CommunityModules.jar";
 const DEFAULT_TLA_LIBRARY: &str = "test_specs/tla_library";
 const ENV_TLA_LIBRARY: &str = "TLA_LIBRARY";
 const ENV_TLA_PLUS_LIBRARY: &str = "TLA_PLUS_LIBRARY";
-const MATRIX_SUMMARY_SCHEMA: &str = "ty.supremacy.matrix_summary.v1";
-const RUNTIME_EVIDENCE_SCHEMA: &str = "ty.supremacy.matrix_runtime_evidence.v1";
+const MATRIX_SUMMARY_SCHEMA: &str = "ty.supremacy.matrix_summary.v2";
+const RUNTIME_EVIDENCE_SCHEMA: &str = "ty.supremacy.matrix_runtime_evidence.v4";
+const RUNTIME_EVIDENCE_PAYLOAD_SCHEMA: &str = "ty.supremacy.matrix_runtime_evidence_payload.v2";
+const RUNTIME_CAMPAIGN_EVIDENCE_SCHEMA: &str = "ty.supremacy.matrix_runtime_evidence.v5";
+const RUNTIME_CAMPAIGN_EVIDENCE_PAYLOAD_SCHEMA: &str =
+    "ty.supremacy.matrix_runtime_evidence_payload.v3";
+const RUNTIME_CAMPAIGN_PLAN_SCHEMA: &str = "ty.supremacy.matrix_campaign_plan.v2";
+const RUNTIME_CAMPAIGN_ATTEMPT_CLAIM_SCHEMA: &str = "ty.supremacy.campaign-attempt-claim.v1";
+const RUNTIME_CAMPAIGN_SEGMENT_SUMMARY_SCHEMA: &str =
+    "ty.supremacy.matrix_campaign_segment_summary.v1";
 const RUNTIME_BATCH_PLAN_SCHEMA: &str = "ty.supremacy.matrix_runtime_batch_plan.v1";
+const RUNTIME_CAMPAIGN_BATCH_PLAN_SCHEMA: &str = "ty.supremacy.matrix_runtime_batch_plan.v2";
 const RUNTIME_METADATA_WARNING_FIELD: &str = "matrix_runtime_refresh_metadata_warning";
 const MISSING_RUNTIME_MEANING: &str = "missing_runtime means the row is a runnable, parity-verified check or simulation spec, but the baseline lacks finite positive runtime_seconds for TLC, TY, or both, or runtime evidence was collected with an undersized per-spec timeout budget";
 const MISSING_RUNTIME_LAUNCH_GATE_POLICY: &str = "missing_runtime is a strict launch-gate blocker, not an unsupported spec and not a win; refresh runtime evidence before enforcing all-runnable supremacy";
 const RUNTIME_REFRESH_COMPILE_JOBS_ENV: &str = "TY_TRUST_CG_NATIVE_CALLOUT_COMPILE_JOBS";
-const DEFAULT_RUNTIME_REFRESH_COMPILE_JOBS: &str = "27";
+const DEFAULT_RUNTIME_REFRESH_COMPILE_JOBS: &str = "1";
+const LEGACY_WORK_EQUIVALENCE_FIELDS: &[&str] = &[
+    "work_equivalence_rule",
+    "equivalent_work_rule",
+    "performance_work_equivalence_rule",
+];
+const MACHINE_PROVENANCE_PATH_ENV: &str = "TY_SUPREMACY_MACHINE_PROVENANCE";
+const MACHINE_PROVENANCE_ID_ENV: &str = "TY_SUPREMACY_MACHINE_PROVENANCE_ID";
+const MACHINE_CGROUP_PARENT_ENV: &str = "TY_SUPREMACY_CGROUP_PARENT";
+const FINAL_RECEIPT_PATH_ENV: &str = "TY_SUPREMACY_FINAL_RECEIPT";
+const MACHINE_PROVENANCE_SCHEMA: &str = "ty.supremacy.linux-machine-provenance.v2";
+const FINAL_RECEIPT_SCHEMA: &str = "ty.supremacy.strict-evidence-receipt.v2";
+const OBSERVATION_STORAGE_CAPABILITY_NAME: &str = "observation-storage-capability.json";
+const OBSERVATION_STORAGE_CAPABILITY_SCHEMA: &str =
+    "ty.supremacy.observation-storage-capability.v2";
+const OBSERVATION_STORAGE_RAW_ATTESTATION_SCHEMA: &str =
+    "ty.supremacy.observation-storage-raw-attestation.v2";
+const OBSERVATION_STORAGE_LEASE_LEDGER_SCHEMA: &str =
+    "ty.supremacy.observation-storage-lease-ledger.v2";
+const OBSERVATION_STORAGE_RELEASE_NAME: &str = "observation-storage-release.json";
+const OBSERVATION_STORAGE_RELEASE_SCHEMA: &str =
+    "ty.supremacy.observation-storage-lease-release.v2";
+const OBSERVATION_STORAGE_RELEASE_BINDING_SCHEMA: &str =
+    "ty.supremacy.observation-storage-release-binding.v1";
+const OBSERVATION_STORAGE_CGROUP_BINDING_SCHEMA: &str =
+    "ty.supremacy.observation-storage-cgroup-binding.v1";
+const OBSERVATION_STORAGE_CGROUP_REMOVAL_PROOF_SCHEMA: &str =
+    "ty.supremacy.observation-storage-cgroup-removal-proof.v1";
+const SUDO_ATTESTOR_AUTHORIZATION_SCHEMA: &str = "ty.supremacy.sudo-attestor-authorization.v1";
+const MAXIMUM_SUDO_POLICY_OUTPUT_BYTES: u64 = 65_536;
+const MAXIMUM_STORAGE_LEASE_RELEASE_HISTORY: u64 = 1_024;
+const OBSERVATION_STORAGE_STATE_DIRECTORY_NAME: &str = ".ty-supremacy-project-quota-state";
+const EXACT_STORAGE_INVENTORY_SCHEMA: &str = "ty.supremacy.exact-storage-inventory.v1";
+const OBSERVATION_STORAGE_RELEASE_SLOT_BYTES: u64 = 1_048_576;
+const AUTHORIZED_STORAGE_INVENTORY_SCHEMA: &str = "ty.supremacy.authorized-storage-inventory.v1";
+const AUTHORIZED_STORAGE_PATH_ENCODING: &str = "strict-utf8-relative-posix-no-normalization-v1";
+const STRICT_LAUNCHER_SCRATCH_NAME: &str = "strict-launcher-scratch";
+const STRICT_LAUNCHER_STORAGE_DIRECTORY_NAMES: &[&str] = &[
+    "home",
+    "tmp",
+    "ty-cache",
+    "xdg-cache",
+    "xdg-config",
+    "xdg-state",
+];
+const RETAINED_OBSERVATION_FILE_NAMES: &[&str] = &[
+    "artifact-retention.json",
+    "command.json",
+    "payload-manifest.json",
+    "stderr.txt",
+    "stdout.txt",
+];
+const REQUIRED_MACHINE_QUALIFICATION_CONTROLS: &[&str] = &[
+    "cgroup_v2_read_write",
+    "systemd_user_unit_delegate",
+    "systemd_user_unit_delegate_controllers",
+    "systemd_user_unit_control_group",
+    "systemd_runtime_max_bound",
+    "ancestor_delegation_xattr",
+    "delegation_verified",
+    "delegated_parent_empty",
+    "required_controllers_enabled",
+    "parent_cgroup_procs_writable",
+    "swap_disabled",
+    "cpu_quota_unlimited",
+    "single_cpu_confined",
+    "cpu_isolated",
+    "repository_head_valid",
+    "repository_top_level_absolute_resolved",
+    "repository_working_directory_contained",
+    "repository_tracked_worktree_clean",
+    "repository_no_assume_unchanged_entries",
+    "repository_no_skip_worktree_entries",
+    "guest_identity_stable",
+    "output_storage_contract_stable",
+    "observation_storage_contract_verified",
+    "semantic_environment_stable",
+    "child_environment_allowlisted",
+];
 const MISSING_RUNTIME_REFRESH_COMMAND_ARGS: &[&str] = &[
     "ty",
     "supremacy",
@@ -141,11 +480,20 @@ const MISSING_RUNTIME_REFRESH_COMMAND_ARGS: &[&str] = &[
     "--runtime-output-dir",
     "<output-dir>",
 ];
-// Runtime evidence is currently a single wall-clock sample. Treat sub-10ms
-// non-faster deltas as measurement noise instead of actionable regressions.
+// Diagnostic legacy rows may still carry one wall-clock sample. Strict rows
+// use the balanced paired protocol below; retain this tolerance only for the
+// non-strict legacy classification surface.
 const PERF_TIE_TOLERANCE_SECONDS: f64 = 0.010;
 // Below 50ms, process startup and scheduler noise dominate the checker runtime.
 const PERF_TIE_TINY_RUNTIME_FLOOR_SECONDS: f64 = 0.050;
+/// Strict corpus defaults. Equality is a loss on both axes.
+const STRICT_MIN_RUNTIME_SPEEDUP: f64 = 1.05;
+const STRICT_MAX_MEMORY_RATIO: f64 = 0.95;
+const STRICT_MIN_PAIRED_RUNS: usize = 6;
+const STRICT_PAIRED_STATISTIC: &str = "median_within_pair_ratio.v1";
+const STRICT_PAIRED_SCHEDULE: &str = "dual_counterbalanced_tlc_ty_pairs.v1";
+const STRICT_OS_CACHE_POLICY_SCHEMA: &str = "balanced_steady_guest_page_cache.v2";
+const STRICT_CACHE_WARMUP_OBSERVATIONS_PER_ROW: usize = 8;
 const MATRIX_SIMULATION_TRACES: u64 = 1_000;
 const MATRIX_SIMULATION_DEPTH: u64 = 100;
 const MATRIX_SIMULATION_SEED: u64 = 1;
@@ -155,6 +503,11 @@ const RANDOMIZED_EXTERNAL_OPERATORS: &[&str] = &["RandomElement"];
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(super) struct SupremacyMatrixSummary {
     pub(super) schema: &'static str,
+    pub(super) min_runtime_speedup: f64,
+    pub(super) max_memory_ratio: f64,
+    pub(super) minimum_paired_runs: usize,
+    pub(super) paired_statistic: &'static str,
+    pub(super) paired_schedule: &'static str,
     pub(super) verdict: SupremacyMatrixVerdict,
     pub(super) strict_pass: bool,
     pub(super) strict_blockers: usize,
@@ -184,6 +537,18 @@ pub(super) struct SupremacyMatrixBuildIdentity {
     pub(super) ty_binary_path: String,
     pub(super) ty_binary_sha256: String,
     pub(super) allow_debug_runtime: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) evidence_set_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) runtime_evidence_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) refreshed_specs_jcs_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) machine_provenance_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) machine_provenance_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) final_receipt_path: Option<PathBuf>,
 }
 
 impl SupremacyMatrixBuildIdentity {
@@ -195,6 +560,12 @@ impl SupremacyMatrixBuildIdentity {
             ty_binary_path: refresh.binary_path.clone()?,
             ty_binary_sha256: refresh.binary_sha256.clone()?,
             allow_debug_runtime: refresh.allow_debug_runtime,
+            evidence_set_id: refresh.evidence_set_id.clone(),
+            runtime_evidence_path: refresh.runtime_evidence_path.clone(),
+            refreshed_specs_jcs_sha256: refresh.refreshed_specs_jcs_sha256.clone(),
+            machine_provenance_path: refresh.machine_provenance_path.clone(),
+            machine_provenance_id: refresh.machine_provenance_id.clone(),
+            final_receipt_path: refresh.final_receipt_path.clone(),
         })
     }
 }
@@ -252,9 +623,18 @@ pub(super) struct SupremacyMatrixMissingRuntimeDetail {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(super) struct SupremacyMatrixRow {
     pub(super) spec: String,
+    pub(super) eligible: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) exclusion_reason_code: Option<String>,
     pub(super) class: SupremacyMatrixClass,
+    pub(super) runtime_axis: SupremacyMatrixAxisVerdict,
+    pub(super) memory_axis: SupremacyMatrixAxisVerdict,
+    pub(super) overall: SupremacyMatrixOverallVerdict,
+    pub(super) claim_class: SupremacyMatrixClaimClass,
     pub(super) next_action: SupremacyMatrixNextAction,
     pub(super) reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) work_equivalence: Option<WorkEquivalenceEvidence>,
     #[serde(skip_serializing)]
     pub(super) missing_tlc_runtime: bool,
     #[serde(skip_serializing)]
@@ -272,13 +652,34 @@ pub(super) struct SupremacyMatrixRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) ty_pinned_seconds: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) tlc_process_tree_peak_memory_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ty_process_tree_peak_memory_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ty_pinned_process_tree_peak_memory_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) speedup_tlc_vs_ty: Option<f64>,
+    /// Median within-pair speedup for the independent count-verification
+    /// TLC/TY pair. Strict runtime superiority requires this and the production
+    /// speedup to pass.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) count_speedup_tlc_vs_ty: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) memory_ratio_ty_vs_tlc: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) slowdown_ty_vs_tlc: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) seconds_lost_vs_tlc: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) perf_loser_follow_up: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) tlc_samples: Vec<SupremacyMatrixPerformanceSample>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) count_tlc_samples: Vec<SupremacyMatrixPerformanceSample>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) ty_samples: Vec<SupremacyMatrixPerformanceSample>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) ty_pinned_samples: Vec<SupremacyMatrixPerformanceSample>,
 }
 
 /// Canonical JSON status strings for supremacy comparisons.
@@ -303,6 +704,36 @@ pub(crate) const SUPREMACY_STATUS_FAIL: &str = "fail";
 pub(super) enum SupremacyMatrixVerdict {
     Pass,
     Fail,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum SupremacyMatrixAxisVerdict {
+    Pass,
+    Loss,
+    MissingOrStale,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum SupremacyMatrixOverallVerdict {
+    PassBoth,
+    RuntimeLoss,
+    MemoryLoss,
+    BothLoss,
+    MissingOrStale,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(super) enum SupremacyMatrixClaimClass {
+    PassBoth,
+    RuntimeLoss,
+    MemoryLoss,
+    BothLoss,
+    ParityBlocker,
+    Unsupported,
+    MissingOrStale,
 }
 
 impl SupremacyMatrixVerdict {
@@ -448,7 +879,37 @@ fn validate_enforceable_baseline_value(baseline: &Value) -> Result<()> {
             "matrix baseline was refreshed with --allow-debug-runtime; debug runtime evidence is not allowed in --mode enforce"
         );
     }
+    validate_enforceable_work_equivalence_declarations(baseline)?;
     validate_baseline_promotion_metadata_value(baseline)?;
+    Ok(())
+}
+
+fn validate_enforceable_work_equivalence_declarations(baseline: &Value) -> Result<()> {
+    let specs = baseline
+        .get("specs")
+        .and_then(Value::as_object)
+        .context("baseline has no 'specs' object")?;
+    for (spec, value) in specs {
+        let entry = value
+            .as_object()
+            .with_context(|| format!("baseline spec {spec} is not an object"))?;
+        reject_legacy_work_equivalence_fields(spec, entry)?;
+        if let Some(rule) = entry.get("work_equivalence") {
+            WorkEquivalenceEvidence::parse_exact(rule)
+                .with_context(|| format!("baseline spec {spec} work_equivalence"))?;
+        }
+    }
+    Ok(())
+}
+
+fn reject_legacy_work_equivalence_fields(spec: &str, entry: &Map<String, Value>) -> Result<()> {
+    for legacy_field in LEGACY_WORK_EQUIVALENCE_FIELDS {
+        if entry.contains_key(*legacy_field) {
+            bail!(
+                "baseline spec {spec} uses legacy work-equivalence field {legacy_field:?}; only typed work_equivalence is accepted"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -471,7 +932,10 @@ fn validate_baseline_promotion_metadata_value(baseline: &Value) -> Result<()> {
         specs_obj,
         existing_category_keys,
     ));
-    let expected_stats = Value::Object(compute_baseline_stats(specs_obj));
+    let expected_stats = Value::Object(compute_baseline_stats(
+        specs_obj,
+        baseline_has_extended_tlc_stats(root),
+    ));
     let expected_digest = Value::String(sha256_jcs_value(&Value::Object(specs_obj.clone()))?);
 
     let mut stale_fields = Vec::new();
@@ -497,6 +961,5215 @@ fn validate_baseline_promotion_metadata_value(baseline: &Value) -> Result<()> {
         "matrix baseline promotion metadata is stale: {}",
         stale_fields.join("; ")
     )
+}
+
+fn validate_finalized_runtime_evidence_path(baseline_path: &Path) -> Result<()> {
+    validate_finalized_runtime_evidence_path_for_scope(
+        baseline_path,
+        FinalizedRuntimeEvidenceScope::PublicClaim,
+        None,
+    )
+}
+
+fn validate_finalized_campaign_segment_evidence_path(
+    baseline_path: &Path,
+    expected_report: &RuntimeFileProvenance,
+) -> Result<()> {
+    validate_finalized_runtime_evidence_path_for_scope(
+        baseline_path,
+        FinalizedRuntimeEvidenceScope::CampaignSegment,
+        Some(expected_report),
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FinalizedRuntimeEvidenceScope {
+    PublicClaim,
+    CampaignSegment,
+}
+
+fn validate_finalized_runtime_evidence_path_for_scope(
+    baseline_path: &Path,
+    expected_scope: FinalizedRuntimeEvidenceScope,
+    expected_campaign_report: Option<&RuntimeFileProvenance>,
+) -> Result<()> {
+    let baseline_file = RuntimeFileProvenance::new(baseline_path)
+        .with_context(|| format!("hash finalized baseline {}", baseline_path.display()))?;
+    let (baseline, _, _) = read_regular_json_nofollow(&baseline_file.path)?;
+    if RuntimeFileProvenance::new(baseline_path)? != baseline_file {
+        bail!("finalized baseline changed while it was being validated");
+    }
+    if let Some(expected_report) = expected_campaign_report {
+        validate_campaign_segment_baseline_report_link(&baseline, expected_report)?;
+    }
+    let refresh = baseline
+        .get("ty_refresh")
+        .and_then(Value::as_object)
+        .context("strict stored baseline has no ty_refresh object")?;
+    let evidence_set_id =
+        required_json_string(refresh.get("evidence_set_id"), "ty_refresh.evidence_set_id")?;
+    if !valid_sha256(evidence_set_id) {
+        bail!("ty_refresh.evidence_set_id is not a SHA-256 digest");
+    }
+    let refreshed_specs_jcs_sha256 = required_json_string(
+        refresh.get("refreshed_specs_jcs_sha256"),
+        "ty_refresh.refreshed_specs_jcs_sha256",
+    )?;
+    let actual_specs_jcs_sha256 = sha256_jcs_value(
+        baseline
+            .get("specs")
+            .context("strict stored baseline has no specs object")?,
+    )?;
+    if refreshed_specs_jcs_sha256 != actual_specs_jcs_sha256
+        || baseline.get("specs_jcs_sha256").and_then(Value::as_str)
+            != Some(actual_specs_jcs_sha256.as_str())
+    {
+        bail!("strict stored baseline specs digest does not match its finalized evidence link");
+    }
+
+    let report_path = required_absolute_json_path(
+        refresh.get("runtime_evidence_path"),
+        "ty_refresh.runtime_evidence_path",
+    )?;
+    let machine_path = required_absolute_json_path(
+        refresh.get("machine_provenance_path"),
+        "ty_refresh.machine_provenance_path",
+    )?;
+    let machine_id = required_json_string(
+        refresh.get("machine_provenance_id"),
+        "ty_refresh.machine_provenance_id",
+    )?;
+    let receipt_path = required_absolute_json_path(
+        refresh.get("final_receipt_path"),
+        "ty_refresh.final_receipt_path",
+    )?;
+
+    let report_file = RuntimeFileProvenance::new(&report_path)
+        .with_context(|| format!("hash finalized runtime report {}", report_path.display()))?;
+    if expected_campaign_report.is_some_and(|expected| expected != &report_file) {
+        bail!("segment baseline does not resolve to the exact candidate runtime report");
+    }
+    if report_file.path != report_path {
+        bail!(
+            "ty_refresh.runtime_evidence_path is not canonical: {}",
+            report_path.display()
+        );
+    }
+    let (report, _, _) = read_regular_json_nofollow(&report_path)?;
+    if RuntimeFileProvenance::new(&report_path)? != report_file {
+        bail!("finalized runtime report changed while it was being validated");
+    }
+    let report_schema = report.get("schema").and_then(Value::as_str);
+    if !matches!(
+        report_schema,
+        Some(RUNTIME_EVIDENCE_SCHEMA) | Some(RUNTIME_CAMPAIGN_EVIDENCE_SCHEMA)
+    ) {
+        bail!(
+            "finalized runtime report schema must be {RUNTIME_EVIDENCE_SCHEMA} or {RUNTIME_CAMPAIGN_EVIDENCE_SCHEMA}"
+        );
+    }
+    if report.get("evidence_set_id").and_then(Value::as_str) != Some(evidence_set_id) {
+        bail!("runtime report evidence_set_id does not match the refreshed baseline");
+    }
+    let payload = report
+        .get("evidence_payload")
+        .context("runtime report has no evidence_payload")?;
+    if sha256_jcs_value(payload)? != evidence_set_id {
+        bail!("runtime report evidence payload digest does not match evidence_set_id");
+    }
+    let reconstructed_payload = runtime_evidence_payload_from_report_value(&report)?;
+    if payload != &reconstructed_payload {
+        bail!("runtime report top-level compatibility fields diverge from evidence_payload");
+    }
+    if report_schema == Some(RUNTIME_CAMPAIGN_EVIDENCE_SCHEMA) {
+        let campaign: RuntimeCampaignReportBinding = serde_json::from_value(
+            report
+                .get("campaign")
+                .cloned()
+                .context("campaign runtime report has no campaign binding")?,
+        )
+        .context("parse campaign runtime report binding")?;
+        campaign.validate_claim_role()?;
+        validate_finalized_campaign_scope(&campaign, expected_scope)?;
+        if refresh.get("campaign") != report.get("campaign") {
+            bail!("refreshed baseline campaign link differs from the runtime report");
+        }
+        if report.get("corpus_claim_complete") != Some(&Value::Bool(campaign.corpus_claim_complete))
+            || report.get("corpus_claim_pass") != Some(&Value::Bool(campaign.corpus_claim_pass))
+        {
+            bail!("campaign claim fields diverge from the campaign binding");
+        }
+        let (campaign_plan, current_plan_provenance) =
+            load_runtime_campaign_plan(&campaign.campaign_plan.path)?;
+        if current_plan_provenance != campaign.campaign_plan
+            || campaign_plan.campaign_id != campaign.campaign_id
+            || sha256_ty_canonical_json_v1_value(&campaign_plan.payload.contract_attestations)?
+                != campaign.contract_attestations_sha256
+        {
+            bail!("runtime report campaign binding does not match the current digest-bound plan");
+        }
+        match campaign.role.as_str() {
+            "segment" => {
+                let segment_id = campaign
+                    .segment_id
+                    .as_deref()
+                    .context("campaign segment has no segment id")?;
+                let planned = campaign_plan
+                    .payload
+                    .segments
+                    .iter()
+                    .find(|segment| segment.segment_id == segment_id)
+                    .with_context(|| format!("campaign plan has no segment {segment_id:?}"))?;
+                if campaign.planned_runtime_specs != planned.runtime_specs {
+                    bail!("campaign segment report row membership differs from the plan");
+                }
+                if report_file.path != planned.report_path {
+                    bail!("campaign segment report is not at its one allowed plan-bound path");
+                }
+            }
+            "aggregate" => validate_finalized_campaign_aggregate(
+                &report,
+                &baseline,
+                &report_file,
+                &campaign,
+                &campaign_plan,
+                &current_plan_provenance,
+            )?,
+            _ => unreachable!("campaign role validated above"),
+        }
+    } else if report.get("campaign").is_some()
+        || report.get("corpus_claim_complete").is_some()
+        || report.get("corpus_claim_pass").is_some()
+    {
+        bail!("legacy monolithic runtime reports may not carry campaign claim fields");
+    } else if expected_scope == FinalizedRuntimeEvidenceScope::CampaignSegment {
+        bail!("campaign merge requires finalized segment evidence, not a monolithic report");
+    }
+    if report.get("collection_complete") != Some(&Value::Bool(true))
+        || report.get("complete") != Some(&Value::Bool(false))
+        || report.get("finalization_pending") != Some(&Value::Bool(true))
+    {
+        bail!("runtime report was not a complete collection awaiting external finalization");
+    }
+    if report
+        .get("refreshed_specs_jcs_sha256")
+        .and_then(Value::as_str)
+        != Some(actual_specs_jcs_sha256.as_str())
+    {
+        bail!("runtime report refreshed specs digest does not match the stored baseline");
+    }
+    if json_path(&report, "/refreshed_baseline", "report.refreshed_baseline")? != baseline_file.path
+    {
+        bail!("runtime report refreshed_baseline does not identify the enforced baseline");
+    }
+    if json_path(&report, "/final_receipt_path", "report.final_receipt_path")? != receipt_path {
+        bail!("runtime report final receipt path does not match the baseline link");
+    }
+    if json_path(
+        &report,
+        "/metadata/benchmark/final_receipt_path",
+        "report.metadata.benchmark.final_receipt_path",
+    )? != receipt_path
+    {
+        bail!("runtime metadata final receipt path does not match the baseline link");
+    }
+    if json_path(
+        &report,
+        "/metadata/machine/path",
+        "report.metadata.machine.path",
+    )? != machine_path
+        || report
+            .pointer("/metadata/machine/provenance_id")
+            .and_then(Value::as_str)
+            != Some(machine_id)
+    {
+        bail!("runtime report machine link does not match the refreshed baseline");
+    }
+
+    let rows: Vec<RuntimeEvidenceRow> = serde_json::from_value(
+        report
+            .get("rows")
+            .cloned()
+            .context("runtime report has no rows")?,
+    )
+    .context("parse finalized runtime rows")?;
+    let (observed_artifacts, observed_artifact_errors) = runtime_artifact_digests(&rows);
+    if !observed_artifact_errors.is_empty() {
+        bail!(
+            "finalized runtime artifacts are missing, duplicated, or invalid: {}",
+            observed_artifact_errors.join("; ")
+        );
+    }
+    if serde_json::to_value(&observed_artifacts)?
+        != report
+            .get("artifact_digests")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new()))
+    {
+        bail!("finalized per-command artifact manifest or contents changed");
+    }
+
+    validate_final_receipt_and_machine(
+        &report,
+        &report_file,
+        &baseline_file,
+        &receipt_path,
+        &machine_path,
+        machine_id,
+    )
+}
+
+fn validate_finalized_campaign_scope(
+    campaign: &RuntimeCampaignReportBinding,
+    expected_scope: FinalizedRuntimeEvidenceScope,
+) -> Result<()> {
+    match (expected_scope, campaign.role.as_str()) {
+        (FinalizedRuntimeEvidenceScope::PublicClaim, "aggregate")
+            if campaign.merge_purpose.as_deref() == Some("superiority")
+                && campaign.corpus_claim_complete
+                && campaign.corpus_claim_pass =>
+        {
+            Ok(())
+        }
+        (FinalizedRuntimeEvidenceScope::PublicClaim, "segment") => {
+            bail!(
+                "campaign segment evidence cannot be admitted as a public full-corpus baseline; use the finalized passing aggregate"
+            )
+        }
+        (FinalizedRuntimeEvidenceScope::PublicClaim, "aggregate")
+            if campaign.merge_purpose.as_deref() == Some("inventory") =>
+        {
+            bail!(
+                "campaign inventory aggregates are receipt-sealed loser inventories, not public superiority baselines"
+            )
+        }
+        (FinalizedRuntimeEvidenceScope::PublicClaim, "aggregate") => {
+            bail!("public campaign baseline requires complete and passing aggregate claims")
+        }
+        (FinalizedRuntimeEvidenceScope::CampaignSegment, "segment") => Ok(()),
+        (FinalizedRuntimeEvidenceScope::CampaignSegment, "aggregate") => {
+            bail!("campaign merge segment input cannot be an aggregate report")
+        }
+        (_, role) => bail!("unsupported campaign evidence role {role:?}"),
+    }
+}
+
+fn runtime_evidence_payload_from_report_value(report: &Value) -> Result<Value> {
+    let field = |name: &str| {
+        report
+            .get(name)
+            .cloned()
+            .with_context(|| format!("runtime report is missing {name}"))
+    };
+    let campaign_report =
+        report.get("schema").and_then(Value::as_str) == Some(RUNTIME_CAMPAIGN_EVIDENCE_SCHEMA);
+    let mut payload = json!({
+        "schema": if campaign_report {
+            RUNTIME_CAMPAIGN_EVIDENCE_PAYLOAD_SCHEMA
+        } else {
+            RUNTIME_EVIDENCE_PAYLOAD_SCHEMA
+        },
+        "contract": {
+            "min_runtime_speedup": field("min_runtime_speedup")?,
+            "max_memory_ratio": field("max_memory_ratio")?,
+            "minimum_paired_runs": field("minimum_paired_runs")?,
+            "paired_statistic": field("paired_statistic")?,
+            "paired_schedule": field("paired_schedule")?,
+            "memory_metric": field("memory_metric")?,
+            "timeout_seconds": field("timeout_seconds")?,
+            "runs": field("runs")?,
+            "limit": field("limit")?,
+            "allow_debug_runtime": field("allow_debug_runtime")?,
+            "observation_storage_contract": field("observation_storage_contract")?,
+        },
+        "paths": {
+            "baseline": field("baseline")?,
+            "output_dir": field("output_dir")?,
+            "refreshed_baseline": field("refreshed_baseline")?,
+            "matrix_after_refresh": field("matrix_after_refresh")?,
+            "final_receipt": field("final_receipt_path")?,
+        },
+        "runtime_batch_plan": field("runtime_batch_plan_provenance")?,
+        "coverage": {
+            "selected_runtime_specs": field("selected_runtime_specs")?,
+            "selected_runtime_spec_count": field("selected_runtime_spec_count")?,
+            "collected_runtime_specs": field("collected_runtime_specs")?,
+            "collected_runtime_spec_count": field("collected_runtime_spec_count")?,
+            "attempted_all_selected_runtime_specs": field("attempted_all_selected_runtime_specs")?,
+            "uncollected_selected_runtime_specs": field("uncollected_selected_runtime_specs")?,
+            "incomplete_runtime_specs": field("incomplete_runtime_specs")?,
+            "blocked_runtime_specs": field("blocked_runtime_specs")?,
+            "collection_complete": field("collection_complete")?,
+            "measurement_complete": field("measurement_complete")?,
+        },
+        "provenance": {
+            "qualified": field("provenance_qualified")?,
+            "errors": report.get("provenance_errors").cloned().unwrap_or_else(|| json!([])),
+        },
+        "metadata": field("metadata")?,
+        "rows": field("rows")?,
+        "artifact_digests": field("artifact_digests")?,
+        "artifact_errors": report.get("artifact_errors").cloned().unwrap_or_else(|| json!([])),
+        "errors": report.get("errors").cloned().unwrap_or_else(|| json!([])),
+        "refreshed_specs_jcs_sha256": field("refreshed_specs_jcs_sha256")?,
+    });
+    if campaign_report {
+        let root = payload
+            .as_object_mut()
+            .expect("runtime evidence payload is an object");
+        root.insert("campaign".to_string(), field("campaign")?);
+        root.insert(
+            "corpus_claim_complete".to_string(),
+            field("corpus_claim_complete")?,
+        );
+        root.insert("corpus_claim_pass".to_string(), field("corpus_claim_pass")?);
+    }
+    Ok(payload)
+}
+
+fn validate_finalized_campaign_aggregate(
+    report: &Value,
+    finalized_baseline: &Value,
+    report_file: &RuntimeFileProvenance,
+    campaign: &RuntimeCampaignReportBinding,
+    plan: &RuntimeCampaignPlan,
+    plan_provenance: &RuntimeFileProvenance,
+) -> Result<()> {
+    if campaign.merge_purpose.as_deref() != Some("superiority")
+        || !campaign.corpus_claim_complete
+        || !campaign.corpus_claim_pass
+    {
+        bail!("finalized campaign aggregate must carry complete and passing corpus claims");
+    }
+    if json_path(report, "/output_dir", "campaign aggregate output directory")?
+        != plan.payload.artifacts.superiority_output_dir
+        || report_file.path != plan.payload.artifacts.superiority_report_path
+    {
+        bail!("campaign aggregate is not at its exact plan-bound superiority output path");
+    }
+    if !plan.payload.blocked_runtime_specs.is_empty()
+        || campaign.planned_runtime_specs != plan.payload.runtime_specs
+    {
+        bail!("campaign aggregate does not cover the plan's exact full runnable corpus");
+    }
+    if runtime_campaign_contract_attestations_from_report(report)?
+        != plan.payload.contract_attestations
+    {
+        bail!("campaign aggregate runtime/input attestations differ from its digest-bound plan");
+    }
+    validate_campaign_manifest_cover(&plan.payload, &campaign.segments)?;
+    let expected_machine_digest = campaign
+        .machine_compatibility_sha256
+        .as_deref()
+        .context("campaign aggregate has no machine compatibility digest")?;
+    let aggregate_machine_digest =
+        sha256_ty_canonical_json_v1_value(&runtime_machine_compatibility_from_report(report)?)?;
+    if aggregate_machine_digest != expected_machine_digest {
+        bail!("aggregate machine snapshot differs from its compatibility digest");
+    }
+
+    let mut merged_rows = Vec::new();
+    for (expected, manifest) in plan.payload.segments.iter().zip(campaign.segments.iter()) {
+        if manifest.segment_id != expected.segment_id
+            || manifest.runtime_specs != expected.runtime_specs
+            || manifest.machine_compatibility_sha256 != expected_machine_digest
+        {
+            bail!(
+                "aggregate segment manifest {} differs from the campaign plan or machine contract",
+                manifest.segment_id
+            );
+        }
+        for (file, label) in [
+            (&manifest.report, "segment report"),
+            (&manifest.refreshed_baseline, "segment refreshed baseline"),
+            (&manifest.final_receipt, "segment final receipt"),
+            (&manifest.machine_provenance, "segment machine provenance"),
+        ] {
+            validate_campaign_file_provenance(file, label)?;
+        }
+        let validated =
+            validate_campaign_segment_report(plan, plan_provenance, &manifest.report.path)?;
+        if validated.manifest != *manifest {
+            bail!(
+                "aggregate segment manifest {} no longer matches its finalized evidence",
+                manifest.segment_id
+            );
+        }
+        merged_rows.extend(validated.rows);
+    }
+    let merged_specs = validate_campaign_aggregate_row_union(report, &merged_rows)?;
+    if merged_specs != plan.payload.runtime_specs {
+        bail!("aggregate segment manifests are not an exact ordered row union");
+    }
+    let merged_specs_value = serde_json::to_value(&merged_specs)?;
+    if report.get("selected_runtime_specs") != Some(&merged_specs_value)
+        || report.get("collected_runtime_specs") != Some(&merged_specs_value)
+        || report
+            .get("selected_runtime_spec_count")
+            .and_then(Value::as_u64)
+            != Some(merged_specs.len() as u64)
+        || report
+            .get("collected_runtime_spec_count")
+            .and_then(Value::as_u64)
+            != Some(merged_specs.len() as u64)
+        || report.get("attempted_all_selected_runtime_specs") != Some(&Value::Bool(true))
+        || report.get("blocked_runtime_specs") != Some(&Value::Array(Vec::new()))
+    {
+        bail!("aggregate report coverage fields are not the exact campaign row union");
+    }
+    validate_finalized_superiority_measurements(report, &merged_rows)?;
+    validate_campaign_aggregate_reconstruction(
+        report,
+        finalized_baseline,
+        report_file,
+        campaign,
+        plan,
+        &merged_rows,
+    )?;
+    Ok(())
+}
+
+fn validate_finalized_superiority_measurements(
+    report: &Value,
+    rows: &[RuntimeEvidenceRow],
+) -> Result<()> {
+    validate_campaign_rows_for_merge(rows, RuntimeCampaignMergePurpose::Superiority)
+        .context("validate finalized superiority aggregate row outcomes")?;
+    if rows
+        .iter()
+        .any(|row| row.collection_outcome != "complete_measurement")
+        || report.get("measurement_complete") != Some(&Value::Bool(true))
+        || report.get("incomplete_runtime_specs") != Some(&Value::Array(Vec::new()))
+    {
+        bail!(
+            "finalized superiority aggregate contains incomplete or resource-limited measurements"
+        );
+    }
+    Ok(())
+}
+
+fn validate_campaign_aggregate_row_union(
+    report: &Value,
+    merged_rows: &[RuntimeEvidenceRow],
+) -> Result<Vec<String>> {
+    let report_rows = report
+        .get("rows")
+        .context("aggregate runtime report has no rows")?;
+    if report_rows != &serde_json::to_value(merged_rows)? {
+        bail!("aggregate rows are not the exact sealed segment row union");
+    }
+    Ok(merged_rows.iter().map(|row| row.spec.clone()).collect())
+}
+
+fn validate_campaign_aggregate_reconstruction(
+    report: &Value,
+    finalized_baseline: &Value,
+    report_file: &RuntimeFileProvenance,
+    campaign: &RuntimeCampaignReportBinding,
+    plan: &RuntimeCampaignPlan,
+    merged_rows: &[RuntimeEvidenceRow],
+) -> Result<()> {
+    let (original_baseline, _, _) = read_regular_json_nofollow(&plan.payload.baseline.path)?;
+    let provenance =
+        campaign_baseline_provenance_from_report(report, report_file, campaign, "aggregate")?;
+    let reconstructed = reconstruct_campaign_baseline(original_baseline, merged_rows, &provenance)?;
+    validate_exact_campaign_baseline(finalized_baseline, &reconstructed, "aggregate")?;
+
+    let matrix_policy = match plan.payload.policy.as_ref() {
+        Some(policy) => super::policy::load_matrix_policy(&policy.path)?,
+        None => MatrixPolicy::default(),
+    };
+    let summary = classify_baseline_value_with_policy(reconstructed, &matrix_policy)
+        .context("reclassify reconstructed campaign aggregate baseline")?;
+    if !campaign_summary_supports_strict_claim(&summary) {
+        bail!("campaign aggregate claim is not supported by its reconstructed matrix");
+    }
+    let matrix_path = json_path(
+        report,
+        "/matrix_after_refresh",
+        "campaign aggregate matrix summary",
+    )?;
+    let (matrix, _, _) = read_regular_json_nofollow(&matrix_path)?;
+    if matrix != serde_json::to_value(&summary)? {
+        bail!("campaign aggregate matrix summary differs from its reconstructed baseline");
+    }
+    validate_campaign_plan_inputs(&plan.payload)?;
+    Ok(())
+}
+
+fn campaign_baseline_provenance_from_report(
+    report: &Value,
+    report_file: &RuntimeFileProvenance,
+    campaign: &RuntimeCampaignReportBinding,
+    role: &str,
+) -> Result<RuntimeBaselineProvenance> {
+    let ty_binary: RuntimeFileProvenance = serde_json::from_value(
+        report
+            .pointer("/metadata/ty/binary")
+            .cloned()
+            .with_context(|| format!("campaign {role} has no TY binary provenance"))?,
+    )
+    .with_context(|| format!("parse campaign {role} TY binary provenance"))?;
+    let allow_debug_runtime = report
+        .get("allow_debug_runtime")
+        .and_then(Value::as_bool)
+        .with_context(|| format!("campaign {role} allow_debug_runtime is not a boolean"))?;
+    if allow_debug_runtime {
+        bail!("campaign {role} may not use debug runtime evidence");
+    }
+    Ok(RuntimeBaselineProvenance {
+        timestamp: required_json_string(
+            report.pointer("/metadata/generated_at"),
+            &format!("campaign {role} generation timestamp"),
+        )?
+        .to_string(),
+        ty_git_commit: required_json_string(
+            report.pointer("/metadata/ty/git_commit"),
+            &format!("campaign {role} TY git commit"),
+        )?
+        .to_string(),
+        ty_binary,
+        allow_debug_runtime,
+        evidence_set_id: required_json_string(
+            report.get("evidence_set_id"),
+            &format!("campaign {role} evidence_set_id"),
+        )?
+        .to_string(),
+        runtime_evidence_path: report_file.path.clone(),
+        refreshed_specs_jcs_sha256: required_json_string(
+            report.get("refreshed_specs_jcs_sha256"),
+            &format!("campaign {role} refreshed specs digest"),
+        )?
+        .to_string(),
+        machine_provenance_path: Some(json_path(
+            report,
+            "/metadata/machine/path",
+            &format!("campaign {role} machine provenance"),
+        )?),
+        machine_provenance_id: Some(
+            required_json_string(
+                report.pointer("/metadata/machine/provenance_id"),
+                &format!("campaign {role} machine provenance id"),
+            )?
+            .to_string(),
+        ),
+        final_receipt_path: Some(json_path(
+            report,
+            "/final_receipt_path",
+            &format!("campaign {role} final receipt"),
+        )?),
+        campaign: Some(campaign.clone()),
+    })
+}
+
+fn reconstruct_campaign_baseline(
+    mut baseline: Value,
+    rows: &[RuntimeEvidenceRow],
+    provenance: &RuntimeBaselineProvenance,
+) -> Result<Value> {
+    for row in rows {
+        if row.collection_outcome == "complete_measurement" {
+            apply_runtime_row(&mut baseline, row, provenance);
+        }
+    }
+    let reconstructed_specs_sha256 = sha256_jcs_value(
+        baseline
+            .get("specs")
+            .context("reconstructed campaign baseline has no specs")?,
+    )?;
+    if reconstructed_specs_sha256 != provenance.refreshed_specs_jcs_sha256 {
+        bail!("campaign refreshed specs digest is not reconstructed from its sealed rows");
+    }
+    if refresh_runtime_baseline_metadata(&mut baseline, rows, provenance)?
+        != BaselineMetadataRefresh::PromotionReady
+    {
+        bail!("reconstructed campaign baseline is not promotion-ready");
+    }
+    Ok(baseline)
+}
+
+fn validate_exact_campaign_baseline(
+    finalized: &Value,
+    reconstructed: &Value,
+    role: &str,
+) -> Result<()> {
+    if finalized != reconstructed {
+        bail!("campaign {role} baseline is not the exact plan-plus-sealed-rows reconstruction");
+    }
+    Ok(())
+}
+
+fn required_json_string<'a>(value: Option<&'a Value>, label: &str) -> Result<&'a str> {
+    value
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && *value == value.trim())
+        .with_context(|| format!("{label} must be a nonempty trimmed string"))
+}
+
+fn required_absolute_json_path(value: Option<&Value>, label: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(required_json_string(value, label)?);
+    if !path.is_absolute() {
+        bail!("{label} must be absolute, got {}", path.display());
+    }
+    Ok(path)
+}
+
+fn exact_json_object_fields<'a>(
+    value: &'a Value,
+    label: &str,
+    expected_fields: &[&str],
+) -> Result<&'a Map<String, Value>> {
+    let object = value
+        .as_object()
+        .with_context(|| format!("{label} must be an object"))?;
+    let expected = expected_fields.iter().copied().collect::<BTreeSet<_>>();
+    let actual = object.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    if actual != expected {
+        let missing = expected.difference(&actual).copied().collect::<Vec<_>>();
+        let extra = actual.difference(&expected).copied().collect::<Vec<_>>();
+        bail!("{label} field set is not exact; missing={missing:?}, extra={extra:?}");
+    }
+    Ok(object)
+}
+
+fn json_path(value: &Value, pointer: &str, label: &str) -> Result<PathBuf> {
+    required_absolute_json_path(value.pointer(pointer), label)
+}
+
+fn validate_authorized_inventory_relative_path(
+    relative_path: &str,
+    entry_type: &str,
+    maximum_path_bytes: u64,
+    label: &str,
+) -> Result<()> {
+    if relative_path.is_empty()
+        || u64::try_from(relative_path.len()).unwrap_or(u64::MAX) > maximum_path_bytes
+        || !matches!(entry_type, "directory" | "regular_file")
+    {
+        bail!("{label} has an invalid path, type, or encoded length");
+    }
+    if relative_path == "." {
+        if entry_type != "directory" {
+            bail!("{label} root entry must be a directory");
+        }
+        return Ok(());
+    }
+    if relative_path.starts_with('/')
+        || relative_path
+            .split('/')
+            .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    {
+        bail!("{label} is not a strict relative POSIX path");
+    }
+    Ok(())
+}
+
+fn validate_strict_absolute_inventory_path(path: &str, label: &str) -> Result<()> {
+    if !path.starts_with('/') || path == "/" {
+        bail!("{label} must be a non-root absolute POSIX path");
+    }
+    if path[1..]
+        .split('/')
+        .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    {
+        bail!("{label} is not an exact normalized absolute POSIX path");
+    }
+    Ok(())
+}
+
+fn strict_inventory_descendant(
+    output_directory: &str,
+    candidate: &str,
+    maximum_path_bytes: u64,
+    label: &str,
+) -> Result<String> {
+    validate_strict_absolute_inventory_path(output_directory, "strict output directory")?;
+    validate_strict_absolute_inventory_path(candidate, label)?;
+    let prefix = format!("{output_directory}/");
+    let relative = candidate
+        .strip_prefix(&prefix)
+        .with_context(|| format!("{label} is outside the strict output directory"))?;
+    validate_authorized_inventory_relative_path(relative, "directory", maximum_path_bytes, label)?;
+    Ok(relative.to_string())
+}
+
+fn authorized_inventory_paths_overlap(left: &str, right: &str) -> bool {
+    left == right
+        || left
+            .strip_prefix(right)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        || right
+            .strip_prefix(left)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn insert_authorized_inventory_directory(
+    entries: &mut BTreeMap<String, String>,
+    relative_path: &str,
+    maximum_path_bytes: u64,
+    label: &str,
+) -> Result<()> {
+    validate_authorized_inventory_relative_path(
+        relative_path,
+        "directory",
+        maximum_path_bytes,
+        label,
+    )?;
+    if relative_path == "." {
+        match entries.get(".").map(String::as_str) {
+            None | Some("directory") => {
+                entries.insert(".".to_string(), "directory".to_string());
+                return Ok(());
+            }
+            Some(_) => bail!("{label} collides with an authorized regular file"),
+        }
+    }
+    let components = relative_path.split('/').collect::<Vec<_>>();
+    for end in 1..=components.len() {
+        let ancestor = components[..end].join("/");
+        match entries.get(&ancestor).map(String::as_str) {
+            None | Some("directory") => {
+                entries.insert(ancestor, "directory".to_string());
+            }
+            Some(_) => bail!("{label} has an ancestor authorized as a regular file"),
+        }
+    }
+    Ok(())
+}
+
+fn insert_authorized_inventory_file(
+    entries: &mut BTreeMap<String, String>,
+    relative_path: &str,
+    maximum_path_bytes: u64,
+    label: &str,
+) -> Result<()> {
+    validate_authorized_inventory_relative_path(
+        relative_path,
+        "regular_file",
+        maximum_path_bytes,
+        label,
+    )?;
+    let parent = relative_path
+        .rsplit_once('/')
+        .map_or(".", |(parent, _)| parent);
+    insert_authorized_inventory_directory(entries, parent, maximum_path_bytes, label)?;
+    match entries.get(relative_path).map(String::as_str) {
+        None | Some("regular_file") => {
+            entries.insert(relative_path.to_string(), "regular_file".to_string());
+            Ok(())
+        }
+        Some(_) => bail!("{label} collides with an authorized directory"),
+    }
+}
+
+fn expected_authorized_storage_inventory(
+    report: &Value,
+    observation_role: &str,
+    contract: &ObservationStorageContract,
+) -> Result<Value> {
+    let output_directory = required_json_string(
+        report.get("output_dir"),
+        "campaign runtime report output_dir",
+    )?;
+    validate_strict_absolute_inventory_path(
+        output_directory,
+        "campaign runtime report output_dir",
+    )?;
+    let maximum_path_bytes = contract.maximum_payload_relative_path_bytes;
+    let mut entries = BTreeMap::<String, String>::new();
+    insert_authorized_inventory_directory(
+        &mut entries,
+        ".",
+        maximum_path_bytes,
+        "authorized output root",
+    )?;
+    insert_authorized_inventory_directory(
+        &mut entries,
+        OBSERVATION_PAYLOAD_DIRECTORY_NAME,
+        maximum_path_bytes,
+        "authorized payload root",
+    )?;
+    let scratch_root = format!(
+        "{}/{}",
+        OBSERVATION_PAYLOAD_DIRECTORY_NAME, STRICT_LAUNCHER_SCRATCH_NAME
+    );
+    insert_authorized_inventory_directory(
+        &mut entries,
+        &scratch_root,
+        maximum_path_bytes,
+        "authorized launcher scratch root",
+    )?;
+    for name in STRICT_LAUNCHER_STORAGE_DIRECTORY_NAMES {
+        insert_authorized_inventory_directory(
+            &mut entries,
+            &format!("{scratch_root}/{name}"),
+            maximum_path_bytes,
+            "authorized launcher scratch directory",
+        )?;
+    }
+    for name in [
+        "runtime_evidence.json",
+        "spec_baseline.refreshed.json",
+        "matrix_after_refresh.json",
+        "runtime_batch_plan.json",
+    ] {
+        insert_authorized_inventory_file(
+            &mut entries,
+            name,
+            maximum_path_bytes,
+            "authorized primary artifact",
+        )?;
+    }
+
+    match observation_role {
+        "segment" => {
+            for name in [
+                OBSERVATION_STORAGE_CAPABILITY_NAME,
+                OBSERVATION_STORAGE_RELEASE_NAME,
+            ] {
+                insert_authorized_inventory_file(
+                    &mut entries,
+                    name,
+                    maximum_path_bytes,
+                    "authorized observation-storage control artifact",
+                )?;
+            }
+            let preflight = "runtime-ty-trust_cg-preflight";
+            let preflight_artifact = format!("{preflight}/run");
+            insert_authorized_inventory_directory(
+                &mut entries,
+                preflight,
+                maximum_path_bytes,
+                "authorized trust-cg preflight directory",
+            )?;
+            insert_authorized_inventory_directory(
+                &mut entries,
+                &preflight_artifact,
+                maximum_path_bytes,
+                "authorized trust-cg preflight artifact directory",
+            )?;
+            insert_authorized_inventory_file(
+                &mut entries,
+                &format!("{preflight}/SupremacyMatrixRuntimePreflight.tla"),
+                maximum_path_bytes,
+                "authorized trust-cg preflight specification",
+            )?;
+            for name in RETAINED_OBSERVATION_FILE_NAMES {
+                insert_authorized_inventory_file(
+                    &mut entries,
+                    &format!("{preflight_artifact}/{name}"),
+                    maximum_path_bytes,
+                    "authorized trust-cg preflight artifact",
+                )?;
+            }
+
+            let fixed_paths = [
+                OBSERVATION_PAYLOAD_DIRECTORY_NAME,
+                OBSERVATION_STORAGE_CAPABILITY_NAME,
+                OBSERVATION_STORAGE_RELEASE_NAME,
+                "runtime_evidence.json",
+                "spec_baseline.refreshed.json",
+                "matrix_after_refresh.json",
+                "runtime_batch_plan.json",
+                preflight,
+            ];
+            let artifact_digests = report
+                .get("artifact_digests")
+                .and_then(Value::as_array)
+                .context("campaign runtime report has no artifact digests")?;
+            let mut measured_directories = Vec::<String>::new();
+            for (index, artifact) in artifact_digests.iter().enumerate() {
+                let artifact_directory = required_json_string(
+                    artifact.get("artifact_dir"),
+                    &format!("runtime artifact digest {index} artifact_dir"),
+                )?;
+                let relative = strict_inventory_descendant(
+                    output_directory,
+                    artifact_directory,
+                    maximum_path_bytes,
+                    &format!("runtime artifact digest {index} artifact_dir"),
+                )?;
+                if fixed_paths
+                    .iter()
+                    .any(|fixed| authorized_inventory_paths_overlap(&relative, fixed))
+                    || measured_directories
+                        .iter()
+                        .any(|existing| authorized_inventory_paths_overlap(&relative, existing))
+                {
+                    bail!(
+                        "runtime artifact digest {index} directory overlaps a fixed or measured path"
+                    );
+                }
+                insert_authorized_inventory_directory(
+                    &mut entries,
+                    &relative,
+                    maximum_path_bytes,
+                    "authorized measured artifact directory",
+                )?;
+                for name in RETAINED_OBSERVATION_FILE_NAMES {
+                    insert_authorized_inventory_file(
+                        &mut entries,
+                        &format!("{relative}/{name}"),
+                        maximum_path_bytes,
+                        "authorized measured artifact",
+                    )?;
+                }
+                measured_directories.push(relative);
+            }
+        }
+        "merge_inventory" | "merge_superiority" => {}
+        role => bail!("unsupported authorized storage inventory role {role:?}"),
+    }
+
+    let maximum_entries = contract
+        .evidence_hard_inodes
+        .checked_add(contract.hard_observation_inodes)
+        .context("authorized storage inventory inode bound overflow")?;
+    if u64::try_from(entries.len()).unwrap_or(u64::MAX) > maximum_entries {
+        bail!("authorized storage inventory exceeds the combined hard inode bound");
+    }
+    let scheduled_entries = entries
+        .into_iter()
+        .map(|(relative_path, entry_type)| {
+            json!({
+                "relative_path": relative_path,
+                "entry_type": entry_type,
+            })
+        })
+        .collect::<Vec<_>>();
+    let commitment = json!({
+        "schema": AUTHORIZED_STORAGE_INVENTORY_SCHEMA,
+        "path_encoding": AUTHORIZED_STORAGE_PATH_ENCODING,
+        "entries": scheduled_entries,
+    });
+    Ok(json!({
+        "schema": AUTHORIZED_STORAGE_INVENTORY_SCHEMA,
+        "path_encoding": AUTHORIZED_STORAGE_PATH_ENCODING,
+        "entries": commitment["entries"],
+        "entry_count": commitment["entries"].as_array().map_or(0, Vec::len),
+        "sha256": sha256_ty_canonical_json_v1_value(&commitment)?,
+    }))
+}
+
+fn validate_authorized_storage_inventory(
+    report: &Value,
+    observation_role: &str,
+    contract: &ObservationStorageContract,
+    value: &Value,
+) -> Result<()> {
+    let inventory = exact_json_object_fields(
+        value,
+        "final strict receipt authorized storage inventory",
+        &[
+            "schema",
+            "path_encoding",
+            "entries",
+            "entry_count",
+            "sha256",
+        ],
+    )?;
+    let entries = inventory
+        .get("entries")
+        .and_then(Value::as_array)
+        .context("authorized storage inventory entries must be an array")?;
+    let maximum_entries = contract
+        .evidence_hard_inodes
+        .checked_add(contract.hard_observation_inodes)
+        .context("authorized storage inventory inode bound overflow")?;
+    if inventory.get("schema").and_then(Value::as_str) != Some(AUTHORIZED_STORAGE_INVENTORY_SCHEMA)
+        || inventory.get("path_encoding").and_then(Value::as_str)
+            != Some(AUTHORIZED_STORAGE_PATH_ENCODING)
+        || inventory.get("entry_count").and_then(Value::as_u64) != u64::try_from(entries.len()).ok()
+        || u64::try_from(entries.len()).unwrap_or(u64::MAX) > maximum_entries
+    {
+        bail!("authorized storage inventory header is invalid");
+    }
+    let mut previous_path: Option<&str> = None;
+    let mut observed_paths = BTreeSet::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let entry = exact_json_object_fields(
+            entry,
+            &format!("authorized storage inventory entry {index}"),
+            &["relative_path", "entry_type"],
+        )?;
+        let relative_path = required_json_string(
+            entry.get("relative_path"),
+            &format!("authorized storage inventory entry {index} relative_path"),
+        )?;
+        let entry_type = required_json_string(
+            entry.get("entry_type"),
+            &format!("authorized storage inventory entry {index} entry_type"),
+        )?;
+        validate_authorized_inventory_relative_path(
+            relative_path,
+            entry_type,
+            contract.maximum_payload_relative_path_bytes,
+            &format!("authorized storage inventory entry {index}"),
+        )?;
+        if previous_path.is_some_and(|previous| previous.as_bytes() >= relative_path.as_bytes())
+            || !observed_paths.insert(relative_path)
+        {
+            bail!("authorized storage inventory entries are not unique UTF-8 byte ordered paths");
+        }
+        previous_path = Some(relative_path);
+    }
+    if entries
+        .first()
+        .and_then(|entry| entry.get("relative_path"))
+        .and_then(Value::as_str)
+        != Some(".")
+        || entries
+            .first()
+            .and_then(|entry| entry.get("entry_type"))
+            .and_then(Value::as_str)
+            != Some("directory")
+    {
+        bail!("authorized storage inventory omits its root directory");
+    }
+    let commitment = json!({
+        "schema": AUTHORIZED_STORAGE_INVENTORY_SCHEMA,
+        "path_encoding": AUTHORIZED_STORAGE_PATH_ENCODING,
+        "entries": entries,
+    });
+    let expected_digest = sha256_ty_canonical_json_v1_value(&commitment)?;
+    let claimed_digest = inventory
+        .get("sha256")
+        .and_then(Value::as_str)
+        .context("authorized storage inventory has no digest")?;
+    if claimed_digest.len() != 64
+        || !claimed_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || claimed_digest != expected_digest
+    {
+        bail!("authorized storage inventory commitment is invalid");
+    }
+    let expected = expected_authorized_storage_inventory(report, observation_role, contract)?;
+    if value != &expected {
+        bail!(
+            "authorized storage inventory differs from the report-derived exact path/type schedule"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_immutable_storage_entry(path: &Path, label: &str) -> Result<(fs::Metadata, u64)> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    const FS_IOC_GETFLAGS: libc::c_ulong = 0x8008_6601;
+    const FS_IMMUTABLE_FL: libc::c_long = 0x0000_0010;
+
+    let linked =
+        fs::symlink_metadata(path).with_context(|| format!("lstat {label} {}", path.display()))?;
+    if !linked.file_type().is_file() && !linked.file_type().is_dir() {
+        bail!("{label} is not a non-symlink regular file or directory");
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true).custom_flags(
+        libc::O_NOFOLLOW
+            | libc::O_CLOEXEC
+            | if linked.file_type().is_dir() {
+                libc::O_DIRECTORY
+            } else {
+                0
+            },
+    );
+    let opened = options
+        .open(path)
+        .with_context(|| format!("open immutable {label} {}", path.display()))?;
+    let metadata = opened
+        .metadata()
+        .with_context(|| format!("fstat immutable {label} {}", path.display()))?;
+    if linked.dev() != metadata.dev()
+        || linked.ino() != metadata.ino()
+        || linked.mode() != metadata.mode()
+        || linked.len() != metadata.len()
+        || linked.uid() != metadata.uid()
+        || linked.gid() != metadata.gid()
+        || linked.nlink() != metadata.nlink()
+        || linked.blocks() != metadata.blocks()
+        || linked.file_type().is_dir() != metadata.file_type().is_dir()
+        || linked.file_type().is_file() != metadata.file_type().is_file()
+    {
+        bail!("{label} identity or metadata changed during no-follow open");
+    }
+    let mut flags: libc::c_long = 0;
+    if unsafe { libc::ioctl(opened.as_raw_fd(), FS_IOC_GETFLAGS, &mut flags) } != 0
+        || flags & FS_IMMUTABLE_FL == 0
+    {
+        bail!("{label} does not carry the Linux immutable inode flag");
+    }
+    Ok((
+        metadata,
+        u64::try_from(flags).context("immutable inode flags are negative")?,
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_immutable_storage_entry(_path: &Path, _label: &str) -> Result<(fs::Metadata, u64)> {
+    bail!("strict observation-storage release validation requires Linux")
+}
+
+fn read_root_immutable_release_slot(output_directory: &Path) -> Result<(Value, Value)> {
+    #[cfg(unix)]
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let path = output_directory.join(OBSERVATION_STORAGE_RELEASE_NAME);
+    let (metadata, filesystem_flags) =
+        linux_immutable_storage_entry(&path, "observation-storage release slot")?;
+    #[cfg(unix)]
+    if !metadata.file_type().is_file()
+        || metadata.uid() != 0
+        || metadata.gid() != 0
+        || metadata.permissions().mode() & 0o7777 != 0o444
+        || metadata.nlink() != 1
+        || metadata.len() != OBSERVATION_STORAGE_RELEASE_SLOT_BYTES
+        || metadata.blocks().saturating_mul(512) < OBSERVATION_STORAGE_RELEASE_SLOT_BYTES
+    {
+        bail!(
+            "observation-storage release slot is not the fixed root-owned, allocated, sealed inode"
+        );
+    }
+    let (document, device, inode) =
+        read_regular_json_nofollow_bounded(&path, OBSERVATION_STORAGE_RELEASE_SLOT_BYTES)?;
+    #[cfg(unix)]
+    if device != Some(metadata.dev()) || inode != Some(metadata.ino()) {
+        bail!("observation-storage release slot identity changed while parsing");
+    }
+    let file = RuntimeFileProvenance::new(&path)?;
+    if file.size_bytes != OBSERVATION_STORAGE_RELEASE_SLOT_BYTES {
+        bail!("observation-storage release slot changed while hashing");
+    }
+    #[cfg(unix)]
+    let record = json!({
+        "path": path,
+        "device": metadata.dev(),
+        "inode": metadata.ino(),
+        "uid": metadata.uid(),
+        "gid": metadata.gid(),
+        "mode": "0444",
+        "nlink": metadata.nlink(),
+        "size_bytes": metadata.len(),
+        "allocated_bytes": metadata.blocks().saturating_mul(512),
+        "sha256": file.sha256,
+        "filesystem_flags": filesystem_flags,
+        "immutable": true,
+    });
+    #[cfg(not(unix))]
+    let record = Value::Null;
+    Ok((document, record))
+}
+
+fn read_root_immutable_capability(
+    output_directory: &Path,
+    maximum_bytes: u64,
+) -> Result<(Value, Value)> {
+    #[cfg(unix)]
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let path = output_directory.join(OBSERVATION_STORAGE_CAPABILITY_NAME);
+    let (metadata, filesystem_flags) =
+        linux_immutable_storage_entry(&path, "observation-storage capability")?;
+    #[cfg(unix)]
+    if !metadata.file_type().is_file()
+        || metadata.uid() != 0
+        || metadata.gid() != 0
+        || metadata.permissions().mode() & 0o7777 != 0o444
+        || metadata.nlink() != 1
+        || metadata.len() == 0
+        || metadata.len() > maximum_bytes
+        || metadata.blocks().saturating_mul(512) < metadata.len()
+    {
+        bail!(
+            "observation-storage capability is not a bounded, allocated, singly-linked root-owned sealed file"
+        );
+    }
+    let (document, device, inode) = read_regular_json_nofollow_bounded(&path, maximum_bytes)?;
+    #[cfg(unix)]
+    if device != Some(metadata.dev()) || inode != Some(metadata.ino()) {
+        bail!("observation-storage capability identity changed while parsing");
+    }
+    let file = RuntimeFileProvenance::new(&path)?;
+    let (metadata_after, flags_after) =
+        linux_immutable_storage_entry(&path, "rehashed observation-storage capability")?;
+    #[cfg(unix)]
+    if metadata_after.dev() != metadata.dev()
+        || metadata_after.ino() != metadata.ino()
+        || metadata_after.mode() != metadata.mode()
+        || metadata_after.len() != metadata.len()
+        || metadata_after.uid() != metadata.uid()
+        || metadata_after.gid() != metadata.gid()
+        || metadata_after.nlink() != metadata.nlink()
+        || metadata_after.blocks() != metadata.blocks()
+        || flags_after != filesystem_flags
+    {
+        bail!("observation-storage capability metadata changed while it was hashed");
+    }
+    #[cfg(unix)]
+    let record = json!({
+        "path": path,
+        "sha256": file.sha256,
+        "size_bytes": file.size_bytes,
+        "device": metadata.dev(),
+        "inode": metadata.ino(),
+        "uid": metadata.uid(),
+        "gid": metadata.gid(),
+        "mode": "0444",
+        "filesystem_flags": filesystem_flags,
+        "immutable": true,
+    });
+    #[cfg(not(unix))]
+    let record = Value::Null;
+    Ok((document, record))
+}
+
+#[cfg(target_os = "linux")]
+fn collect_exact_storage_inventory_entry(
+    output_directory: &Path,
+    path: &Path,
+    relative_path: &str,
+    root_device: u64,
+    maximum_path_bytes: u64,
+    actual_entries: &mut BTreeMap<String, String>,
+    leaf_digests: &mut Vec<[u8; 32]>,
+) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let (metadata, _) =
+        linux_immutable_storage_entry(path, "retained observation-storage inventory entry")?;
+    if metadata.dev() != root_device {
+        bail!("retained observation-storage inventory crossed a filesystem boundary");
+    }
+    let (entry_type, content_sha256) = if metadata.file_type().is_dir() {
+        ("directory", Value::Null)
+    } else if metadata.file_type().is_file() {
+        if metadata.nlink() != 1 {
+            bail!("retained observation-storage regular file has more than one hard link");
+        }
+        let digest = if relative_path == OBSERVATION_STORAGE_RELEASE_NAME {
+            Value::Null
+        } else {
+            let (hashed_path, digest, size_bytes) = sha256_regular_file_nofollow(path)?;
+            if hashed_path != path || size_bytes != metadata.len() {
+                bail!("retained observation-storage regular file changed while hashing");
+            }
+            Value::String(digest)
+        };
+        ("regular_file", digest)
+    } else {
+        bail!("retained observation-storage inventory contains a special entry");
+    };
+    validate_authorized_inventory_relative_path(
+        relative_path,
+        entry_type,
+        maximum_path_bytes,
+        "retained observation-storage inventory entry",
+    )?;
+    if actual_entries
+        .insert(relative_path.to_string(), entry_type.to_string())
+        .is_some()
+    {
+        bail!("retained observation-storage inventory contains a duplicate UTF-8 path");
+    }
+    let leaf = json!({
+        "relative_path_utf8": relative_path,
+        "relative_path_encoding": AUTHORIZED_STORAGE_PATH_ENCODING,
+        "entry_type": entry_type,
+        "device": metadata.dev(),
+        "inode": metadata.ino(),
+        "uid": metadata.uid(),
+        "gid": metadata.gid(),
+        "mode": format!("{:04o}", metadata.permissions().mode() & 0o7777),
+        "nlink": metadata.nlink(),
+        "size_bytes": metadata.len(),
+        "allocated_bytes": metadata.blocks().saturating_mul(512),
+        "content_sha256": content_sha256,
+    });
+    let mut canonical = String::new();
+    write_canonical_json(&leaf, &mut canonical)?;
+    let digest = Sha256::digest(canonical.as_bytes());
+    let mut digest_bytes = [0_u8; 32];
+    digest_bytes.copy_from_slice(&digest);
+    leaf_digests.push(digest_bytes);
+
+    if metadata.file_type().is_dir() {
+        for child in fs::read_dir(path)
+            .with_context(|| format!("scan retained directory {}", path.display()))?
+        {
+            let child =
+                child.with_context(|| format!("read retained directory {}", path.display()))?;
+            let child_path = child.path();
+            let relative = child_path
+                .strip_prefix(output_directory)
+                .with_context(|| {
+                    format!(
+                        "retained inventory entry escaped {}",
+                        output_directory.display()
+                    )
+                })?
+                .to_str()
+                .context("retained inventory entry is not strict UTF-8")?;
+            collect_exact_storage_inventory_entry(
+                output_directory,
+                &child_path,
+                relative,
+                root_device,
+                maximum_path_bytes,
+                actual_entries,
+                leaf_digests,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn recompute_exact_storage_inventory(
+    output_directory: &Path,
+    authorized_inventory: &Value,
+    contract: &ObservationStorageContract,
+) -> Result<Value> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if fs::canonicalize(output_directory)
+            .with_context(|| format!("canonicalize strict output {}", output_directory.display()))?
+            != output_directory
+        {
+            bail!("strict output directory is not canonical during inventory revalidation");
+        }
+        let root_metadata = fs::symlink_metadata(output_directory)
+            .with_context(|| format!("lstat strict output {}", output_directory.display()))?;
+        let expected_entries = authorized_inventory
+            .get("entries")
+            .and_then(Value::as_array)
+            .context("authorized storage inventory has no entry array")?
+            .iter()
+            .map(|entry| {
+                Ok((
+                    required_json_string(
+                        entry.get("relative_path"),
+                        "authorized storage inventory relative path",
+                    )?
+                    .to_string(),
+                    required_json_string(
+                        entry.get("entry_type"),
+                        "authorized storage inventory entry type",
+                    )?
+                    .to_string(),
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let mut actual_entries = BTreeMap::new();
+        let mut leaf_digests = Vec::new();
+        collect_exact_storage_inventory_entry(
+            output_directory,
+            output_directory,
+            ".",
+            root_metadata.dev(),
+            contract.maximum_payload_relative_path_bytes,
+            &mut actual_entries,
+            &mut leaf_digests,
+        )?;
+        let maximum_entries = contract
+            .evidence_hard_inodes
+            .checked_add(contract.hard_observation_inodes)
+            .context("exact storage inventory inode bound overflow")?;
+        if actual_entries != expected_entries
+            || u64::try_from(actual_entries.len()).unwrap_or(u64::MAX) > maximum_entries
+        {
+            bail!("live immutable E/P inventory differs from the exact authorized schedule");
+        }
+        leaf_digests.sort_unstable();
+        let mut aggregate = Sha256::new();
+        aggregate.update(b"ty.supremacy.exact-storage-inventory.v1\0");
+        aggregate.update(
+            u64::try_from(leaf_digests.len())
+                .context("exact storage inventory count overflow")?
+                .to_be_bytes(),
+        );
+        for leaf in leaf_digests {
+            aggregate.update(leaf);
+        }
+        Ok(json!({
+            "schema": "ty.supremacy.exact-storage-inventory.v1",
+            "entry_count": actual_entries.len(),
+            "leaf": "ty-canonical-json-v1(strict-utf8 relative path without normalization,type,identity,metadata,regular-content-sha256-except-release-slot)",
+            "aggregation": "sha256-domain-count-sorted-leaf-sha256",
+            "sha256": format!("{:x}", aggregate.finalize()),
+        }))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (output_directory, authorized_inventory, contract);
+        bail!("strict observation-storage inventory revalidation requires Linux")
+    }
+}
+
+fn validate_final_receipt_semantic_admission(report: &Value, receipt: &Value) -> Result<()> {
+    let semantic = receipt
+        .get("semantic_validation")
+        .context("final strict receipt has no semantic validation")?;
+    let semantic = exact_json_object_fields(
+        semantic,
+        "final strict receipt semantic_validation",
+        &[
+            "schema",
+            "admitted",
+            "runtime_evidence_schema",
+            "observation_role",
+            "campaign_id",
+            "campaign_plan_sha256",
+            "observation_storage_contract_sha256",
+            "row_count",
+            "complete_measurement_rows",
+            "resource_limited_rows",
+            "corpus_claim_complete",
+            "corpus_claim_pass",
+            "artifact_admission",
+        ],
+    )?;
+    let artifact_admission = exact_json_object_fields(
+        semantic
+            .get("artifact_admission")
+            .context("semantic admission has no artifact admission")?,
+        "final strict receipt semantic_validation.artifact_admission",
+        &[
+            "measured_observation_count",
+            "retained_observation_bytes",
+            "resource_limited_observation_count",
+            "all_artifact_commitments_revalidated",
+            "authorized_storage_inventory",
+        ],
+    )?;
+    let rows = report
+        .get("rows")
+        .and_then(Value::as_array)
+        .context("campaign runtime report has no rows")?;
+    let complete_measurement_rows = rows
+        .iter()
+        .filter(|row| {
+            row.get("collection_outcome").and_then(Value::as_str) == Some("complete_measurement")
+        })
+        .count();
+    let resource_limited_rows = rows
+        .iter()
+        .filter(|row| {
+            row.get("collection_outcome").and_then(Value::as_str) == Some("resource_limited")
+        })
+        .count();
+    let artifact_digests = report
+        .get("artifact_digests")
+        .and_then(Value::as_array)
+        .context("campaign runtime report has no artifact digests")?;
+    let retained_observation_bytes = artifact_digests.iter().try_fold(0u64, |total, item| {
+        [
+            "command",
+            "stdout",
+            "stderr",
+            "retention",
+            "payload_manifest",
+        ]
+        .into_iter()
+        .try_fold(total, |subtotal, name| {
+            let size = item
+                .get(name)
+                .and_then(|record| record.get("size_bytes"))
+                .and_then(Value::as_u64)
+                .with_context(|| format!("runtime artifact digest has no {name} size_bytes"))?;
+            subtotal
+                .checked_add(size)
+                .context("retained observation byte total overflow")
+        })
+    })?;
+    let observation_role = semantic
+        .get("observation_role")
+        .and_then(Value::as_str)
+        .context("semantic admission has no observation role")?;
+    let campaign = report
+        .get("campaign")
+        .and_then(Value::as_object)
+        .context("campaign runtime report has no campaign binding")?;
+    let role_matches = match observation_role {
+        "segment" => {
+            campaign.get("role").and_then(Value::as_str) == Some("segment")
+                && campaign.get("merge_purpose").is_none()
+        }
+        "merge_inventory" => {
+            campaign.get("role").and_then(Value::as_str) == Some("aggregate")
+                && campaign.get("merge_purpose").and_then(Value::as_str) == Some("inventory")
+        }
+        "merge_superiority" => {
+            campaign.get("role").and_then(Value::as_str) == Some("aggregate")
+                && campaign.get("merge_purpose").and_then(Value::as_str) == Some("superiority")
+        }
+        _ => false,
+    };
+    let storage_contract_sha256 = sha256_ty_canonical_json_v1_value(
+        report
+            .get("observation_storage_contract")
+            .context("campaign report has no observation storage contract")?,
+    )?;
+    let storage_contract: ObservationStorageContract = serde_json::from_value(
+        report
+            .get("observation_storage_contract")
+            .cloned()
+            .context("campaign report has no observation storage contract")?,
+    )
+    .context("parse campaign report observation storage contract")?;
+    storage_contract.validate()?;
+    validate_authorized_storage_inventory(
+        report,
+        observation_role,
+        &storage_contract,
+        artifact_admission
+            .get("authorized_storage_inventory")
+            .context("artifact admission has no authorized storage inventory")?,
+    )?;
+    if semantic.get("schema").and_then(Value::as_str)
+        != Some("ty.supremacy.runtime-evidence-semantic-admission.v1")
+        || semantic.get("admitted").and_then(Value::as_bool) != Some(true)
+        || semantic
+            .get("runtime_evidence_schema")
+            .and_then(Value::as_str)
+            != Some(RUNTIME_CAMPAIGN_EVIDENCE_SCHEMA)
+        || !role_matches
+        || receipt
+            .pointer("/storage_confinement/observation_role")
+            .and_then(Value::as_str)
+            != Some(observation_role)
+        || semantic.get("campaign_id") != campaign.get("campaign_id")
+        || semantic.get("campaign_plan_sha256")
+            != campaign
+                .get("campaign_plan")
+                .and_then(|record| record.get("sha256"))
+        || semantic
+            .get("observation_storage_contract_sha256")
+            .and_then(Value::as_str)
+            != Some(storage_contract_sha256.as_str())
+        || semantic.get("row_count").and_then(Value::as_u64) != u64::try_from(rows.len()).ok()
+        || semantic
+            .get("complete_measurement_rows")
+            .and_then(Value::as_u64)
+            != u64::try_from(complete_measurement_rows).ok()
+        || semantic
+            .get("resource_limited_rows")
+            .and_then(Value::as_u64)
+            != u64::try_from(resource_limited_rows).ok()
+        || semantic.get("corpus_claim_complete") != report.get("corpus_claim_complete")
+        || semantic.get("corpus_claim_pass") != report.get("corpus_claim_pass")
+        || artifact_admission
+            .get("measured_observation_count")
+            .and_then(Value::as_u64)
+            != u64::try_from(artifact_digests.len()).ok()
+        || artifact_admission
+            .get("retained_observation_bytes")
+            .and_then(Value::as_u64)
+            != Some(retained_observation_bytes)
+        || artifact_admission
+            .get("resource_limited_observation_count")
+            .and_then(Value::as_u64)
+            != u64::try_from(resource_limited_rows).ok()
+        || artifact_admission
+            .get("all_artifact_commitments_revalidated")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        bail!("final strict receipt semantic admission diverges from the runtime report");
+    }
+    Ok(())
+}
+
+fn validate_final_receipt_and_machine(
+    report: &Value,
+    report_file: &RuntimeFileProvenance,
+    baseline_file: &RuntimeFileProvenance,
+    receipt_path: &Path,
+    machine_path: &Path,
+    machine_id: &str,
+) -> Result<()> {
+    let matrix_after_path = json_path(
+        report,
+        "/matrix_after_refresh",
+        "report.matrix_after_refresh",
+    )?;
+    let matrix_after_file = RuntimeFileProvenance::new(&matrix_after_path)
+        .with_context(|| format!("hash matrix summary {}", matrix_after_path.display()))?;
+    let runtime_batch_plan_path =
+        json_path(report, "/runtime_batch_plan", "report.runtime_batch_plan")?;
+    let runtime_batch_plan_file = RuntimeFileProvenance::new(&runtime_batch_plan_path)
+        .with_context(|| {
+            format!(
+                "hash runtime batch plan {}",
+                runtime_batch_plan_path.display()
+            )
+        })?;
+    if serde_json::to_value(&runtime_batch_plan_file)?
+        != report
+            .get("runtime_batch_plan_provenance")
+            .cloned()
+            .context("runtime report has no runtime_batch_plan_provenance")?
+    {
+        bail!("runtime batch plan provenance changed after report creation");
+    }
+    let (runtime_batch_plan, _, _) = read_regular_json_nofollow(&runtime_batch_plan_path)?;
+    let campaign_report = report.get("campaign").is_some();
+    let expected_batch_schema = if campaign_report {
+        RUNTIME_CAMPAIGN_BATCH_PLAN_SCHEMA
+    } else {
+        RUNTIME_BATCH_PLAN_SCHEMA
+    };
+    if runtime_batch_plan.get("schema").and_then(Value::as_str) != Some(expected_batch_schema)
+        || runtime_batch_plan.get("campaign") != report.get("campaign")
+    {
+        bail!("runtime batch plan schema or campaign linkage differs from the runtime report");
+    }
+    if campaign_report {
+        validate_campaign_runtime_batch_plan_linkage(report, &runtime_batch_plan)?;
+    }
+
+    let receipt_file = RuntimeFileProvenance::new(receipt_path)
+        .with_context(|| format!("hash final strict receipt {}", receipt_path.display()))?;
+    if receipt_file.path != receipt_path {
+        bail!("final receipt link is not a canonical path");
+    }
+    validate_private_evidence_file_mode(receipt_path, "final strict receipt")?;
+    let (receipt, _, _) = read_regular_json_nofollow(receipt_path)?;
+    if RuntimeFileProvenance::new(receipt_path)? != receipt_file {
+        bail!("final strict receipt changed while it was being validated");
+    }
+    exact_json_object_fields(
+        &receipt,
+        "final strict receipt",
+        &[
+            "schema",
+            "provenance_id",
+            "created_at_utc",
+            "machine_provenance",
+            "command",
+            "input_dependencies",
+            "artifacts",
+            "storage_confinement",
+            "semantic_validation",
+        ],
+    )?;
+    exact_json_object_fields(
+        receipt
+            .get("machine_provenance")
+            .context("final strict receipt has no machine provenance record")?,
+        "final strict receipt machine_provenance",
+        &["path", "provenance_id"],
+    )?;
+    exact_json_object_fields(
+        receipt
+            .get("command")
+            .context("final strict receipt has no command record")?,
+        "final strict receipt command",
+        &[
+            "argv",
+            "exit_code",
+            "subcommand",
+            "output_directory",
+            "started_at_utc",
+            "finished_at_utc",
+        ],
+    )?;
+    for (pointer, label) in [
+        ("/created_at_utc", "final strict receipt created_at_utc"),
+        (
+            "/command/started_at_utc",
+            "final strict receipt command started_at_utc",
+        ),
+        (
+            "/command/finished_at_utc",
+            "final strict receipt command finished_at_utc",
+        ),
+    ] {
+        required_json_string(receipt.pointer(pointer), label)?;
+    }
+    if receipt.get("schema").and_then(Value::as_str) != Some(FINAL_RECEIPT_SCHEMA)
+        || receipt.get("provenance_id").and_then(Value::as_str) != Some(machine_id)
+    {
+        bail!("final strict receipt schema or provenance id is invalid");
+    }
+    validate_final_receipt_semantic_admission(report, &receipt)?;
+    if json_path(
+        &receipt,
+        "/machine_provenance/path",
+        "receipt.machine_provenance.path",
+    )? != machine_path
+        || receipt
+            .pointer("/machine_provenance/provenance_id")
+            .and_then(Value::as_str)
+            != Some(machine_id)
+    {
+        bail!("final strict receipt machine link does not match the baseline");
+    }
+    if receipt
+        .pointer("/command/exit_code")
+        .and_then(Value::as_i64)
+        != Some(0)
+    {
+        bail!("final strict receipt does not record a successful child command");
+    }
+    let subcommand = receipt
+        .pointer("/command/subcommand")
+        .and_then(Value::as_str);
+    let campaign_role = report.pointer("/campaign/role").and_then(Value::as_str);
+    let expected_subcommands: &[&str] = match campaign_role {
+        None => &["matrix", "matrix-full-suite"],
+        Some("segment") => &["matrix-segment"],
+        Some("aggregate")
+            if report
+                .pointer("/campaign/merge_purpose")
+                .and_then(Value::as_str)
+                == Some("inventory") =>
+        {
+            &["matrix-merge-inventory"]
+        }
+        Some("aggregate")
+            if report
+                .pointer("/campaign/merge_purpose")
+                .and_then(Value::as_str)
+                == Some("superiority") =>
+        {
+            &["matrix-merge"]
+        }
+        Some("aggregate") => bail!("campaign aggregate has no valid merge purpose"),
+        Some(role) => bail!("unsupported campaign role in runtime report: {role:?}"),
+    };
+    if !subcommand.is_some_and(|subcommand| expected_subcommands.contains(&subcommand)) {
+        bail!(
+            "final strict receipt subcommand {:?} does not match runtime evidence role {:?}",
+            subcommand,
+            campaign_role
+        );
+    }
+    let output_dir = json_path(report, "/output_dir", "report.output_dir")?;
+    if json_path(
+        &receipt,
+        "/command/output_directory",
+        "receipt.command.output_directory",
+    )? != output_dir
+    {
+        bail!("final strict receipt output directory differs from the runtime report");
+    }
+    let argv = receipt
+        .pointer("/command/argv")
+        .and_then(Value::as_array)
+        .context("final strict receipt command argv is missing")?;
+    let launched_binary = argv
+        .first()
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .context("final strict receipt command executable is missing")?;
+    if !launched_binary.is_absolute()
+        || launched_binary
+            != json_path(
+                report,
+                "/metadata/ty/binary/path",
+                "report.metadata.ty.binary.path",
+            )?
+    {
+        bail!("final strict receipt command did not launch the provenance-bound TY binary");
+    }
+    if campaign_role.is_some() {
+        validate_campaign_receipt_argv(report, argv)?;
+        validate_campaign_receipt_dependencies(report, &receipt)?;
+    }
+
+    let expected_artifacts = BTreeMap::from([
+        ("runtime_evidence.json", report_file),
+        ("spec_baseline.refreshed.json", baseline_file),
+        ("matrix_after_refresh.json", &matrix_after_file),
+        ("runtime_batch_plan.json", &runtime_batch_plan_file),
+    ]);
+    let receipt_artifacts = receipt
+        .get("artifacts")
+        .and_then(Value::as_object)
+        .context("final strict receipt has no artifacts object")?;
+    let observed_names = receipt_artifacts
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let expected_names = expected_artifacts.keys().copied().collect::<BTreeSet<_>>();
+    if observed_names != expected_names {
+        bail!(
+            "final strict receipt artifact set is not exact: expected {expected_names:?}, found {observed_names:?}"
+        );
+    }
+    for (name, expected) in expected_artifacts {
+        exact_json_object_fields(
+            receipt_artifacts
+                .get(name)
+                .expect("validated artifact name"),
+            &format!("receipt.artifacts.{name}"),
+            &["path", "sha256", "size_bytes"],
+        )?;
+        validate_json_file_record(
+            receipt_artifacts
+                .get(name)
+                .expect("validated artifact name"),
+            expected,
+            &format!("receipt.artifacts.{name}"),
+        )?;
+    }
+
+    let machine_file = RuntimeFileProvenance::new(machine_path)
+        .with_context(|| format!("hash final machine provenance {}", machine_path.display()))?;
+    if machine_file.path != machine_path {
+        bail!("final machine provenance link is not canonical");
+    }
+    let (machine, _, _) = read_regular_json_nofollow(machine_path)?;
+    if RuntimeFileProvenance::new(machine_path)? != machine_file {
+        bail!("final machine provenance changed while it was being validated");
+    }
+    validate_final_machine_document(
+        report,
+        &receipt,
+        &receipt_file,
+        &machine,
+        machine_id,
+        &output_dir,
+    )
+}
+
+fn validate_campaign_receipt_argv(report: &Value, argv: &[Value]) -> Result<()> {
+    let campaign: RuntimeCampaignReportBinding = serde_json::from_value(
+        report
+            .get("campaign")
+            .cloned()
+            .context("campaign report has no campaign binding")?,
+    )
+    .context("parse campaign receipt binding")?;
+    campaign.validate_claim_role()?;
+    let tokens = argv
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .with_context(|| format!("receipt command argv[{index}] is not a string"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let expected_subcommand = match campaign.role.as_str() {
+        "segment" => "matrix-segment",
+        "aggregate" if campaign.merge_purpose.as_deref() == Some("inventory") => {
+            "matrix-merge-inventory"
+        }
+        "aggregate" if campaign.merge_purpose.as_deref() == Some("superiority") => "matrix-merge",
+        "aggregate" => bail!("campaign aggregate receipt has no valid merge purpose"),
+        role => bail!("unsupported campaign receipt role {role:?}"),
+    };
+    if tokens.len() < 3
+        || tokens.get(1).map(String::as_str) != Some("supremacy")
+        || tokens.get(2).map(String::as_str) != Some(expected_subcommand)
+    {
+        bail!("campaign receipt argv does not invoke the expected supremacy subcommand");
+    }
+
+    let allowed_single: &[&str] = match campaign.role.as_str() {
+        "segment" => &[
+            "--mode",
+            "--campaign-plan",
+            "--segment-id",
+            "--runtime-output-dir",
+            "--format",
+        ],
+        "aggregate" => &[
+            "--mode",
+            "--campaign-plan",
+            "--runtime-output-dir",
+            "--format",
+        ],
+        _ => unreachable!("role validated above"),
+    };
+    let mut singles = BTreeMap::<String, String>::new();
+    let mut segment_reports = Vec::<String>::new();
+    let mut index = 3;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        if !token.starts_with("--") {
+            bail!("campaign receipt argv has unexpected positional argument {token:?}");
+        }
+        let (name, inline_value) = token
+            .split_once('=')
+            .map_or((token.as_str(), None), |(name, value)| (name, Some(value)));
+        let is_multi = campaign.role == "aggregate" && name == "--segment-report";
+        if !is_multi && !allowed_single.contains(&name) {
+            bail!("campaign receipt argv contains unadmitted option {name:?}");
+        }
+        if let Some(value) = inline_value {
+            if value.is_empty() {
+                bail!("campaign receipt argv option {name} has no value");
+            }
+            if is_multi {
+                segment_reports.push(value.to_string());
+            } else if singles
+                .insert(name.to_string(), value.to_string())
+                .is_some()
+            {
+                bail!("campaign receipt argv repeats single-value option {name}");
+            }
+            index += 1;
+            continue;
+        }
+
+        index += 1;
+        if is_multi {
+            let start = index;
+            while index < tokens.len() && !tokens[index].starts_with("--") {
+                segment_reports.push(tokens[index].clone());
+                index += 1;
+            }
+            if index == start {
+                bail!("campaign receipt argv option {name} has no value");
+            }
+        } else {
+            let value = tokens
+                .get(index)
+                .filter(|value| !value.starts_with("--"))
+                .with_context(|| format!("campaign receipt argv option {name} has no value"))?;
+            if singles.insert(name.to_string(), value.clone()).is_some() {
+                bail!("campaign receipt argv repeats single-value option {name}");
+            }
+            index += 1;
+        }
+    }
+
+    let required = |name: &str| {
+        singles
+            .get(name)
+            .map(String::as_str)
+            .with_context(|| format!("campaign receipt argv is missing {name}"))
+    };
+    if required("--mode")? != "enforce" {
+        bail!("campaign receipt argv must use explicit --mode enforce");
+    }
+    if Path::new(required("--campaign-plan")?) != campaign.campaign_plan.path.as_path() {
+        bail!("campaign receipt argv names a different campaign plan");
+    }
+    if Path::new(required("--runtime-output-dir")?)
+        != json_path(report, "/output_dir", "campaign report output directory")?
+    {
+        bail!("campaign receipt argv names a different output directory");
+    }
+    if let Some(format) = singles.get("--format") {
+        if !matches!(format.as_str(), "human" | "json" | "markdown") {
+            bail!("campaign receipt argv has unsupported output format {format:?}");
+        }
+    }
+    match campaign.role.as_str() {
+        "segment" => {
+            if required("--segment-id")? != campaign.segment_id.as_deref().unwrap_or_default() {
+                bail!("campaign segment receipt argv names a different segment id");
+            }
+            if !segment_reports.is_empty() {
+                bail!("campaign segment receipt argv may not name segment reports");
+            }
+        }
+        "aggregate" => {
+            if segment_reports.is_empty() {
+                bail!("campaign merge receipt argv has no segment reports");
+            }
+            let observed = segment_reports
+                .iter()
+                .map(PathBuf::from)
+                .collect::<BTreeSet<_>>();
+            let expected = campaign
+                .segments
+                .iter()
+                .map(|manifest| manifest.report.path.clone())
+                .collect::<BTreeSet<_>>();
+            if observed.len() != segment_reports.len() || observed != expected {
+                bail!(
+                    "campaign merge receipt argv segment-report set differs from the aggregate manifest"
+                );
+            }
+        }
+        _ => unreachable!("role validated above"),
+    }
+    Ok(())
+}
+
+fn validate_campaign_receipt_dependencies(report: &Value, receipt: &Value) -> Result<()> {
+    let campaign: RuntimeCampaignReportBinding = serde_json::from_value(
+        report
+            .get("campaign")
+            .cloned()
+            .context("campaign report has no campaign binding")?,
+    )
+    .context("parse campaign dependency binding")?;
+    campaign.validate_claim_role()?;
+    let dependencies = receipt
+        .get("input_dependencies")
+        .and_then(Value::as_array)
+        .context("campaign receipt has no input dependency array")?;
+    let (plan, plan_file) = load_runtime_campaign_plan(&campaign.campaign_plan.path)
+        .context("revalidate campaign plan for receipt attempt claim")?;
+    if plan.campaign_id != campaign.campaign_id || plan_file != campaign.campaign_plan {
+        bail!("campaign receipt plan or campaign id differs from the sealed report");
+    }
+    let (attempt_marker_path, expected_kind, expected_subcommand) = match campaign.role.as_str() {
+        "segment" => {
+            let segment_id = campaign
+                .segment_id
+                .as_deref()
+                .context("campaign segment receipt has no segment id")?;
+            let segment = plan
+                .payload
+                .segments
+                .iter()
+                .find(|segment| segment.segment_id == segment_id)
+                .with_context(|| {
+                    format!("campaign segment receipt names unplanned segment {segment_id:?}")
+                })?;
+            (segment.attempt_marker.clone(), "segment", "matrix-segment")
+        }
+        "aggregate" if campaign.merge_purpose.as_deref() == Some("inventory") => (
+            plan.payload.artifacts.inventory_attempt_marker.clone(),
+            "inventory",
+            "matrix-merge-inventory",
+        ),
+        "aggregate" if campaign.merge_purpose.as_deref() == Some("superiority") => (
+            plan.payload.artifacts.superiority_attempt_marker.clone(),
+            "superiority",
+            "matrix-merge",
+        ),
+        _ => bail!("campaign receipt has no valid attempt-claim role"),
+    };
+    let attempt_marker_file =
+        RuntimeFileProvenance::new(&attempt_marker_path).with_context(|| {
+            format!(
+                "hash campaign attempt marker {}",
+                attempt_marker_path.display()
+            )
+        })?;
+    if attempt_marker_file.path != attempt_marker_path {
+        bail!("campaign attempt marker path is not canonical");
+    }
+    validate_private_evidence_file_mode(&attempt_marker_path, "campaign attempt marker")?;
+    let (attempt_marker, _, _) = read_regular_json_nofollow(&attempt_marker_path)?;
+    if RuntimeFileProvenance::new(&attempt_marker_path)? != attempt_marker_file {
+        bail!("campaign attempt marker changed while it was being validated");
+    }
+    let marker_fields = if campaign.role == "segment" {
+        &[
+            "schema",
+            "provenance_id",
+            "created_at_utc",
+            "campaign_id",
+            "kind",
+            "subcommand",
+            "campaign_plan",
+            "command",
+            "local_filesystem_trust_boundary",
+            "segment_id",
+        ][..]
+    } else {
+        &[
+            "schema",
+            "provenance_id",
+            "created_at_utc",
+            "campaign_id",
+            "kind",
+            "subcommand",
+            "campaign_plan",
+            "command",
+            "local_filesystem_trust_boundary",
+        ][..]
+    };
+    exact_json_object_fields(&attempt_marker, "campaign attempt marker", marker_fields)?;
+    exact_json_object_fields(
+        attempt_marker
+            .get("campaign_plan")
+            .context("campaign attempt marker has no campaign plan record")?,
+        "campaign attempt marker campaign_plan",
+        &["path", "sha256", "size_bytes"],
+    )?;
+    exact_json_object_fields(
+        attempt_marker
+            .get("command")
+            .context("campaign attempt marker has no command record")?,
+        "campaign attempt marker command",
+        &["argv", "output_directory"],
+    )?;
+    required_json_string(
+        attempt_marker.get("created_at_utc"),
+        "campaign attempt marker created_at_utc",
+    )?;
+    required_json_string(
+        attempt_marker.get("local_filesystem_trust_boundary"),
+        "campaign attempt marker local-filesystem trust boundary",
+    )?;
+    if attempt_marker.get("schema").and_then(Value::as_str)
+        != Some(RUNTIME_CAMPAIGN_ATTEMPT_CLAIM_SCHEMA)
+        || attempt_marker.get("provenance_id").and_then(Value::as_str)
+            != receipt.get("provenance_id").and_then(Value::as_str)
+        || attempt_marker.get("campaign_id").and_then(Value::as_str)
+            != Some(campaign.campaign_id.as_str())
+        || attempt_marker.get("kind").and_then(Value::as_str) != Some(expected_kind)
+        || attempt_marker.get("subcommand").and_then(Value::as_str) != Some(expected_subcommand)
+        || attempt_marker.pointer("/command/argv") != receipt.pointer("/command/argv")
+        || attempt_marker.pointer("/command/output_directory")
+            != receipt.pointer("/command/output_directory")
+    {
+        bail!("campaign attempt marker does not match the successful receipt");
+    }
+    if campaign.role == "segment" {
+        if attempt_marker.get("segment_id").and_then(Value::as_str)
+            != campaign.segment_id.as_deref()
+        {
+            bail!("campaign segment attempt marker names a different segment");
+        }
+    } else if attempt_marker.get("segment_id").is_some() {
+        bail!("campaign aggregate attempt marker may not name a segment");
+    }
+    validate_json_file_record(
+        attempt_marker
+            .get("campaign_plan")
+            .expect("validated campaign plan marker field"),
+        &campaign.campaign_plan,
+        "campaign attempt marker campaign_plan",
+    )?;
+
+    let mut expected = BTreeMap::<PathBuf, (&str, RuntimeFileProvenance)>::new();
+    expected.insert(
+        campaign.campaign_plan.path.clone(),
+        ("campaign_plan", campaign.campaign_plan.clone()),
+    );
+    expected.insert(attempt_marker_path, ("attempt_marker", attempt_marker_file));
+    if campaign.role == "segment" {
+        let capability_path =
+            json_path(report, "/output_dir", "campaign segment output directory")?
+                .join(OBSERVATION_STORAGE_CAPABILITY_NAME);
+        let capability_file = RuntimeFileProvenance::new(&capability_path).with_context(|| {
+            format!(
+                "hash observation-storage capability dependency {}",
+                capability_path.display()
+            )
+        })?;
+        if capability_file.path != capability_path
+            || expected
+                .insert(
+                    capability_path,
+                    ("observation_storage_capability", capability_file),
+                )
+                .is_some()
+        {
+            bail!("campaign segment capability dependency path is not exact and unique");
+        }
+    } else if campaign.role == "aggregate" {
+        for manifest in &campaign.segments {
+            if expected
+                .insert(
+                    manifest.report.path.clone(),
+                    ("segment_report", manifest.report.clone()),
+                )
+                .is_some()
+            {
+                bail!("campaign receipt dependency manifest contains a duplicate path");
+            }
+        }
+    }
+    if dependencies.len() != expected.len() {
+        bail!(
+            "campaign receipt dependency count differs from the exact plan/report dependency set"
+        );
+    }
+    let mut seen = BTreeSet::new();
+    for (index, dependency) in dependencies.iter().enumerate() {
+        exact_json_object_fields(
+            dependency,
+            &format!("receipt.input_dependencies[{index}]"),
+            &["role", "path", "sha256", "size_bytes"],
+        )?;
+        let path = required_absolute_json_path(
+            dependency.get("path"),
+            &format!("receipt.input_dependencies[{index}].path"),
+        )?;
+        let (expected_role, expected_file) = expected.get(&path).with_context(|| {
+            format!(
+                "campaign receipt contains foreign input dependency {}",
+                path.display()
+            )
+        })?;
+        if dependency.get("role").and_then(Value::as_str) != Some(*expected_role)
+            || !seen.insert(path.clone())
+        {
+            bail!("campaign receipt input dependency role or uniqueness is invalid");
+        }
+        validate_json_file_record(
+            dependency,
+            expected_file,
+            &format!("receipt.input_dependencies[{index}]"),
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_campaign_runtime_batch_plan_linkage(
+    report: &Value,
+    runtime_batch_plan: &Value,
+) -> Result<()> {
+    let planned_runtime_specs = report
+        .pointer("/campaign/planned_runtime_specs")
+        .context("campaign report has no planned runtime specs")?;
+    let selected_runtime_specs = report
+        .get("selected_runtime_specs")
+        .context("campaign report has no selected runtime specs")?;
+    let expected_empty = Value::Array(Vec::new());
+    if selected_runtime_specs != planned_runtime_specs
+        || runtime_batch_plan.get("baseline") != report.get("baseline")
+        || runtime_batch_plan.get("output_dir") != report.get("output_dir")
+        || runtime_batch_plan.get("runtime_limit") != report.get("limit")
+        || runtime_batch_plan.get("explicit_runtime_specs") != Some(planned_runtime_specs)
+        || runtime_batch_plan.get("selected_runtime_specs") != Some(planned_runtime_specs)
+        || runtime_batch_plan.get("skipped_batchable_runtime_specs_by_limit")
+            != Some(&expected_empty)
+    {
+        bail!(
+            "campaign runtime batch plan selection or path contract differs from the sealed report"
+        );
+    }
+    Ok(())
+}
+
+fn validate_json_file_record(
+    record: &Value,
+    expected: &RuntimeFileProvenance,
+    label: &str,
+) -> Result<()> {
+    let path = required_absolute_json_path(record.get("path"), &format!("{label}.path"))?;
+    let sha256 = required_json_string(record.get("sha256"), &format!("{label}.sha256"))?;
+    let size_bytes = record
+        .get("size_bytes")
+        .and_then(Value::as_u64)
+        .with_context(|| format!("{label}.size_bytes must be an unsigned integer"))?;
+    let actual_size = fs::metadata(&expected.path)
+        .with_context(|| format!("stat {}", expected.path.display()))?
+        .len();
+    if path != expected.path || sha256 != expected.sha256 || size_bytes != actual_size {
+        bail!("{label} does not match the current canonical file");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_private_evidence_file_mode(path: &Path, label: &str) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("lstat {label} {}", path.display()))?;
+    if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o7777 != 0o600 {
+        bail!(
+            "{label} must remain a non-symlink regular file with mode 0600: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_private_evidence_file_mode(_path: &Path, _label: &str) -> Result<()> {
+    Ok(())
+}
+
+fn validate_final_machine_document(
+    report: &Value,
+    receipt: &Value,
+    receipt_file: &RuntimeFileProvenance,
+    machine: &Value,
+    machine_id: &str,
+    output_dir: &Path,
+) -> Result<()> {
+    validate_final_machine_top_level_fields(report, machine)?;
+    for (pointer, label) in [
+        ("/created_at_utc", "final machine provenance created_at_utc"),
+        (
+            "/qualified_at_utc",
+            "final machine provenance qualified_at_utc",
+        ),
+    ] {
+        required_json_string(machine.pointer(pointer), label)?;
+    }
+    if machine.get("schema").and_then(Value::as_str) != Some(MACHINE_PROVENANCE_SCHEMA)
+        || machine.get("provenance_id").and_then(Value::as_str) != Some(machine_id)
+        || machine.get("status").and_then(Value::as_str) != Some("command_passed")
+    {
+        bail!("final machine provenance schema, id, or command status is invalid");
+    }
+    validate_machine_observation_storage_release_role(report, machine)?;
+    if machine
+        .pointer("/qualification/state")
+        .and_then(Value::as_str)
+        != Some("qualified")
+        || machine.pointer("/qualification/succeeded") != Some(&Value::Bool(true))
+        || !machine.get("machine").is_some_and(Value::is_object)
+    {
+        bail!("final machine provenance no longer carries a qualified machine snapshot");
+    }
+    let controls = machine
+        .pointer("/qualification/controls")
+        .and_then(Value::as_object)
+        .context("final machine provenance has no qualification controls")?;
+    validate_required_machine_qualification_controls(controls)?;
+    let selected_cpu = machine
+        .pointer("/qualification/selected_cpu")
+        .and_then(Value::as_u64);
+    let cgroup_cpu = machine
+        .pointer("/cgroup/cpu/selected_logical_cpu")
+        .and_then(Value::as_u64);
+    if selected_cpu.is_none() || selected_cpu != cgroup_cpu {
+        bail!("final machine provenance selected CPU identity is incomplete");
+    }
+    let delegated_parent = machine
+        .pointer("/cgroup/delegated_parent")
+        .and_then(Value::as_str)
+        .context("final machine provenance delegated parent is missing")?;
+    if !Path::new(delegated_parent).is_absolute() {
+        bail!("final machine provenance delegated parent is not absolute");
+    }
+    if machine
+        .pointer("/command/exit_code")
+        .and_then(Value::as_i64)
+        != Some(0)
+        || machine.pointer("/command/argv") != receipt.pointer("/command/argv")
+        || machine.pointer("/command/output_directory")
+            != receipt.pointer("/command/output_directory")
+        || json_path(
+            machine,
+            "/command/output_directory",
+            "machine.command.output_directory",
+        )? != output_dir
+    {
+        bail!("final machine command record does not match the strict receipt");
+    }
+    let final_receipt = machine
+        .get("final_receipt")
+        .context("final machine provenance has no final_receipt record")?;
+    if final_receipt.get("schema").and_then(Value::as_str) != Some(FINAL_RECEIPT_SCHEMA)
+        || final_receipt.get("status").and_then(Value::as_str) != Some("created")
+    {
+        bail!("final machine provenance does not mark the receipt as created");
+    }
+    exact_json_object_fields(
+        final_receipt,
+        "final machine provenance final_receipt",
+        &[
+            "schema",
+            "path",
+            "sha256",
+            "size_bytes",
+            "device",
+            "inode",
+            "status",
+        ],
+    )?;
+    validate_json_file_record(final_receipt, receipt_file, "machine.final_receipt")?;
+    let receipt_metadata = fs::metadata(&receipt_file.path)
+        .with_context(|| format!("stat final receipt {}", receipt_file.path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if final_receipt.get("device").and_then(Value::as_u64) != Some(receipt_metadata.dev())
+            || final_receipt.get("inode").and_then(Value::as_u64) != Some(receipt_metadata.ino())
+        {
+            bail!("final machine receipt device/inode differs from the linked receipt");
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = receipt_metadata;
+    }
+    if machine.get("storage_confinement") != receipt.get("storage_confinement") {
+        bail!("final machine storage confinement differs from the exact strict receipt snapshot");
+    }
+
+    let repository_finalization = completed_machine_finalization(
+        machine,
+        "/repository_finalization",
+        "matches_qualified_snapshot",
+        "repository",
+    )?;
+    if repository_finalization.get("snapshot") != machine.get("repository") {
+        bail!("final repository recheck differs from the qualified repository");
+    }
+    let machine_contract_finalization = completed_machine_finalization(
+        machine,
+        "/machine_contract_finalization",
+        "matches_qualified_snapshot",
+        "machine contract",
+    )?;
+    for name in ["guest_identity", "output_storage", "semantic_environment"] {
+        if machine_contract_finalization.pointer(&format!("/snapshot/{name}"))
+            != machine.pointer(&format!("/machine/{name}"))
+        {
+            bail!("final machine-contract recheck differs for {name}");
+        }
+    }
+    let runtime_max_finalization = completed_machine_finalization(
+        machine,
+        "/systemd_runtime_max_finalization",
+        "matches_qualified_value",
+        "systemd runtime maximum",
+    )?;
+    let requested_seconds = machine
+        .pointer("/systemd/requested_runtime_max_seconds")
+        .and_then(Value::as_u64)
+        .context("final machine provenance has no requested systemd runtime maximum")?;
+    if requested_seconds == 0
+        || runtime_max_finalization
+            .pointer("/snapshot/requested_seconds")
+            .and_then(Value::as_u64)
+            != Some(requested_seconds)
+        || runtime_max_finalization
+            .pointer("/snapshot/microseconds")
+            .and_then(Value::as_u64)
+            != requested_seconds.checked_mul(1_000_000)
+        || runtime_max_finalization.pointer("/snapshot/unit") != machine.pointer("/systemd/unit")
+    {
+        bail!("final systemd RuntimeMaxUSec recheck differs from the requested outer wall cap");
+    }
+    let observation_storage_finalization = completed_machine_finalization(
+        machine,
+        "/observation_storage_finalization",
+        "matches_qualified_snapshot",
+        "observation storage",
+    )?;
+    if stable_observation_storage_snapshot(
+        observation_storage_finalization
+            .get("snapshot")
+            .context("observation-storage finalization has no snapshot")?,
+    )? != stable_observation_storage_snapshot(
+        machine
+            .get("observation_storage")
+            .context("final machine provenance has no observation storage snapshot")?,
+    )? {
+        bail!("final observation-storage recheck differs from the qualified storage snapshot");
+    }
+
+    let initial_snapshot = report
+        .pointer("/metadata/machine/snapshot")
+        .context("runtime report has no initial machine snapshot")?;
+    for pointer in [
+        "/schema",
+        "/provenance_id",
+        "/created_at_utc",
+        "/qualification",
+        "/observation_storage",
+        "/systemd",
+        "/identity",
+        "/working_directory",
+        "/repository",
+        "/environment",
+        "/cgroup",
+        "/qualified_at_utc",
+    ] {
+        if initial_snapshot.pointer(pointer) != machine.pointer(pointer) {
+            bail!("final machine provenance changed launcher-bound field {pointer}");
+        }
+    }
+    if object_without_fields(
+        initial_snapshot
+            .get("command")
+            .context("initial machine snapshot has no command object")?,
+        &["exit_code", "finished_at_utc"],
+        "initial machine command",
+    )? != object_without_fields(
+        machine
+            .get("command")
+            .context("final machine provenance has no command object")?,
+        &["exit_code", "finished_at_utc"],
+        "final machine command",
+    )? {
+        bail!("final machine provenance changed immutable command fields");
+    }
+    if object_without_fields(
+        initial_snapshot
+            .get("machine")
+            .context("initial machine snapshot has no machine object")?,
+        &["loadavg_after"],
+        "initial machine snapshot",
+    )? != object_without_fields(
+        machine
+            .get("machine")
+            .context("final machine provenance has no machine object")?,
+        &["loadavg_after"],
+        "final machine snapshot",
+    )? {
+        bail!("final machine provenance changed the qualified machine snapshot");
+    }
+    if report.pointer("/campaign/role").and_then(Value::as_str) == Some("segment") {
+        validate_segment_observation_storage_release(
+            report, receipt, machine, machine_id, output_dir,
+        )?;
+    }
+    Ok(())
+}
+
+fn object_without_fields(value: &Value, removable_fields: &[&str], label: &str) -> Result<Value> {
+    let mut object = value
+        .as_object()
+        .with_context(|| format!("{label} must be an object"))?
+        .clone();
+    for field in removable_fields {
+        object.remove(*field);
+    }
+    Ok(Value::Object(object))
+}
+
+fn stable_observation_storage_snapshot(value: &Value) -> Result<Value> {
+    let mut stable = value
+        .as_object()
+        .context("observation-storage snapshot must be an object")?
+        .clone();
+    for field in [
+        "filesystem_available_bytes",
+        "filesystem_available_inodes",
+        "evidence_quota_current_bytes",
+        "evidence_quota_current_inodes",
+        "payload_quota_current_bytes",
+        "payload_quota_current_inodes",
+        "root_capability",
+        "root_capability_file",
+        "checked_at_utc",
+    ] {
+        stable.remove(field);
+    }
+    for role in ["evidence", "payload"] {
+        if let Some(project_statvfs) = stable
+            .get_mut(&format!("{role}_project_statvfs"))
+            .and_then(Value::as_object_mut)
+        {
+            project_statvfs.remove("available_bytes");
+            project_statvfs.remove("available_inodes");
+        }
+        if let Some(project_attributes) = stable
+            .get_mut(&format!("{role}_project_directory_attributes"))
+            .and_then(Value::as_object_mut)
+        {
+            project_attributes.remove("nextents");
+        }
+    }
+    if let Some(privileged_execution) = stable
+        .get_mut("privileged_attestor_execution")
+        .and_then(Value::as_object_mut)
+    {
+        privileged_execution.remove("command");
+    }
+    if let Some(raw) = stable
+        .get_mut("raw_attestation")
+        .and_then(Value::as_object_mut)
+    {
+        for field in [
+            "filesystem_available_bytes",
+            "filesystem_available_inodes",
+            "configuration_performed",
+            "allocation_initial_quotas",
+            "configuration_binding",
+            "quota_enforcement",
+            "quota_enforcement_status",
+            "attested_at_utc",
+        ] {
+            raw.remove(field);
+        }
+        for role in ["evidence", "payload"] {
+            if let Some(project) = raw
+                .get_mut(&format!("{role}_project_directory_attributes"))
+                .and_then(Value::as_object_mut)
+            {
+                project.remove("nextents");
+            }
+            if let Some(project_statvfs) = raw
+                .get_mut(&format!("{role}_project_statvfs"))
+                .and_then(Value::as_object_mut)
+            {
+                project_statvfs.remove("available_bytes");
+                project_statvfs.remove("available_inodes");
+            }
+            if let Some(quota) = raw
+                .get_mut(&format!("{role}_project_quota"))
+                .and_then(Value::as_object_mut)
+            {
+                quota.remove("current_bytes");
+                quota.remove("current_inodes");
+            }
+        }
+    }
+    Ok(Value::Object(stable))
+}
+
+fn validate_final_machine_top_level_fields(report: &Value, machine: &Value) -> Result<()> {
+    let mut expected = vec![
+        "schema",
+        "provenance_id",
+        "created_at_utc",
+        "status",
+        "qualification",
+        "final_receipt",
+        "storage_confinement",
+        "observation_storage",
+        "systemd",
+        "identity",
+        "working_directory",
+        "machine",
+        "environment",
+        "repository",
+        "command",
+        "cgroup",
+        "qualified_at_utc",
+        "systemd_runtime_max_finalization",
+        "machine_contract_finalization",
+        "observation_storage_finalization",
+        "repository_finalization",
+    ];
+    if report.pointer("/campaign/role").and_then(Value::as_str) == Some("segment") {
+        expected.push("observation_storage_release");
+    }
+    exact_json_object_fields(machine, "final machine provenance", &expected).map(|_| ())
+}
+
+fn require_release_sha256(value: Option<&Value>, label: &str) -> Result<String> {
+    let digest = required_json_string(value, label)?;
+    if !valid_sha256(digest) {
+        bail!("{label} is not a lowercase SHA-256 digest");
+    }
+    Ok(digest.to_string())
+}
+
+fn validate_release_basic_file_record(
+    value: &Value,
+    label: &str,
+    expected_fields: &[&str],
+) -> Result<()> {
+    let record = exact_json_object_fields(value, label, expected_fields)?;
+    required_absolute_json_path(record.get("path"), &format!("{label}.path"))?;
+    require_release_sha256(record.get("sha256"), &format!("{label}.sha256"))?;
+    if record.get("size_bytes").and_then(Value::as_u64) == Some(0)
+        || record.get("size_bytes").and_then(Value::as_u64).is_none()
+    {
+        bail!("{label}.size_bytes must be a positive unsigned integer");
+    }
+    for field in ["device", "inode"] {
+        if expected_fields.contains(&field) && record.get(field).and_then(Value::as_u64).is_none() {
+            bail!("{label}.{field} must be an unsigned integer");
+        }
+    }
+    Ok(())
+}
+
+fn validate_release_executable_record(
+    value: &Value,
+    label: &str,
+    expected_mode: &str,
+) -> Result<()> {
+    validate_release_basic_file_record(
+        value,
+        label,
+        &[
+            "path",
+            "sha256",
+            "size_bytes",
+            "device",
+            "inode",
+            "uid",
+            "gid",
+            "mode",
+            "parent_chain",
+        ],
+    )?;
+    let record = value.as_object().expect("exact object validated");
+    if record.get("uid").and_then(Value::as_u64) != Some(0)
+        || record.get("gid").and_then(Value::as_u64).is_none()
+        || record.get("mode").and_then(Value::as_str) != Some(expected_mode)
+    {
+        bail!("{label} is not the expected root-owned executable");
+    }
+    let parents = record
+        .get("parent_chain")
+        .and_then(Value::as_array)
+        .context(format!("{label}.parent_chain must be an array"))?;
+    if parents.is_empty() {
+        bail!("{label}.parent_chain is empty");
+    }
+    for (index, parent) in parents.iter().enumerate() {
+        let parent = exact_json_object_fields(
+            parent,
+            &format!("{label}.parent_chain[{index}]"),
+            &["path", "device", "inode", "uid", "gid", "mode"],
+        )?;
+        required_absolute_json_path(
+            parent.get("path"),
+            &format!("{label}.parent_chain[{index}].path"),
+        )?;
+        let mode = required_json_string(
+            parent.get("mode"),
+            &format!("{label}.parent_chain[{index}].mode"),
+        )?;
+        let parsed_mode = u32::from_str_radix(mode, 8)
+            .with_context(|| format!("{label}.parent_chain[{index}].mode is not octal"))?;
+        if mode.len() != 4
+            || parent.get("uid").and_then(Value::as_u64) != Some(0)
+            || parent.get("gid").and_then(Value::as_u64).is_none()
+            || parent.get("device").and_then(Value::as_u64).is_none()
+            || parent.get("inode").and_then(Value::as_u64).is_none()
+            || parsed_mode & 0o022 != 0
+        {
+            bail!("{label}.parent_chain[{index}] is not root-controlled");
+        }
+    }
+    Ok(())
+}
+
+fn validate_exact_inventory_commitment(value: &Value, label: &str) -> Result<()> {
+    let inventory = exact_json_object_fields(
+        value,
+        label,
+        &["schema", "entry_count", "leaf", "aggregation", "sha256"],
+    )?;
+    if inventory.get("schema").and_then(Value::as_str) != Some(EXACT_STORAGE_INVENTORY_SCHEMA)
+        || inventory.get("entry_count").and_then(Value::as_u64).is_none()
+        || inventory.get("leaf").and_then(Value::as_str)
+            != Some(
+                "ty-canonical-json-v1(strict-utf8 relative path without normalization,type,identity,metadata,regular-content-sha256-except-release-slot)",
+            )
+        || inventory.get("aggregation").and_then(Value::as_str)
+            != Some("sha256-domain-count-sorted-leaf-sha256")
+    {
+        bail!("{label} does not use the exact storage-inventory commitment contract");
+    }
+    require_release_sha256(inventory.get("sha256"), &format!("{label}.sha256"))?;
+    Ok(())
+}
+
+fn validate_normalized_absolute_cgroup_path(value: Option<&Value>, label: &str) -> Result<PathBuf> {
+    use std::path::Component;
+
+    let text = required_json_string(value, label)?;
+    let path = PathBuf::from(text);
+    if !path.is_absolute()
+        || (text != "/" && (text.ends_with('/') || text.contains("//")))
+        || text
+            .split('/')
+            .any(|component| matches!(component, "." | ".." | "(deleted)"))
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
+    {
+        bail!("{label} must be a normalized absolute cgroup path");
+    }
+    Ok(path)
+}
+
+fn valid_strict_cgroup_unit_name(value: &str) -> bool {
+    let Some(body) = value
+        .strip_prefix("ty-supremacy-")
+        .and_then(|value| value.strip_suffix(".service"))
+    else {
+        return false;
+    };
+    !body.is_empty()
+        && body
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+}
+
+fn validate_release_cgroup_binding(value: &Value, label: &str) -> Result<()> {
+    let binding = exact_json_object_fields(
+        value,
+        label,
+        &[
+            "schema",
+            "unit_name",
+            "mount_root",
+            "mount_point",
+            "mount_device",
+            "mount_inode",
+            "delegated_parent",
+            "delegated_parent_device",
+            "delegated_parent_inode",
+            "supervisor",
+            "supervisor_device",
+            "supervisor_inode",
+        ],
+    )?;
+    if binding.get("schema").and_then(Value::as_str)
+        != Some(OBSERVATION_STORAGE_CGROUP_BINDING_SCHEMA)
+    {
+        bail!("{label} has the wrong schema");
+    }
+    let unit_name = required_json_string(binding.get("unit_name"), &format!("{label}.unit_name"))?;
+    if !valid_strict_cgroup_unit_name(unit_name) {
+        bail!("{label}.unit_name is not a strict transient service");
+    }
+    let mount_root = validate_normalized_absolute_cgroup_path(
+        binding.get("mount_root"),
+        &format!("{label}.mount_root"),
+    )?;
+    let mount_point = validate_normalized_absolute_cgroup_path(
+        binding.get("mount_point"),
+        &format!("{label}.mount_point"),
+    )?;
+    let delegated_parent = validate_normalized_absolute_cgroup_path(
+        binding.get("delegated_parent"),
+        &format!("{label}.delegated_parent"),
+    )?;
+    let supervisor = validate_normalized_absolute_cgroup_path(
+        binding.get("supervisor"),
+        &format!("{label}.supervisor"),
+    )?;
+    for field in [
+        "mount_device",
+        "mount_inode",
+        "delegated_parent_device",
+        "delegated_parent_inode",
+        "supervisor_device",
+        "supervisor_inode",
+    ] {
+        if binding.get(field).and_then(Value::as_u64) == Some(0)
+            || binding.get(field).and_then(Value::as_u64).is_none()
+        {
+            bail!("{label}.{field} must be a positive unsigned integer");
+        }
+    }
+    if mount_root.as_os_str().is_empty()
+        || delegated_parent == mount_point
+        || !delegated_parent.starts_with(&mount_point)
+        || delegated_parent.file_name().and_then(OsStr::to_str) != Some(unit_name)
+        || supervisor != delegated_parent.join("supervisor")
+    {
+        bail!("{label} has inconsistent delegated-parent/supervisor paths");
+    }
+    Ok(())
+}
+
+fn validate_release_cgroup_removal_proof(value: &Value, label: &str) -> Result<()> {
+    let proof = exact_json_object_fields(
+        value,
+        label,
+        &[
+            "schema",
+            "binding",
+            "delegated_parent_absent",
+            "supervisor_absent",
+            "kernel_semantics",
+            "checked_at_utc",
+        ],
+    )?;
+    validate_release_cgroup_binding(
+        proof
+            .get("binding")
+            .context(format!("{label}.binding is missing"))?,
+        &format!("{label}.binding"),
+    )?;
+    if proof.get("schema").and_then(Value::as_str)
+        != Some(OBSERVATION_STORAGE_CGROUP_REMOVAL_PROOF_SCHEMA)
+        || proof.get("delegated_parent_absent") != Some(&Value::Bool(true))
+        || proof.get("supervisor_absent") != Some(&Value::Bool(true))
+        || proof.get("kernel_semantics").and_then(Value::as_str)
+            != Some("cgroup_v2_rmdir_requires_unpopulated_subtree")
+    {
+        bail!("{label} is not a completed cgroup-v2 removal proof");
+    }
+    required_json_string(
+        proof.get("checked_at_utc"),
+        &format!("{label}.checked_at_utc"),
+    )?;
+    Ok(())
+}
+
+fn validate_retired_project_quota(value: &Value, label: &str) -> Result<()> {
+    let quota = exact_json_object_fields(
+        value,
+        label,
+        &[
+            "queried_project_id",
+            "hard_bytes",
+            "soft_bytes",
+            "current_bytes",
+            "hard_inodes",
+            "soft_inodes",
+            "current_inodes",
+            "valid_fields",
+        ],
+    )?;
+    let integer = |field: &str| {
+        quota
+            .get(field)
+            .and_then(Value::as_u64)
+            .with_context(|| format!("{label}.{field} must be an unsigned integer"))
+    };
+    let hard_bytes = integer("hard_bytes")?;
+    let soft_bytes = integer("soft_bytes")?;
+    let current_bytes = integer("current_bytes")?;
+    let hard_inodes = integer("hard_inodes")?;
+    let soft_inodes = integer("soft_inodes")?;
+    let current_inodes = integer("current_inodes")?;
+    let expected_bytes = current_bytes
+        .checked_add(1023)
+        .context("retired project quota byte ceiling overflow")?
+        / 1024
+        * 1024;
+    let expected_bytes = expected_bytes.max(1024);
+    let expected_inodes = current_inodes.max(1);
+    if integer("queried_project_id")? == 0
+        || integer("valid_fields")? & 15 != 15
+        || hard_bytes != expected_bytes
+        || soft_bytes != expected_bytes
+        || hard_inodes != expected_inodes
+        || soft_inodes != expected_inodes
+    {
+        bail!("{label} is not clamped to retained project usage");
+    }
+    Ok(())
+}
+
+fn validate_release_core_shape(value: &Value, machine_response: bool) -> Result<()> {
+    let mut fields = vec![
+        "schema",
+        "status",
+        "released",
+        "proof_phase",
+        "released_at_utc",
+        "filesystem_uuid",
+        "provenance_id",
+        "campaign_id",
+        "campaign_plan_sha256",
+        "segment_id",
+        "output_directory",
+        "evidence_project_id",
+        "payload_project_id",
+        "contract_sha256",
+        "receipt_file",
+        "machine_pre_release_file",
+        "machine_pre_release_ty_canonical_json_v1_sha256",
+        "capability_file",
+        "attestor",
+        "sudo_authorization",
+        "semantic_validation_ty_canonical_json_v1_sha256",
+        "cgroup_removal_proof",
+        "immutable_seal",
+        "sealed_inventory_commitment",
+        "payload_post_prune",
+        "ledger_transition",
+        "retired_project_quotas",
+        "prepared_inventory_commitment",
+        "final_cgroup_removal_proof",
+        "durable_ledger_commit",
+    ];
+    if machine_response {
+        fields.extend([
+            "release_file",
+            "final_inventory_commitment",
+            "privileged_execution",
+        ]);
+    }
+    let release = exact_json_object_fields(value, "observation-storage release", &fields)?;
+    if release.get("schema").and_then(Value::as_str) != Some(OBSERVATION_STORAGE_RELEASE_SCHEMA)
+        || release.get("status").and_then(Value::as_str) != Some("released")
+        || release.get("released") != Some(&Value::Bool(true))
+        || release.get("proof_phase").and_then(Value::as_str) != Some("committed")
+    {
+        bail!("observation-storage release is not an exact committed v2 release");
+    }
+    for field in [
+        "released_at_utc",
+        "filesystem_uuid",
+        "provenance_id",
+        "campaign_id",
+        "segment_id",
+    ] {
+        required_json_string(release.get(field), &format!("release.{field}"))?;
+    }
+    required_absolute_json_path(release.get("output_directory"), "release.output_directory")?;
+    for field in [
+        "campaign_plan_sha256",
+        "campaign_id",
+        "contract_sha256",
+        "machine_pre_release_ty_canonical_json_v1_sha256",
+        "semantic_validation_ty_canonical_json_v1_sha256",
+    ] {
+        require_release_sha256(release.get(field), &format!("release.{field}"))?;
+    }
+    for field in ["evidence_project_id", "payload_project_id"] {
+        if release.get(field).and_then(Value::as_u64) == Some(0)
+            || release.get(field).and_then(Value::as_u64).is_none()
+        {
+            bail!("release.{field} must be a positive unsigned integer");
+        }
+    }
+    for (field, label) in [
+        ("receipt_file", "release.receipt_file"),
+        (
+            "machine_pre_release_file",
+            "release.machine_pre_release_file",
+        ),
+    ] {
+        validate_release_basic_file_record(
+            release.get(field).context(format!("{label} is missing"))?,
+            label,
+            &["path", "sha256", "size_bytes", "device", "inode"],
+        )?;
+    }
+    validate_release_basic_file_record(
+        release
+            .get("capability_file")
+            .context("release.capability_file is missing")?,
+        "release.capability_file",
+        &[
+            "path",
+            "sha256",
+            "size_bytes",
+            "device",
+            "inode",
+            "uid",
+            "gid",
+            "mode",
+            "filesystem_flags",
+            "immutable",
+        ],
+    )?;
+    let capability_file = release["capability_file"]
+        .as_object()
+        .expect("validated capability record");
+    if capability_file.get("uid").and_then(Value::as_u64) != Some(0)
+        || capability_file.get("gid").and_then(Value::as_u64) != Some(0)
+        || capability_file.get("mode").and_then(Value::as_str) != Some("0444")
+        || capability_file.get("immutable") != Some(&Value::Bool(true))
+        || capability_file
+            .get("filesystem_flags")
+            .and_then(Value::as_u64)
+            .is_none_or(|flags| flags & 0x10 == 0)
+    {
+        bail!("release capability file is not the root-owned immutable file");
+    }
+    validate_release_executable_record(
+        release
+            .get("attestor")
+            .context("release.attestor is missing")?,
+        "release.attestor",
+        "0755",
+    )?;
+    validate_release_cgroup_removal_proof(
+        release
+            .get("cgroup_removal_proof")
+            .context("release.cgroup_removal_proof is missing")?,
+        "release.cgroup_removal_proof",
+    )?;
+    validate_release_cgroup_removal_proof(
+        release
+            .get("final_cgroup_removal_proof")
+            .context("release.final_cgroup_removal_proof is missing")?,
+        "release.final_cgroup_removal_proof",
+    )?;
+    let seal = exact_json_object_fields(
+        release
+            .get("immutable_seal")
+            .context("release.immutable_seal is missing")?,
+        "release.immutable_seal",
+        &[
+            "schema",
+            "scope_root",
+            "scope_device",
+            "scope_inode",
+            "root_deferred",
+            "counts",
+            "regular_hard_link_policy",
+            "special_entry_policy",
+            "seal",
+        ],
+    )?;
+    let seal_counts = exact_json_object_fields(
+        seal.get("counts")
+            .context("release immutable-seal counts are missing")?,
+        "release.immutable_seal.counts",
+        &["directories", "regular_files", "entries"],
+    )?;
+    if seal.get("schema").and_then(Value::as_str)
+        != Some("ty.supremacy.observation-storage-immutable-seal.v1")
+        || seal.get("root_deferred") != Some(&Value::Bool(false))
+        || seal.get("regular_hard_link_policy").and_then(Value::as_str)
+            != Some("reject_nlink_not_one")
+        || seal.get("special_entry_policy").and_then(Value::as_str) != Some("reject")
+        || seal.get("seal").and_then(Value::as_str) != Some("FS_IMMUTABLE_FL")
+        || seal.get("scope_device").and_then(Value::as_u64).is_none()
+        || seal.get("scope_inode").and_then(Value::as_u64).is_none()
+        || seal_counts
+            .get("directories")
+            .and_then(Value::as_u64)
+            .is_none()
+        || seal_counts
+            .get("regular_files")
+            .and_then(Value::as_u64)
+            .is_none()
+        || seal_counts.get("entries").and_then(Value::as_u64).is_none()
+    {
+        bail!("release immutable seal has an invalid exact contract");
+    }
+    required_absolute_json_path(seal.get("scope_root"), "release immutable-seal scope")?;
+    for field in [
+        "sealed_inventory_commitment",
+        "prepared_inventory_commitment",
+    ] {
+        validate_exact_inventory_commitment(
+            release
+                .get(field)
+                .context(format!("release.{field} is missing"))?,
+            &format!("release.{field}"),
+        )?;
+    }
+    let payload = exact_json_object_fields(
+        release
+            .get("payload_post_prune")
+            .context("release.payload_post_prune is missing")?,
+        "release.payload_post_prune",
+        &[
+            "current_bytes",
+            "current_inodes",
+            "maximum_residual_bytes",
+            "maximum_residual_inodes",
+        ],
+    )?;
+    for field in [
+        "current_bytes",
+        "current_inodes",
+        "maximum_residual_bytes",
+        "maximum_residual_inodes",
+    ] {
+        if payload.get(field).and_then(Value::as_u64).is_none() {
+            bail!("release.payload_post_prune.{field} must be an unsigned integer");
+        }
+    }
+    let transition = exact_json_object_fields(
+        release
+            .get("ledger_transition")
+            .context("release.ledger_transition is missing")?,
+        "release.ledger_transition",
+        &[
+            "persistent_ledger_path",
+            "release_history_index",
+            "active_lease_ty_canonical_json_v1_sha256",
+            "required_transition",
+        ],
+    )?;
+    required_absolute_json_path(
+        transition.get("persistent_ledger_path"),
+        "release ledger path",
+    )?;
+    if transition
+        .get("release_history_index")
+        .and_then(Value::as_u64)
+        .is_none_or(|index| index >= MAXIMUM_STORAGE_LEASE_RELEASE_HISTORY)
+        || transition
+            .get("required_transition")
+            .and_then(Value::as_str)
+            != Some("same_atomic_rename_clears_active_and_appends_history")
+    {
+        bail!("release ledger transition has an invalid exact contract");
+    }
+    require_release_sha256(
+        transition.get("active_lease_ty_canonical_json_v1_sha256"),
+        "release active-lease digest",
+    )?;
+    let quotas = exact_json_object_fields(
+        release
+            .get("retired_project_quotas")
+            .context("release.retired_project_quotas is missing")?,
+        "release.retired_project_quotas",
+        &["evidence", "payload"],
+    )?;
+    for role in ["evidence", "payload"] {
+        validate_retired_project_quota(
+            quotas
+                .get(role)
+                .context(format!("release retired {role} quota is missing"))?,
+            &format!("release.retired_project_quotas.{role}"),
+        )?;
+    }
+    let durable_fields: &[&str] = if machine_response {
+        &[
+            "persistent_ledger_path",
+            "filesystem_uuid",
+            "release_history_index",
+            "required_phase",
+            "proof_phase",
+            "finalized_entry_ty_canonical_json_v1_sha256",
+        ]
+    } else {
+        &[
+            "persistent_ledger_path",
+            "filesystem_uuid",
+            "release_history_index",
+            "required_phase",
+        ]
+    };
+    let durable = exact_json_object_fields(
+        release
+            .get("durable_ledger_commit")
+            .context("release durable-ledger commitment is missing")?,
+        "release.durable_ledger_commit",
+        durable_fields,
+    )?;
+    required_absolute_json_path(
+        durable.get("persistent_ledger_path"),
+        "release durable ledger path",
+    )?;
+    if durable.get("filesystem_uuid") != release.get("filesystem_uuid")
+        || durable.get("release_history_index") != transition.get("release_history_index")
+        || durable.get("persistent_ledger_path") != transition.get("persistent_ledger_path")
+        || durable.get("required_phase").and_then(Value::as_str) != Some("committed")
+    {
+        bail!("release durable-ledger commitment differs from its prepared transition");
+    }
+    if machine_response {
+        if durable.get("proof_phase").and_then(Value::as_str) != Some("committed") {
+            bail!("machine release durable-ledger proof is not committed");
+        }
+        require_release_sha256(
+            durable.get("finalized_entry_ty_canonical_json_v1_sha256"),
+            "machine release finalized ledger-entry digest",
+        )?;
+        validate_release_basic_file_record(
+            release
+                .get("release_file")
+                .context("machine release file record is missing")?,
+            "machine release.release_file",
+            &[
+                "path",
+                "sha256",
+                "size_bytes",
+                "device",
+                "inode",
+                "uid",
+                "gid",
+                "mode",
+                "nlink",
+                "allocated_bytes",
+                "filesystem_flags",
+                "immutable",
+            ],
+        )?;
+        let release_file = release["release_file"]
+            .as_object()
+            .expect("validated release file");
+        if release_file.get("uid").and_then(Value::as_u64) != Some(0)
+            || release_file.get("gid").and_then(Value::as_u64) != Some(0)
+            || release_file.get("mode").and_then(Value::as_str) != Some("0444")
+            || release_file.get("nlink").and_then(Value::as_u64) != Some(1)
+            || release_file.get("size_bytes").and_then(Value::as_u64)
+                != Some(OBSERVATION_STORAGE_RELEASE_SLOT_BYTES)
+            || release_file.get("immutable") != Some(&Value::Bool(true))
+            || release_file
+                .get("filesystem_flags")
+                .and_then(Value::as_u64)
+                .is_none_or(|flags| flags & 0x10 == 0)
+            || release_file
+                .get("allocated_bytes")
+                .and_then(Value::as_u64)
+                .is_none_or(|allocated| allocated < OBSERVATION_STORAGE_RELEASE_SLOT_BYTES)
+        {
+            bail!("machine release file is not the fixed allocated immutable root slot");
+        }
+        validate_exact_inventory_commitment(
+            release
+                .get("final_inventory_commitment")
+                .context("machine final inventory commitment is missing")?,
+            "machine release.final_inventory_commitment",
+        )?;
+        let execution = exact_json_object_fields(
+            release
+                .get("privileged_execution")
+                .context("machine release privileged execution is missing")?,
+            "machine release.privileged_execution",
+            &["attestor_executable", "sudo_executable", "command"],
+        )?;
+        validate_release_executable_record(
+            execution
+                .get("attestor_executable")
+                .context("release privileged attestor is missing")?,
+            "machine release privileged attestor",
+            "0755",
+        )?;
+        validate_release_executable_record(
+            execution
+                .get("sudo_executable")
+                .context("release privileged sudo is missing")?,
+            "machine release privileged sudo",
+            "4755",
+        )?;
+        validate_sudo_attestor_authorization(
+            release
+                .get("sudo_authorization")
+                .context("machine release sudo authorization is missing")?,
+            execution
+                .get("sudo_executable")
+                .context("release privileged sudo is missing")?,
+            execution
+                .get("attestor_executable")
+                .context("release privileged attestor is missing")?,
+        )?;
+        let command = execution
+            .get("command")
+            .and_then(Value::as_array)
+            .context("machine release privileged command must be an array")?;
+        if command.is_empty() || command.iter().any(|token| !token.is_string()) {
+            bail!("machine release privileged command is not a nonempty string argv");
+        }
+    }
+    Ok(())
+}
+
+fn root_release_projection(machine_release: &Value) -> Result<Value> {
+    validate_release_core_shape(machine_release, true)?;
+    let mut projection = machine_release
+        .as_object()
+        .expect("release shape validated")
+        .clone();
+    for field in [
+        "release_file",
+        "final_inventory_commitment",
+        "privileged_execution",
+    ] {
+        projection.remove(field);
+    }
+    let durable = projection
+        .get_mut("durable_ledger_commit")
+        .and_then(Value::as_object_mut)
+        .context("machine release durable-ledger commitment is not an object")?;
+    durable.remove("proof_phase");
+    durable.remove("finalized_entry_ty_canonical_json_v1_sha256");
+    let projection = Value::Object(projection);
+    validate_release_core_shape(&projection, false)?;
+    Ok(projection)
+}
+
+fn release_executable_authorization_identity(value: &Value, label: &str) -> Result<Value> {
+    let record = value
+        .as_object()
+        .with_context(|| format!("{label} is not an executable record"))?;
+    let mut identity = Map::new();
+    for field in [
+        "path",
+        "sha256",
+        "size_bytes",
+        "device",
+        "inode",
+        "uid",
+        "gid",
+        "mode",
+    ] {
+        identity.insert(
+            field.to_string(),
+            record
+                .get(field)
+                .cloned()
+                .with_context(|| format!("{label} has no {field}"))?,
+        );
+    }
+    Ok(Value::Object(identity))
+}
+
+fn validate_sudo_attestor_authorization(
+    value: &Value,
+    sudo_executable: &Value,
+    attestor_executable: &Value,
+) -> Result<()> {
+    let authorization = exact_json_object_fields(
+        value,
+        "immutable capability sudo authorization",
+        &[
+            "schema",
+            "status",
+            "exclusive",
+            "caller_uid",
+            "caller_user",
+            "sudo_executable",
+            "attestor_executable",
+            "policy_query",
+            "authorized_command",
+            "effective_command_count",
+            "policy_stdout_sha256",
+            "policy_stdout_size_bytes",
+        ],
+    )?;
+    let sudo_identity =
+        release_executable_authorization_identity(sudo_executable, "sudo executable")?;
+    let attestor_identity =
+        release_executable_authorization_identity(attestor_executable, "storage attestor")?;
+    let caller_uid = authorization
+        .get("caller_uid")
+        .and_then(Value::as_u64)
+        .filter(|uid| *uid > 0 && *uid <= u64::from(u32::MAX))
+        .context("sudo authorization caller uid is invalid")?;
+    let caller_user = required_json_string(
+        authorization.get("caller_user"),
+        "sudo authorization caller user",
+    )?;
+    let sudo_path =
+        required_json_string(sudo_identity.get("path"), "sudo authorization sudo path")?;
+    let attestor_path = required_json_string(
+        attestor_identity.get("path"),
+        "sudo authorization attestor path",
+    )?;
+    let attestor_sha = required_json_string(
+        attestor_identity.get("sha256"),
+        "sudo authorization attestor digest",
+    )?;
+    let expected_query = json!([sudo_path, "-n", "-U", caller_user, "-l"]);
+    let expected_command = format!(
+        "(root) NOPASSWD: sha256:{attestor_sha} {attestor_path} attest-observation-storage *"
+    );
+    if authorization.get("schema").and_then(Value::as_str)
+        != Some(SUDO_ATTESTOR_AUTHORIZATION_SCHEMA)
+        || authorization.get("status").and_then(Value::as_str) != Some("verified")
+        || authorization.get("exclusive") != Some(&Value::Bool(true))
+        || authorization.get("sudo_executable") != Some(&sudo_identity)
+        || authorization.get("attestor_executable") != Some(&attestor_identity)
+        || authorization.get("policy_query") != Some(&expected_query)
+        || authorization
+            .get("authorized_command")
+            .and_then(Value::as_str)
+            != Some(expected_command.as_str())
+        || authorization
+            .get("effective_command_count")
+            .and_then(Value::as_u64)
+            != Some(1)
+        || authorization
+            .get("policy_stdout_size_bytes")
+            .and_then(Value::as_u64)
+            .is_none_or(|size| size == 0 || size > MAXIMUM_SUDO_POLICY_OUTPUT_BYTES)
+    {
+        bail!("sudo authorization is not the sole digest-bound root attestor command");
+    }
+    let _ = caller_uid;
+    require_release_sha256(
+        authorization.get("policy_stdout_sha256"),
+        "sudo authorization policy output digest",
+    )?;
+    Ok(())
+}
+
+fn validate_exact_observation_storage_capability_shape(value: &Value) -> Result<()> {
+    exact_json_object_fields(
+        value,
+        "immutable observation-storage capability",
+        &[
+            "schema",
+            "provenance_id",
+            "status",
+            "qualified",
+            "role",
+            "campaign_id",
+            "campaign_plan_sha256",
+            "segment_id",
+            "segment_ordinal",
+            "output_dir",
+            "payload_dir",
+            "output_directory_identity",
+            "payload_directory_identity",
+            "contract",
+            "contract_sha256",
+            "filesystem_mount",
+            "filesystem_type",
+            "filesystem_mount_source",
+            "filesystem_device",
+            "filesystem_total_bytes",
+            "filesystem_available_bytes",
+            "filesystem_available_inodes",
+            "evidence_project_statvfs",
+            "payload_project_statvfs",
+            "evidence_project_byte_reserve_bytes",
+            "evidence_project_inode_reserve",
+            "payload_project_byte_reserve_bytes",
+            "payload_project_inode_reserve",
+            "project_quota_scope",
+            "filesystem_reserve_scope",
+            "quota_backend",
+            "quota_enforcement_status",
+            "quota_enforcement",
+            "privileged_quota_enforcement_preexisting",
+            "quota_enforcement_verified",
+            "evidence_project_id",
+            "payload_project_id",
+            "payload_quota_applicable",
+            "evidence_quota_soft_bytes",
+            "evidence_quota_hard_bytes",
+            "evidence_quota_soft_inodes",
+            "evidence_quota_hard_inodes",
+            "evidence_quota_current_bytes",
+            "evidence_quota_current_inodes",
+            "payload_quota_soft_bytes",
+            "payload_quota_hard_bytes",
+            "payload_quota_soft_inodes",
+            "payload_quota_hard_inodes",
+            "payload_quota_current_bytes",
+            "payload_quota_current_inodes",
+            "evidence_finalization_reserve_bytes",
+            "active_lease",
+            "active_lease_ledger",
+            "cgroup_binding",
+            "attestor",
+            "sudo_authorization",
+            "release_authorization_placeholder",
+            "raw_attestation",
+            "qualified_at_utc",
+            "capability_path",
+            "capability_file_contract",
+        ],
+    )?;
+    Ok(())
+}
+
+fn strict_segment_ordinal(segment_id: &str) -> Result<u32> {
+    let digits = segment_id
+        .strip_prefix("segment-")
+        .context("campaign segment id must start with segment-")?;
+    if digits.len() < 4 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        bail!("campaign segment id must match segment-([0-9]{{4,}})");
+    }
+    let ordinal = digits
+        .parse::<u32>()
+        .context("campaign segment ordinal does not fit u32")?;
+    if ordinal == 0 {
+        bail!("campaign segment ordinal must be positive");
+    }
+    Ok(ordinal)
+}
+
+fn validate_capability_security_semantics(
+    capability: &Map<String, Value>,
+    raw: &Map<String, Value>,
+    contract: &ObservationStorageContract,
+    segment_id: &str,
+    output_dir: &Path,
+) -> Result<()> {
+    let segment_ordinal = strict_segment_ordinal(segment_id)?;
+    let (evidence_project_id, payload_project_id) = contract.project_ids(segment_ordinal)?;
+    if capability.get("role").and_then(Value::as_str) != Some("segment")
+        || capability.get("segment_ordinal").and_then(Value::as_u64)
+            != Some(u64::from(segment_ordinal))
+        || capability.get("payload_quota_applicable") != Some(&Value::Bool(true))
+        || capability
+            .get("project_quota_scope")
+            .and_then(Value::as_str)
+            != Some("split_segment_evidence_and_payload_trees")
+        || capability
+            .get("filesystem_reserve_scope")
+            .and_then(Value::as_str)
+            != Some("global_mount")
+        || capability.get("quota_backend").and_then(Value::as_str)
+            != Some("ext4_dual_project_quota")
+        || capability.get("privileged_quota_enforcement_preexisting") != Some(&Value::Bool(true))
+        || capability.get("quota_enforcement_verified") != Some(&Value::Bool(true))
+        || capability
+            .get("evidence_project_id")
+            .and_then(Value::as_u64)
+            != Some(u64::from(evidence_project_id))
+        || capability.get("payload_project_id").and_then(Value::as_u64)
+            != Some(u64::from(payload_project_id))
+    {
+        bail!("immutable capability does not carry the exact segment quota semantics");
+    }
+
+    let capability_file_contract = exact_json_object_fields(
+        capability
+            .get("capability_file_contract")
+            .context("immutable capability has no file contract")?,
+        "immutable capability file contract",
+        &["uid", "mode", "immutable_flag", "exclusive_creation"],
+    )?;
+    if capability_file_contract.get("uid").and_then(Value::as_u64) != Some(0)
+        || capability_file_contract.get("mode").and_then(Value::as_str) != Some("0444")
+        || capability_file_contract
+            .get("immutable_flag")
+            .and_then(Value::as_str)
+            != Some("FS_IMMUTABLE_FL")
+        || capability_file_contract.get("exclusive_creation") != Some(&Value::Bool(true))
+    {
+        bail!("immutable capability file contract is not exact");
+    }
+
+    for (field, expected) in [
+        (
+            "evidence_quota_soft_bytes",
+            contract.evidence_soft_allocated_bytes,
+        ),
+        (
+            "evidence_quota_hard_bytes",
+            contract.evidence_hard_allocated_bytes,
+        ),
+        ("evidence_quota_soft_inodes", contract.evidence_soft_inodes),
+        ("evidence_quota_hard_inodes", contract.evidence_hard_inodes),
+        (
+            "payload_quota_soft_bytes",
+            contract.max_observation_allocated_bytes,
+        ),
+        (
+            "payload_quota_hard_bytes",
+            contract.hard_observation_allocated_bytes,
+        ),
+        (
+            "payload_quota_soft_inodes",
+            contract.max_observation_entries,
+        ),
+        (
+            "payload_quota_hard_inodes",
+            contract.hard_observation_inodes,
+        ),
+        (
+            "evidence_finalization_reserve_bytes",
+            contract.evidence_finalization_reserve_bytes,
+        ),
+        (
+            "evidence_project_byte_reserve_bytes",
+            contract
+                .evidence_hard_allocated_bytes
+                .checked_sub(contract.evidence_soft_allocated_bytes)
+                .context("evidence byte reserve underflow")?,
+        ),
+        (
+            "evidence_project_inode_reserve",
+            contract
+                .evidence_hard_inodes
+                .checked_sub(contract.evidence_soft_inodes)
+                .context("evidence inode reserve underflow")?,
+        ),
+        (
+            "payload_project_byte_reserve_bytes",
+            contract.payload_hard_byte_headroom(),
+        ),
+        (
+            "payload_project_inode_reserve",
+            contract.payload_hard_inode_headroom(),
+        ),
+    ] {
+        if capability.get(field).and_then(Value::as_u64) != Some(expected) {
+            bail!("immutable capability {field} differs from the campaign plan");
+        }
+    }
+    for (field, maximum) in [
+        (
+            "evidence_quota_current_bytes",
+            contract.evidence_soft_allocated_bytes,
+        ),
+        (
+            "evidence_quota_current_inodes",
+            contract.evidence_soft_inodes,
+        ),
+        (
+            "payload_quota_current_bytes",
+            contract.max_observation_allocated_bytes,
+        ),
+        (
+            "payload_quota_current_inodes",
+            contract.max_observation_entries,
+        ),
+    ] {
+        if capability
+            .get(field)
+            .and_then(Value::as_u64)
+            .is_none_or(|current| current >= maximum)
+        {
+            bail!("immutable capability {field} is absent or has no positive soft-quota headroom");
+        }
+    }
+    let filesystem_total_bytes = capability
+        .get("filesystem_total_bytes")
+        .and_then(Value::as_u64)
+        .filter(|total| *total > 0)
+        .context("immutable capability has no positive filesystem total")?;
+    let mut filesystem_total_inodes = None;
+    for role in ["evidence", "payload"] {
+        let statvfs = capability
+            .get(&format!("{role}_project_statvfs"))
+            .and_then(Value::as_object)
+            .with_context(|| format!("immutable capability has no {role} directory statvfs"))?;
+        let total_inodes = statvfs
+            .get("total_inodes")
+            .and_then(Value::as_u64)
+            .filter(|total| *total > 0);
+        if statvfs.get("total_bytes").and_then(Value::as_u64) != Some(filesystem_total_bytes)
+            || total_inodes.is_none()
+            || filesystem_total_inodes.is_some_and(|expected| Some(expected) != total_inodes)
+            || statvfs
+                .get("available_bytes")
+                .and_then(Value::as_u64)
+                .is_none_or(|available| {
+                    available < contract.minimum_prelaunch_available_bytes
+                        || available > filesystem_total_bytes
+                })
+            || statvfs
+                .get("available_inodes")
+                .and_then(Value::as_u64)
+                .is_none_or(|available| {
+                    available < contract.minimum_prelaunch_available_inodes
+                        || total_inodes.is_none_or(|total| available > total)
+                })
+        {
+            bail!(
+                "immutable capability {role} directory statvfs is not the global filesystem view"
+            );
+        }
+        filesystem_total_inodes = total_inodes;
+    }
+    let filesystem_total_inodes =
+        filesystem_total_inodes.context("immutable capability has no global inode total view")?;
+    if capability
+        .get("filesystem_available_bytes")
+        .and_then(Value::as_u64)
+        .is_none_or(|available| {
+            available < contract.minimum_prelaunch_available_bytes
+                || available > filesystem_total_bytes
+        })
+        || capability
+            .get("filesystem_available_inodes")
+            .and_then(Value::as_u64)
+            .is_none_or(|available| {
+                available < contract.minimum_prelaunch_available_inodes
+                    || available > filesystem_total_inodes
+            })
+    {
+        bail!("immutable capability did not satisfy the plan-bound prelaunch reserve");
+    }
+
+    let quota_enforcement = exact_json_object_fields(
+        capability
+            .get("quota_enforcement")
+            .context("immutable capability has no quota enforcement proof")?,
+        "immutable capability quota enforcement",
+        &["operation", "quota_type", "status", "errno"],
+    )?;
+    if quota_enforcement.get("operation").and_then(Value::as_str) != Some("Q_GETINFO")
+        || quota_enforcement.get("quota_type").and_then(Value::as_str) != Some("project")
+        || quota_enforcement.get("status").and_then(Value::as_str)
+            != Some("already_enabled_verified")
+        || quota_enforcement.get("errno").and_then(Value::as_u64) != Some(0)
+        || capability
+            .get("quota_enforcement_status")
+            .and_then(Value::as_str)
+            != Some("q_getinfo_and_dual_q_getquota_then_lease_persisted_before_assignment")
+    {
+        bail!("immutable capability quota-enforcement proof is not exact");
+    }
+
+    if raw.get("schema").and_then(Value::as_str) != Some(OBSERVATION_STORAGE_RAW_ATTESTATION_SCHEMA)
+        || raw.get("attestor_euid").and_then(Value::as_u64) != Some(0)
+        || raw.get("configuration_performed") != Some(&Value::Bool(true))
+        || raw.get("output_directory").and_then(Value::as_str) != output_dir.to_str()
+        || raw.get("payload_directory").and_then(Value::as_str)
+            != output_dir.join(OBSERVATION_PAYLOAD_DIRECTORY_NAME).to_str()
+        || raw.get("allocation_ledger").and_then(Value::as_str)
+            != Some("durable_nonzero_project_quota_limits_never_cleared")
+        || raw.get("quota_enforcement") != capability.get("quota_enforcement")
+        || raw.get("quota_enforcement_status") != capability.get("quota_enforcement_status")
+    {
+        bail!("immutable capability raw root attestation is not the exact configured proof");
+    }
+    for field in [
+        "output_directory_identity",
+        "payload_directory_identity",
+        "filesystem_mount",
+        "filesystem_type",
+        "filesystem_mount_source",
+        "filesystem_device",
+        "filesystem_total_bytes",
+        "filesystem_available_bytes",
+        "filesystem_available_inodes",
+        "evidence_project_statvfs",
+        "payload_project_statvfs",
+        "active_lease",
+        "active_lease_ledger",
+        "cgroup_binding",
+        "sudo_authorization",
+    ] {
+        if capability.get(field) != raw.get(field) {
+            bail!("immutable capability differs from its raw root attestation at {field}");
+        }
+    }
+
+    let configuration = raw
+        .get("configuration_binding")
+        .and_then(Value::as_object)
+        .context("raw root attestation has no configuration binding")?;
+    if configuration.get("provenance_id") != capability.get("provenance_id")
+        || configuration.get("campaign_id") != capability.get("campaign_id")
+        || configuration.get("campaign_plan_sha256") != capability.get("campaign_plan_sha256")
+        || configuration.get("segment_id") != capability.get("segment_id")
+        || configuration
+            .get("output_directory")
+            .and_then(Value::as_str)
+            != output_dir.to_str()
+        || configuration.get("contract") != capability.get("contract")
+        || configuration.get("contract_sha256") != capability.get("contract_sha256")
+        || configuration
+            .get("evidence_project_id")
+            .and_then(Value::as_u64)
+            != Some(u64::from(evidence_project_id))
+        || configuration
+            .get("payload_project_id")
+            .and_then(Value::as_u64)
+            != Some(u64::from(payload_project_id))
+        || configuration.get("cgroup_binding") != capability.get("cgroup_binding")
+    {
+        bail!("raw root configuration binding differs from the immutable capability");
+    }
+
+    let active_lease = capability
+        .get("active_lease")
+        .and_then(Value::as_object)
+        .context("immutable capability has no active lease")?;
+    for field in [
+        "provenance_id",
+        "campaign_id",
+        "campaign_plan_sha256",
+        "segment_id",
+        "contract_sha256",
+        "cgroup_binding",
+    ] {
+        if active_lease.get(field) != capability.get(field) {
+            bail!("immutable capability active lease differs at {field}");
+        }
+    }
+    if active_lease.get("output_directory").and_then(Value::as_str) != output_dir.to_str()
+        || active_lease
+            .get("evidence_project_id")
+            .and_then(Value::as_u64)
+            != Some(u64::from(evidence_project_id))
+        || active_lease
+            .get("payload_project_id")
+            .and_then(Value::as_u64)
+            != Some(u64::from(payload_project_id))
+    {
+        bail!("immutable capability active lease has the wrong E/P binding");
+    }
+    let ledger = exact_json_object_fields(
+        capability
+            .get("active_lease_ledger")
+            .context("immutable capability has no active lease ledger")?,
+        "immutable capability active lease ledger",
+        &["schema", "filesystem_uuid", "leases", "releases"],
+    )?;
+    if ledger.get("schema").and_then(Value::as_str) != Some(OBSERVATION_STORAGE_LEASE_LEDGER_SCHEMA)
+        || ledger
+            .get("leases")
+            .and_then(Value::as_array)
+            .is_none_or(|leases| leases.as_slice() != [Value::Object(active_lease.clone())])
+        || ledger
+            .get("releases")
+            .and_then(Value::as_array)
+            .is_none_or(|releases| {
+                u64::try_from(releases.len()).unwrap_or(u64::MAX)
+                    >= MAXIMUM_STORAGE_LEASE_RELEASE_HISTORY
+            })
+    {
+        bail!("immutable capability active lease ledger is not exact");
+    }
+    Ok(())
+}
+
+fn validate_current_capability_release_binding(
+    report: &Value,
+    machine: &Value,
+    output_dir: &Path,
+    contract: &ObservationStorageContract,
+    root_release: &Value,
+    root_release_file: &Value,
+    capability: &Value,
+    capability_file: &Value,
+) -> Result<()> {
+    validate_exact_observation_storage_capability_shape(capability)?;
+    let release = root_release
+        .as_object()
+        .context("root observation-storage release is not an object")?;
+    if release.get("capability_file") != Some(capability_file) {
+        bail!("root release capability-file record differs from the current immutable file");
+    }
+    let capability_bytes = python_sorted_pretty_json_file(capability)?;
+    if capability_file.get("sha256").and_then(Value::as_str)
+        != Some(sha256_bytes(&capability_bytes).as_str())
+        || capability_file.get("size_bytes").and_then(Value::as_u64)
+            != u64::try_from(capability_bytes.len()).ok()
+    {
+        bail!("immutable capability bytes are not the exact producer serialization");
+    }
+    let capability = capability
+        .as_object()
+        .context("immutable observation-storage capability is not an object")?;
+    let contract_value = serde_json::to_value(contract)?;
+    if capability.get("schema").and_then(Value::as_str)
+        != Some(OBSERVATION_STORAGE_CAPABILITY_SCHEMA)
+        || capability.get("status").and_then(Value::as_str) != Some("qualified")
+        || capability.get("qualified") != Some(&Value::Bool(true))
+        || capability.get("provenance_id") != machine.get("provenance_id")
+        || capability.get("campaign_id") != report.pointer("/campaign/campaign_id")
+        || capability.get("campaign_plan_sha256")
+            != report.pointer("/campaign/campaign_plan/sha256")
+        || capability.get("segment_id") != report.pointer("/campaign/segment_id")
+        || capability.get("output_dir").and_then(Value::as_str)
+            != Some(
+                output_dir
+                    .to_str()
+                    .context("strict output directory is not UTF-8")?,
+            )
+        || capability.get("payload_dir").and_then(Value::as_str)
+            != Some(
+                output_dir
+                    .join(OBSERVATION_PAYLOAD_DIRECTORY_NAME)
+                    .to_str()
+                    .context("strict payload directory is not UTF-8")?,
+            )
+        || capability.get("evidence_project_id") != release.get("evidence_project_id")
+        || capability.get("payload_project_id") != release.get("payload_project_id")
+        || capability.get("contract") != Some(&contract_value)
+        || capability.get("contract_sha256") != release.get("contract_sha256")
+        || capability.get("attestor") != release.get("attestor")
+        || capability.get("capability_path") != capability_file.get("path")
+        || machine.pointer("/observation_storage/prelaunch_snapshot/root_capability")
+            != Some(&Value::Object(capability.clone()))
+    {
+        bail!("immutable observation-storage capability differs from the release/report binding");
+    }
+    if machine.pointer("/observation_storage/prelaunch_snapshot/root_capability_file")
+        != Some(capability_file)
+        || machine.pointer("/observation_storage/storage_attestor") != release.get("attestor")
+        || machine.pointer("/observation_storage_release/privileged_execution/attestor_executable")
+            != release.get("attestor")
+        || machine.pointer("/observation_storage/sudo_executable")
+            != machine.pointer("/observation_storage_release/privileged_execution/sudo_executable")
+    {
+        bail!("machine provenance differs from the current capability/privileged release bridge");
+    }
+    let sudo_executable = machine
+        .pointer("/observation_storage_release/privileged_execution/sudo_executable")
+        .context("machine release has no sudo executable")?;
+    let sudo_authorization = capability
+        .get("sudo_authorization")
+        .context("immutable capability has no sudo authorization")?;
+    if release.get("sudo_authorization") != Some(sudo_authorization) {
+        bail!("root release sudo authorization differs from the immutable capability");
+    }
+    validate_sudo_attestor_authorization(
+        sudo_authorization,
+        sudo_executable,
+        release
+            .get("attestor")
+            .context("root release has no attestor")?,
+    )?;
+    let cgroup_binding = capability
+        .get("cgroup_binding")
+        .context("immutable capability has no cgroup binding")?;
+    if root_release.pointer("/cgroup_removal_proof/binding") != Some(cgroup_binding)
+        || root_release.pointer("/final_cgroup_removal_proof/binding") != Some(cgroup_binding)
+        || machine.pointer("/observation_storage/prelaunch_snapshot/root_capability/cgroup_binding")
+            != Some(cgroup_binding)
+    {
+        bail!("capability, machine, and root release cgroup bindings differ");
+    }
+    let raw = capability
+        .get("raw_attestation")
+        .and_then(Value::as_object)
+        .context("immutable capability has no raw root attestation")?;
+    let filesystem_uuid = required_json_string(
+        release.get("filesystem_uuid"),
+        "root release filesystem UUID",
+    )?;
+    if raw
+        .get("ext4_superblock_features")
+        .and_then(|value| value.get("filesystem_uuid"))
+        .and_then(Value::as_str)
+        != Some(filesystem_uuid)
+        || capability
+            .get("active_lease_ledger")
+            .and_then(|value| value.get("filesystem_uuid"))
+            .and_then(Value::as_str)
+            != Some(filesystem_uuid)
+        || capability.get("filesystem_mount") != raw.get("filesystem_mount")
+        || capability.get("filesystem_mount_source") != raw.get("filesystem_mount_source")
+        || capability.get("filesystem_device") != raw.get("filesystem_device")
+        || capability.get("filesystem_type").and_then(Value::as_str) != Some("ext4")
+        || capability.get("sudo_authorization") != raw.get("sudo_authorization")
+        || capability
+            .get("active_lease")
+            .and_then(|value| value.get("cgroup_binding"))
+            != capability.get("cgroup_binding")
+    {
+        bail!("release filesystem UUID/mount/device differs from the immutable capability");
+    }
+    let segment_id = required_json_string(
+        capability.get("segment_id"),
+        "immutable capability segment id",
+    )?;
+    validate_capability_security_semantics(capability, raw, contract, segment_id, output_dir)?;
+    let filesystem_mount = required_absolute_json_path(
+        capability.get("filesystem_mount"),
+        "immutable capability filesystem mount",
+    )?;
+    let expected_ledger_path = filesystem_mount
+        .join(OBSERVATION_STORAGE_STATE_DIRECTORY_NAME)
+        .join("lease-ledger.json");
+    let active_lease = capability
+        .get("active_lease")
+        .context("immutable capability has no active lease")?;
+    let active_lease_digest = sha256_ty_canonical_json_v1_value(active_lease)?;
+    let prior_release_count = capability
+        .get("active_lease_ledger")
+        .and_then(|value| value.get("releases"))
+        .and_then(Value::as_array)
+        .and_then(|releases| u64::try_from(releases.len()).ok())
+        .context("immutable capability has no bounded prior release history")?;
+    let transition = release
+        .get("ledger_transition")
+        .context("root release has no ledger transition")?;
+    if transition
+        .get("persistent_ledger_path")
+        .and_then(Value::as_str)
+        .map(Path::new)
+        != Some(expected_ledger_path.as_path())
+        || transition
+            .get("active_lease_ty_canonical_json_v1_sha256")
+            .and_then(Value::as_str)
+            != Some(active_lease_digest.as_str())
+        || transition
+            .get("release_history_index")
+            .and_then(Value::as_u64)
+            != Some(prior_release_count)
+        || capability
+            .get("active_lease_ledger")
+            .and_then(|value| value.get("filesystem_uuid"))
+            .and_then(Value::as_str)
+            != Some(filesystem_uuid)
+    {
+        bail!("release ledger path or filesystem UUID is not the capability-bound ledger");
+    }
+    let placeholder = capability
+        .get("release_authorization_placeholder")
+        .and_then(Value::as_object)
+        .context("immutable capability has no release authorization placeholder")?;
+    let final_file = root_release_file
+        .as_object()
+        .context("current root release-file record is not an object")?;
+    for field in [
+        "path",
+        "device",
+        "inode",
+        "uid",
+        "gid",
+        "mode",
+        "nlink",
+        "size_bytes",
+        "allocated_bytes",
+    ] {
+        if placeholder.get(field) != final_file.get(field) {
+            bail!("immutable capability release-slot authorization differs at field {field}");
+        }
+    }
+    Ok(())
+}
+
+fn reconstructed_committed_release_history_entry(
+    root_release: &Value,
+    root_release_file: &Value,
+    final_inventory: &Value,
+) -> Result<Value> {
+    let release = root_release
+        .as_object()
+        .context("root release document is not an object")?;
+    let release_binding = json!({
+        "schema": OBSERVATION_STORAGE_RELEASE_BINDING_SCHEMA,
+        "filesystem_uuid": release["filesystem_uuid"],
+        "provenance_id": release["provenance_id"],
+        "campaign_id": release["campaign_id"],
+        "campaign_plan_sha256": release["campaign_plan_sha256"],
+        "segment_id": release["segment_id"],
+        "output_directory": release["output_directory"],
+        "evidence_project_id": release["evidence_project_id"],
+        "payload_project_id": release["payload_project_id"],
+        "contract_sha256": release["contract_sha256"],
+        "receipt_file": release["receipt_file"],
+        "machine_pre_release_file": release["machine_pre_release_file"],
+        "machine_pre_release_ty_canonical_json_v1_sha256":
+            release["machine_pre_release_ty_canonical_json_v1_sha256"],
+        "capability_file": release["capability_file"],
+        "attestor": release["attestor"],
+    });
+    Ok(json!({
+        "schema": OBSERVATION_STORAGE_RELEASE_SCHEMA,
+        "status": "released",
+        "released": true,
+        "proof_phase": "committed",
+        "release_binding_sha256":
+            sha256_ty_canonical_json_v1_value(&release_binding)?,
+        "final_release_document_sha256":
+            sha256_ty_canonical_json_v1_value(root_release)?,
+        "final_release_file_sha256":
+            required_json_string(root_release_file.get("sha256"), "root release-file digest")?,
+        "final_inventory_commitment_sha256":
+            sha256_ty_canonical_json_v1_value(final_inventory)?,
+        "retired_project_quotas_sha256":
+            sha256_ty_canonical_json_v1_value(&release["retired_project_quotas"])?,
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn validate_current_root_executable_record(
+    value: &Value,
+    label: &str,
+    expected_mode: u32,
+) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    validate_release_executable_record(value, label, &format!("{expected_mode:04o}"))?;
+    let expected = value
+        .as_object()
+        .expect("root executable record shape validated");
+    let path = required_absolute_json_path(expected.get("path"), &format!("{label}.path"))?;
+    if fs::canonicalize(&path).with_context(|| format!("canonicalize {label}"))? != path {
+        bail!("{label} path is not canonical");
+    }
+    let metadata =
+        fs::symlink_metadata(&path).with_context(|| format!("lstat {label} {}", path.display()))?;
+    let (canonical, sha256, size_bytes) = sha256_regular_file_nofollow(&path)?;
+    let metadata_after = fs::symlink_metadata(&path)
+        .with_context(|| format!("re-lstat {label} {}", path.display()))?;
+    if canonical != path
+        || !metadata.file_type().is_file()
+        || metadata.uid() != 0
+        || metadata.permissions().mode() & 0o7777 != expected_mode
+        || metadata.dev() != metadata_after.dev()
+        || metadata.ino() != metadata_after.ino()
+        || metadata.mode() != metadata_after.mode()
+        || metadata.len() != metadata_after.len()
+        || metadata.uid() != metadata_after.uid()
+        || metadata.gid() != metadata_after.gid()
+        || metadata.nlink() != metadata_after.nlink()
+    {
+        bail!("{label} is not the current canonical root-owned executable");
+    }
+    let mut parents = Vec::new();
+    let mut cursor = path
+        .parent()
+        .context("root executable path has no parent")?
+        .to_path_buf();
+    loop {
+        let parent = fs::symlink_metadata(&cursor)
+            .with_context(|| format!("lstat {label} parent {}", cursor.display()))?;
+        let mode = parent.permissions().mode() & 0o7777;
+        if !parent.file_type().is_dir() || parent.uid() != 0 || mode & 0o022 != 0 {
+            bail!(
+                "{label} parent is not root-controlled: {}",
+                cursor.display()
+            );
+        }
+        parents.push(json!({
+            "path": cursor,
+            "device": parent.dev(),
+            "inode": parent.ino(),
+            "uid": parent.uid(),
+            "gid": parent.gid(),
+            "mode": format!("{mode:04o}"),
+        }));
+        if cursor.parent() == Some(cursor.as_path()) {
+            break;
+        }
+        cursor = cursor
+            .parent()
+            .context("root executable parent chain ended before filesystem root")?
+            .to_path_buf();
+    }
+    let current = json!({
+        "path": path,
+        "sha256": sha256,
+        "size_bytes": size_bytes,
+        "device": metadata.dev(),
+        "inode": metadata.ino(),
+        "uid": metadata.uid(),
+        "gid": metadata.gid(),
+        "mode": format!("{expected_mode:04o}"),
+        "parent_chain": parents,
+    });
+    if &current != value {
+        bail!("{label} identity, hash, mode, or root-controlled parent chain changed");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn read_bounded_policy_stream<R: Read>(
+    mut stream: R,
+    maximum_bytes: usize,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut captured = Vec::with_capacity(maximum_bytes.min(8 * 1024));
+    let mut exceeded = false;
+    let mut buffer = [0u8; 8 * 1024];
+    loop {
+        let read = stream.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let remaining = maximum_bytes.saturating_sub(captured.len());
+        let retained = remaining.min(read);
+        captured.extend_from_slice(&buffer[..retained]);
+        exceeded |= retained != read;
+    }
+    Ok((captured, exceeded))
+}
+
+#[cfg(target_os = "linux")]
+struct BoundedPolicyOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+#[cfg(target_os = "linux")]
+fn query_current_sudo_policy_bounded(executable: &str) -> Result<BoundedPolicyOutput> {
+    use std::os::unix::process::CommandExt;
+
+    const TIMEOUT: Duration = Duration::from_secs(10);
+    const POLL_INTERVAL: Duration = Duration::from_millis(10);
+    let maximum_bytes = usize::try_from(MAXIMUM_SUDO_POLICY_OUTPUT_BYTES)
+        .context("sudo policy output bound does not fit usize")?;
+    let mut command = Command::new(executable);
+    command
+        .args(["-n", "-l"])
+        .env_clear()
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
+        .env("COLUMNS", "4096")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut child = command
+        .spawn()
+        .context("spawn current effective sudo policy query")?;
+    let process_group = i32::try_from(child.id()).context("sudo query pid does not fit i32")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("sudo policy query has no stdout pipe")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("sudo policy query has no stderr pipe")?;
+    let stdout_reader = thread::spawn(move || read_bounded_policy_stream(stdout, maximum_bytes));
+    let stderr_reader = thread::spawn(move || read_bounded_policy_stream(stderr, maximum_bytes));
+    let deadline = Instant::now() + TIMEOUT;
+    let (status, timed_out) = loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("poll current effective sudo policy query")?
+        {
+            break (status, false);
+        }
+        if Instant::now() >= deadline {
+            // The query has its own process group so timeout cleanup also
+            // closes pipes inherited by an NSS or sudo-plugin descendant.
+            unsafe {
+                libc::kill(-process_group, libc::SIGKILL);
+            }
+            let _ = child.kill();
+            break (
+                child
+                    .wait()
+                    .context("reap timed-out current sudo policy query")?,
+                true,
+            );
+        }
+        thread::sleep(POLL_INTERVAL);
+    };
+    // A broken sudo/NSS plugin can exit its leader while leaving a descendant
+    // holding a pipe.  Reap that private process group before joining readers.
+    unsafe {
+        libc::kill(-process_group, libc::SIGKILL);
+    }
+    let (stdout, stdout_exceeded) = stdout_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("sudo policy stdout reader panicked"))?
+        .context("read current sudo policy stdout")?;
+    let (stderr, stderr_exceeded) = stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("sudo policy stderr reader panicked"))?
+        .context("read current sudo policy stderr")?;
+    if timed_out {
+        bail!("current effective sudo policy query exceeded its 10-second deadline");
+    }
+    if stdout_exceeded || stderr_exceeded {
+        bail!("current effective sudo policy query exceeded its bounded pipe capture");
+    }
+    Ok(BoundedPolicyOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn validate_current_sudo_authorization(value: &Value) -> Result<()> {
+    let authorization = value
+        .as_object()
+        .context("sudo authorization is not an object")?;
+    let caller_uid = authorization
+        .get("caller_uid")
+        .and_then(Value::as_u64)
+        .context("sudo authorization has no caller uid")?;
+    if caller_uid != u64::from(unsafe { libc::geteuid() }) {
+        bail!("sudo authorization caller uid differs from the current verifier user");
+    }
+    let caller_user = required_json_string(
+        authorization.get("caller_user"),
+        "sudo authorization caller user",
+    )?;
+    let authorized_command = required_json_string(
+        authorization.get("authorized_command"),
+        "sudo authorization sole command",
+    )?;
+    let query = authorization
+        .get("policy_query")
+        .and_then(Value::as_array)
+        .context("sudo authorization policy query is not an argv")?
+        .iter()
+        .map(|token| {
+            token
+                .as_str()
+                .map(str::to_string)
+                .context("sudo authorization query contains a non-string token")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let (executable, _) = query
+        .split_first()
+        .context("sudo authorization policy query is empty")?;
+    // The immutable creation-time proof is collected by root with
+    // `sudo -U <caller> -l`.  A deliberately unprivileged benchmark account
+    // cannot replay `-U`, so revalidate its effective policy as itself and
+    // compare the normalized sole command instead of comparing root's output
+    // bytes.
+    let output = query_current_sudo_policy_bounded(executable)?;
+    if !output.status.success()
+        || !output.stderr.is_empty()
+        || output.stdout.is_empty()
+        || output.stdout.contains(&0)
+        || output.stdout.contains(&b'\r')
+    {
+        bail!("current effective sudo policy query failed or violated its output contract");
+    }
+    let policy = std::str::from_utf8(&output.stdout)
+        .context("current effective sudo policy output is not UTF-8")?;
+    validate_exact_sudo_policy_text(policy, caller_user, authorized_command)
+}
+
+fn validate_exact_sudo_policy_text(
+    policy: &str,
+    caller_user: &str,
+    authorized_command: &str,
+) -> Result<()> {
+    let expected_header_prefix = format!("User {caller_user} may run the following commands on ");
+    let lines = policy.lines().collect::<Vec<_>>();
+    let header_indexes = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            (line.starts_with(&expected_header_prefix) && line.ends_with(':')).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if header_indexes.len() != 1 {
+        bail!("current effective sudo policy has no unique command-list header");
+    }
+    let command_lines = lines[header_indexes[0] + 1..]
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect::<Vec<_>>();
+    if command_lines.len() != 1 || command_lines[0] != authorized_command {
+        bail!("current effective sudo policy is not the sole digest-bound root attestor command");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_live_retired_projects_and_cgroup(
+    output_dir: &Path,
+    root_release: &Value,
+) -> Result<()> {
+    let evidence_project_id = root_release
+        .get("evidence_project_id")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .context("release evidence project id does not fit u32")?;
+    let payload_project_id = root_release
+        .get("payload_project_id")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .context("release payload project id does not fit u32")?;
+    let payload_dir = output_dir.join(OBSERVATION_PAYLOAD_DIRECTORY_NAME);
+    for (role, path, expected_id) in [
+        ("evidence", output_dir, evidence_project_id),
+        ("payload", payload_dir.as_path(), payload_project_id),
+    ] {
+        let (project_id, inherit) = linux_project_directory_attributes(path)
+            .with_context(|| format!("revalidate live retired {role} project attributes"))?;
+        if project_id != expected_id || !inherit {
+            bail!("live retired {role} tree has the wrong project id or lacks inheritance");
+        }
+    }
+
+    let binding = root_release
+        .pointer("/cgroup_removal_proof/binding")
+        .and_then(Value::as_object)
+        .context("release has no cgroup-removal binding")?;
+    let mount_root =
+        validate_normalized_absolute_cgroup_path(binding.get("mount_root"), "cgroup mount root")?;
+    let mount_point =
+        validate_normalized_absolute_cgroup_path(binding.get("mount_point"), "cgroup mount point")?;
+    validate_live_cgroup2_mount_binding(
+        &mount_root,
+        &mount_point,
+        binding
+            .get("mount_device")
+            .and_then(Value::as_u64)
+            .context("cgroup binding has no mount device")?,
+        binding
+            .get("mount_inode")
+            .and_then(Value::as_u64)
+            .context("cgroup binding has no mount inode")?,
+    )?;
+    for field in ["supervisor", "delegated_parent"] {
+        let path = validate_normalized_absolute_cgroup_path(
+            binding.get(field),
+            &format!("cgroup {field}"),
+        )?;
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("prove removed cgroup path {}", path.display()));
+            }
+            Ok(_) => bail!("released cgroup path still exists: {}", path.display()),
+        }
+    }
+    Ok(())
+}
+
+fn validate_observation_storage_release_bridge_values(
+    report: &Value,
+    receipt: &Value,
+    machine: &Value,
+    machine_id: &str,
+    output_dir: &Path,
+    root_release: &Value,
+    root_release_file: &Value,
+    live_inventory: &Value,
+) -> Result<()> {
+    validate_release_core_shape(root_release, false)?;
+    let machine_release = machine
+        .get("observation_storage_release")
+        .context("segment machine provenance has no observation-storage release")?;
+    validate_release_core_shape(machine_release, true)?;
+    let projected = root_release_projection(machine_release)?;
+    if &projected != root_release {
+        bail!("machine observation-storage release is not the exact root-slot document projection");
+    }
+    if machine_release.get("release_file") != Some(root_release_file) {
+        bail!("machine release-file record differs from the live immutable root slot");
+    }
+    let mut expected_release_slot = python_sorted_pretty_json_file(root_release)?;
+    let slot_bytes = usize::try_from(OBSERVATION_STORAGE_RELEASE_SLOT_BYTES)
+        .context("release slot size does not fit usize")?;
+    if expected_release_slot.len() > slot_bytes {
+        bail!("root release document exceeds the fixed release slot");
+    }
+    expected_release_slot.resize(slot_bytes, b' ');
+    if root_release_file.get("sha256").and_then(Value::as_str)
+        != Some(sha256_bytes(&expected_release_slot).as_str())
+    {
+        bail!("immutable root release slot bytes are not the exact producer serialization");
+    }
+    let release = root_release
+        .as_object()
+        .expect("root release shape validated");
+    require_integer_only_json_numbers(root_release, "$.root_release")?;
+    if release.get("provenance_id").and_then(Value::as_str) != Some(machine_id)
+        || release.get("campaign_id") != report.pointer("/campaign/campaign_id")
+        || release.get("campaign_plan_sha256") != report.pointer("/campaign/campaign_plan/sha256")
+        || release.get("segment_id") != report.pointer("/campaign/segment_id")
+        || release.get("output_directory").and_then(Value::as_str)
+            != Some(
+                output_dir
+                    .to_str()
+                    .context("strict output directory is not UTF-8")?,
+            )
+    {
+        bail!("root observation-storage release differs from the report/provenance binding");
+    }
+    let contract = report
+        .get("observation_storage_contract")
+        .context("segment report has no observation-storage contract")?;
+    let contract_sha256 = sha256_ty_canonical_json_v1_value(contract)?;
+    let storage_contract: ObservationStorageContract =
+        serde_json::from_value(contract.clone()).context("parse release storage contract")?;
+    storage_contract.validate()?;
+    let filesystem_uuid =
+        required_json_string(release.get("filesystem_uuid"), "release filesystem UUID")?;
+    if filesystem_uuid.len() != 32
+        || !filesystem_uuid
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || filesystem_uuid.bytes().all(|byte| byte == b'0')
+    {
+        bail!("root release filesystem UUID is not a canonical nonzero ext4 UUID");
+    }
+    let segment_id = required_json_string(release.get("segment_id"), "release segment id")?;
+    let ordinal_text = segment_id
+        .strip_prefix("segment-")
+        .filter(|value| value.len() >= 4 && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .context("release segment id is not canonical")?;
+    let ordinal = ordinal_text
+        .parse::<u64>()
+        .context("release segment ordinal does not fit u64")?;
+    if ordinal == 0 {
+        bail!("release segment ordinal must be positive");
+    }
+    let expected_evidence_project_id = u64::from(storage_contract.segment_project_id_start)
+        .checked_add(
+            ordinal
+                .checked_sub(1)
+                .and_then(|value| value.checked_mul(2))
+                .context("release segment project-id offset overflow")?,
+        )
+        .context("release evidence project id overflow")?;
+    let expected_payload_project_id = expected_evidence_project_id
+        .checked_add(1)
+        .context("release payload project id overflow")?;
+    if expected_payload_project_id > u64::from(u32::MAX) {
+        bail!("release segment project-id pair exceeds u32");
+    }
+    if release.get("contract_sha256").and_then(Value::as_str) != Some(contract_sha256.as_str())
+        || release.get("evidence_project_id") != machine.pointer("/command/evidence_project_id")
+        || release.get("payload_project_id") != machine.pointer("/command/payload_project_id")
+        || release.get("evidence_project_id").and_then(Value::as_u64)
+            != Some(expected_evidence_project_id)
+        || release.get("payload_project_id").and_then(Value::as_u64)
+            != Some(expected_payload_project_id)
+    {
+        bail!("root release contract or E/P project ids differ from the qualified command");
+    }
+    let privileged_execution = machine_release
+        .get("privileged_execution")
+        .and_then(Value::as_object)
+        .expect("machine release privileged execution shape validated");
+    let sudo_path = required_json_string(
+        privileged_execution
+            .get("sudo_executable")
+            .and_then(|value| value.get("path")),
+        "release sudo executable path",
+    )?;
+    let attestor_path = required_json_string(
+        privileged_execution
+            .get("attestor_executable")
+            .and_then(|value| value.get("path")),
+        "release attestor executable path",
+    )?;
+    let campaign_plan_path = required_json_string(
+        report.pointer("/campaign/campaign_plan/path"),
+        "release campaign-plan path",
+    )?;
+    let capability_path = required_json_string(
+        root_release.pointer("/capability_file/path"),
+        "release capability path",
+    )?;
+    let receipt_path = required_json_string(
+        root_release.pointer("/receipt_file/path"),
+        "release receipt path",
+    )?;
+    let machine_path = required_json_string(
+        root_release.pointer("/machine_pre_release_file/path"),
+        "release machine-provenance path",
+    )?;
+    let expected_privileged_command = [
+        sudo_path.to_string(),
+        "-n".to_string(),
+        "--".to_string(),
+        attestor_path.to_string(),
+        "attest-observation-storage".to_string(),
+        "--operation".to_string(),
+        "release".to_string(),
+        "--sudo-executable".to_string(),
+        sudo_path.to_string(),
+        "--output-directory".to_string(),
+        output_dir
+            .to_str()
+            .context("strict output directory is not UTF-8")?
+            .to_string(),
+        "--evidence-project-id".to_string(),
+        expected_evidence_project_id.to_string(),
+        "--payload-project-id".to_string(),
+        expected_payload_project_id.to_string(),
+        "--capability-output".to_string(),
+        capability_path.to_string(),
+        "--provenance-id".to_string(),
+        machine_id.to_string(),
+        "--campaign-id".to_string(),
+        required_json_string(release.get("campaign_id"), "release campaign id")?.to_string(),
+        "--campaign-plan".to_string(),
+        campaign_plan_path.to_string(),
+        "--campaign-plan-sha256".to_string(),
+        required_json_string(
+            release.get("campaign_plan_sha256"),
+            "release campaign-plan digest",
+        )?
+        .to_string(),
+        "--segment-id".to_string(),
+        segment_id.to_string(),
+        "--receipt".to_string(),
+        receipt_path.to_string(),
+        "--machine-provenance".to_string(),
+        machine_path.to_string(),
+    ];
+    if privileged_execution.get("command")
+        != Some(&Value::Array(
+            expected_privileged_command
+                .into_iter()
+                .map(Value::String)
+                .collect(),
+        ))
+    {
+        bail!("machine release privileged argv differs from the one exact release command");
+    }
+
+    let receipt_record = object_without_fields(
+        machine
+            .get("final_receipt")
+            .context("final machine has no receipt record")?,
+        &["schema", "status"],
+        "final machine receipt record",
+    )?;
+    if release.get("receipt_file") != Some(&receipt_record)
+        || root_release.pointer("/receipt_file/path")
+            != machine
+                .get("final_receipt")
+                .and_then(|value| value.get("path"))
+    {
+        bail!("root release receipt record differs from the current final receipt");
+    }
+    let pending_machine_file = reconstructed_pending_machine_file(machine)?;
+    if root_release.pointer("/machine_pre_release_file/path")
+        != receipt.pointer("/machine_provenance/path")
+        || release
+            .get("machine_pre_release_ty_canonical_json_v1_sha256")
+            .and_then(Value::as_str)
+            != Some(reconstructed_pending_machine_sha256(machine)?.as_str())
+        || root_release
+            .pointer("/machine_pre_release_file/sha256")
+            .and_then(Value::as_str)
+            != Some(sha256_bytes(&pending_machine_file).as_str())
+        || root_release
+            .pointer("/machine_pre_release_file/size_bytes")
+            .and_then(Value::as_u64)
+            != u64::try_from(pending_machine_file.len()).ok()
+    {
+        bail!("root release does not bind the exact reconstructed pending machine provenance");
+    }
+    let semantic_digest = sha256_ty_canonical_json_v1_value(
+        receipt
+            .get("semantic_validation")
+            .context("final receipt has no semantic validation")?,
+    )?;
+    if release
+        .get("semantic_validation_ty_canonical_json_v1_sha256")
+        .and_then(Value::as_str)
+        != Some(semantic_digest.as_str())
+    {
+        bail!("root release semantic-admission digest differs from the final receipt");
+    }
+
+    validate_exact_inventory_commitment(live_inventory, "live exact storage inventory")?;
+    for field in [
+        "sealed_inventory_commitment",
+        "prepared_inventory_commitment",
+    ] {
+        if release.get(field) != Some(live_inventory) {
+            bail!("root release {field} differs from the live immutable E/P inventory");
+        }
+    }
+    if machine_release.get("final_inventory_commitment") != Some(live_inventory) {
+        bail!("machine final inventory commitment differs from the live immutable E/P tree");
+    }
+    let authorized_count = receipt
+        .pointer("/semantic_validation/artifact_admission/authorized_storage_inventory/entry_count")
+        .and_then(Value::as_u64)
+        .context("final receipt has no authorized inventory entry count")?;
+    let authorized_entries = receipt
+        .pointer("/semantic_validation/artifact_admission/authorized_storage_inventory/entries")
+        .and_then(Value::as_array)
+        .context("final receipt has no authorized inventory entries")?;
+    let authorized_directories = authorized_entries
+        .iter()
+        .filter(|entry| entry.get("entry_type").and_then(Value::as_str) == Some("directory"))
+        .count();
+    let authorized_files = authorized_entries
+        .iter()
+        .filter(|entry| entry.get("entry_type").and_then(Value::as_str) == Some("regular_file"))
+        .count();
+    let live_count = live_inventory
+        .get("entry_count")
+        .and_then(Value::as_u64)
+        .context("live inventory has no entry count")?;
+    let sealed_count = root_release
+        .pointer("/immutable_seal/counts/entries")
+        .and_then(Value::as_u64)
+        .context("release immutable seal has no entry count")?;
+    let sealed_directories = root_release
+        .pointer("/immutable_seal/counts/directories")
+        .and_then(Value::as_u64)
+        .context("release immutable seal has no directory count")?;
+    let sealed_files = root_release
+        .pointer("/immutable_seal/counts/regular_files")
+        .and_then(Value::as_u64)
+        .context("release immutable seal has no regular-file count")?;
+    if authorized_count != live_count
+        || u64::try_from(authorized_directories + authorized_files).ok() != Some(authorized_count)
+        || sealed_count != live_count
+        || u64::try_from(authorized_directories).ok() != Some(sealed_directories)
+        || u64::try_from(authorized_files).ok() != Some(sealed_files)
+        || sealed_directories.checked_add(sealed_files) != Some(sealed_count)
+        || root_release.pointer("/immutable_seal/scope_root") != release.get("output_directory")
+    {
+        bail!("release inventory/seal counts differ from the exact authorized schedule");
+    }
+    if release.get("cgroup_removal_proof") != release.get("final_cgroup_removal_proof")
+        || root_release.pointer("/cgroup_removal_proof/checked_at_utc")
+            != release.get("released_at_utc")
+    {
+        bail!("release cgroup-removal proof changed across the committed transition");
+    }
+
+    let payload = release
+        .get("payload_post_prune")
+        .and_then(Value::as_object)
+        .expect("release payload shape validated");
+    let payload_quota = root_release
+        .pointer("/retired_project_quotas/payload")
+        .and_then(Value::as_object)
+        .expect("release payload quota shape validated");
+    if payload
+        .get("maximum_residual_bytes")
+        .and_then(Value::as_u64)
+        != Some(storage_contract.maximum_payload_post_prune_bytes)
+        || payload
+            .get("maximum_residual_inodes")
+            .and_then(Value::as_u64)
+            != Some(storage_contract.maximum_payload_post_prune_inodes)
+        || payload
+            .get("current_bytes")
+            .and_then(Value::as_u64)
+            .is_none_or(|current| current > storage_contract.maximum_payload_post_prune_bytes)
+        || payload
+            .get("current_inodes")
+            .and_then(Value::as_u64)
+            .is_none_or(|current| current > storage_contract.maximum_payload_post_prune_inodes)
+        || payload.get("current_bytes") != payload_quota.get("current_bytes")
+        || payload.get("current_inodes") != payload_quota.get("current_inodes")
+        || root_release.pointer("/retired_project_quotas/evidence/queried_project_id")
+            != release.get("evidence_project_id")
+        || root_release.pointer("/retired_project_quotas/payload/queried_project_id")
+            != release.get("payload_project_id")
+    {
+        bail!("release post-prune usage or retired quota binding is inconsistent");
+    }
+
+    let compact_history_entry = reconstructed_committed_release_history_entry(
+        root_release,
+        root_release_file,
+        live_inventory,
+    )?;
+    let finalized_entry_digest = sha256_ty_canonical_json_v1_value(&compact_history_entry)?;
+    if machine_release
+        .pointer("/durable_ledger_commit/finalized_entry_ty_canonical_json_v1_sha256")
+        .and_then(Value::as_str)
+        != Some(finalized_entry_digest.as_str())
+    {
+        bail!("machine release compact durable-ledger entry digest is inconsistent");
+    }
+    Ok(())
+}
+
+fn validate_segment_observation_storage_release(
+    report: &Value,
+    receipt: &Value,
+    machine: &Value,
+    machine_id: &str,
+    output_dir: &Path,
+) -> Result<()> {
+    let contract: ObservationStorageContract = serde_json::from_value(
+        report
+            .get("observation_storage_contract")
+            .cloned()
+            .context("segment report has no observation-storage contract")?,
+    )
+    .context("parse segment observation-storage contract")?;
+    contract.validate()?;
+    let authorized_inventory = receipt
+        .pointer("/semantic_validation/artifact_admission/authorized_storage_inventory")
+        .context("segment receipt has no authorized storage inventory")?;
+    validate_authorized_storage_inventory(report, "segment", &contract, authorized_inventory)?;
+
+    let (root_release, root_release_file) = read_root_immutable_release_slot(output_dir)
+        .context("read committed root observation-storage release slot")?;
+    let (capability, capability_file) = read_root_immutable_capability(
+        output_dir,
+        contract.maximum_control_artifacts_combined_bytes,
+    )
+    .context("read immutable observation-storage capability")?;
+    let live_inventory =
+        recompute_exact_storage_inventory(output_dir, authorized_inventory, &contract)
+            .context("recompute exact immutable observation-storage inventory")?;
+    validate_current_capability_release_binding(
+        report,
+        machine,
+        output_dir,
+        &contract,
+        &root_release,
+        &root_release_file,
+        &capability,
+        &capability_file,
+    )?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let output_metadata = fs::symlink_metadata(output_dir)
+            .with_context(|| format!("lstat strict output {}", output_dir.display()))?;
+        let payload_path = output_dir.join(OBSERVATION_PAYLOAD_DIRECTORY_NAME);
+        let payload_metadata = fs::symlink_metadata(&payload_path)
+            .with_context(|| format!("lstat strict payload {}", payload_path.display()))?;
+        let output_mode = format!("{:04o}", output_metadata.permissions().mode() & 0o7777);
+        let payload_mode = format!("{:04o}", payload_metadata.permissions().mode() & 0o7777);
+        if root_release
+            .pointer("/immutable_seal/scope_device")
+            .and_then(Value::as_u64)
+            != Some(output_metadata.dev())
+            || root_release
+                .pointer("/immutable_seal/scope_inode")
+                .and_then(Value::as_u64)
+                != Some(output_metadata.ino())
+        {
+            bail!("root release immutable-seal scope differs from the live output inode");
+        }
+        if capability
+            .pointer("/output_directory_identity/device")
+            .and_then(Value::as_u64)
+            != Some(output_metadata.dev())
+            || capability
+                .pointer("/output_directory_identity/inode")
+                .and_then(Value::as_u64)
+                != Some(output_metadata.ino())
+            || capability
+                .pointer("/output_directory_identity/uid")
+                .and_then(Value::as_u64)
+                != Some(u64::from(output_metadata.uid()))
+            || capability
+                .pointer("/output_directory_identity/gid")
+                .and_then(Value::as_u64)
+                != Some(u64::from(output_metadata.gid()))
+            || capability
+                .pointer("/output_directory_identity/mode")
+                .and_then(Value::as_str)
+                != Some(output_mode.as_str())
+            || capability
+                .pointer("/payload_directory_identity/device")
+                .and_then(Value::as_u64)
+                != Some(payload_metadata.dev())
+            || capability
+                .pointer("/payload_directory_identity/inode")
+                .and_then(Value::as_u64)
+                != Some(payload_metadata.ino())
+            || capability
+                .pointer("/payload_directory_identity/uid")
+                .and_then(Value::as_u64)
+                != Some(u64::from(payload_metadata.uid()))
+            || capability
+                .pointer("/payload_directory_identity/gid")
+                .and_then(Value::as_u64)
+                != Some(u64::from(payload_metadata.gid()))
+            || capability
+                .pointer("/payload_directory_identity/mode")
+                .and_then(Value::as_str)
+                != Some(payload_mode.as_str())
+            || capability
+                .pointer("/filesystem_device/st_dev")
+                .and_then(Value::as_u64)
+                != Some(output_metadata.dev())
+            || root_release_file.get("device").and_then(Value::as_u64)
+                != Some(output_metadata.dev())
+        {
+            bail!("live output identity/device differs from the immutable capability and release");
+        }
+        let attestor = root_release
+            .get("attestor")
+            .context("root release has no attestor")?;
+        let sudo = machine
+            .pointer("/observation_storage_release/privileged_execution/sudo_executable")
+            .context("machine release has no sudo executable")?;
+        validate_current_root_executable_record(
+            attestor,
+            "current observation-storage attestor",
+            0o755,
+        )?;
+        validate_current_root_executable_record(sudo, "current sudo executable", 0o4755)?;
+        validate_current_sudo_authorization(
+            capability
+                .get("sudo_authorization")
+                .context("immutable capability has no sudo authorization")?,
+        )?;
+        validate_live_retired_projects_and_cgroup(output_dir, &root_release)?;
+    }
+    validate_observation_storage_release_bridge_values(
+        report,
+        receipt,
+        machine,
+        machine_id,
+        output_dir,
+        &root_release,
+        &root_release_file,
+        &live_inventory,
+    )
+}
+
+fn validate_machine_observation_storage_release_role(
+    report: &Value,
+    machine: &Value,
+) -> Result<()> {
+    let campaign_role = report.pointer("/campaign/role").and_then(Value::as_str);
+    match campaign_role {
+        Some("segment") => {
+            let release = machine
+                .get("observation_storage_release")
+                .and_then(Value::as_object)
+                .context(
+                    "segment machine provenance has no completed observation-storage release",
+                )?;
+            validate_release_core_shape(&Value::Object(release.clone()), true)
+                .context("validate exact segment observation-storage release shape")?;
+        }
+        _ if machine.get("observation_storage_release").is_some() => {
+            bail!("non-segment machine provenance unexpectedly contains an observation-storage release");
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn reconstructed_pending_machine(machine: &Value) -> Result<Value> {
+    let mut pending = machine.clone();
+    let root = pending
+        .as_object_mut()
+        .context("final machine provenance is not an object")?;
+    if !root.contains_key("observation_storage_release") {
+        bail!("final machine provenance has no observation-storage release to reconstruct");
+    }
+    root.insert(
+        "observation_storage_release".to_string(),
+        json!({
+            "schema": OBSERVATION_STORAGE_RELEASE_SCHEMA,
+            "status": "pending",
+            "released": false,
+        }),
+    );
+    require_integer_only_json_numbers(&pending, "$")?;
+    Ok(pending)
+}
+
+fn reconstructed_pending_machine_sha256(machine: &Value) -> Result<String> {
+    sha256_ty_canonical_json_v1_value(&reconstructed_pending_machine(machine)?)
+}
+
+fn write_python_ascii_json_string(value: &str, output: &mut String) -> std::fmt::Result {
+    output.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\u{0008}' => output.push_str("\\b"),
+            '\u{000c}' => output.push_str("\\f"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            character if character <= '\u{001f}' => {
+                write!(output, "\\u{:04x}", u32::from(character))?;
+            }
+            character if ('\u{0020}'..='\u{007e}').contains(&character) => {
+                output.push(character);
+            }
+            character => {
+                let scalar = u32::from(character);
+                if scalar <= 0xffff {
+                    write!(output, "\\u{scalar:04x}")?;
+                } else {
+                    let surrogate = scalar - 0x1_0000;
+                    let high = 0xd800 + (surrogate >> 10);
+                    let low = 0xdc00 + (surrogate & 0x3ff);
+                    write!(output, "\\u{high:04x}\\u{low:04x}")?;
+                }
+            }
+        }
+    }
+    output.push('"');
+    Ok(())
+}
+
+fn write_python_sorted_pretty_json(value: &Value, output: &mut String, depth: usize) -> Result<()> {
+    match value {
+        Value::Null => output.push_str("null"),
+        Value::Bool(true) => output.push_str("true"),
+        Value::Bool(false) => output.push_str("false"),
+        Value::Number(number) if number.as_i64().is_some() || number.as_u64().is_some() => {
+            output.push_str(&number.to_string());
+        }
+        Value::Number(_) => bail!("Python machine-provenance bridge forbids floats"),
+        Value::String(text) => {
+            write_python_ascii_json_string(text, output)
+                .map_err(|_| anyhow::anyhow!("format Python JSON string"))?;
+        }
+        Value::Array(items) => {
+            output.push('[');
+            if !items.is_empty() {
+                output.push('\n');
+                for (index, item) in items.iter().enumerate() {
+                    output.push_str(&"  ".repeat(depth + 1));
+                    write_python_sorted_pretty_json(item, output, depth + 1)?;
+                    if index + 1 != items.len() {
+                        output.push(',');
+                    }
+                    output.push('\n');
+                }
+                output.push_str(&"  ".repeat(depth));
+            }
+            output.push(']');
+        }
+        Value::Object(fields) => {
+            output.push('{');
+            if !fields.is_empty() {
+                output.push('\n');
+                let mut names = fields.keys().collect::<Vec<_>>();
+                names.sort_unstable();
+                for (index, name) in names.iter().enumerate() {
+                    output.push_str(&"  ".repeat(depth + 1));
+                    write_python_ascii_json_string(name, output)
+                        .map_err(|_| anyhow::anyhow!("format Python JSON object key"))?;
+                    output.push_str(": ");
+                    write_python_sorted_pretty_json(
+                        fields.get(*name).expect("known JSON object field"),
+                        output,
+                        depth + 1,
+                    )?;
+                    if index + 1 != names.len() {
+                        output.push(',');
+                    }
+                    output.push('\n');
+                }
+                output.push_str(&"  ".repeat(depth));
+            }
+            output.push('}');
+        }
+    }
+    Ok(())
+}
+
+fn python_sorted_pretty_json_file(value: &Value) -> Result<Vec<u8>> {
+    let mut encoded = String::new();
+    write_python_sorted_pretty_json(value, &mut encoded, 0)?;
+    encoded.push('\n');
+    Ok(encoded.into_bytes())
+}
+
+fn reconstructed_pending_machine_file(machine: &Value) -> Result<Vec<u8>> {
+    python_sorted_pretty_json_file(&reconstructed_pending_machine(machine)?)
+}
+
+fn require_integer_only_json_numbers(value: &Value, path: &str) -> Result<()> {
+    match value {
+        Value::Number(number) if number.as_i64().is_none() && number.as_u64().is_none() => {
+            bail!(
+                "{path} contains a non-integer JSON number; the cross-language release preimage forbids floats"
+            );
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                require_integer_only_json_numbers(item, &format!("{path}[{index}]"))?;
+            }
+        }
+        Value::Object(fields) => {
+            for (name, item) in fields {
+                require_integer_only_json_numbers(item, &format!("{path}.{name}"))?;
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+    Ok(())
+}
+
+fn validate_required_machine_qualification_controls(controls: &Map<String, Value>) -> Result<()> {
+    let expected = REQUIRED_MACHINE_QUALIFICATION_CONTROLS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let actual = controls.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    if actual != expected {
+        let missing = expected.difference(&actual).copied().collect::<Vec<_>>();
+        let extra = actual.difference(&expected).copied().collect::<Vec<_>>();
+        bail!(
+            "final machine provenance qualification control set is not exact; missing={missing:?}, extra={extra:?}"
+        );
+    }
+    let failed = controls
+        .iter()
+        .filter_map(|(name, value)| (value != &Value::Bool(true)).then_some(name.as_str()))
+        .collect::<Vec<_>>();
+    if !failed.is_empty() {
+        bail!("final machine provenance qualification controls are not all true: {failed:?}");
+    }
+    Ok(())
+}
+
+fn completed_machine_finalization<'a>(
+    machine: &'a Value,
+    pointer: &str,
+    match_field: &str,
+    label: &str,
+) -> Result<&'a Value> {
+    let finalization = machine
+        .pointer(pointer)
+        .with_context(|| format!("final machine provenance has no {label} finalization"))?;
+    exact_json_object_fields(
+        finalization,
+        &format!("final machine provenance {label} finalization"),
+        &[
+            "pre_receipt_checked_at_utc",
+            "post_receipt_checked_at_utc",
+            match_field,
+            "snapshot",
+        ],
+    )?;
+    if finalization.get(match_field) != Some(&Value::Bool(true))
+        || !finalization
+            .get("pre_receipt_checked_at_utc")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+        || !finalization
+            .get("post_receipt_checked_at_utc")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+        || !finalization.get("snapshot").is_some_and(Value::is_object)
+    {
+        bail!("final machine provenance {label} finalization is incomplete");
+    }
+    Ok(finalization)
 }
 
 fn collect_stale_metadata_field(
@@ -528,12 +6201,265 @@ fn is_zero(value: &usize) -> bool {
 }
 
 pub(super) fn validate_matrix_enforce_inputs(args: &SupremacyMatrixArgs) -> Result<()> {
-    validate_matrix_runtime_refresh_policy(args.mode, args.allow_debug_runtime)?;
+    validate_matrix_runtime_refresh_policy(
+        args.mode,
+        args.allow_debug_runtime,
+        args.refresh_runtime,
+    )?;
+    if args.refresh_runtime {
+        if args.runtime_runs == 0 {
+            bail!("--runtime-runs must be >= 1");
+        }
+        if args.mode == SupremacyMode::Enforce
+            && (args.runtime_runs < STRICT_MIN_PAIRED_RUNS || args.runtime_runs % 2 != 0)
+        {
+            bail!(
+                "--runtime-runs must be even and >= {STRICT_MIN_PAIRED_RUNS} with --mode enforce"
+            );
+        }
+        if args.mode == SupremacyMode::Enforce && !args.production_runtime {
+            bail!("--production-runtime true is required with --mode enforce");
+        }
+    }
     run_matrix_anti_overfit_scan(args)?;
     if args.mode == SupremacyMode::Enforce {
+        validate_strict_corpus_baseline_path(&args.baseline)?;
+        if args.refresh_runtime {
+            validate_strict_corpus_checkout_for_refresh(&args.baseline)?;
+        }
         validate_enforceable_baseline_path(&args.baseline)?;
+        if !args.refresh_runtime {
+            validate_finalized_runtime_evidence_path(&args.baseline)?;
+        }
     }
     Ok(())
+}
+
+fn validate_strict_corpus_baseline_path(baseline_path: &Path) -> Result<()> {
+    let cwd = env::current_dir().context("resolve current working directory")?;
+    let manifest_path =
+        supremacy_repo_root(&cwd).join("tests/tlc_comparison/strict_corpus_manifest.json");
+    let manifest_text = fs::read_to_string(&manifest_path).with_context(|| {
+        format!(
+            "read normalized strict-corpus manifest {}",
+            manifest_path.display()
+        )
+    })?;
+    let manifest: StrictCorpusManifest =
+        serde_json::from_str(&manifest_text).with_context(|| {
+            format!(
+                "parse normalized strict-corpus manifest {}",
+                manifest_path.display()
+            )
+        })?;
+    if manifest.schema_version != 1 || manifest.claim != "ty_vs_tlc_strict_superiority" {
+        bail!(
+            "normalized strict-corpus manifest has unsupported identity (schema={}, claim={})",
+            manifest.schema_version,
+            manifest.claim
+        );
+    }
+    manifest
+        .work_equivalence_policy
+        .validate_exact()
+        .context("normalized strict-corpus manifest work-equivalence policy")?;
+    if manifest.rows.len() != manifest.source.expected_cfg_count {
+        bail!(
+            "normalized strict-corpus manifest row count {} differs from expected_cfg_count {}",
+            manifest.rows.len(),
+            manifest.source.expected_cfg_count
+        );
+    }
+
+    let baseline_text = fs::read_to_string(baseline_path)
+        .with_context(|| format!("read baseline {}", baseline_path.display()))?;
+    let baseline: Value = serde_json::from_str(&baseline_text)
+        .with_context(|| format!("parse baseline {}", baseline_path.display()))?;
+    validate_strict_baseline_schema_version(&baseline)?;
+    let specs = baseline
+        .get("specs")
+        .and_then(Value::as_object)
+        .context("strict matrix baseline has no specs object")?;
+    let manifest_names = manifest
+        .rows
+        .iter()
+        .map(|row| row.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let baseline_names = specs.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    if baseline_names != manifest_names {
+        let missing = manifest_names
+            .difference(&baseline_names)
+            .take(8)
+            .copied()
+            .collect::<Vec<_>>();
+        let extra = baseline_names
+            .difference(&manifest_names)
+            .take(8)
+            .copied()
+            .collect::<Vec<_>>();
+        bail!(
+            "strict matrix baseline corpus does not match normalized manifest: baseline_rows={}, manifest_rows={}, missing={missing:?}, extra={extra:?}; regenerate with `cargo run -p tla-petri --bin ty-tlc-baseline -- --write-skeleton` or collect from tests/tlc_comparison/strict_corpus_manifest.json",
+            baseline_names.len(),
+            manifest_names.len()
+        );
+    }
+
+    let manifest_sha256 = sha256_bytes(manifest_text.as_bytes());
+    let recorded_manifest_sha256 = baseline
+        .pointer("/collector/manifest_sha256")
+        .and_then(Value::as_str);
+    if recorded_manifest_sha256 != Some(manifest_sha256.as_str()) {
+        bail!(
+            "strict matrix baseline manifest digest mismatch: expected {manifest_sha256}, found {}; regenerate from {}",
+            recorded_manifest_sha256.unwrap_or("<missing>"),
+            manifest_path.display()
+        );
+    }
+    let recorded_commit = baseline
+        .pointer("/inputs/strict_corpus/commit")
+        .and_then(Value::as_str);
+    if recorded_commit != Some(manifest.source.commit.as_str()) {
+        bail!(
+            "strict matrix baseline source pin mismatch: expected {}, found {}",
+            manifest.source.commit,
+            recorded_commit.unwrap_or("<missing>")
+        );
+    }
+
+    for row in &manifest.rows {
+        let entry = &specs[&row.name];
+        let expected_exclusion = manifest.eligibility.exclusions.get(&row.cfg_path);
+        let expected_eligibility = if expected_exclusion.is_some() {
+            "excluded"
+        } else {
+            "eligible"
+        };
+        let actual_eligibility = entry
+            .get("eligibility")
+            .and_then(Value::as_str)
+            .unwrap_or("eligible");
+        let actual_cfg = entry.pointer("/source/cfg_path").and_then(Value::as_str);
+        let actual_tla = entry.pointer("/source/tla_path").and_then(Value::as_str);
+        if actual_eligibility != expected_eligibility
+            || actual_cfg != Some(row.cfg_path.as_str())
+            || actual_tla != Some(row.tla_path.as_str())
+        {
+            bail!(
+                "strict matrix baseline row {} does not match manifest (eligibility={}, cfg={:?}, tla={:?})",
+                row.name,
+                actual_eligibility,
+                actual_cfg,
+                actual_tla
+            );
+        }
+        validate_strict_row_work_equivalence(&row.name, entry, expected_eligibility == "eligible")?;
+        if let Some(exclusion) = expected_exclusion {
+            let reason = entry
+                .pointer("/exclusion/reason_code")
+                .and_then(Value::as_str);
+            if reason != Some(exclusion.reason_code.as_str()) {
+                bail!(
+                    "strict matrix baseline row {} exclusion reason mismatch: expected {}, found {}",
+                    row.name,
+                    exclusion.reason_code,
+                    reason.unwrap_or("<missing>")
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_strict_baseline_schema_version(baseline: &Value) -> Result<()> {
+    let schema_version = baseline
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .context("strict matrix baseline is missing integer schema_version")?;
+    if schema_version < 4 {
+        bail!(
+            "strict matrix baseline schema_version must be >= 4 for canonical raw generated-work evidence; found {schema_version}"
+        );
+    }
+    Ok(())
+}
+
+fn validate_strict_row_work_equivalence(spec: &str, entry: &Value, eligible: bool) -> Result<()> {
+    let object = entry
+        .as_object()
+        .with_context(|| format!("strict matrix baseline row {spec} is not an object"))?;
+    reject_legacy_work_equivalence_fields(spec, object)?;
+
+    if !eligible {
+        if object.contains_key("work_equivalence") {
+            bail!("strict matrix baseline excluded row {spec} must omit work_equivalence");
+        }
+        return Ok(());
+    }
+
+    let raw_rule = object.get("work_equivalence").with_context(|| {
+        format!("strict matrix baseline eligible row {spec} is missing typed work_equivalence")
+    })?;
+    WorkEquivalenceEvidence::parse_exact(raw_rule)
+        .with_context(|| format!("strict matrix baseline eligible row {spec} work_equivalence"))?;
+    Ok(())
+}
+
+fn validate_strict_corpus_checkout_for_refresh(baseline_path: &Path) -> Result<()> {
+    let cwd = env::current_dir().context("resolve current working directory")?;
+    let repo_root = supremacy_repo_root(&cwd);
+    let manifest_path = repo_root.join("tests/tlc_comparison/strict_corpus_manifest.json");
+    let manifest_text = fs::read_to_string(&manifest_path).with_context(|| {
+        format!(
+            "read normalized strict-corpus manifest {}",
+            manifest_path.display()
+        )
+    })?;
+    let manifest: StrictCorpusManifest =
+        serde_json::from_str(&manifest_text).with_context(|| {
+            format!(
+                "parse normalized strict-corpus manifest {}",
+                manifest_path.display()
+            )
+        })?;
+    let baseline_text = fs::read_to_string(baseline_path)
+        .with_context(|| format!("read baseline {}", baseline_path.display()))?;
+    let baseline: SpecBaseline = serde_json::from_str(&baseline_text)
+        .with_context(|| format!("parse baseline {}", baseline_path.display()))?;
+    let examples_dir = super::resolve_examples_dir(baseline.inputs.examples_dir.as_deref());
+    let checkout = git_checkout_provenance(&examples_dir);
+    validate_checkout_state_matches_pin(
+        &manifest.source.commit,
+        checkout.head.as_deref(),
+        checkout.is_dirty,
+        checkout.error.as_deref(),
+    )
+    .with_context(|| {
+        format!(
+            "--mode enforce --refresh-runtime requires {} to be a clean checkout at normalized corpus commit {}",
+            examples_dir.display(),
+            manifest.source.commit
+        )
+    })
+}
+
+fn validate_checkout_state_matches_pin(
+    expected_head: &str,
+    actual_head: Option<&str>,
+    is_dirty: Option<bool>,
+    inspection_error: Option<&str>,
+) -> Result<()> {
+    if let Some(error) = inspection_error {
+        bail!("could not inspect Examples checkout: {error}");
+    }
+    let actual_head = actual_head.context("Examples checkout HEAD is unavailable")?;
+    if actual_head != expected_head {
+        bail!("Examples checkout HEAD mismatch: expected {expected_head}, found {actual_head}");
+    }
+    match is_dirty {
+        Some(false) => Ok(()),
+        Some(true) => bail!("Examples checkout is dirty"),
+        None => bail!("Examples checkout cleanliness is unavailable"),
+    }
 }
 
 fn run_matrix_anti_overfit_scan(args: &SupremacyMatrixArgs) -> Result<()> {
@@ -647,11 +6573,2718 @@ fn is_matrix_only_policy_document(policy_path: &Path) -> Result<bool> {
 fn validate_matrix_runtime_refresh_policy(
     mode: SupremacyMode,
     allow_debug_runtime: bool,
+    refresh_runtime: bool,
+) -> Result<()> {
+    let compile_jobs = runtime_refresh_compile_jobs_value();
+    validate_matrix_runtime_refresh_policy_with_compile_jobs(
+        mode,
+        allow_debug_runtime,
+        refresh_runtime,
+        &compile_jobs,
+    )
+}
+
+fn validate_matrix_runtime_refresh_policy_with_compile_jobs(
+    mode: SupremacyMode,
+    allow_debug_runtime: bool,
+    refresh_runtime: bool,
+    compile_jobs: &str,
 ) -> Result<()> {
     if mode == SupremacyMode::Enforce && allow_debug_runtime {
         bail!("--allow-debug-runtime is not allowed with --mode enforce");
     }
+    if mode == SupremacyMode::Enforce && refresh_runtime {
+        if compile_jobs != DEFAULT_RUNTIME_REFRESH_COMPILE_JOBS {
+            bail!(
+                "--mode enforce runtime refresh requires {RUNTIME_REFRESH_COMPILE_JOBS_ENV}={DEFAULT_RUNTIME_REFRESH_COMPILE_JOBS}; found {compile_jobs:?}"
+            );
+        }
+    }
     Ok(())
+}
+
+pub(super) fn write_campaign_plan(args: &SupremacyMatrixCampaignPlanArgs) -> Result<()> {
+    if args.segment_size != 1 {
+        bail!("strict storage-safe campaigns require --segment-size 1");
+    }
+    if args.runtime_timeout == 0 {
+        bail!("--runtime-timeout must be >= 1");
+    }
+    if args.runtime_runs != STRICT_MIN_PAIRED_RUNS {
+        bail!(
+            "--runtime-runs must be exactly {STRICT_MIN_PAIRED_RUNS} for the frozen one-row storage budget"
+        );
+    }
+    if !args.production_runtime {
+        bail!("--production-runtime true is required for a strict campaign");
+    }
+    let requested_storage_contract = ObservationStorageContract {
+        schema: ObservationStorageContract::SCHEMA.to_string(),
+        mechanism: "ext4_dual_project_quota".to_string(),
+        max_observation_allocated_bytes: args.max_observation_allocated_bytes,
+        hard_observation_allocated_bytes: args.hard_observation_allocated_bytes,
+        max_observation_entries: args.max_observation_entries,
+        hard_observation_inodes: args.hard_observation_inodes,
+        evidence_soft_allocated_bytes: args.evidence_soft_allocated_bytes,
+        evidence_hard_allocated_bytes: args.evidence_hard_allocated_bytes,
+        evidence_soft_inodes: args.evidence_soft_inodes,
+        evidence_hard_inodes: args.evidence_hard_inodes,
+        evidence_finalization_reserve_bytes: 1_073_741_824,
+        maximum_measured_observations: 32,
+        maximum_preflight_observations: 1,
+        maximum_preflight_stdout_bytes: 2_097_152,
+        maximum_preflight_stderr_bytes: 2_097_152,
+        maximum_payload_manifest_bytes: 1_048_576,
+        maximum_payload_relative_path_bytes: 4_096,
+        maximum_command_metadata_bytes: 1_048_576,
+        maximum_retention_metadata_bytes: 1_048_576,
+        maximum_primary_artifacts_combined_bytes: 134_217_728,
+        maximum_control_artifacts_combined_bytes: 33_554_432,
+        maximum_payload_post_prune_bytes: 16_777_216,
+        maximum_payload_post_prune_inodes: 128,
+        minimum_filesystem_available_bytes: args.minimum_filesystem_available_bytes,
+        minimum_prelaunch_available_bytes: args.minimum_prelaunch_available_bytes,
+        minimum_filesystem_available_inodes: args.minimum_filesystem_available_inodes,
+        minimum_prelaunch_available_inodes: args.minimum_prelaunch_available_inodes,
+        monitor_interval_ms: args.monitor_interval_ms,
+        stdout_max_bytes: args.stdout_max_bytes,
+        stderr_max_bytes: args.stderr_max_bytes,
+        payload_lifecycle: "metadata_commitment_then_prune_v2".to_string(),
+        content_digest: false,
+        segment_project_id_start: args.segment_project_id_start,
+        project_id_assignment: "campaign_pair_v2".to_string(),
+    };
+    requested_storage_contract
+        .validate()
+        .context("validate frozen campaign observation storage options")?;
+
+    let artifact_root = canonical_new_directory_path(&args.artifact_root, "--artifact-root")?;
+    let output = artifact_root.join("campaign-plan.json");
+    if args.output != output {
+        bail!(
+            "--output must be the campaign root's exact plan path {}",
+            output.display()
+        );
+    }
+    let baseline = RuntimeFileProvenance::new(&args.baseline)
+        .with_context(|| format!("bind campaign baseline {}", args.baseline.display()))?;
+    let policy = args
+        .policy
+        .as_deref()
+        .map(RuntimeFileProvenance::new)
+        .transpose()
+        .context("bind campaign matrix policy")?;
+    let matrix_args = SupremacyMatrixArgs {
+        baseline: baseline.path.clone(),
+        policy: policy.as_ref().map(|file| file.path.clone()),
+        mode: SupremacyMode::Enforce,
+        format: crate::cli_schema::SupremacyOutputFormat::Json,
+        refresh_runtime: true,
+        runtime_scope: SupremacyMatrixRuntimeScope::AllRunnable,
+        runtime_output_dir: Some(artifact_root.clone()),
+        runtime_limit: None,
+        runtime_specs: Vec::new(),
+        runtime_timeout: args.runtime_timeout,
+        runtime_runs: args.runtime_runs,
+        production_runtime: args.production_runtime,
+        runtime_ty_bin: args.runtime_ty_bin.clone(),
+        allow_debug_runtime: false,
+        runtime_tlc_jar: args.runtime_tlc_jar.clone(),
+        runtime_community_modules: args.runtime_community_modules.clone(),
+        runtime_tla_library: args.runtime_tla_library.clone(),
+    };
+    validate_matrix_enforce_inputs(&matrix_args)?;
+
+    let matrix_policy = match matrix_args.policy.as_deref() {
+        Some(path) => super::policy::load_matrix_policy(path)?,
+        None => MatrixPolicy::default(),
+    };
+    let summary = classify_baseline_path_with_policy(&baseline.path, &matrix_policy)?;
+    let baseline_text = fs::read_to_string(&baseline.path)
+        .with_context(|| format!("read campaign baseline {}", baseline.path.display()))?;
+    let baseline_document: SpecBaseline = serde_json::from_str(&baseline_text)
+        .with_context(|| format!("parse campaign baseline {}", baseline.path.display()))?;
+    let cwd = env::current_dir().context("resolve current working directory")?;
+    let repo_root = supremacy_repo_root(&cwd);
+    let config = RuntimeCollectionConfig::from_args(&matrix_args, &repo_root)?;
+    validate_file(&config.ty_bin)?;
+    validate_runtime_ty_binary_for_refresh(&config.ty_bin, false)?;
+    validate_file(&config.tlc_jar)?;
+    if let Some(path) = config.community_modules.as_deref() {
+        validate_file(path)?;
+    }
+    if let Some(path) = config.tla_library.as_deref() {
+        validate_dir(path)?;
+    }
+    let examples_dir =
+        super::resolve_examples_dir(baseline_document.inputs.examples_dir.as_deref());
+    let refresh_plan = matrix_refresh::plan_runtime_refresh_str(
+        &baseline_text,
+        &baseline.path,
+        Some(&examples_dir),
+        matrix_refresh::MatrixRefreshScope::AllRunnable,
+    )
+    .with_context(|| {
+        format!(
+            "plan full campaign matrix refresh for {}",
+            baseline.path.display()
+        )
+    })?;
+    let selection = runtime_batch_selection(&summary, &refresh_plan, &[], None)?;
+    if selection.selected_specs.is_empty() {
+        bail!("campaign plan has no batchable all-runnable runtime rows");
+    }
+    validate_campaign_spec_names(
+        &selection.selected_specs,
+        &refresh_plan.blocked_runtime_specs,
+    )?;
+    if !refresh_plan.blocked_runtime_specs.is_empty() {
+        bail!(
+            "strict campaign plan cannot be created with {} blocked all-runnable row(s): {}; resolve them before a multi-day collection",
+            refresh_plan.blocked_runtime_specs.len(),
+            refresh_plan
+                .blocked_runtime_specs
+                .iter()
+                .take(10)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    let mut metadata = RuntimeEvidenceMetadata::collect_campaign_attestations(
+        &repo_root,
+        &examples_dir,
+        &config.ty_bin,
+        &config.tlc_jar,
+        config.community_modules.as_deref(),
+        config.tla_library.as_deref(),
+        &baseline.path,
+        &config,
+        chrono::Utc::now().to_rfc3339(),
+    )
+    .context("collect campaign input attestations")?;
+    let input_revalidation_errors = runtime_input_revalidation_errors(&metadata);
+    metadata.input_revalidation_errors = input_revalidation_errors;
+    let plan_provenance_errors = strict_campaign_plan_provenance_errors(&metadata);
+    if !plan_provenance_errors.is_empty() {
+        bail!(
+            "campaign plan inputs are not strict-evidence ready: {}",
+            plan_provenance_errors.join("; ")
+        );
+    }
+    let segments = selection
+        .selected_specs
+        .chunks(args.segment_size)
+        .enumerate()
+        .map(|(index, specs)| RuntimeCampaignPlanSegment {
+            segment_id: format!("segment-{:04}", index + 1),
+            runtime_specs: specs.to_vec(),
+            output_dir: artifact_root
+                .join("segments")
+                .join(format!("segment-{:04}", index + 1)),
+            report_path: artifact_root
+                .join("segments")
+                .join(format!("segment-{:04}", index + 1))
+                .join("runtime_evidence.json"),
+            attempt_marker: artifact_root
+                .join("attempts")
+                .join(format!("segment-{:04}.json", index + 1)),
+        })
+        .collect::<Vec<_>>();
+    let payload = RuntimeCampaignPlanPayload {
+        artifacts: RuntimeCampaignArtifactLayout {
+            root: artifact_root.clone(),
+            campaign_plan: output.clone(),
+            attempts_dir: artifact_root.join("attempts"),
+            inventory_output_dir: artifact_root.join("merge-inventory"),
+            inventory_report_path: artifact_root
+                .join("merge-inventory")
+                .join("runtime_evidence.json"),
+            inventory_attempt_marker: artifact_root.join("attempts/merge-inventory.json"),
+            superiority_output_dir: artifact_root.join("merge-superiority"),
+            superiority_report_path: artifact_root
+                .join("merge-superiority")
+                .join("runtime_evidence.json"),
+            superiority_attempt_marker: artifact_root.join("attempts/merge-superiority.json"),
+        },
+        baseline,
+        policy,
+        runtime: RuntimeCampaignRuntimeConfig {
+            timeout_seconds: config.timeout_seconds,
+            runs: config.runs,
+            production_runtime: config.production_runtime,
+            allow_debug_runtime: config.allow_debug_runtime,
+            ty_binary: RuntimeFileProvenance::new(&config.ty_bin)?,
+            java_executable: config.java.executable.clone(),
+            java_home: config.java.java_home.clone(),
+            tlc_jar: RuntimeFileProvenance::new(&config.tlc_jar)?,
+            community_modules: config
+                .community_modules
+                .as_deref()
+                .map(RuntimeFileProvenance::new)
+                .transpose()?,
+            tla_library: config
+                .tla_library
+                .as_deref()
+                .map(RuntimeDirectoryProvenance::new)
+                .transpose()?,
+        },
+        observation_storage_contract: requested_storage_contract,
+        contract_attestations: runtime_campaign_contract_attestations(&metadata)?,
+        segment_size: args.segment_size,
+        runtime_specs: selection.selected_specs,
+        blocked_runtime_specs: refresh_plan.blocked_runtime_specs,
+        segments,
+    };
+    validate_campaign_plan_payload(&payload)?;
+    let campaign_id = sha256_ty_canonical_json_v1_value(&serde_json::to_value(&payload)?)?;
+    let plan = RuntimeCampaignPlan {
+        schema: RUNTIME_CAMPAIGN_PLAN_SCHEMA.to_string(),
+        campaign_id,
+        payload,
+    };
+    let bytes = serde_json::to_vec_pretty(&plan)?;
+    create_private_campaign_directory(&artifact_root, "campaign artifact root")?;
+    create_private_campaign_directory(&artifact_root.join("segments"), "campaign segment parent")?;
+    create_private_campaign_directory(
+        &artifact_root.join("attempts"),
+        "campaign attempt-marker parent",
+    )?;
+    let mut file = create_private_campaign_plan_file(&output)?;
+    IoWrite::write_all(&mut file, &bytes)
+        .and_then(|_| IoWrite::write_all(&mut file, b"\n"))
+        .with_context(|| format!("write campaign plan {}", output.display()))?;
+    file.sync_all()
+        .with_context(|| format!("sync campaign plan {}", output.display()))?;
+    sync_campaign_directory(&artifact_root.join("segments"))?;
+    sync_campaign_directory(&artifact_root.join("attempts"))?;
+    sync_campaign_directory(&artifact_root)?;
+    if let Some(parent) = artifact_root.parent() {
+        sync_campaign_directory(parent)?;
+    }
+    eprintln!(
+        "[supremacy] campaign {}: {} runtime rows in {} segment(s); wrote {}",
+        plan.campaign_id,
+        plan.payload.runtime_specs.len(),
+        plan.payload.segments.len(),
+        output.display()
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_campaign_directory(path: &Path) -> Result<()> {
+    fs::File::open(path)
+        .with_context(|| format!("open campaign directory {} for sync", path.display()))?
+        .sync_all()
+        .with_context(|| format!("sync campaign directory {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_campaign_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn create_private_campaign_directory(path: &Path, label: &str) -> Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(path)
+        .with_context(|| format!("exclusively create {label} {}", path.display()))?;
+    validate_private_campaign_directory(path, label)
+}
+
+fn create_private_campaign_plan_file(path: &Path) -> Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let file = options.open(path).with_context(|| {
+        format!(
+            "exclusively create private campaign plan {}",
+            path.display()
+        )
+    })?;
+    validate_private_campaign_plan_file(&file, path)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn validate_private_campaign_plan_file(file: &fs::File, path: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("fstat private campaign plan {}", path.display()))?;
+    if !metadata.file_type().is_file()
+        || metadata.permissions().mode() & 0o7777 != 0o600
+        || metadata.nlink() != 1
+    {
+        bail!(
+            "campaign plan must be a private regular file with mode 0600 and one link: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_private_campaign_plan_file(file: &fs::File, path: &Path) -> Result<()> {
+    if !file
+        .metadata()
+        .with_context(|| format!("stat private campaign plan {}", path.display()))?
+        .file_type()
+        .is_file()
+    {
+        bail!("campaign plan must be a regular file: {}", path.display());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_private_campaign_directory(path: &Path, label: &str) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("lstat {label} {}", path.display()))?;
+    if !metadata.file_type().is_dir() || metadata.permissions().mode() & 0o7777 != 0o700 {
+        bail!(
+            "{label} must remain a non-symlink directory with mode 0700: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_private_campaign_directory(path: &Path, label: &str) -> Result<()> {
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("stat {label} {}", path.display()))?;
+    if !metadata.file_type().is_dir() {
+        bail!("{label} must remain a directory: {}", path.display());
+    }
+    Ok(())
+}
+
+fn canonical_new_directory_path(path: &Path, label: &str) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        bail!("{label} must be an absolute path");
+    }
+    if path.file_name().is_none() {
+        bail!("{label} must name a directory below an existing parent");
+    }
+    let parent = path
+        .parent()
+        .with_context(|| format!("{label} has no parent directory"))?;
+    let canonical_parent = parent
+        .canonicalize()
+        .with_context(|| format!("canonicalize {label} parent {}", parent.display()))?;
+    let canonical = canonical_parent.join(path.file_name().expect("validated file name"));
+    if canonical != path {
+        bail!(
+            "{label} must already be canonical and contain no aliases or '..': expected {}, got {}",
+            canonical.display(),
+            path.display()
+        );
+    }
+    if fs::symlink_metadata(path).is_ok() {
+        bail!("{label} already exists; each campaign requires a fresh artifact root");
+    }
+    Ok(canonical)
+}
+
+fn runtime_campaign_contract_attestations(metadata: &RuntimeEvidenceMetadata) -> Result<Value> {
+    let os_cache_attestation = serde_json::to_value(&metadata.benchmark.os_cache_policy)?;
+    let os_cache_attestation_sha256 = sha256_ty_canonical_json_v1_value(&os_cache_attestation)?;
+    Ok(json!({
+        "runtime_contract": {
+            "mode": metadata.benchmark.mode,
+            "timeout_seconds": metadata.benchmark.timeout_seconds,
+            "runs": metadata.benchmark.runs,
+            "production_runtime": metadata.benchmark.production_runtime,
+            "paired_statistic": metadata.benchmark.paired_statistic,
+            "paired_schedule": metadata.benchmark.paired_schedule,
+            "memory_metric": metadata.benchmark.memory_metric,
+            "min_runtime_speedup": metadata.benchmark.min_runtime_speedup,
+            "max_memory_ratio": metadata.benchmark.max_memory_ratio,
+            "tlc_jvm_args": metadata.benchmark.tlc_jvm_args,
+            "ty_environment": metadata.benchmark.ty_environment,
+        },
+        "independent_attestations": {
+            "os_cache_policy": {
+                "attestation": os_cache_attestation,
+                "ty_canonical_json_v1_sha256": os_cache_attestation_sha256,
+            },
+            "source_revision": {
+                "reported_git_commit": metadata.ty.git_commit,
+                "build_worktree_dirty": metadata.ty.build_worktree_dirty,
+                "workspace_git_commit": metadata.ty.workspace_git_commit,
+                "workspace_checkout": metadata.ty.workspace_checkout,
+            },
+            "ty_binary": metadata.ty.binary,
+            "binary_source_build_linkage": {
+                "asserted": false,
+                "meaning": "source revision and TY binary digest are independent attestations"
+            }
+        },
+        "inputs": {
+            "baseline": metadata.benchmark.baseline,
+            "strict_corpus_manifest": metadata.benchmark.strict_corpus_manifest,
+            "tlc": metadata.tlc,
+            "community_modules": metadata.community_modules,
+            "tla_library": metadata.tla_library,
+            "java": metadata.java,
+            "examples_checkout": metadata.examples_checkout,
+        }
+    }))
+}
+
+fn validate_campaign_plan_payload(payload: &RuntimeCampaignPlanPayload) -> Result<()> {
+    if payload.segment_size != 1 {
+        bail!("storage-safe campaign plan segment_size must be exactly 1");
+    }
+    payload
+        .observation_storage_contract
+        .validate()
+        .context("validate campaign observation storage contract")?;
+    if payload.runtime.timeout_seconds == 0
+        || payload.runtime.runs != STRICT_MIN_PAIRED_RUNS
+        || !payload.runtime.production_runtime
+        || payload.runtime.allow_debug_runtime
+    {
+        bail!("campaign plan runtime contract is not strict and promotable");
+    }
+    let attestations = payload
+        .contract_attestations
+        .as_object()
+        .context("campaign contract_attestations must be an object")?;
+    let os_cache_binding = payload
+        .contract_attestations
+        .pointer("/independent_attestations/os_cache_policy")
+        .and_then(Value::as_object)
+        .context("campaign OS-cache policy binding must be an object")?;
+    let os_cache_attestation = os_cache_binding
+        .get("attestation")
+        .filter(|value| !value.is_null())
+        .context("campaign OS-cache policy binding has no attestation")?;
+    let os_cache_sha256 = os_cache_binding
+        .get("ty_canonical_json_v1_sha256")
+        .and_then(Value::as_str)
+        .context("campaign OS-cache policy binding has no TY canonical-JSON v1 digest")?;
+    if os_cache_attestation != &strict_os_cache_policy()
+        || os_cache_sha256 != sha256_ty_canonical_json_v1_value(os_cache_attestation)?
+        || !valid_sha256(os_cache_sha256)
+        || payload
+            .contract_attestations
+            .pointer("/independent_attestations/binary_source_build_linkage/asserted")
+            != Some(&Value::Bool(false))
+        || !payload
+            .contract_attestations
+            .pointer("/independent_attestations/source_revision")
+            .is_some_and(Value::is_object)
+        || !payload
+            .contract_attestations
+            .pointer("/independent_attestations/ty_binary")
+            .is_some_and(Value::is_object)
+        || !attestations.contains_key("runtime_contract")
+        || !attestations.contains_key("inputs")
+    {
+        bail!(
+            "campaign plan must bind the exact balanced steady-cache policy, source revision, TY binary, runtime contract, and inputs without asserting build linkage"
+        );
+    }
+    let runtime_contract = payload
+        .contract_attestations
+        .get("runtime_contract")
+        .and_then(Value::as_object)
+        .context("campaign runtime_contract must be an object")?;
+    let enforce_mode = json!("enforce");
+    let timeout_seconds = json!(payload.runtime.timeout_seconds);
+    let runs = json!(payload.runtime.runs);
+    let production_runtime = json!(payload.runtime.production_runtime);
+    let ty_binary = serde_json::to_value(&payload.runtime.ty_binary)?;
+    let java_executable = serde_json::to_value(&payload.runtime.java_executable)?;
+    let java_home = serde_json::to_value(&payload.runtime.java_home)?;
+    let baseline = serde_json::to_value(&payload.baseline)?;
+    let tlc_jar = serde_json::to_value(&payload.runtime.tlc_jar)?;
+    let community_modules = serde_json::to_value(&payload.runtime.community_modules)?;
+    let tla_library = serde_json::to_value(&payload.runtime.tla_library)?;
+    if runtime_contract.get("mode") != Some(&enforce_mode)
+        || runtime_contract.get("timeout_seconds") != Some(&timeout_seconds)
+        || runtime_contract.get("runs") != Some(&runs)
+        || runtime_contract.get("production_runtime") != Some(&production_runtime)
+        || payload
+            .contract_attestations
+            .pointer("/independent_attestations/ty_binary")
+            != Some(&ty_binary)
+        || payload
+            .contract_attestations
+            .pointer("/inputs/java/executable")
+            != Some(&java_executable)
+        || payload
+            .contract_attestations
+            .pointer("/inputs/java/java_home")
+            != Some(&java_home)
+        || payload.contract_attestations.pointer("/inputs/baseline") != Some(&baseline)
+        || payload.contract_attestations.pointer("/inputs/tlc/jar") != Some(&tlc_jar)
+        || payload
+            .contract_attestations
+            .pointer("/inputs/community_modules")
+            != Some(&community_modules)
+        || payload.contract_attestations.pointer("/inputs/tla_library") != Some(&tla_library)
+    {
+        bail!("campaign runtime config and independent contract attestations diverge");
+    }
+    if payload.runtime_specs.is_empty() {
+        bail!("campaign plan runtime_specs must not be empty");
+    }
+    validate_campaign_spec_names(&payload.runtime_specs, &payload.blocked_runtime_specs)?;
+    let runtime_specs = payload
+        .runtime_specs
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if runtime_specs.len() != payload.runtime_specs.len() {
+        bail!("campaign plan runtime_specs must be unique");
+    }
+    let blocked = payload
+        .blocked_runtime_specs
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if blocked.len() != payload.blocked_runtime_specs.len() || !runtime_specs.is_disjoint(&blocked)
+    {
+        bail!("campaign blocked_runtime_specs are duplicated or overlap runnable rows");
+    }
+    if !payload.blocked_runtime_specs.is_empty() {
+        bail!("strict campaign plans may not contain blocked all-runnable rows");
+    }
+    if payload.segments.is_empty() {
+        bail!("campaign plan must contain at least one segment");
+    }
+    validate_campaign_project_id_range(
+        payload
+            .observation_storage_contract
+            .segment_project_id_start,
+        payload.segments.len(),
+    )?;
+    let artifact_root = &payload.artifacts.root;
+    let normalized_absolute = |path: &Path| {
+        path.is_absolute()
+            && !path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::CurDir | std::path::Component::ParentDir
+                )
+            })
+    };
+    if !normalized_absolute(artifact_root)
+        || payload.artifacts.campaign_plan != artifact_root.join("campaign-plan.json")
+        || payload.artifacts.attempts_dir != artifact_root.join("attempts")
+        || payload.artifacts.inventory_output_dir != artifact_root.join("merge-inventory")
+        || payload.artifacts.inventory_report_path
+            != payload
+                .artifacts
+                .inventory_output_dir
+                .join("runtime_evidence.json")
+        || payload.artifacts.inventory_attempt_marker
+            != payload.artifacts.attempts_dir.join("merge-inventory.json")
+        || payload.artifacts.superiority_output_dir != artifact_root.join("merge-superiority")
+        || payload.artifacts.superiority_report_path
+            != payload
+                .artifacts
+                .superiority_output_dir
+                .join("runtime_evidence.json")
+        || payload.artifacts.superiority_attempt_marker
+            != payload
+                .artifacts
+                .attempts_dir
+                .join("merge-superiority.json")
+    {
+        bail!("campaign artifact layout is not the exact canonical one-attempt layout");
+    }
+    let mut flattened = Vec::new();
+    for (index, segment) in payload.segments.iter().enumerate() {
+        let expected_id = format!("segment-{:04}", index + 1);
+        if segment.segment_id != expected_id {
+            bail!(
+                "campaign segment id/order is not canonical: expected {expected_id}, found {}",
+                segment.segment_id
+            );
+        }
+        if segment.runtime_specs.is_empty()
+            || segment.runtime_specs.len() > payload.segment_size
+            || (index + 1 < payload.segments.len()
+                && segment.runtime_specs.len() != payload.segment_size)
+        {
+            bail!(
+                "campaign segment {} does not obey canonical segment_size {}",
+                segment.segment_id,
+                payload.segment_size
+            );
+        }
+        let expected_output = artifact_root.join("segments").join(&expected_id);
+        let expected_attempt_marker = payload
+            .artifacts
+            .attempts_dir
+            .join(format!("{expected_id}.json"));
+        if segment.output_dir != expected_output
+            || segment.report_path != expected_output.join("runtime_evidence.json")
+            || segment.attempt_marker != expected_attempt_marker
+        {
+            bail!(
+                "campaign segment {} does not use its exact one-attempt artifact path",
+                segment.segment_id
+            );
+        }
+        flattened.extend(segment.runtime_specs.iter().cloned());
+    }
+    if flattened != payload.runtime_specs {
+        bail!("campaign segment memberships are not the exact ordered partition of runtime_specs");
+    }
+    Ok(())
+}
+
+fn validate_campaign_spec_names(runtime_specs: &[String], blocked_specs: &[String]) -> Result<()> {
+    for (kind, specs) in [
+        ("runtime_specs", runtime_specs),
+        ("blocked_runtime_specs", blocked_specs),
+    ] {
+        for spec in specs {
+            validate_runtime_spec_artifact_component(spec)
+                .with_context(|| format!("campaign plan {kind} entry {spec:?}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_runtime_spec_artifact_component(spec: &str) -> Result<()> {
+    let mut components = Path::new(spec).components();
+    let is_exact_normal_component = matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(component)), None)
+            if component == OsStr::new(spec)
+    );
+    if spec.is_empty()
+        || spec.trim() != spec
+        || spec.chars().any(char::is_control)
+        || spec.contains(['/', '\\'])
+        || !is_exact_normal_component
+    {
+        bail!("runtime spec name must be exactly one safe normal UTF-8 filesystem component");
+    }
+    Ok(())
+}
+
+fn runtime_spec_artifact_dir(output_dir: &Path, spec: &str) -> Result<PathBuf> {
+    validate_runtime_spec_artifact_component(spec)?;
+    let artifact_dir = output_dir.join(spec);
+    if artifact_dir.parent() != Some(output_dir) || !artifact_dir.starts_with(output_dir) {
+        bail!("runtime spec artifact directory escapes its output directory");
+    }
+    Ok(artifact_dir)
+}
+
+fn validate_campaign_project_id_range(
+    segment_project_id_start: u32,
+    segment_count: usize,
+) -> Result<()> {
+    if segment_project_id_start == 0 || segment_project_id_start % 2 != 0 {
+        bail!("campaign project-id base must be a positive even u32");
+    }
+    let last_segment_offset = segment_count
+        .checked_sub(1)
+        .context("campaign project-id range requires at least one segment")
+        .and_then(|offset| {
+            u32::try_from(offset)
+                .context("campaign has more segments than the project-id assignment can represent")
+        })?
+        .checked_mul(2)
+        .context("campaign project-id pair range overflows u32")?;
+    segment_project_id_start
+        .checked_add(last_segment_offset)
+        .and_then(|evidence| evidence.checked_add(1))
+        .context("campaign segment project-id range overflows u32")?;
+    Ok(())
+}
+
+fn load_runtime_campaign_plan(path: &Path) -> Result<(RuntimeCampaignPlan, RuntimeFileProvenance)> {
+    if !path.is_absolute() {
+        bail!("--campaign-plan must be absolute");
+    }
+    let provenance = RuntimeFileProvenance::new(path)
+        .with_context(|| format!("hash campaign plan {}", path.display()))?;
+    if provenance.path != path {
+        bail!(
+            "--campaign-plan must be canonical: expected {}, got {}",
+            provenance.path.display(),
+            path.display()
+        );
+    }
+    let (value, _, _) = read_regular_json_nofollow(path)?;
+    if RuntimeFileProvenance::new(path)? != provenance {
+        bail!("campaign plan changed while it was being read");
+    }
+    let plan: RuntimeCampaignPlan =
+        serde_json::from_value(value).context("parse matrix campaign plan")?;
+    if plan.schema != RUNTIME_CAMPAIGN_PLAN_SCHEMA {
+        bail!(
+            "campaign plan schema must be {RUNTIME_CAMPAIGN_PLAN_SCHEMA}, found {:?}",
+            plan.schema
+        );
+    }
+    validate_campaign_plan_payload(&plan.payload)?;
+    if plan.payload.artifacts.campaign_plan != path {
+        bail!("campaign plan was loaded from a path different from its bound artifact layout");
+    }
+    let canonical_artifact_root = plan
+        .payload
+        .artifacts
+        .root
+        .canonicalize()
+        .context("canonicalize campaign artifact root")?;
+    if canonical_artifact_root != plan.payload.artifacts.root {
+        bail!("campaign artifact root is no longer canonical");
+    }
+    for (directory, label) in [
+        (
+            plan.payload.artifacts.root.clone(),
+            "campaign artifact root",
+        ),
+        (
+            plan.payload.artifacts.root.join("segments"),
+            "campaign segment parent",
+        ),
+        (
+            plan.payload.artifacts.attempts_dir.clone(),
+            "campaign attempt-marker parent",
+        ),
+    ] {
+        validate_private_campaign_directory(&directory, label)?;
+    }
+    let expected_id = sha256_ty_canonical_json_v1_value(&serde_json::to_value(&plan.payload)?)?;
+    if plan.campaign_id != expected_id || !valid_sha256(&plan.campaign_id) {
+        bail!("campaign_id does not match the TY canonical-JSON v1 campaign payload digest");
+    }
+    validate_campaign_plan_inputs(&plan.payload)?;
+    Ok((plan, provenance))
+}
+
+fn validate_campaign_plan_inputs(payload: &RuntimeCampaignPlanPayload) -> Result<()> {
+    validate_campaign_file_provenance(&payload.baseline, "campaign baseline")?;
+    if let Some(policy) = payload.policy.as_ref() {
+        validate_campaign_file_provenance(policy, "campaign policy")?;
+    }
+    validate_campaign_file_provenance(&payload.runtime.ty_binary, "campaign TY binary")?;
+    validate_campaign_file_provenance(
+        &payload.runtime.java_executable,
+        "campaign Java executable",
+    )?;
+    let java_home = RuntimeJavaHomeProvenance::new(&payload.runtime.java_home.path)
+        .context("revalidate campaign Java home runtime tree")?;
+    if java_home != payload.runtime.java_home {
+        bail!("campaign Java home runtime tree changed after plan creation");
+    }
+    let java_home_executable = payload
+        .runtime
+        .java_home
+        .path
+        .join("bin")
+        .join(java_executable_file_name())
+        .canonicalize()
+        .context("canonicalize campaign java.home/bin/java")?;
+    if java_home_executable != payload.runtime.java_executable.path {
+        bail!("campaign Java executable does not equal canonical java.home/bin/java");
+    }
+    validate_campaign_file_provenance(&payload.runtime.tlc_jar, "campaign TLC jar")?;
+    if let Some(community_modules) = payload.runtime.community_modules.as_ref() {
+        validate_campaign_file_provenance(community_modules, "campaign CommunityModules jar")?;
+    }
+    if let Some(tla_library) = payload.runtime.tla_library.as_ref() {
+        let actual = RuntimeDirectoryProvenance::new(&tla_library.path)
+            .context("revalidate campaign TLA library")?;
+        if &actual != tla_library {
+            bail!("campaign TLA library tree changed after plan creation");
+        }
+    }
+    Ok(())
+}
+
+fn validate_campaign_file_provenance(expected: &RuntimeFileProvenance, label: &str) -> Result<()> {
+    let actual = RuntimeFileProvenance::new(&expected.path)
+        .with_context(|| format!("revalidate {label} {}", expected.path.display()))?;
+    if &actual != expected {
+        bail!("{label} changed after campaign plan creation");
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeCampaignCollectionContext {
+    binding: RuntimeCampaignReportBinding,
+    expected_contract_attestations: Value,
+    plan_payload: RuntimeCampaignPlanPayload,
+}
+
+pub(super) struct CampaignSegmentCollection {
+    summary: SupremacyMatrixSummary,
+    binding: RuntimeCampaignReportBinding,
+}
+
+pub(super) fn collect_campaign_segment(
+    args: &SupremacyMatrixSegmentArgs,
+) -> Result<CampaignSegmentCollection> {
+    if args.mode != SupremacyMode::Enforce {
+        bail!("matrix-segment requires --mode enforce");
+    }
+    let output_dir = required_campaign_output_dir(args.runtime_output_dir.as_deref())?;
+    let (plan, plan_provenance) = load_runtime_campaign_plan(&args.campaign_plan)?;
+    let segment = plan
+        .payload
+        .segments
+        .iter()
+        .find(|segment| segment.segment_id == args.segment_id)
+        .with_context(|| {
+            format!(
+                "segment id {:?} is not present in campaign {}",
+                args.segment_id, plan.campaign_id
+            )
+        })?;
+    if output_dir != segment.output_dir {
+        bail!(
+            "matrix-segment output must match its one allowed campaign path {}",
+            segment.output_dir.display()
+        );
+    }
+    let matrix_args =
+        matrix_args_from_campaign_plan(&plan.payload, output_dir, segment.runtime_specs.clone());
+    validate_matrix_enforce_inputs(&matrix_args)?;
+    let matrix_policy = match matrix_args.policy.as_deref() {
+        Some(path) => super::policy::load_matrix_policy(path)?,
+        None => MatrixPolicy::default(),
+    };
+    let summary = classify_baseline_path_with_policy(&matrix_args.baseline, &matrix_policy)?;
+    validate_campaign_plan_against_current_matrix(&plan.payload, &summary)?;
+    let contract_attestations_sha256 =
+        sha256_ty_canonical_json_v1_value(&plan.payload.contract_attestations)?;
+    let binding = RuntimeCampaignReportBinding {
+        role: "segment".to_string(),
+        campaign_id: plan.campaign_id.clone(),
+        campaign_plan: plan_provenance,
+        contract_attestations_sha256,
+        segment_id: Some(segment.segment_id.clone()),
+        merge_purpose: None,
+        planned_runtime_specs: segment.runtime_specs.clone(),
+        segments: Vec::new(),
+        machine_compatibility_sha256: None,
+        corpus_claim_complete: false,
+        corpus_claim_pass: false,
+    };
+    binding.validate_claim_role()?;
+    let context = RuntimeCampaignCollectionContext {
+        binding,
+        expected_contract_attestations: plan.payload.contract_attestations.clone(),
+        plan_payload: plan.payload.clone(),
+    };
+    let summary = collect_missing_runtime_path_with_campaign(
+        &matrix_args,
+        &summary,
+        &matrix_policy,
+        Some(&context),
+    )?
+    .context("matrix-segment did not produce a refreshed summary")?;
+    if !segment.report_path.is_file() {
+        bail!(
+            "matrix-segment did not write its exact planned report {}",
+            segment.report_path.display()
+        );
+    }
+    Ok(CampaignSegmentCollection {
+        summary,
+        binding: context.binding,
+    })
+}
+
+fn required_campaign_output_dir(path: Option<&Path>) -> Result<PathBuf> {
+    let path = path.context("campaign evidence commands require --runtime-output-dir")?;
+    if !path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+    {
+        bail!("--runtime-output-dir must be an absolute normalized path");
+    }
+    Ok(path.to_path_buf())
+}
+
+fn matrix_args_from_campaign_plan(
+    payload: &RuntimeCampaignPlanPayload,
+    output_dir: PathBuf,
+    runtime_specs: Vec<String>,
+) -> SupremacyMatrixArgs {
+    // This is deliberately not a merge-only executable override. Both
+    // matrix-segment and matrix-merge feed this value through
+    // RuntimeCollectionConfig::from_args in enforce mode, which requires its
+    // canonical path to equal current_exe(). The plan-bound measured binary
+    // is therefore also the only binary allowed to synthesize campaign
+    // segment or aggregate evidence.
+    SupremacyMatrixArgs {
+        baseline: payload.baseline.path.clone(),
+        policy: payload.policy.as_ref().map(|policy| policy.path.clone()),
+        mode: SupremacyMode::Enforce,
+        format: crate::cli_schema::SupremacyOutputFormat::Json,
+        refresh_runtime: true,
+        runtime_scope: SupremacyMatrixRuntimeScope::AllRunnable,
+        runtime_output_dir: Some(output_dir),
+        runtime_limit: None,
+        runtime_specs,
+        runtime_timeout: payload.runtime.timeout_seconds,
+        runtime_runs: payload.runtime.runs,
+        production_runtime: payload.runtime.production_runtime,
+        runtime_ty_bin: Some(payload.runtime.ty_binary.path.clone()),
+        allow_debug_runtime: payload.runtime.allow_debug_runtime,
+        runtime_tlc_jar: Some(payload.runtime.tlc_jar.path.clone()),
+        runtime_community_modules: payload
+            .runtime
+            .community_modules
+            .as_ref()
+            .map(|file| file.path.clone()),
+        runtime_tla_library: payload
+            .runtime
+            .tla_library
+            .as_ref()
+            .map(|directory| directory.path.clone()),
+    }
+}
+
+fn validate_campaign_plan_against_current_matrix(
+    payload: &RuntimeCampaignPlanPayload,
+    summary: &SupremacyMatrixSummary,
+) -> Result<()> {
+    let text = fs::read_to_string(&payload.baseline.path)
+        .with_context(|| format!("read campaign baseline {}", payload.baseline.path.display()))?;
+    let baseline: SpecBaseline = serde_json::from_str(&text).with_context(|| {
+        format!(
+            "parse campaign baseline {}",
+            payload.baseline.path.display()
+        )
+    })?;
+    let examples_dir = super::resolve_examples_dir(baseline.inputs.examples_dir.as_deref());
+    let refresh_plan = matrix_refresh::plan_runtime_refresh_str(
+        &text,
+        &payload.baseline.path,
+        Some(&examples_dir),
+        matrix_refresh::MatrixRefreshScope::AllRunnable,
+    )?;
+    let selection = runtime_batch_selection(summary, &refresh_plan, &[], None)?;
+    if selection.selected_specs != payload.runtime_specs
+        || refresh_plan.blocked_runtime_specs != payload.blocked_runtime_specs
+    {
+        bail!("campaign row universe no longer matches the current baseline refresh plan");
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ValidatedCampaignSegment {
+    binding: RuntimeCampaignReportBinding,
+    rows: Vec<RuntimeEvidenceRow>,
+    manifest: RuntimeCampaignSegmentManifest,
+    machine_compatibility: Value,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeCampaignMergePurpose {
+    Inventory,
+    Superiority,
+}
+
+impl RuntimeCampaignMergePurpose {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Inventory => "inventory",
+            Self::Superiority => "superiority",
+        }
+    }
+
+    fn subcommand(self) -> &'static str {
+        match self {
+            Self::Inventory => "matrix-merge-inventory",
+            Self::Superiority => "matrix-merge",
+        }
+    }
+}
+
+pub(super) fn merge_campaign_inventory(
+    args: &SupremacyMatrixMergeArgs,
+) -> Result<SupremacyMatrixSummary> {
+    merge_campaign_segments_with_purpose(args, RuntimeCampaignMergePurpose::Inventory)
+}
+
+pub(super) fn merge_campaign_segments(
+    args: &SupremacyMatrixMergeArgs,
+) -> Result<SupremacyMatrixSummary> {
+    merge_campaign_segments_with_purpose(args, RuntimeCampaignMergePurpose::Superiority)
+}
+
+fn merge_campaign_segments_with_purpose(
+    args: &SupremacyMatrixMergeArgs,
+    purpose: RuntimeCampaignMergePurpose,
+) -> Result<SupremacyMatrixSummary> {
+    if args.mode != SupremacyMode::Enforce {
+        bail!("{} requires --mode enforce", purpose.subcommand());
+    }
+    let (plan, plan_provenance) = load_runtime_campaign_plan(&args.campaign_plan)?;
+    let output_dir = required_campaign_output_dir(args.runtime_output_dir.as_deref())?;
+    let planned_output = match purpose {
+        RuntimeCampaignMergePurpose::Inventory => &plan.payload.artifacts.inventory_output_dir,
+        RuntimeCampaignMergePurpose::Superiority => &plan.payload.artifacts.superiority_output_dir,
+    };
+    if &output_dir != planned_output {
+        bail!(
+            "{} output must match its one allowed campaign path {}",
+            purpose.subcommand(),
+            planned_output.display()
+        );
+    }
+    if args.segment_reports.len() != plan.payload.segments.len() {
+        bail!(
+            "matrix-merge requires exactly one report for each of {} planned segments; received {}",
+            plan.payload.segments.len(),
+            args.segment_reports.len()
+        );
+    }
+    let observed_report_paths = args.segment_reports.iter().collect::<BTreeSet<_>>();
+    let expected_report_paths = plan
+        .payload
+        .segments
+        .iter()
+        .map(|segment| &segment.report_path)
+        .collect::<BTreeSet<_>>();
+    if observed_report_paths.len() != args.segment_reports.len()
+        || observed_report_paths != expected_report_paths
+    {
+        bail!(
+            "{} requires the exact one-attempt report path for every planned segment",
+            purpose.subcommand()
+        );
+    }
+
+    let full_args = matrix_args_from_campaign_plan(
+        &plan.payload,
+        output_dir.clone(),
+        plan.payload.runtime_specs.clone(),
+    );
+    validate_matrix_enforce_inputs(&full_args)?;
+    let matrix_policy = match full_args.policy.as_deref() {
+        Some(path) => super::policy::load_matrix_policy(path)?,
+        None => MatrixPolicy::default(),
+    };
+    let initial_summary = classify_baseline_path_with_policy(&full_args.baseline, &matrix_policy)?;
+    validate_campaign_plan_against_current_matrix(&plan.payload, &initial_summary)?;
+
+    let mut validated_by_id = BTreeMap::new();
+    for report_path in &args.segment_reports {
+        let validated = validate_campaign_segment_report(&plan, &plan_provenance, report_path)?;
+        if validated_by_id
+            .insert(
+                validated.binding.segment_id.clone().expect("segment role"),
+                validated,
+            )
+            .is_some()
+        {
+            bail!("matrix-merge received duplicate reports for one segment");
+        }
+    }
+
+    let mut rows = Vec::new();
+    let mut manifests = Vec::new();
+    let mut machine_compatibility: Option<Value> = None;
+    for expected in &plan.payload.segments {
+        let validated = validated_by_id
+            .remove(&expected.segment_id)
+            .with_context(|| {
+                format!(
+                    "matrix-merge is missing finalized report for {}",
+                    expected.segment_id
+                )
+            })?;
+        if validated.binding.planned_runtime_specs != expected.runtime_specs {
+            bail!(
+                "segment {} report membership differs from the campaign plan",
+                expected.segment_id
+            );
+        }
+        match machine_compatibility.as_ref() {
+            None => machine_compatibility = Some(validated.machine_compatibility.clone()),
+            Some(first) if first == &validated.machine_compatibility => {}
+            Some(_) => {
+                bail!(
+                    "segment {} was collected on a statically incompatible machine",
+                    expected.segment_id
+                )
+            }
+        }
+        rows.extend(validated.rows);
+        manifests.push(validated.manifest);
+    }
+    if !validated_by_id.is_empty() {
+        bail!("matrix-merge received segment ids not present in the campaign plan");
+    }
+    let merged_specs = rows.iter().map(|row| row.spec.clone()).collect::<Vec<_>>();
+    if merged_specs != plan.payload.runtime_specs {
+        bail!("merged segment rows are not the exact ordered campaign row union");
+    }
+    let unique_specs = merged_specs.iter().collect::<BTreeSet<_>>();
+    if unique_specs.len() != merged_specs.len() {
+        bail!("merged segment rows overlap");
+    }
+    let machine_compatibility =
+        machine_compatibility.context("campaign merge has no machine compatibility record")?;
+    let machine_compatibility_sha256 = sha256_ty_canonical_json_v1_value(&machine_compatibility)?;
+    if manifests
+        .iter()
+        .any(|manifest| manifest.machine_compatibility_sha256 != machine_compatibility_sha256)
+    {
+        bail!("segment machine compatibility digest does not match its sealed snapshot");
+    }
+    validate_campaign_manifest_cover(&plan.payload, &manifests)?;
+
+    let baseline_text = fs::read_to_string(&plan.payload.baseline.path).with_context(|| {
+        format!(
+            "read campaign baseline {}",
+            plan.payload.baseline.path.display()
+        )
+    })?;
+    let baseline_document: SpecBaseline = serde_json::from_str(&baseline_text)?;
+    let original_baseline_value: Value = serde_json::from_str(&baseline_text)?;
+    let examples_dir =
+        super::resolve_examples_dir(baseline_document.inputs.examples_dir.as_deref());
+    let refresh_plan = matrix_refresh::plan_runtime_refresh_str(
+        &baseline_text,
+        &plan.payload.baseline.path,
+        Some(&examples_dir),
+        matrix_refresh::MatrixRefreshScope::AllRunnable,
+    )?;
+    let selection = runtime_batch_selection(
+        &initial_summary,
+        &refresh_plan,
+        &plan.payload.runtime_specs,
+        None,
+    )?;
+    if selection.selected_specs != plan.payload.runtime_specs {
+        bail!("aggregate selection differs from the campaign plan");
+    }
+
+    let cwd = env::current_dir().context("resolve current working directory")?;
+    let repo_root = supremacy_repo_root(&cwd);
+    let pinned_java = resolved_java_runtime_from_campaign_payload(&plan.payload)?;
+    let mut config =
+        RuntimeCollectionConfig::from_args_with_java(&full_args, &repo_root, Some(pinned_java))?;
+    config.observation_storage_contract = Some(plan.payload.observation_storage_contract.clone());
+    fs::create_dir_all(&config.output_dir)
+        .with_context(|| format!("create {}", config.output_dir.display()))?;
+    let mut metadata = RuntimeEvidenceMetadata::collect(
+        &repo_root,
+        &examples_dir,
+        &config.ty_bin,
+        &config.tlc_jar,
+        config.community_modules.as_deref(),
+        config.tla_library.as_deref(),
+        &plan.payload.baseline.path,
+        &config,
+        chrono::Utc::now().to_rfc3339(),
+    )
+    .context("collect aggregate runtime provenance")?;
+    if runtime_campaign_contract_attestations(&metadata)? != plan.payload.contract_attestations {
+        bail!("aggregate runtime/input attestations differ from the campaign plan");
+    }
+    let aggregate_machine = metadata
+        .machine
+        .as_ref()
+        .context("strict aggregate has no machine provenance")
+        .and_then(|machine| runtime_machine_compatibility_from_snapshot(&machine.snapshot))?;
+    if aggregate_machine != machine_compatibility {
+        bail!("aggregate merge ran on a statically incompatible machine");
+    }
+    let provenance_errors = strict_runtime_provenance_errors(&metadata);
+    if !provenance_errors.is_empty() {
+        bail!(
+            "strict aggregate runtime provenance is incomplete: {}",
+            provenance_errors.join("; ")
+        );
+    }
+
+    let contract_attestations_sha256 =
+        sha256_ty_canonical_json_v1_value(&plan.payload.contract_attestations)?;
+    let provisional_binding = RuntimeCampaignReportBinding {
+        role: "aggregate".to_string(),
+        campaign_id: plan.campaign_id.clone(),
+        campaign_plan: plan_provenance.clone(),
+        contract_attestations_sha256,
+        segment_id: None,
+        merge_purpose: Some(purpose.label().to_string()),
+        planned_runtime_specs: plan.payload.runtime_specs.clone(),
+        segments: manifests.clone(),
+        machine_compatibility_sha256: Some(machine_compatibility_sha256.clone()),
+        corpus_claim_complete: false,
+        corpus_claim_pass: false,
+    };
+    let provisional_provenance = RuntimeBaselineProvenance::from_metadata(
+        &metadata,
+        false,
+        &repo_root,
+        &config.output_dir,
+        Some(&provisional_binding),
+    )?;
+    let mut candidate_baseline = original_baseline_value.clone();
+    for row in &rows {
+        if row.collection_outcome == "complete_measurement" {
+            apply_runtime_row(&mut candidate_baseline, row, &provisional_provenance);
+        }
+    }
+    let candidate_summary =
+        classify_baseline_value_with_policy(candidate_baseline, &matrix_policy)?;
+    let corpus_claim_complete = plan.payload.blocked_runtime_specs.is_empty();
+    let has_resource_limit = rows
+        .iter()
+        .any(|row| row.collection_outcome == "resource_limited");
+    let corpus_claim_pass = purpose == RuntimeCampaignMergePurpose::Superiority
+        && corpus_claim_complete
+        && !has_resource_limit
+        && campaign_summary_supports_strict_claim(&candidate_summary);
+    let binding = RuntimeCampaignReportBinding {
+        corpus_claim_complete,
+        corpus_claim_pass,
+        ..provisional_binding
+    };
+    binding.validate_claim_role()?;
+
+    let baseline_provenance = RuntimeBaselineProvenance::from_metadata(
+        &metadata,
+        false,
+        &repo_root,
+        &config.output_dir,
+        Some(&binding),
+    )?;
+    let mut merged_baseline = original_baseline_value;
+    for row in &rows {
+        if row.collection_outcome == "complete_measurement" {
+            apply_runtime_row(&mut merged_baseline, row, &baseline_provenance);
+        }
+    }
+    let runtime_batch_plan = write_runtime_batch_plan(
+        &plan.payload.baseline.path,
+        &config.output_dir,
+        None,
+        &plan.payload.runtime_specs,
+        &selection,
+        &refresh_plan,
+        Some(&binding),
+    )?;
+    metadata.input_revalidation_errors = runtime_input_revalidation_errors(&metadata);
+    validate_campaign_file_provenance(&plan_provenance, "campaign plan during aggregate merge")?;
+    validate_campaign_plan_inputs(&plan.payload)?;
+    validate_campaign_rows_for_merge(&rows, purpose)?;
+    let checkpoint = write_runtime_refresh_checkpoint(
+        &plan.payload.baseline.path,
+        &config,
+        &merged_baseline,
+        &matrix_policy,
+        &runtime_batch_plan,
+        &selection,
+        &refresh_plan,
+        &metadata,
+        &rows,
+        &baseline_provenance,
+        Some(&binding),
+    )?;
+    if !metadata.input_revalidation_errors.is_empty() {
+        bail!(
+            "strict aggregate runtime inputs changed during merge: {}",
+            metadata.input_revalidation_errors.join("; ")
+        );
+    }
+    if !checkpoint.collection_complete {
+        bail!(
+            "strict campaign aggregate is incomplete; no qualifying final receipt may be created (see {})",
+            checkpoint.report_path.display()
+        );
+    }
+    if checkpoint.metadata_refresh == BaselineMetadataRefresh::WarningInserted {
+        bail!(
+            "campaign aggregate baseline carries {RUNTIME_METADATA_WARNING_FIELD}; it is not promotable"
+        );
+    }
+    validate_campaign_file_provenance(
+        &plan_provenance,
+        "campaign plan after final aggregate artifact write",
+    )?;
+    validate_campaign_plan_inputs(&plan.payload)?;
+    let mut revalidated_rows = Vec::new();
+    let mut revalidated_manifests = Vec::new();
+    for segment in &plan.payload.segments {
+        let validated =
+            validate_campaign_segment_report(&plan, &plan_provenance, &segment.report_path)
+                .with_context(|| {
+                    format!(
+                        "revalidate complete dependency closure for {} after aggregate write",
+                        segment.segment_id
+                    )
+                })?;
+        if validated.machine_compatibility != machine_compatibility {
+            bail!(
+                "segment {} machine compatibility changed during aggregate write",
+                segment.segment_id
+            );
+        }
+        revalidated_rows.extend(validated.rows);
+        revalidated_manifests.push(validated.manifest);
+    }
+    if revalidated_manifests != manifests
+        || serde_json::to_value(&revalidated_rows)? != serde_json::to_value(&rows)?
+    {
+        bail!("campaign segment dependency closure changed during aggregate artifact write");
+    }
+    let planned_report = match purpose {
+        RuntimeCampaignMergePurpose::Inventory => &plan.payload.artifacts.inventory_report_path,
+        RuntimeCampaignMergePurpose::Superiority => &plan.payload.artifacts.superiority_report_path,
+    };
+    if checkpoint.report_path.as_path() != planned_report.as_path() {
+        bail!(
+            "{} did not write its exact planned report {}",
+            purpose.subcommand(),
+            planned_report.display()
+        );
+    }
+    if purpose == RuntimeCampaignMergePurpose::Superiority
+        && (!binding.corpus_claim_complete || !binding.corpus_claim_pass)
+    {
+        bail!(
+            "campaign aggregate cannot claim strict full-corpus pass: blocked_runtime_rows={}, matrix_blockers={}",
+            plan.payload.blocked_runtime_specs.len(),
+            checkpoint.summary.strict_blocker_count()
+        );
+    }
+    Ok(checkpoint.summary)
+}
+
+fn campaign_summary_supports_strict_claim(summary: &SupremacyMatrixSummary) -> bool {
+    summary.strict_pass && summary.strict_blocker_count() == 0
+}
+
+fn validate_campaign_rows_for_merge(
+    rows: &[RuntimeEvidenceRow],
+    purpose: RuntimeCampaignMergePurpose,
+) -> Result<()> {
+    for row in rows {
+        validate_campaign_runtime_row_outcome(row)
+            .with_context(|| format!("validate campaign merge row {}", row.spec))?;
+    }
+    let complete_rows = rows
+        .iter()
+        .filter(|row| row.collection_outcome == "complete_measurement")
+        .cloned()
+        .collect::<Vec<_>>();
+    validate_runtime_refresh_rows_promoted(&complete_rows)?;
+    let resource_limited = rows
+        .iter()
+        .filter(|row| row.collection_outcome == "resource_limited")
+        .count();
+    if purpose == RuntimeCampaignMergePurpose::Superiority {
+        if resource_limited != 0 {
+            bail!("campaign superiority is blocked by {resource_limited} resource-limited row(s)");
+        }
+    }
+    Ok(())
+}
+
+fn validate_campaign_manifest_cover(
+    payload: &RuntimeCampaignPlanPayload,
+    manifests: &[RuntimeCampaignSegmentManifest],
+) -> Result<()> {
+    if manifests.len() != payload.segments.len() {
+        bail!(
+            "campaign aggregate requires {} segment manifests, found {}",
+            payload.segments.len(),
+            manifests.len()
+        );
+    }
+    let mut ids = BTreeSet::new();
+    let mut flattened = Vec::new();
+    for (expected, manifest) in payload.segments.iter().zip(manifests.iter()) {
+        if !ids.insert(manifest.segment_id.as_str()) {
+            bail!(
+                "campaign aggregate has duplicate segment manifest {}",
+                manifest.segment_id
+            );
+        }
+        if manifest.segment_id != expected.segment_id {
+            bail!(
+                "campaign aggregate has foreign or out-of-order segment {}; expected {}",
+                manifest.segment_id,
+                expected.segment_id
+            );
+        }
+        if manifest.runtime_specs != expected.runtime_specs {
+            bail!(
+                "campaign aggregate segment {} row membership differs from the plan",
+                manifest.segment_id
+            );
+        }
+        if manifest.report.path != expected.report_path {
+            bail!(
+                "campaign aggregate segment {} report path differs from the plan",
+                manifest.segment_id
+            );
+        }
+        flattened.extend(manifest.runtime_specs.iter().cloned());
+    }
+    if flattened != payload.runtime_specs {
+        bail!("campaign aggregate segment manifests are not the exact planned row union");
+    }
+    Ok(())
+}
+
+fn validate_campaign_segment_report(
+    plan: &RuntimeCampaignPlan,
+    plan_provenance: &RuntimeFileProvenance,
+    report_path: &Path,
+) -> Result<ValidatedCampaignSegment> {
+    if !report_path.is_absolute() {
+        bail!("--segment-report paths must be absolute");
+    }
+    let report_file = RuntimeFileProvenance::new(report_path)
+        .with_context(|| format!("hash segment report {}", report_path.display()))?;
+    if report_file.path != report_path {
+        bail!(
+            "--segment-report must be canonical: expected {}, got {}",
+            report_file.path.display(),
+            report_path.display()
+        );
+    }
+    let (report, _, _) = read_regular_json_nofollow(report_path)?;
+    if report.get("schema").and_then(Value::as_str) != Some(RUNTIME_CAMPAIGN_EVIDENCE_SCHEMA) {
+        bail!("segment report schema must be {RUNTIME_CAMPAIGN_EVIDENCE_SCHEMA}");
+    }
+    let binding: RuntimeCampaignReportBinding = serde_json::from_value(
+        report
+            .get("campaign")
+            .cloned()
+            .context("segment report has no campaign binding")?,
+    )
+    .context("parse segment campaign binding")?;
+    binding.validate_claim_role()?;
+    if binding.role != "segment"
+        || binding.campaign_id != plan.campaign_id
+        || &binding.campaign_plan != plan_provenance
+        || binding.contract_attestations_sha256
+            != sha256_ty_canonical_json_v1_value(&plan.payload.contract_attestations)?
+    {
+        bail!("segment report is not bound to the supplied campaign plan");
+    }
+    let segment_id = binding
+        .segment_id
+        .as_deref()
+        .context("segment report has no segment id")?;
+    let expected = plan
+        .payload
+        .segments
+        .iter()
+        .find(|segment| segment.segment_id == segment_id)
+        .with_context(|| format!("foreign segment id {segment_id:?}"))?;
+    if report_path != expected.report_path {
+        bail!(
+            "segment {segment_id} report path differs from its one allowed campaign path {}",
+            expected.report_path.display()
+        );
+    }
+    if binding.planned_runtime_specs != expected.runtime_specs {
+        bail!("segment {segment_id} planned rows differ from the campaign plan");
+    }
+    if runtime_campaign_contract_attestations_from_report(&report)?
+        != plan.payload.contract_attestations
+    {
+        bail!("segment {segment_id} runtime/input attestations differ from the campaign plan");
+    }
+    let report_storage_contract: ObservationStorageContract = serde_json::from_value(
+        report
+            .get("observation_storage_contract")
+            .cloned()
+            .context("segment report has no observation_storage_contract")?,
+    )
+    .context("parse segment observation storage contract")?;
+    let payload_storage_contract: ObservationStorageContract = serde_json::from_value(
+        report
+            .pointer("/evidence_payload/contract/observation_storage_contract")
+            .cloned()
+            .context("segment evidence payload has no observation storage contract")?,
+    )
+    .context("parse segment evidence-payload observation storage contract")?;
+    if report_storage_contract != plan.payload.observation_storage_contract
+        || payload_storage_contract != plan.payload.observation_storage_contract
+    {
+        bail!("segment {segment_id} observation storage contract differs from the campaign plan");
+    }
+    if json_path(&report, "/baseline", "segment report baseline")? != plan.payload.baseline.path {
+        bail!("segment {segment_id} used a different baseline");
+    }
+    let refreshed_baseline =
+        json_path(&report, "/refreshed_baseline", "segment refreshed baseline")?;
+    validate_finalized_campaign_segment_evidence_path(&refreshed_baseline, &report_file)
+        .with_context(|| {
+            format!("segment {segment_id} has not been finalized by a valid strict receipt")
+        })?;
+    if RuntimeFileProvenance::new(report_path)? != report_file {
+        bail!("segment report changed while it was being validated");
+    }
+    if report.get("collection_complete") != Some(&Value::Bool(true))
+        || report.get("provenance_qualified") != Some(&Value::Bool(true))
+        || report.get("corpus_claim_complete") != Some(&Value::Bool(false))
+        || report.get("corpus_claim_pass") != Some(&Value::Bool(false))
+    {
+        bail!("segment {segment_id} is incomplete, unqualified, or overclaims corpus scope");
+    }
+    for field in [
+        "uncollected_selected_runtime_specs",
+        "provenance_errors",
+        "artifact_errors",
+        "errors",
+    ] {
+        if report
+            .get(field)
+            .and_then(Value::as_array)
+            .is_some_and(|values| !values.is_empty())
+        {
+            bail!("segment {segment_id} report has nonempty {field}");
+        }
+    }
+    let selected: Vec<String> = serde_json::from_value(
+        report
+            .get("selected_runtime_specs")
+            .cloned()
+            .context("segment report has no selected_runtime_specs")?,
+    )?;
+    let collected: Vec<String> = serde_json::from_value(
+        report
+            .get("collected_runtime_specs")
+            .cloned()
+            .context("segment report has no collected_runtime_specs")?,
+    )?;
+    let rows = deserialize_exact_campaign_rows(
+        report.get("rows").context("segment report has no rows")?,
+        segment_id,
+    )?;
+    let row_specs = rows.iter().map(|row| row.spec.clone()).collect::<Vec<_>>();
+    let resource_limited_specs = rows
+        .iter()
+        .filter(|row| row.collection_outcome == "resource_limited")
+        .map(|row| row.spec.clone())
+        .collect::<Vec<_>>();
+    for row in &rows {
+        validate_campaign_runtime_row_outcome(row)
+            .with_context(|| format!("segment {segment_id} row {}", row.spec))?;
+    }
+    let incomplete: Vec<String> = serde_json::from_value(
+        report
+            .get("incomplete_runtime_specs")
+            .cloned()
+            .context("segment report has no incomplete_runtime_specs")?,
+    )?;
+    if incomplete != resource_limited_specs
+        || report.get("measurement_complete")
+            != Some(&Value::Bool(resource_limited_specs.is_empty()))
+    {
+        bail!("segment {segment_id} measurement completeness does not match resource-limit rows");
+    }
+    let blocked_runtime_specs_value = serde_json::to_value(&plan.payload.blocked_runtime_specs)?;
+    if selected != expected.runtime_specs
+        || collected != expected.runtime_specs
+        || row_specs != expected.runtime_specs
+        || report
+            .get("selected_runtime_spec_count")
+            .and_then(Value::as_u64)
+            != Some(expected.runtime_specs.len() as u64)
+        || report
+            .get("collected_runtime_spec_count")
+            .and_then(Value::as_u64)
+            != Some(expected.runtime_specs.len() as u64)
+        || report.get("attempted_all_selected_runtime_specs") != Some(&Value::Bool(true))
+        || report.get("blocked_runtime_specs") != Some(&blocked_runtime_specs_value)
+    {
+        bail!(
+            "segment {segment_id} selected/collected coverage fields are not its exact planned rows"
+        );
+    }
+    let complete_rows = rows
+        .iter()
+        .filter(|row| row.collection_outcome == "complete_measurement")
+        .cloned()
+        .collect::<Vec<_>>();
+    validate_runtime_refresh_rows_promoted(&complete_rows)?;
+    validate_campaign_segment_reconstruction(
+        &report,
+        &report_file,
+        &refreshed_baseline,
+        &binding,
+        plan,
+        &rows,
+    )?;
+
+    let receipt_path = json_path(&report, "/final_receipt_path", "segment final receipt")?;
+    let machine_path = json_path(
+        &report,
+        "/metadata/machine/path",
+        "segment machine provenance",
+    )?;
+    let machine_provenance_id = required_json_string(
+        report.pointer("/metadata/machine/provenance_id"),
+        "segment machine provenance id",
+    )?
+    .to_string();
+    let machine_compatibility = runtime_machine_compatibility_from_report(&report)?;
+    let machine_compatibility_sha256 = sha256_ty_canonical_json_v1_value(&machine_compatibility)?;
+    let evidence_set_id =
+        required_json_string(report.get("evidence_set_id"), "segment evidence_set_id")?.to_string();
+    if !valid_sha256(&evidence_set_id) {
+        bail!("segment {segment_id} evidence_set_id is not a SHA-256 digest");
+    }
+    let manifest = RuntimeCampaignSegmentManifest {
+        segment_id: segment_id.to_string(),
+        runtime_specs: expected.runtime_specs.clone(),
+        evidence_set_id,
+        report: report_file,
+        refreshed_baseline: RuntimeFileProvenance::new(&refreshed_baseline)?,
+        final_receipt: RuntimeFileProvenance::new(&receipt_path)?,
+        machine_provenance: RuntimeFileProvenance::new(&machine_path)?,
+        machine_provenance_id,
+        machine_compatibility_sha256,
+    };
+    Ok(ValidatedCampaignSegment {
+        binding,
+        rows,
+        manifest,
+        machine_compatibility,
+    })
+}
+
+fn validate_campaign_segment_reconstruction(
+    report: &Value,
+    report_file: &RuntimeFileProvenance,
+    finalized_baseline_path: &Path,
+    binding: &RuntimeCampaignReportBinding,
+    plan: &RuntimeCampaignPlan,
+    rows: &[RuntimeEvidenceRow],
+) -> Result<()> {
+    let (original_baseline, _, _) = read_regular_json_nofollow(&plan.payload.baseline.path)?;
+    let provenance =
+        campaign_baseline_provenance_from_report(report, report_file, binding, "segment")?;
+    let reconstructed = reconstruct_campaign_baseline(original_baseline, rows, &provenance)?;
+
+    let finalized_baseline_file = RuntimeFileProvenance::new(finalized_baseline_path)?;
+    let (finalized_baseline, _, _) = read_regular_json_nofollow(finalized_baseline_path)?;
+    if RuntimeFileProvenance::new(finalized_baseline_path)? != finalized_baseline_file {
+        bail!("campaign segment baseline changed during reconstruction validation");
+    }
+    validate_exact_campaign_baseline(&finalized_baseline, &reconstructed, "segment")?;
+
+    let matrix_policy = match plan.payload.policy.as_ref() {
+        Some(policy) => super::policy::load_matrix_policy(&policy.path)?,
+        None => MatrixPolicy::default(),
+    };
+    let summary = classify_baseline_value_with_policy(reconstructed, &matrix_policy)
+        .context("reclassify reconstructed campaign segment baseline")?;
+    let expected_matrix = campaign_segment_summary_value(&summary, binding);
+    let matrix_path = json_path(
+        report,
+        "/matrix_after_refresh",
+        "campaign segment matrix diagnostic",
+    )?;
+    let matrix_file = RuntimeFileProvenance::new(&matrix_path)?;
+    let (matrix, _, _) = read_regular_json_nofollow(&matrix_path)?;
+    if RuntimeFileProvenance::new(&matrix_path)? != matrix_file {
+        bail!("campaign segment matrix diagnostic changed during validation");
+    }
+    if matrix != expected_matrix {
+        bail!("campaign segment matrix diagnostic differs from its reconstructed baseline");
+    }
+    Ok(())
+}
+
+fn validate_campaign_segment_baseline_report_link(
+    baseline: &Value,
+    report_file: &RuntimeFileProvenance,
+) -> Result<()> {
+    let linked_report = json_path(
+        baseline,
+        "/ty_refresh/runtime_evidence_path",
+        "segment baseline runtime evidence",
+    )?;
+    if linked_report != report_file.path {
+        bail!(
+            "segment refreshed baseline is linked to a different runtime report: expected {}, found {}",
+            report_file.path.display(),
+            linked_report.display()
+        );
+    }
+    Ok(())
+}
+
+fn deserialize_exact_campaign_rows(
+    value: &Value,
+    segment_id: &str,
+) -> Result<Vec<RuntimeEvidenceRow>> {
+    let rows: Vec<RuntimeEvidenceRow> =
+        serde_json::from_value(value.clone()).context("parse campaign runtime rows")?;
+    if &serde_json::to_value(&rows)? != value {
+        bail!(
+            "campaign segment {segment_id} rows contain unrecognized or noncanonical measurement fields"
+        );
+    }
+    Ok(rows)
+}
+
+fn runtime_campaign_contract_attestations_from_report(report: &Value) -> Result<Value> {
+    let at = |pointer: &str, label: &str| {
+        report
+            .pointer(pointer)
+            .cloned()
+            .with_context(|| format!("segment report is missing {label}"))
+    };
+    let optional = |pointer: &str| report.pointer(pointer).cloned().unwrap_or(Value::Null);
+    let os_cache_attestation = at("/metadata/benchmark/os_cache_policy", "OS-cache policy")?;
+    let os_cache_attestation_sha256 = sha256_ty_canonical_json_v1_value(&os_cache_attestation)?;
+    Ok(json!({
+        "runtime_contract": {
+            "mode": at("/metadata/benchmark/mode", "benchmark mode")?,
+            "timeout_seconds": at("/metadata/benchmark/timeout_seconds", "timeout")?,
+            "runs": at("/metadata/benchmark/runs", "runs")?,
+            "production_runtime": at("/metadata/benchmark/production_runtime", "production runtime")?,
+            "paired_statistic": at("/metadata/benchmark/paired_statistic", "paired statistic")?,
+            "paired_schedule": at("/metadata/benchmark/paired_schedule", "paired schedule")?,
+            "memory_metric": at("/metadata/benchmark/memory_metric", "memory metric")?,
+            "min_runtime_speedup": at("/metadata/benchmark/min_runtime_speedup", "runtime threshold")?,
+            "max_memory_ratio": at("/metadata/benchmark/max_memory_ratio", "memory threshold")?,
+            "tlc_jvm_args": at("/metadata/benchmark/tlc_jvm_args", "TLC JVM args")?,
+            "ty_environment": at("/metadata/benchmark/ty_environment", "TY environment")?,
+        },
+        "independent_attestations": {
+            "os_cache_policy": {
+                "attestation": os_cache_attestation,
+                "ty_canonical_json_v1_sha256": os_cache_attestation_sha256,
+            },
+            "source_revision": {
+                "reported_git_commit": at("/metadata/ty/git_commit", "reported source revision")?,
+                "build_worktree_dirty": optional("/metadata/ty/build_worktree_dirty"),
+                "workspace_git_commit": optional("/metadata/ty/workspace_git_commit"),
+                "workspace_checkout": at("/metadata/ty/workspace_checkout", "workspace checkout")?,
+            },
+            "ty_binary": at("/metadata/ty/binary", "TY binary")?,
+            "binary_source_build_linkage": {
+                "asserted": false,
+                "meaning": "source revision and TY binary digest are independent attestations"
+            }
+        },
+        "inputs": {
+            "baseline": at("/metadata/benchmark/baseline", "baseline")?,
+            "strict_corpus_manifest": at("/metadata/benchmark/strict_corpus_manifest", "strict corpus manifest")?,
+            "tlc": at("/metadata/tlc", "TLC provenance")?,
+            "community_modules": optional("/metadata/community_modules"),
+            "tla_library": optional("/metadata/tla_library"),
+            "java": at("/metadata/java", "Java provenance")?,
+            "examples_checkout": at("/metadata/examples_checkout", "examples checkout")?,
+        }
+    }))
+}
+
+fn runtime_machine_compatibility_from_report(report: &Value) -> Result<Value> {
+    let snapshot = report
+        .pointer("/metadata/machine/snapshot")
+        .context("segment report has no sealed machine snapshot")?;
+    runtime_machine_compatibility_from_snapshot(snapshot)
+}
+
+fn validate_block_device_stable_identity(value: &Value) -> Result<Value> {
+    let identity = value
+        .as_object()
+        .context("machine snapshot output-storage stable device identity is not an object")?;
+    let expected_fields = ["model", "vendor", "revision", "serial", "wwid"]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if identity.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected_fields {
+        bail!("machine snapshot output-storage stable device identity fields are not exact");
+    }
+    let allowed_paths = |field: &str| -> &'static [&'static str] {
+        match field {
+            "model" => &["device/model"],
+            "vendor" => &["device/vendor"],
+            "revision" => &["device/rev"],
+            "serial" => &["device/serial", "serial"],
+            "wwid" => &["device/wwid", "wwid"],
+            _ => &[],
+        }
+    };
+    let mut normalized = Map::new();
+    for field in ["model", "vendor", "revision", "serial", "wwid"] {
+        let records = identity
+            .get(field)
+            .and_then(Value::as_array)
+            .with_context(|| {
+                format!(
+                    "machine snapshot output-storage stable device identity {field} is not an array"
+                )
+            })?;
+        let mut normalized_records = Vec::with_capacity(records.len());
+        let mut previous_path: Option<&str> = None;
+        for record in records {
+            let record = record.as_object().with_context(|| {
+                format!(
+                    "machine snapshot output-storage stable device identity {field} record is not an object"
+                )
+            })?;
+            let expected_record_fields = ["path", "size_bytes", "sha256"]
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            if record.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected_record_fields
+            {
+                bail!(
+                    "machine snapshot output-storage stable device identity {field} record fields are not exact"
+                );
+            }
+            let path = required_json_string(
+                record.get("path"),
+                &format!("machine snapshot output-storage stable device identity {field} path"),
+            )?;
+            if !allowed_paths(field).contains(&path)
+                || previous_path.is_some_and(|previous| previous >= path)
+            {
+                bail!(
+                    "machine snapshot output-storage stable device identity {field} path is invalid or unsorted"
+                );
+            }
+            previous_path = Some(path);
+            let size_bytes = record
+                .get("size_bytes")
+                .and_then(Value::as_u64)
+                .filter(|size| *size <= 16 * 1024)
+                .with_context(|| {
+                    format!(
+                        "machine snapshot output-storage stable device identity {field} size is invalid"
+                    )
+                })?;
+            let sha256 = required_json_string(
+                record.get("sha256"),
+                &format!("machine snapshot output-storage stable device identity {field} digest"),
+            )?;
+            if !valid_sha256(sha256) {
+                bail!(
+                    "machine snapshot output-storage stable device identity {field} digest is invalid"
+                );
+            }
+            normalized_records.push(json!({
+                "path": path,
+                "size_bytes": size_bytes,
+                "sha256": sha256,
+            }));
+        }
+        normalized.insert(field.to_string(), Value::Array(normalized_records));
+    }
+    Ok(Value::Object(normalized))
+}
+
+fn validate_block_device_queue_configuration(value: &Value) -> Result<Value> {
+    let configuration = value
+        .as_object()
+        .context("machine snapshot output-storage queue configuration is not an object")?;
+    let expected_fields = [
+        "schema",
+        "digest_algorithm",
+        "file_count",
+        "files",
+        "tree_sha256",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    if configuration
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>()
+        != expected_fields
+        || configuration.get("schema").and_then(Value::as_str)
+            != Some("ty.supremacy.block-device-queue-configuration.v1")
+        || configuration
+            .get("digest_algorithm")
+            .and_then(Value::as_str)
+            != Some("sha256_path_nul_size_nul_digest_nul.v1")
+    {
+        bail!("machine snapshot output-storage queue configuration schema is invalid");
+    }
+    let files = configuration
+        .get("files")
+        .and_then(Value::as_array)
+        .context("machine snapshot output-storage queue configuration files are missing")?;
+    let file_count = configuration
+        .get("file_count")
+        .and_then(Value::as_u64)
+        .filter(|count| *count > 0 && *count <= 512)
+        .context("machine snapshot output-storage queue configuration file count is invalid")?;
+    if file_count != files.len() as u64 {
+        bail!("machine snapshot output-storage queue configuration file count is inconsistent");
+    }
+
+    let mut hasher = Sha256::new();
+    let mut normalized_files = Vec::with_capacity(files.len());
+    let mut previous_path: Option<&str> = None;
+    for record in files {
+        let record = record.as_object().context(
+            "machine snapshot output-storage queue configuration file record is not an object",
+        )?;
+        let expected_record_fields = ["path", "size_bytes", "sha256"]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        if record.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected_record_fields {
+            bail!("machine snapshot output-storage queue configuration file fields are not exact");
+        }
+        let path = required_json_string(
+            record.get("path"),
+            "machine snapshot output-storage queue configuration file path",
+        )?;
+        if path.is_empty()
+            || path.contains('\0')
+            || path
+                .split('/')
+                .any(|part| part.is_empty() || matches!(part, "." | ".."))
+            || previous_path.is_some_and(|previous| previous >= path)
+        {
+            bail!(
+                "machine snapshot output-storage queue configuration file path is invalid or unsorted"
+            );
+        }
+        previous_path = Some(path);
+        let size_bytes = record
+            .get("size_bytes")
+            .and_then(Value::as_u64)
+            .filter(|size| *size <= 16 * 1024)
+            .context("machine snapshot output-storage queue configuration file size is invalid")?;
+        let sha256 = required_json_string(
+            record.get("sha256"),
+            "machine snapshot output-storage queue configuration file digest",
+        )?;
+        if !valid_sha256(sha256) {
+            bail!("machine snapshot output-storage queue configuration file digest is invalid");
+        }
+        hasher.update(path.as_bytes());
+        hasher.update([0]);
+        hasher.update(size_bytes.to_string().as_bytes());
+        hasher.update([0]);
+        for pair in sha256.as_bytes().chunks_exact(2) {
+            let pair = std::str::from_utf8(pair)
+                .context("output-storage queue configuration digest is not UTF-8")?;
+            let byte = u8::from_str_radix(pair, 16)
+                .context("output-storage queue configuration digest is not hexadecimal")?;
+            hasher.update([byte]);
+        }
+        hasher.update([0]);
+        normalized_files.push(json!({
+            "path": path,
+            "size_bytes": size_bytes,
+            "sha256": sha256,
+        }));
+    }
+    let tree_sha256 = required_json_string(
+        configuration.get("tree_sha256"),
+        "machine snapshot output-storage queue configuration tree digest",
+    )?;
+    if !valid_sha256(tree_sha256) || tree_sha256 != format!("{:x}", hasher.finalize()) {
+        bail!("machine snapshot output-storage queue configuration tree digest is invalid");
+    }
+    Ok(json!({
+        "schema": "ty.supremacy.block-device-queue-configuration.v1",
+        "digest_algorithm": "sha256_path_nul_size_nul_digest_nul.v1",
+        "file_count": file_count,
+        "files": normalized_files,
+        "tree_sha256": tree_sha256,
+    }))
+}
+
+fn normalized_cpu_processor_identity(
+    cpu: &Map<String, Value>,
+    field: &str,
+    label: &str,
+    expected_processor: Option<u64>,
+) -> Result<Map<String, Value>> {
+    let mut processor = cpu
+        .get(field)
+        .and_then(Value::as_object)
+        .cloned()
+        .with_context(|| format!("machine snapshot has no {label} identity"))?;
+    let nonempty = |name: &str| {
+        processor
+            .get(name)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    };
+    let x86_identity = nonempty("vendor_id") && nonempty("model name");
+    let arm_identity = ["CPU implementer", "CPU architecture", "CPU part"]
+        .into_iter()
+        .all(nonempty);
+    if !x86_identity && !arm_identity {
+        bail!(
+            "machine snapshot {label} has neither an x86 vendor/model identity nor an ARM implementer/architecture/part identity"
+        );
+    }
+    if let Some(expected) = expected_processor {
+        let observed = required_json_string(
+            processor.get("processor"),
+            &format!("machine snapshot {label} processor number"),
+        )?
+        .parse::<u64>()
+        .with_context(|| {
+            format!("machine snapshot {label} processor number is not an unsigned integer")
+        })?;
+        if observed != expected {
+            bail!(
+                "machine snapshot {label} processor number {observed} differs from selected CPU {expected}"
+            );
+        }
+    }
+    // Frequency is sampled and may vary moment to moment; every remaining
+    // field identifies the processor model/topology/microcode contract.
+    processor.remove("cpu MHz");
+    Ok(processor)
+}
+
+fn runtime_machine_compatibility_from_snapshot(snapshot: &Value) -> Result<Value> {
+    let machine = snapshot
+        .get("machine")
+        .and_then(Value::as_object)
+        .context("machine snapshot has no machine object")?;
+    let guest_identity = machine
+        .get("guest_identity")
+        .and_then(Value::as_object)
+        .context("machine snapshot has no stable guest identity")?;
+    if guest_identity.get("schema").and_then(Value::as_str)
+        != Some("ty.supremacy.guest-identity.v1")
+    {
+        bail!("machine snapshot guest identity schema is invalid");
+    }
+    let machine_id_sha256 = required_json_string(
+        guest_identity.get("machine_id_sha256"),
+        "machine snapshot guest machine-id digest",
+    )?;
+    if !valid_sha256(machine_id_sha256) {
+        bail!("machine snapshot guest machine-id digest is invalid");
+    }
+    let dmi_product_uuid_sha256 = match guest_identity.get("dmi_product_uuid_sha256") {
+        Some(Value::Null) => Value::Null,
+        Some(Value::String(digest)) if valid_sha256(digest) => Value::String(digest.clone()),
+        _ => bail!("machine snapshot DMI product-UUID digest is invalid"),
+    };
+
+    let semantic_environment = machine
+        .get("semantic_environment")
+        .and_then(Value::as_object)
+        .context("machine snapshot has no semantic environment contract")?;
+    if semantic_environment.get("schema").and_then(Value::as_str)
+        != Some("ty.supremacy.semantic-environment.v1")
+        || semantic_environment
+            .get("allowlist_schema")
+            .and_then(Value::as_str)
+            != Some("ty.supremacy.strict-child-environment-allowlist.v1")
+    {
+        bail!("machine snapshot semantic environment schema is invalid");
+    }
+    let environment_variables = semantic_environment
+        .get("variables")
+        .and_then(Value::as_object)
+        .context("machine snapshot semantic environment has no variables object")?;
+    let allowed_environment_variables = [
+        "LANG",
+        "LC_ALL",
+        "TZ",
+        "HOME",
+        "PATH",
+        "TLAPLUS_EXAMPLES",
+        "TLC_JAR",
+        "TYTOOLS_JAR",
+        "COMMUNITY_MODULES",
+        "TLA_LIBRARY",
+        "TLA_PLUS_LIBRARY",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    if environment_variables
+        .keys()
+        .any(|key| !allowed_environment_variables.contains(key.as_str()))
+        || environment_variables
+            .values()
+            .any(|value| !value.as_str().is_some_and(|value| !value.is_empty()))
+        || environment_variables.get("LANG").and_then(Value::as_str) != Some("C")
+        || environment_variables.get("LC_ALL").and_then(Value::as_str) != Some("C")
+        || environment_variables.get("TZ").and_then(Value::as_str) != Some("UTC")
+        || !environment_variables.contains_key("HOME")
+        || !environment_variables.contains_key("PATH")
+    {
+        bail!("machine snapshot semantic environment violates the strict allowlist");
+    }
+
+    let output_storage = machine
+        .get("output_storage")
+        .and_then(Value::as_object)
+        .context("machine snapshot has no output-storage mount contract")?;
+    if output_storage.get("schema").and_then(Value::as_str)
+        != Some("ty.supremacy.output-storage-mount.v2")
+        || output_storage.get("selection").and_then(Value::as_str)
+            != Some("deepest_enclosing_mount_of_canonical_existing_output_ancestor")
+    {
+        bail!("machine snapshot output-storage mount schema is invalid");
+    }
+    let expected_output_storage_fields = [
+        "schema",
+        "selection",
+        "device",
+        "filesystem_type",
+        "mount_source",
+        "mount_root",
+        "mount_options",
+        "super_options",
+        "filesystem_traits",
+        "block_device_identity",
+        "block_device_queue_source",
+        "block_device_traits",
+        "block_device_queue_configuration",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    if output_storage
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>()
+        != expected_output_storage_fields
+    {
+        bail!("machine snapshot output-storage mount fields are not exact");
+    }
+    let storage_device = output_storage
+        .get("device")
+        .and_then(Value::as_object)
+        .context("machine snapshot output-storage device is missing")?;
+    if storage_device
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>()
+        != ["st_dev", "major", "minor", "major_minor"]
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+    {
+        bail!("machine snapshot output-storage device fields are not exact");
+    }
+    let st_dev = storage_device
+        .get("st_dev")
+        .and_then(Value::as_u64)
+        .context("machine snapshot output-storage st_dev is invalid")?;
+    let storage_major = storage_device
+        .get("major")
+        .and_then(Value::as_u64)
+        .context("machine snapshot output-storage major is invalid")?;
+    let storage_minor = storage_device
+        .get("minor")
+        .and_then(Value::as_u64)
+        .context("machine snapshot output-storage minor is invalid")?;
+    let major_minor = required_json_string(
+        storage_device.get("major_minor"),
+        "machine snapshot output-storage major:minor",
+    )?;
+    if major_minor != format!("{storage_major}:{storage_minor}") {
+        bail!("machine snapshot output-storage major:minor is inconsistent");
+    }
+    let filesystem_type = required_json_string(
+        output_storage.get("filesystem_type"),
+        "machine snapshot output-storage filesystem type",
+    )?;
+    let mount_source = required_json_string(
+        output_storage.get("mount_source"),
+        "machine snapshot output-storage mount source",
+    )?;
+    let mount_root = required_json_string(
+        output_storage.get("mount_root"),
+        "machine snapshot output-storage mount root",
+    )?;
+    let normalized_string_array = |field: &str| -> Result<Value> {
+        let values = output_storage
+            .get(field)
+            .and_then(Value::as_array)
+            .with_context(|| format!("machine snapshot output-storage {field} is not an array"))?;
+        let strings = values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .with_context(|| {
+                        format!("machine snapshot output-storage {field} has an invalid option")
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut normalized = strings.clone();
+        normalized.sort();
+        normalized.dedup();
+        if normalized != strings {
+            bail!("machine snapshot output-storage {field} is not sorted and unique");
+        }
+        Ok(serde_json::to_value(normalized)?)
+    };
+    let mount_options = normalized_string_array("mount_options")?;
+    let super_options = normalized_string_array("super_options")?;
+    let filesystem_traits = output_storage
+        .get("filesystem_traits")
+        .and_then(Value::as_object)
+        .context("machine snapshot output-storage filesystem traits are missing")?;
+    if filesystem_traits
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>()
+        != ["block_size", "fragment_size", "flags", "name_max"]
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+    {
+        bail!("machine snapshot output-storage filesystem trait fields are not exact");
+    }
+    let required_storage_trait = |field: &str, positive: bool| -> Result<u64> {
+        let value = filesystem_traits
+            .get(field)
+            .and_then(Value::as_u64)
+            .with_context(|| {
+                format!("machine snapshot output-storage filesystem trait {field} is invalid")
+            })?;
+        if positive && value == 0 {
+            bail!("machine snapshot output-storage filesystem trait {field} must be positive");
+        }
+        Ok(value)
+    };
+    let block_size = required_storage_trait("block_size", true)?;
+    let fragment_size = required_storage_trait("fragment_size", true)?;
+    let filesystem_flags = required_storage_trait("flags", false)?;
+    let name_max = required_storage_trait("name_max", true)?;
+    let block_device_identity = output_storage
+        .get("block_device_identity")
+        .and_then(Value::as_object)
+        .context("machine snapshot output-storage block-device identity is missing")?;
+    let expected_identity_fields = [
+        "kind",
+        "kernel_name",
+        "major",
+        "minor",
+        "major_minor",
+        "sysfs_path_sha256",
+        "partition",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    if block_device_identity
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>()
+        != expected_identity_fields
+    {
+        bail!("machine snapshot output-storage block-device identity fields are not exact");
+    }
+    let block_kind = required_json_string(
+        block_device_identity.get("kind"),
+        "machine snapshot output-storage block-device kind",
+    )?;
+    if !matches!(block_kind, "whole_device" | "partition") {
+        bail!("machine snapshot output-storage block-device kind is invalid");
+    }
+    let block_kernel_name = required_json_string(
+        block_device_identity.get("kernel_name"),
+        "machine snapshot output-storage block-device kernel name",
+    )?;
+    let block_major = block_device_identity
+        .get("major")
+        .and_then(Value::as_u64)
+        .context("machine snapshot output-storage block-device major is invalid")?;
+    let block_minor = block_device_identity
+        .get("minor")
+        .and_then(Value::as_u64)
+        .context("machine snapshot output-storage block-device minor is invalid")?;
+    let block_major_minor = required_json_string(
+        block_device_identity.get("major_minor"),
+        "machine snapshot output-storage block-device major:minor",
+    )?;
+    let block_sysfs_sha256 = required_json_string(
+        block_device_identity.get("sysfs_path_sha256"),
+        "machine snapshot output-storage block-device sysfs-path digest",
+    )?;
+    if block_kernel_name.is_empty()
+        || block_major != storage_major
+        || block_minor != storage_minor
+        || block_major_minor != format!("{block_major}:{block_minor}")
+        || !valid_sha256(block_sysfs_sha256)
+    {
+        bail!("machine snapshot output-storage block-device identity is inconsistent");
+    }
+    let normalized_partition = match (block_kind, block_device_identity.get("partition")) {
+        ("whole_device", Some(Value::Null)) => Value::Null,
+        ("partition", Some(Value::Object(partition))) => {
+            let expected_partition_fields =
+                ["number", "start_512_byte_sectors", "size_512_byte_sectors"]
+                    .into_iter()
+                    .collect::<BTreeSet<_>>();
+            if partition
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>()
+                != expected_partition_fields
+            {
+                bail!("machine snapshot output-storage partition fields are not exact");
+            }
+            let number = partition
+                .get("number")
+                .and_then(Value::as_u64)
+                .filter(|value| *value > 0)
+                .context("machine snapshot output-storage partition number is invalid")?;
+            let start = partition
+                .get("start_512_byte_sectors")
+                .and_then(Value::as_u64)
+                .context("machine snapshot output-storage partition start is invalid")?;
+            let size = partition
+                .get("size_512_byte_sectors")
+                .and_then(Value::as_u64)
+                .filter(|value| *value > 0)
+                .context("machine snapshot output-storage partition size is invalid")?;
+            json!({
+                "number": number,
+                "start_512_byte_sectors": start,
+                "size_512_byte_sectors": size,
+            })
+        }
+        _ => bail!("machine snapshot output-storage partition identity is inconsistent"),
+    };
+    let queue_source = output_storage
+        .get("block_device_queue_source")
+        .and_then(Value::as_object)
+        .context("machine snapshot output-storage block queue source is missing")?;
+    let expected_queue_fields = [
+        "kernel_name",
+        "major",
+        "minor",
+        "major_minor",
+        "sysfs_path_sha256",
+        "relationship",
+        "device_mapper",
+        "size_512_byte_sectors",
+        "stable_identity",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    if queue_source
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>()
+        != expected_queue_fields
+        || queue_source.get("device_mapper") != Some(&Value::Null)
+    {
+        bail!("machine snapshot output-storage block queue-source fields are not exact");
+    }
+    let queue_kernel_name = required_json_string(
+        queue_source.get("kernel_name"),
+        "machine snapshot output-storage queue-source kernel name",
+    )?;
+    let queue_major = queue_source
+        .get("major")
+        .and_then(Value::as_u64)
+        .context("machine snapshot output-storage queue-source major is invalid")?;
+    let queue_minor = queue_source
+        .get("minor")
+        .and_then(Value::as_u64)
+        .context("machine snapshot output-storage queue-source minor is invalid")?;
+    let queue_major_minor = required_json_string(
+        queue_source.get("major_minor"),
+        "machine snapshot output-storage queue-source major:minor",
+    )?;
+    let queue_sysfs_sha256 = required_json_string(
+        queue_source.get("sysfs_path_sha256"),
+        "machine snapshot output-storage queue-source sysfs-path digest",
+    )?;
+    let queue_relationship = required_json_string(
+        queue_source.get("relationship"),
+        "machine snapshot output-storage queue-source relationship",
+    )?;
+    let queue_size = queue_source
+        .get("size_512_byte_sectors")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .context("machine snapshot output-storage queue-source size is invalid")?;
+    if queue_kernel_name.is_empty()
+        || queue_major_minor != format!("{queue_major}:{queue_minor}")
+        || !valid_sha256(queue_sysfs_sha256)
+        || !matches!(queue_relationship, "mounted_device" | "partition_parent")
+        || (block_kind == "whole_device"
+            && (queue_relationship != "mounted_device"
+                || queue_major != block_major
+                || queue_minor != block_minor))
+        || (block_kind == "partition" && queue_relationship != "partition_parent")
+    {
+        bail!("machine snapshot output-storage block queue-source identity is inconsistent");
+    }
+    let stable_identity = validate_block_device_stable_identity(
+        queue_source
+            .get("stable_identity")
+            .context("machine snapshot output-storage stable device identity is missing")?,
+    )?;
+    let block_device_traits = output_storage
+        .get("block_device_traits")
+        .and_then(Value::as_object)
+        .context("machine snapshot output-storage block-device traits are missing")?;
+    let expected_block_trait_fields = [
+        "logical_block_size",
+        "physical_block_size",
+        "minimum_io_size",
+        "optimal_io_size",
+        "discard_granularity",
+        "rotational",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    if block_device_traits
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>()
+        != expected_block_trait_fields
+    {
+        bail!("machine snapshot output-storage block-device trait fields are not exact");
+    }
+    let mut normalized_block_traits = Map::new();
+    for field in [
+        "logical_block_size",
+        "physical_block_size",
+        "minimum_io_size",
+        "optimal_io_size",
+        "discard_granularity",
+        "rotational",
+    ] {
+        let value = block_device_traits.get(field).with_context(|| {
+            format!("machine snapshot output-storage block trait {field} is missing")
+        })?;
+        if !value.is_null() && value.as_u64().is_none() {
+            bail!("machine snapshot output-storage block trait {field} is invalid");
+        }
+        normalized_block_traits.insert(field.to_string(), value.clone());
+    }
+    let queue_configuration = validate_block_device_queue_configuration(
+        output_storage
+            .get("block_device_queue_configuration")
+            .context("machine snapshot output-storage queue configuration is missing")?,
+    )?;
+    let uname = machine
+        .get("uname")
+        .and_then(Value::as_object)
+        .context("machine snapshot has no uname identity")?;
+    for field in ["system", "node", "release", "machine"] {
+        required_json_string(uname.get(field), &format!("machine snapshot uname.{field}"))?;
+    }
+    let os_release = machine
+        .get("os_release")
+        .and_then(Value::as_object)
+        .context("machine snapshot has no OS release identity")?;
+    required_json_string(os_release.get("ID"), "machine snapshot os_release.ID")?;
+    required_json_string(
+        machine.get("kernel_command_line"),
+        "machine snapshot kernel command line",
+    )?;
+    required_json_string(machine.get("clocksource"), "machine snapshot clocksource")?;
+    let cpu = machine
+        .get("cpu")
+        .and_then(Value::as_object)
+        .context("machine snapshot has no CPU object")?;
+    let logical_count = cpu
+        .get("logical_count")
+        .and_then(Value::as_u64)
+        .filter(|count| *count > 0)
+        .context("machine snapshot has no positive logical CPU count")?;
+    let selected_cpu = cpu
+        .get("selected")
+        .and_then(Value::as_u64)
+        .filter(|selected| *selected < logical_count)
+        .context("machine snapshot selected CPU is absent or out of range")?;
+    let first_processor =
+        normalized_cpu_processor_identity(cpu, "first_processor", "first processor", None)?;
+    let selected_processor = normalized_cpu_processor_identity(
+        cpu,
+        "selected_processor",
+        "selected processor",
+        Some(selected_cpu),
+    )?;
+    required_json_string(cpu.get("online"), "machine snapshot online CPU set")?;
+    for field in ["offline", "isolated", "nohz_full"] {
+        if !cpu.get(field).is_some_and(Value::is_string) {
+            bail!("machine snapshot CPU field {field} must be a string");
+        }
+    }
+    let topology = cpu
+        .get("selected_topology")
+        .and_then(Value::as_object)
+        .context("machine snapshot has no selected CPU topology")?;
+    for field in ["core_id", "physical_package_id", "thread_siblings_list"] {
+        required_json_string(
+            topology.get(field),
+            &format!("machine snapshot selected_topology.{field}"),
+        )?;
+    }
+    for field in ["scaling_governor", "scaling_driver"] {
+        match topology.get(field) {
+            Some(Value::Null) => {}
+            Some(Value::String(value)) if !value.trim().is_empty() => {}
+            _ => {
+                bail!(
+                    "machine snapshot selected_topology.{field} must be a nonempty string or explicit null"
+                )
+            }
+        }
+    }
+    for field in ["intel_pstate_no_turbo", "cpufreq_boost"] {
+        if !cpu.contains_key(field) {
+            bail!("machine snapshot is missing CPU control field {field}");
+        }
+    }
+    let memory = machine
+        .get("memory")
+        .and_then(Value::as_object)
+        .context("machine snapshot has no memory object")?;
+    for field in ["MemTotal", "SwapTotal", "Hugepagesize"] {
+        required_json_string(
+            memory.get(field),
+            &format!("machine snapshot memory.{field}"),
+        )?;
+    }
+    let active_swap = machine
+        .get("active_swap")
+        .and_then(Value::as_array)
+        .context("machine snapshot active_swap must be an array")?;
+    let mut static_swap = active_swap
+        .iter()
+        .map(|entry| {
+            let entry = entry
+                .as_object()
+                .context("machine snapshot active_swap entry must be an object")?;
+            for field in ["filename", "type", "size_kib", "priority"] {
+                required_json_string(
+                    entry.get(field),
+                    &format!("machine snapshot active_swap.{field}"),
+                )?;
+            }
+            Ok(json!({
+                "filename": entry.get("filename"),
+                "type": entry.get("type"),
+                "size_kib": entry.get("size_kib"),
+                "priority": entry.get("priority"),
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    static_swap.sort_by(|left, right| {
+        left.get("filename")
+            .and_then(Value::as_str)
+            .cmp(&right.get("filename").and_then(Value::as_str))
+    });
+    let static_memory = ["MemTotal", "SwapTotal", "Hugepagesize"]
+        .into_iter()
+        .map(|key| {
+            (
+                key.to_string(),
+                memory.get(key).cloned().unwrap_or(Value::Null),
+            )
+        })
+        .collect::<Map<_, _>>();
+    Ok(json!({
+        "schema": "ty.supremacy.machine_compatibility.v2",
+        "guest_identity": {
+            "schema": "ty.supremacy.guest-identity.v1",
+            "machine_id_sha256": machine_id_sha256,
+            "dmi_product_uuid_sha256": dmi_product_uuid_sha256,
+        },
+        "semantic_environment": {
+            "schema": "ty.supremacy.semantic-environment.v1",
+            "allowlist_schema": "ty.supremacy.strict-child-environment-allowlist.v1",
+            "variables": environment_variables,
+        },
+        "output_storage": {
+            "schema": "ty.supremacy.output-storage-mount.v2",
+            "selection": "deepest_enclosing_mount_of_canonical_existing_output_ancestor",
+            "device": {
+                "st_dev": st_dev,
+                "major": storage_major,
+                "minor": storage_minor,
+                "major_minor": major_minor,
+            },
+            "filesystem_type": filesystem_type,
+            "mount_source": mount_source,
+            "mount_root": mount_root,
+            "mount_options": mount_options,
+            "super_options": super_options,
+            "filesystem_traits": {
+                "block_size": block_size,
+                "fragment_size": fragment_size,
+                "flags": filesystem_flags,
+                "name_max": name_max,
+            },
+            "block_device_identity": {
+                "kind": block_kind,
+                "kernel_name": block_kernel_name,
+                "major": block_major,
+                "minor": block_minor,
+                "major_minor": block_major_minor,
+                "sysfs_path_sha256": block_sysfs_sha256,
+                "partition": normalized_partition,
+            },
+            "block_device_queue_source": {
+                "kernel_name": queue_kernel_name,
+                "major": queue_major,
+                "minor": queue_minor,
+                "major_minor": queue_major_minor,
+                "sysfs_path_sha256": queue_sysfs_sha256,
+                "relationship": queue_relationship,
+                "device_mapper": null,
+                "size_512_byte_sectors": queue_size,
+                "stable_identity": stable_identity,
+            },
+            "block_device_traits": normalized_block_traits,
+            "block_device_queue_configuration": queue_configuration,
+        },
+        "uname": machine.get("uname").cloned().unwrap_or(Value::Null),
+        "os_release": machine.get("os_release").cloned().unwrap_or(Value::Null),
+        "kernel_command_line": machine.get("kernel_command_line").cloned().unwrap_or(Value::Null),
+        "clocksource": machine.get("clocksource").cloned().unwrap_or(Value::Null),
+        "cpu": {
+            "logical_count": logical_count,
+            "first_processor": first_processor,
+            "selected_processor": selected_processor,
+            "online": cpu.get("online").cloned().unwrap_or(Value::Null),
+            "offline": cpu.get("offline").cloned().unwrap_or(Value::Null),
+            "isolated": cpu.get("isolated").cloned().unwrap_or(Value::Null),
+            "nohz_full": cpu.get("nohz_full").cloned().unwrap_or(Value::Null),
+            "selected": selected_cpu,
+            "selected_topology": cpu.get("selected_topology").cloned().unwrap_or(Value::Null),
+            "intel_pstate_no_turbo": cpu.get("intel_pstate_no_turbo").cloned().unwrap_or(Value::Null),
+            "cpufreq_boost": cpu.get("cpufreq_boost").cloned().unwrap_or(Value::Null),
+        },
+        "memory": static_memory,
+        "active_swap": static_swap,
+    }))
 }
 
 pub(super) fn collect_missing_runtime_path(
@@ -659,10 +9292,23 @@ pub(super) fn collect_missing_runtime_path(
     summary: &SupremacyMatrixSummary,
     matrix_policy: &MatrixPolicy,
 ) -> Result<Option<SupremacyMatrixSummary>> {
+    collect_missing_runtime_path_with_campaign(args, summary, matrix_policy, None)
+}
+
+fn collect_missing_runtime_path_with_campaign(
+    args: &SupremacyMatrixArgs,
+    summary: &SupremacyMatrixSummary,
+    matrix_policy: &MatrixPolicy,
+    campaign: Option<&RuntimeCampaignCollectionContext>,
+) -> Result<Option<SupremacyMatrixSummary>> {
     if !args.refresh_runtime {
         return Ok(None);
     }
-    validate_matrix_runtime_refresh_policy(args.mode, args.allow_debug_runtime)?;
+    validate_matrix_runtime_refresh_policy(
+        args.mode,
+        args.allow_debug_runtime,
+        args.refresh_runtime,
+    )?;
 
     let baseline_path = &args.baseline;
     let text = fs::read_to_string(baseline_path)
@@ -671,14 +9317,33 @@ pub(super) fn collect_missing_runtime_path(
         .with_context(|| format!("parse baseline {}", baseline_path.display()))?;
     let mut baseline_value: Value = serde_json::from_str(&text)
         .with_context(|| format!("parse baseline value {}", baseline_path.display()))?;
-    let repo_root = env::current_dir().context("resolve current working directory")?;
-    let config = RuntimeCollectionConfig::from_args(args, &repo_root)?;
-    let examples_dir = baseline
-        .inputs
-        .examples_dir
-        .clone()
-        .or_else(default_examples_dir)
-        .context("baseline inputs.examples_dir is absent and HOME is not set")?;
+    let cwd = env::current_dir().context("resolve current working directory")?;
+    let repo_root = supremacy_repo_root(&cwd);
+    let pinned_java = campaign
+        .map(|context| resolved_java_runtime_from_campaign_payload(&context.plan_payload))
+        .transpose()?;
+    let mut config = RuntimeCollectionConfig::from_args_with_java(args, &repo_root, pinned_java)?;
+    config.observation_storage_contract =
+        campaign.map(|context| context.plan_payload.observation_storage_contract.clone());
+    config.observation_storage_binding = campaign
+        .map(|context| {
+            Ok::<ObservationStorageBinding, anyhow::Error>(ObservationStorageBinding {
+                campaign_id: context.binding.campaign_id.clone(),
+                campaign_plan_sha256: context.binding.campaign_plan.sha256.clone(),
+                segment_id: context
+                    .binding
+                    .segment_id
+                    .clone()
+                    .context("campaign segment binding has no segment id")?,
+                segment_output_dir: config.output_dir.clone(),
+                segment_payload_dir: config.output_dir.join(OBSERVATION_PAYLOAD_DIRECTORY_NAME),
+                contract_sha256: sha256_ty_canonical_json_v1_value(&serde_json::to_value(
+                    &context.plan_payload.observation_storage_contract,
+                )?)?,
+            })
+        })
+        .transpose()?;
+    let examples_dir = super::resolve_examples_dir(baseline.inputs.examples_dir.as_deref());
     let refresh_scope = runtime_refresh_scope(args.runtime_scope, &args.runtime_specs);
     let refresh_plan = matrix_refresh::plan_runtime_refresh_str(
         &text,
@@ -707,6 +9372,7 @@ pub(super) fn collect_missing_runtime_path(
         &args.runtime_specs,
         &selection,
         &refresh_plan,
+        campaign.map(|context| &context.binding),
     )?;
     eprintln!(
         "[supremacy] matrix runtime batch plan: {} selected, {} batchable selected runtime rows, {} blocked; wrote {}",
@@ -730,24 +9396,50 @@ pub(super) fn collect_missing_runtime_path(
                 &config.ty_bin,
                 &config.output_dir,
                 &repo_root,
-                config.timeout_seconds,
-                &config.ty_base_env,
+                &config,
             )?;
         }
     }
-    let metadata = RuntimeEvidenceMetadata::collect(
+    let mut metadata = RuntimeEvidenceMetadata::collect(
         &repo_root,
         &examples_dir,
         &config.ty_bin,
         &tlc_jar,
+        config.community_modules.as_deref(),
+        config.tla_library.as_deref(),
+        baseline_path,
+        &config,
         chrono::Utc::now().to_rfc3339(),
     )
     .context("collect matrix runtime provenance")?;
-    let baseline_provenance =
-        RuntimeBaselineProvenance::from_metadata(&metadata, config.allow_debug_runtime);
+    if let Some(campaign) = campaign {
+        let observed = runtime_campaign_contract_attestations(&metadata)?;
+        if observed != campaign.expected_contract_attestations {
+            bail!("campaign runtime/input attestations differ from the digest-bound campaign plan");
+        }
+        let machine = metadata
+            .machine
+            .as_ref()
+            .context("campaign segment has no machine provenance")?;
+        runtime_machine_compatibility_from_snapshot(&machine.snapshot)
+            .context("campaign segment machine snapshot is not merge-compatible")?;
+    }
+    let provenance_errors = strict_runtime_provenance_errors(&metadata);
+    if config.mode == SupremacyMode::Enforce && !provenance_errors.is_empty() {
+        bail!(
+            "strict matrix runtime provenance is incomplete: {}",
+            provenance_errors.join("; ")
+        );
+    }
+    let baseline_provenance = RuntimeBaselineProvenance::from_metadata(
+        &metadata,
+        config.allow_debug_runtime,
+        &repo_root,
+        &config.output_dir,
+        campaign.map(|context| &context.binding),
+    )?;
 
     let mut rows = Vec::new();
-    let mut checkpoint = None;
     for row in &selection.selected_rows {
         let Some(entry) = baseline.specs.get(&row.spec) else {
             continue;
@@ -764,16 +9456,26 @@ pub(super) fn collect_missing_runtime_path(
         ) {
             Ok(collected) => collected,
             Err(error) => {
-                eprintln!(
-                    "[supremacy] {}: runtime collection failed; recording row error and continuing: {error:#}",
-                    row.spec
-                );
-                runtime_collection_error_row(&row.spec, &config.output_dir, &error)
+                if let Some(limit) = error.downcast_ref::<ObservationStorageLimitError>() {
+                    eprintln!(
+                        "[supremacy] {}: observation storage limit captured; recording a typed inventory blocker and continuing: {limit}",
+                        row.spec
+                    );
+                    runtime_resource_limit_row(&row.spec, &config.output_dir, limit)?
+                } else {
+                    eprintln!(
+                        "[supremacy] {}: runtime collection failed; recording row error and continuing: {error:#}",
+                        row.spec
+                    );
+                    runtime_collection_error_row(&row.spec, &config.output_dir, &error)?
+                }
             }
         };
-        apply_runtime_row(&mut baseline_value, &collected, &baseline_provenance);
+        if collected.collection_outcome == "complete_measurement" {
+            apply_runtime_row(&mut baseline_value, &collected, &baseline_provenance);
+        }
         rows.push(collected);
-        checkpoint = Some(write_runtime_refresh_checkpoint(
+        let _provisional_checkpoint = write_runtime_refresh_checkpoint(
             baseline_path,
             &config,
             &baseline_value,
@@ -784,23 +9486,33 @@ pub(super) fn collect_missing_runtime_path(
             &metadata,
             &rows,
             &baseline_provenance,
-        )?);
+            campaign.map(|context| &context.binding),
+        )?;
     }
-    let checkpoint = match checkpoint {
-        Some(checkpoint) => checkpoint,
-        None => write_runtime_refresh_checkpoint(
-            baseline_path,
-            &config,
-            &baseline_value,
-            matrix_policy,
-            &runtime_batch_plan,
-            &selection,
-            &refresh_plan,
-            &metadata,
-            &rows,
-            &baseline_provenance,
-        )?,
-    };
+    metadata.input_revalidation_errors = runtime_input_revalidation_errors(&metadata);
+    if let Some(campaign) = campaign {
+        validate_campaign_file_provenance(
+            &campaign.binding.campaign_plan,
+            "campaign plan during segment collection",
+        )?;
+        validate_campaign_plan_inputs(&campaign.plan_payload)?;
+    }
+    // Always rewrite the final checkpoint after end-of-suite input
+    // revalidation. Earlier checkpoints are explicitly provisional recovery
+    // artifacts and must not be promoted.
+    let checkpoint = write_runtime_refresh_checkpoint(
+        baseline_path,
+        &config,
+        &baseline_value,
+        matrix_policy,
+        &runtime_batch_plan,
+        &selection,
+        &refresh_plan,
+        &metadata,
+        &rows,
+        &baseline_provenance,
+        campaign.map(|context| &context.binding),
+    )?;
     if checkpoint.metadata_refresh == BaselineMetadataRefresh::WarningInserted {
         eprintln!(
             "[supremacy] matrix runtime metadata warning: refreshed baseline carries {RUNTIME_METADATA_WARNING_FIELD}"
@@ -813,7 +9525,19 @@ pub(super) fn collect_missing_runtime_path(
         checkpoint.matrix_after_refresh.display()
     );
     if args.mode == SupremacyMode::Enforce {
-        validate_runtime_refresh_rows_promoted(&rows)?;
+        if !metadata.input_revalidation_errors.is_empty() {
+            bail!(
+                "strict matrix runtime inputs changed during collection: {}",
+                metadata.input_revalidation_errors.join("; ")
+            );
+        }
+        validate_strict_runtime_collection_outcomes(&rows, checkpoint.measurement_complete)?;
+        if !checkpoint.collection_complete {
+            bail!(
+                "strict matrix runtime evidence collection is incomplete; no qualifying final receipt may be created (see {})",
+                checkpoint.report_path.display()
+            );
+        }
     }
     if args.mode == SupremacyMode::Enforce
         && checkpoint.metadata_refresh == BaselineMetadataRefresh::WarningInserted
@@ -821,6 +9545,13 @@ pub(super) fn collect_missing_runtime_path(
         bail!(
             "refreshed runtime baseline carries {RUNTIME_METADATA_WARNING_FIELD}; it is not valid enforce-mode evidence"
         );
+    }
+    if let Some(campaign) = campaign {
+        validate_campaign_file_provenance(
+            &campaign.binding.campaign_plan,
+            "campaign plan after final segment artifact write",
+        )?;
+        validate_campaign_plan_inputs(&campaign.plan_payload)?;
     }
     Ok(Some(checkpoint.summary))
 }
@@ -1154,6 +9885,8 @@ fn missing_runtime_side_rank(tlc_seconds: Option<f64>, ty_seconds: Option<f64>) 
 #[derive(Serialize)]
 struct RuntimeBatchPlanReport<'a> {
     schema: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    campaign: Option<&'a RuntimeCampaignReportBinding>,
     baseline: &'a Path,
     output_dir: &'a Path,
     runtime_limit: Option<usize>,
@@ -1170,10 +9903,16 @@ fn write_runtime_batch_plan(
     explicit_runtime_specs: &[String],
     selection: &RuntimeBatchSelection<'_>,
     refresh_plan: &matrix_refresh::MatrixRefreshPlan,
+    campaign: Option<&RuntimeCampaignReportBinding>,
 ) -> Result<PathBuf> {
     let path = output_dir.join("runtime_batch_plan.json");
     let report = RuntimeBatchPlanReport {
-        schema: RUNTIME_BATCH_PLAN_SCHEMA,
+        schema: if campaign.is_some() {
+            RUNTIME_CAMPAIGN_BATCH_PLAN_SCHEMA
+        } else {
+            RUNTIME_BATCH_PLAN_SCHEMA
+        },
+        campaign,
         baseline,
         output_dir,
         runtime_limit,
@@ -1220,7 +9959,7 @@ fn classify_baseline(
     corpus: SupremacyMatrixCorpusIdentity,
 ) -> SupremacyMatrixSummary {
     let build_identity = SupremacyMatrixBuildIdentity::from_refresh(baseline.ty_refresh.as_ref());
-    let examples_dir = baseline.inputs.examples_dir.clone();
+    let examples_dir = verified_examples_source_dir(&baseline.inputs);
     let mut counts = SupremacyMatrixCounts::default();
     let mut rows = Vec::with_capacity(baseline.specs.len());
 
@@ -1230,13 +9969,16 @@ fn classify_baseline(
         rows.push(row);
     }
     assign_perf_loser_ranks(&mut rows);
-    let strict_blockers = counts.strict_blocker_count();
+    let strict_blockers = rows
+        .iter()
+        .filter(|row| row.eligible && !row_is_strict_pass(row))
+        .count();
     let strict_pass = strict_blockers == 0;
     let missing_runtime_diagnostics = SupremacyMatrixMissingRuntimeDiagnostics::from_rows(&rows);
     let next_action_counts = next_action_counts(&rows);
     let policy = matrix_policy
         .has_comparable_outcome_opt_in()
-        .then(|| SupremacyMatrixPolicySummary::from_counts(&counts, matrix_policy));
+        .then(|| SupremacyMatrixPolicySummary::from_rows(&rows, &counts, matrix_policy));
     let verdict = policy
         .as_ref()
         .map(|policy| policy.verdict)
@@ -1250,6 +9992,11 @@ fn classify_baseline(
 
     SupremacyMatrixSummary {
         schema: MATRIX_SUMMARY_SCHEMA,
+        min_runtime_speedup: STRICT_MIN_RUNTIME_SPEEDUP,
+        max_memory_ratio: STRICT_MAX_MEMORY_RATIO,
+        minimum_paired_runs: STRICT_MIN_PAIRED_RUNS,
+        paired_statistic: STRICT_PAIRED_STATISTIC,
+        paired_schedule: STRICT_PAIRED_SCHEDULE,
         verdict,
         strict_pass,
         strict_blockers,
@@ -1274,31 +10021,139 @@ fn next_action_counts(rows: &[SupremacyMatrixRow]) -> BTreeMap<&'static str, usi
     counts
 }
 
+fn baseline_work_equivalence_verdict(
+    entry: &BaselineSpec,
+    examples_dir: Option<&Path>,
+) -> WorkEquivalenceVerdict {
+    if matrix_source_mode(entry) == MatrixSourceMode::Simulation {
+        return WorkEquivalenceVerdict::Simulation;
+    }
+    if randomized_external_operator_evidence(entry, examples_dir).is_some() {
+        return WorkEquivalenceVerdict::RandomizedExternalOperator;
+    }
+    if is_timeout(&entry.tlc) || is_timeout(&entry.ty) {
+        return WorkEquivalenceVerdict::Timeout;
+    }
+
+    let violation_kinds = [
+        expected_violation_kind(entry.tlc.error_type.as_deref()),
+        expected_violation_kind(entry.ty.error_type.as_deref()),
+    ];
+    if violation_kinds
+        .iter()
+        .flatten()
+        .any(|kind| *kind == ExpectedViolationKind::Deadlock)
+    {
+        return WorkEquivalenceVerdict::Deadlock;
+    }
+    if violation_kinds.iter().any(Option::is_some) {
+        return WorkEquivalenceVerdict::ExpectedViolation;
+    }
+
+    if matrix_source_mode(entry) == MatrixSourceMode::Check
+        && baseline_modes_are_clean_pass(entry)
+        && entry.verified_match
+        && matches!(
+            (entry.tlc.states, entry.ty.states),
+            (Some(tlc), Some(ty)) if tlc == ty
+        )
+        && matches!(
+            (
+                entry.tlc.raw_initial_states_generated,
+                entry.ty.raw_initial_states_generated
+            ),
+            (Some(tlc), Some(ty)) if tlc == ty
+        )
+        && matches!(
+            (
+                entry.tlc.raw_successors_generated,
+                entry.ty.raw_successors_generated
+            ),
+            (Some(tlc), Some(ty)) if tlc == ty
+        )
+        && matches!(
+            (entry.tlc.states_generated, entry.ty.states_generated),
+            (Some(tlc), Some(ty)) if tlc == ty
+        )
+    {
+        WorkEquivalenceVerdict::Holds
+    } else {
+        WorkEquivalenceVerdict::Other
+    }
+}
+
 fn classify_spec(
     spec: String,
     entry: &BaselineSpec,
     matrix_policy: &MatrixPolicy,
     examples_dir: Option<&Path>,
 ) -> SupremacyMatrixRow {
-    let tlc_seconds = entry.tlc.runtime_seconds;
+    // The primary TLC axis is paired with production-default TY. Count
+    // verification owns an independent TLC/TY pair so scheduling noise in one
+    // claim cannot be reused as evidence for the other.
+    let tlc_seconds = aggregate_runtime_seconds(entry.tlc.runtime_seconds, &entry.tlc.samples);
+    let count_tlc_seconds = aggregate_runtime_seconds(
+        entry.tlc.count_verification_runtime_seconds,
+        &entry.tlc.count_verification_samples,
+    );
     // Two-axis TY runtime evidence (mirrors the soundness sweep's design):
     // - COUNT-VERIFY axis (`runtime_seconds`): auto-POR/auto-symmetry pinned off so
     //   `states` is unreduced-parity comparable with TLC; owns verified_match.
     // - SPEED axis (`production_runtime_seconds` when present): production-default
     //   configuration — what users actually get — owns the perf classification.
-    let pinned_ty_seconds = entry.ty.runtime_seconds;
-    let production_ty_seconds = entry
-        .ty
-        .production_runtime_seconds
-        .filter(|seconds| has_finite_positive_runtime(Some(*seconds)));
+    let pinned_ty_seconds = aggregate_runtime_seconds(entry.ty.runtime_seconds, &entry.ty.samples);
+    let production_ty_seconds = aggregate_runtime_seconds(
+        entry.ty.production_runtime_seconds,
+        &entry.ty.production_samples,
+    );
     let ty_seconds = production_ty_seconds.or(pinned_ty_seconds);
-    let speedup_tlc_vs_ty = speedup(tlc_seconds, ty_seconds);
+    let production_axis_present = entry.ty.production_status.is_some()
+        || entry.ty.production_runtime_seconds.is_some()
+        || !entry.ty.production_samples.is_empty();
+    let ty_samples = if production_axis_present {
+        &entry.ty.production_samples
+    } else {
+        &entry.ty.samples
+    };
+    let paired_speedup_tlc_vs_ty = paired_runtime_speedup(&entry.tlc.samples, ty_samples);
+    let paired_count_speedup_tlc_vs_ty =
+        paired_runtime_speedup(&entry.tlc.count_verification_samples, &entry.ty.samples);
+    let paired_memory_ratio_ty_vs_tlc = paired_memory_ratio(&entry.tlc.samples, ty_samples);
+    let speedup_tlc_vs_ty = paired_speedup_tlc_vs_ty.or_else(|| speedup(tlc_seconds, ty_seconds));
     let slowdown_ty_vs_tlc = slowdown(tlc_seconds, ty_seconds);
     let seconds_lost_vs_tlc = seconds_lost(tlc_seconds, ty_seconds);
+    let tlc_process_tree_peak_memory_bytes = aggregate_process_tree_peak_memory(
+        entry.tlc.process_tree_peak_memory_bytes,
+        &entry.tlc.samples,
+    );
+    let pinned_ty_process_tree_peak_memory_bytes = aggregate_process_tree_peak_memory(
+        entry.ty.process_tree_peak_memory_bytes,
+        &entry.ty.samples,
+    );
+    let production_ty_process_tree_peak_memory_bytes = aggregate_process_tree_peak_memory(
+        entry.ty.production_process_tree_peak_memory_bytes,
+        &entry.ty.production_samples,
+    );
+    let ty_process_tree_peak_memory_bytes = if production_axis_present {
+        production_ty_process_tree_peak_memory_bytes
+    } else {
+        pinned_ty_process_tree_peak_memory_bytes
+    };
+    let memory_ratio_ty_vs_tlc = paired_memory_ratio_ty_vs_tlc.or_else(|| {
+        memory_ratio(
+            ty_process_tree_peak_memory_bytes,
+            tlc_process_tree_peak_memory_bytes,
+        )
+    });
     let randomized_count_policy = randomized_count_policy(entry, examples_dir);
+    let work_equivalence = entry
+        .work_equivalence
+        .as_ref()
+        .and_then(BaselineWorkEquivalenceDeclaration::exact_evidence)
+        .cloned();
 
     let source_mode = matrix_source_mode(entry);
-    let (class, reason) = if let MatrixSourceMode::Unsupported(mode) = source_mode {
+    let (class, mut reason) = if let MatrixSourceMode::Unsupported(mode) = source_mode {
         (
             SupremacyMatrixClass::Unsupported,
             format!("baseline source mode `{mode}` is not runnable by the supremacy matrix"),
@@ -1390,12 +10245,103 @@ fn classify_spec(
     let next_action = SupremacyMatrixNextAction::from_class(class);
     let (missing_tlc_runtime, missing_ty_runtime) =
         missing_runtime_modes_for_row(class, entry, tlc_seconds, pinned_ty_seconds);
+    let strict_axis_summaries_qualified = baseline_axis_summary_matches_samples(
+        Some(entry.tlc.status.as_str()),
+        entry.tlc.error_type.as_deref(),
+        entry.tlc.states,
+        entry.tlc.raw_initial_states_generated,
+        entry.tlc.raw_successors_generated,
+        entry.tlc.states_generated,
+        &entry.tlc.samples,
+    ) && baseline_axis_summary_matches_samples(
+        entry.tlc.count_verification_status.as_deref(),
+        entry.tlc.count_verification_error_type.as_deref(),
+        entry.tlc.count_verification_states,
+        entry.tlc.count_verification_raw_initial_states_generated,
+        entry.tlc.count_verification_raw_successors_generated,
+        entry.tlc.count_verification_states_generated,
+        &entry.tlc.count_verification_samples,
+    ) && baseline_axis_summary_matches_samples(
+        Some(entry.ty.status.as_str()),
+        entry.ty.error_type.as_deref(),
+        entry.ty.states,
+        entry.ty.raw_initial_states_generated,
+        entry.ty.raw_successors_generated,
+        entry.ty.states_generated,
+        &entry.ty.samples,
+    ) && baseline_axis_summary_matches_samples(
+        entry.ty.production_status.as_deref(),
+        entry.ty.production_error_type.as_deref(),
+        entry.ty.production_states,
+        entry.ty.production_raw_initial_states_generated,
+        entry.ty.production_raw_successors_generated,
+        entry.ty.production_states_generated,
+        &entry.ty.production_samples,
+    );
+    let strict_resources_qualified = production_axis_present
+        && strict_axis_summaries_qualified
+        && strict_performance_evidence_qualified(
+            &entry.tlc.samples,
+            &entry.ty.production_samples,
+            &entry.tlc.count_verification_samples,
+            &entry.ty.samples,
+        )
+        && strict_cache_warmups_qualified(
+            &entry.tlc.cache_warmup_samples,
+            &entry.ty.production_cache_warmup_samples,
+            &entry.tlc.count_verification_cache_warmup_samples,
+            &entry.ty.cache_warmup_samples,
+            &entry.tlc.samples,
+            &entry.ty.production_samples,
+            &entry.tlc.count_verification_samples,
+            &entry.ty.samples,
+        );
+    let runtime_axis = if strict_resources_qualified {
+        combine_required_runtime_axes(
+            classify_runtime_axis(paired_speedup_tlc_vs_ty),
+            classify_runtime_axis(paired_count_speedup_tlc_vs_ty),
+        )
+    } else {
+        SupremacyMatrixAxisVerdict::MissingOrStale
+    };
+    let memory_axis = if strict_resources_qualified {
+        classify_memory_axis(paired_memory_ratio_ty_vs_tlc)
+    } else {
+        SupremacyMatrixAxisVerdict::MissingOrStale
+    };
+    let eligible = entry.eligibility.eq_ignore_ascii_case("eligible");
+    let work_equivalence_verdict = baseline_work_equivalence_verdict(entry, examples_dir);
+    let work_equivalence_qualified = work_equivalence
+        .as_ref()
+        .is_some_and(|rule| rule.qualifies(work_equivalence_verdict));
+    let overall = if eligible && !work_equivalence_qualified {
+        let detail = if work_equivalence.is_none() {
+            "strict eligible row lacks exact typed schema-v1 exhaustive work_equivalence"
+        } else {
+            "typed exhaustive work_equivalence cannot bind this non-holds outcome"
+        };
+        write!(reason, "; {detail}").expect("write to String");
+        SupremacyMatrixOverallVerdict::MissingOrStale
+    } else {
+        derive_overall_verdict(runtime_axis, memory_axis)
+    };
+    let claim_class = derive_claim_class(class, overall);
 
     SupremacyMatrixRow {
         spec,
+        eligible,
+        exclusion_reason_code: entry
+            .exclusion
+            .as_ref()
+            .map(|exclusion| exclusion.reason_code.clone()),
         class,
+        runtime_axis,
+        memory_axis,
+        overall,
+        claim_class,
         next_action,
         reason,
+        work_equivalence,
         missing_tlc_runtime,
         missing_ty_runtime,
         perf_loser_rank: None,
@@ -1406,11 +10352,47 @@ fn classify_spec(
         } else {
             None
         },
+        tlc_process_tree_peak_memory_bytes,
+        ty_process_tree_peak_memory_bytes,
+        ty_pinned_process_tree_peak_memory_bytes: production_axis_present
+            .then_some(pinned_ty_process_tree_peak_memory_bytes)
+            .flatten(),
         speedup_tlc_vs_ty,
+        count_speedup_tlc_vs_ty: paired_count_speedup_tlc_vs_ty
+            .or_else(|| speedup(count_tlc_seconds, pinned_ty_seconds)),
+        memory_ratio_ty_vs_tlc,
         slowdown_ty_vs_tlc,
         seconds_lost_vs_tlc,
         perf_loser_follow_up,
+        tlc_samples: entry.tlc.samples.clone(),
+        count_tlc_samples: entry.tlc.count_verification_samples.clone(),
+        ty_samples: ty_samples.clone(),
+        ty_pinned_samples: if production_axis_present {
+            entry.ty.samples.clone()
+        } else {
+            Vec::new()
+        },
     }
+}
+
+fn baseline_axis_summary_matches_samples(
+    status: Option<&str>,
+    error_type: Option<&str>,
+    states: Option<u64>,
+    raw_initial_states_generated: Option<u64>,
+    raw_successors_generated: Option<u64>,
+    states_generated: Option<u64>,
+    samples: &[SupremacyMatrixPerformanceSample],
+) -> bool {
+    let Some(first) = samples.first() else {
+        return false;
+    };
+    status == first.status.as_deref()
+        && error_type == first.error_type.as_deref()
+        && states == first.states
+        && raw_initial_states_generated == first.raw_initial_states_generated
+        && raw_successors_generated == first.raw_successors_generated
+        && states_generated == first.states_generated
 }
 
 fn classify_simulation_spec(
@@ -1552,6 +10534,31 @@ fn successful_check_parity_failure_reason(
             "TLC and TY both passed but exact state counts differ (TLC states={tlc_states}, TY states={ty_states}); no randomized external operator evidence was found, so state-count parity is required"
         ));
     }
+    if randomized_count_policy.is_none() {
+        for (label, tlc_count, ty_count) in [
+            (
+                "raw initial-state generation",
+                entry.tlc.raw_initial_states_generated,
+                entry.ty.raw_initial_states_generated,
+            ),
+            (
+                "raw successor generation",
+                entry.tlc.raw_successors_generated,
+                entry.ty.raw_successors_generated,
+            ),
+            (
+                "total state generation",
+                entry.tlc.states_generated,
+                entry.ty.states_generated,
+            ),
+        ] {
+            if (tlc_count.is_some() || ty_count.is_some()) && tlc_count != ty_count {
+                return Some(format!(
+                    "TLC and TY both passed but exact {label} counts differ (TLC={tlc_count:?}, TY={ty_count:?})"
+                ));
+            }
+        }
+    }
     (!entry.verified_match).then(|| "TY baseline did not verify against TLC".to_string())
 }
 
@@ -1585,6 +10592,32 @@ fn state_count_mismatch(entry: &BaselineSpec) -> Option<(u64, u64)> {
     }
 }
 
+/// Return the corpus directory only when its source bytes are identified by
+/// the baseline provenance. A recorded dirty checkout is not commit-addressed,
+/// and a missing, dirty, or mismatched live checkout must not influence
+/// classification.
+fn verified_examples_source_dir(inputs: &BaselineInputs) -> Option<PathBuf> {
+    let recorded = inputs.examples_git.as_ref()?;
+    if recorded.is_dirty != Some(false) {
+        return None;
+    }
+    let recorded_head = recorded
+        .head
+        .as_deref()
+        .map(str::trim)
+        .filter(|head| !head.is_empty())?;
+    let requested_dir = super::resolve_examples_dir(inputs.examples_dir.as_deref());
+    let current = git_checkout_provenance(&requested_dir);
+    validate_checkout_state_matches_pin(
+        recorded_head,
+        current.head.as_deref(),
+        current.is_dirty,
+        current.error.as_deref(),
+    )
+    .ok()?;
+    Some(current.path)
+}
+
 fn randomized_external_operator_evidence(
     entry: &BaselineSpec,
     examples_dir: Option<&Path>,
@@ -1611,24 +10644,26 @@ fn randomized_external_operator_evidence(
         &mut evidence_sources,
     );
 
-    if let Some(source) = &entry.source {
+    if let (Some(examples_dir), Some(source)) = (examples_dir, &entry.source) {
         if let Some(path) = &source.tla_path {
-            let resolved = resolve_baseline_source_path(examples_dir, path);
-            collect_randomized_operator_evidence_from_source_path(
-                &resolved,
-                &format!("source {}", resolved.display()),
-                &mut operators,
-                &mut evidence_sources,
-            );
+            if let Some(resolved) = resolve_baseline_source_path(examples_dir, path) {
+                collect_randomized_operator_evidence_from_source_path(
+                    &resolved,
+                    &format!("source {}", resolved.display()),
+                    &mut operators,
+                    &mut evidence_sources,
+                );
+            }
         }
         if let Some(path) = &source.cfg_path {
-            let resolved = resolve_baseline_source_path(examples_dir, path);
-            collect_randomized_operator_evidence_from_source_path(
-                &resolved,
-                &format!("source {}", resolved.display()),
-                &mut operators,
-                &mut evidence_sources,
-            );
+            if let Some(resolved) = resolve_baseline_source_path(examples_dir, path) {
+                collect_randomized_operator_evidence_from_source_path(
+                    &resolved,
+                    &format!("source {}", resolved.display()),
+                    &mut operators,
+                    &mut evidence_sources,
+                );
+            }
         }
     }
 
@@ -1640,13 +10675,14 @@ fn randomized_external_operator_evidence(
     })
 }
 
-fn resolve_baseline_source_path(examples_dir: Option<&Path>, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        return path.to_path_buf();
-    }
-    examples_dir
-        .map(|base| base.join(path))
-        .unwrap_or_else(|| path.to_path_buf())
+fn resolve_baseline_source_path(examples_dir: &Path, path: &Path) -> Option<PathBuf> {
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        examples_dir.join(path)
+    };
+    let resolved = candidate.canonicalize().ok()?;
+    resolved.starts_with(examples_dir).then_some(resolved)
 }
 
 fn collect_randomized_operator_evidence_from_metadata(
@@ -1808,9 +10844,18 @@ fn assign_perf_loser_ranks(rows: &mut [SupremacyMatrixRow]) {
 }
 
 #[derive(Clone, Debug)]
+struct ResolvedJavaRuntime {
+    executable: RuntimeFileProvenance,
+    java_home: RuntimeJavaHomeProvenance,
+    provenance: RuntimeCommandVersionProvenance,
+}
+
+#[derive(Clone, Debug)]
 struct RuntimeCollectionConfig {
     output_dir: PathBuf,
     timeout_seconds: u64,
+    runs: usize,
+    mode: SupremacyMode,
     limit: Option<usize>,
     ty_bin: PathBuf,
     ty_base_env: BTreeMap<String, String>,
@@ -1818,13 +10863,24 @@ struct RuntimeCollectionConfig {
     /// Collect a second TY measurement per check-mode row under the
     /// production-default configuration (count-parity pins removed).
     production_runtime: bool,
+    java: ResolvedJavaRuntime,
     tlc_jar: PathBuf,
     community_modules: Option<PathBuf>,
     tla_library: Option<PathBuf>,
+    observation_storage_contract: Option<ObservationStorageContract>,
+    observation_storage_binding: Option<ObservationStorageBinding>,
 }
 
 impl RuntimeCollectionConfig {
     fn from_args(args: &SupremacyMatrixArgs, repo_root: &Path) -> Result<Self> {
+        Self::from_args_with_java(args, repo_root, None)
+    }
+
+    fn from_args_with_java(
+        args: &SupremacyMatrixArgs,
+        repo_root: &Path,
+        pinned_java: Option<ResolvedJavaRuntime>,
+    ) -> Result<Self> {
         let output_dir = args
             .runtime_output_dir
             .clone()
@@ -1833,14 +10889,48 @@ impl RuntimeCollectionConfig {
         if timeout_seconds == 0 {
             bail!("--runtime-timeout must be >= 1");
         }
+        let runs = args.runtime_runs;
+        if runs == 0 {
+            bail!("--runtime-runs must be >= 1");
+        }
+        if args.mode == SupremacyMode::Enforce && (runs < STRICT_MIN_PAIRED_RUNS || runs % 2 != 0) {
+            bail!(
+                "--runtime-runs must be even and >= {STRICT_MIN_PAIRED_RUNS} with --mode enforce"
+            );
+        }
+        if args.mode == SupremacyMode::Enforce && !args.production_runtime {
+            bail!("--production-runtime true is required with --mode enforce");
+        }
         let limit = args.runtime_limit;
         let ty_bin = args
             .runtime_ty_bin
             .clone()
             .unwrap_or_else(|| env::current_exe().unwrap_or_else(|_| PathBuf::from("ty")));
+        if args.mode == SupremacyMode::Enforce {
+            validate_file(&ty_bin)?;
+            let candidate = ty_bin
+                .canonicalize()
+                .with_context(|| format!("resolve --runtime-ty-bin {}", ty_bin.display()))?;
+            let launched = env::current_exe()
+                .context("resolve launched TY executable")?
+                .canonicalize()
+                .context("canonicalize launched TY executable")?;
+            if candidate != launched {
+                bail!(
+                    "--mode enforce requires --runtime-ty-bin to be the exact launched TY executable so build provenance cannot be attributed to a different binary: candidate={}, launched={}",
+                    candidate.display(),
+                    launched.display()
+                );
+            }
+        }
         let ty_base_env = matrix_runtime_refresh_base_env();
         let allow_debug_runtime = args.allow_debug_runtime;
         let production_runtime = args.production_runtime;
+        let java = match pinned_java {
+            Some(java) => java,
+            None => resolve_java_runtime_from_environment()
+                .context("resolve and attest the exact Java runtime used for TLC")?,
+        };
         let tlc_jar = args.runtime_tlc_jar.clone().unwrap_or_else(default_tlc_jar);
         let community_modules = args
             .runtime_community_modules
@@ -1855,17 +10945,27 @@ impl RuntimeCollectionConfig {
                 )
             })?;
         }
+        if args.mode == SupremacyMode::Enforce && community_modules.is_none() {
+            bail!(
+                "--mode enforce runtime refresh requires a CommunityModules jar so the complete TLC classpath can be pinned; pass --runtime-community-modules"
+            );
+        }
         Ok(Self {
             output_dir,
             timeout_seconds,
+            runs,
+            mode: args.mode,
             limit,
             ty_bin,
             ty_base_env,
             allow_debug_runtime,
             production_runtime,
+            java,
             tlc_jar,
             community_modules,
             tla_library,
+            observation_storage_contract: None,
+            observation_storage_binding: None,
         })
     }
 }
@@ -1873,6 +10973,8 @@ impl RuntimeCollectionConfig {
 struct RuntimeRefreshCheckpoint {
     summary: SupremacyMatrixSummary,
     metadata_refresh: BaselineMetadataRefresh,
+    collection_complete: bool,
+    measurement_complete: bool,
     report_path: PathBuf,
     refreshed_baseline: PathBuf,
     matrix_after_refresh: PathBuf,
@@ -1889,13 +10991,72 @@ fn write_runtime_refresh_checkpoint(
     metadata: &RuntimeEvidenceMetadata,
     rows: &[RuntimeEvidenceRow],
     baseline_provenance: &RuntimeBaselineProvenance,
+    campaign: Option<&RuntimeCampaignReportBinding>,
 ) -> Result<RuntimeRefreshCheckpoint> {
+    let collected_runtime_specs = rows.iter().map(|row| row.spec.clone()).collect::<Vec<_>>();
+    let uncollected_selected_runtime_specs =
+        uncollected_selected_runtime_specs(&selection.selected_specs, rows);
+    let attempted_all_selected_runtime_specs = uncollected_selected_runtime_specs.is_empty();
+    let incomplete_runtime_specs =
+        incomplete_selected_runtime_specs(&selection.selected_specs, rows);
+    let mut provenance_errors = strict_runtime_provenance_errors(metadata);
+    if !campaign.is_some_and(|campaign| campaign.role == "aggregate") {
+        provenance_errors.extend(runtime_sample_machine_provenance_errors(rows, metadata));
+    }
+    provenance_errors.sort();
+    provenance_errors.dedup();
+    let provenance_qualified = provenance_errors.is_empty();
+    let report_path = config.output_dir.join("runtime_evidence.json");
+    let refreshed_baseline = config.output_dir.join("spec_baseline.refreshed.json");
+    let matrix_after_refresh = config.output_dir.join("matrix_after_refresh.json");
+    let refreshed_specs_jcs_sha256 = baseline_value
+        .get("specs")
+        .context("runtime checkpoint baseline has no specs")
+        .and_then(sha256_jcs_value)?;
+    let (artifact_digests, artifact_errors) = runtime_artifact_digests(rows);
+    let runtime_batch_plan_provenance =
+        RuntimeFileProvenance::new(runtime_batch_plan).context("hash runtime batch plan")?;
+    let errors = runtime_evidence_errors(rows);
+    let has_unclassified_failure = rows
+        .iter()
+        .any(|row| row.collection_outcome == "unclassified_failure");
+    let measurement_complete = incomplete_runtime_specs.is_empty();
+    let collection_complete = attempted_all_selected_runtime_specs
+        && !has_unclassified_failure
+        && provenance_qualified
+        && artifact_errors.is_empty();
+    let evidence_payload = runtime_evidence_payload(
+        baseline_path,
+        config,
+        &refreshed_baseline,
+        &matrix_after_refresh,
+        &runtime_batch_plan_provenance,
+        selection,
+        &collected_runtime_specs,
+        attempted_all_selected_runtime_specs,
+        &uncollected_selected_runtime_specs,
+        &incomplete_runtime_specs,
+        &refresh_plan.blocked_runtime_specs,
+        collection_complete,
+        measurement_complete,
+        provenance_qualified,
+        &provenance_errors,
+        metadata,
+        rows,
+        &artifact_digests,
+        &artifact_errors,
+        &errors,
+        &refreshed_specs_jcs_sha256,
+        campaign,
+    );
+    let evidence_set_id = sha256_jcs_value(&evidence_payload)?;
+    let bound_provenance = baseline_provenance
+        .bind_evidence(evidence_set_id.clone(), refreshed_specs_jcs_sha256.clone());
+
     let mut checkpoint_baseline = baseline_value.clone();
     let metadata_refresh =
-        refresh_runtime_baseline_metadata(&mut checkpoint_baseline, rows, baseline_provenance)
+        refresh_runtime_baseline_metadata(&mut checkpoint_baseline, rows, &bound_provenance)
             .context("refresh runtime baseline metadata")?;
-
-    let refreshed_baseline = config.output_dir.join("spec_baseline.refreshed.json");
     fs::write(
         &refreshed_baseline,
         serde_json::to_string_pretty(&checkpoint_baseline)? + "\n",
@@ -1904,42 +11065,70 @@ fn write_runtime_refresh_checkpoint(
 
     let summary = classify_baseline_value_with_policy(checkpoint_baseline, matrix_policy)
         .context("classify refreshed runtime baseline")?;
-    let matrix_after_refresh = config.output_dir.join("matrix_after_refresh.json");
+    let matrix_document = match campaign {
+        Some(campaign) if campaign.role == "segment" => {
+            campaign_segment_summary_value(&summary, campaign)
+        }
+        _ => serde_json::to_value(&summary)?,
+    };
     fs::write(
         &matrix_after_refresh,
-        serde_json::to_string_pretty(&summary)? + "\n",
+        serde_json::to_string_pretty(&matrix_document)? + "\n",
     )
     .with_context(|| format!("write {}", matrix_after_refresh.display()))?;
 
-    let collected_runtime_specs = rows.iter().map(|row| row.spec.clone()).collect::<Vec<_>>();
-    let uncollected_selected_runtime_specs =
-        uncollected_selected_runtime_specs(&selection.selected_specs, rows);
-    let attempted_all_selected_runtime_specs = uncollected_selected_runtime_specs.is_empty();
-    let incomplete_runtime_specs =
-        incomplete_selected_runtime_specs(&selection.selected_specs, rows);
-    let report_path = config.output_dir.join("runtime_evidence.json");
     let report = RuntimeEvidenceReport {
-        schema: RUNTIME_EVIDENCE_SCHEMA,
+        schema: if campaign.is_some() {
+            RUNTIME_CAMPAIGN_EVIDENCE_SCHEMA
+        } else {
+            RUNTIME_EVIDENCE_SCHEMA
+        },
+        evidence_set_id,
+        evidence_payload,
+        min_runtime_speedup: STRICT_MIN_RUNTIME_SPEEDUP,
+        max_memory_ratio: STRICT_MAX_MEMORY_RATIO,
+        minimum_paired_runs: STRICT_MIN_PAIRED_RUNS,
+        paired_statistic: STRICT_PAIRED_STATISTIC,
+        paired_schedule: STRICT_PAIRED_SCHEDULE,
+        memory_metric: "process_tree_peak_memory_bytes",
         baseline: baseline_path.to_path_buf(),
         output_dir: config.output_dir.clone(),
         refreshed_baseline: refreshed_baseline.clone(),
         matrix_after_refresh: matrix_after_refresh.clone(),
         timeout_seconds: config.timeout_seconds,
+        runs: config.runs,
         limit: config.limit,
         runtime_batch_plan: runtime_batch_plan.to_path_buf(),
+        runtime_batch_plan_provenance,
         selected_runtime_specs: selection.selected_specs.clone(),
         selected_runtime_spec_count: selection.selected_specs.len(),
         collected_runtime_specs,
         collected_runtime_spec_count: rows.len(),
         attempted_all_selected_runtime_specs,
-        complete: attempted_all_selected_runtime_specs && incomplete_runtime_specs.is_empty(),
+        collection_complete,
+        measurement_complete,
+        // The strict Linux parent creates and hashes the write-once receipt only
+        // after this child exits successfully. A live child report is therefore
+        // always provisional even when collection itself is complete.
+        complete: false,
+        finalization_pending: true,
+        final_receipt_path: bound_provenance.final_receipt_path.clone(),
+        refreshed_specs_jcs_sha256,
         uncollected_selected_runtime_specs,
         incomplete_runtime_specs,
         blocked_runtime_specs: refresh_plan.blocked_runtime_specs.clone(),
         allow_debug_runtime: config.allow_debug_runtime,
+        observation_storage_contract: config.observation_storage_contract.clone(),
+        provenance_qualified,
+        provenance_errors,
         metadata: metadata.clone(),
         rows: rows.to_vec(),
-        errors: runtime_evidence_errors(rows),
+        artifact_digests,
+        artifact_errors,
+        errors,
+        campaign: campaign.cloned(),
+        corpus_claim_complete: campaign.map(|campaign| campaign.corpus_claim_complete),
+        corpus_claim_pass: campaign.map(|campaign| campaign.corpus_claim_pass),
     };
     fs::write(&report_path, serde_json::to_string_pretty(&report)? + "\n")
         .with_context(|| format!("write {}", report_path.display()))?;
@@ -1947,6 +11136,8 @@ fn write_runtime_refresh_checkpoint(
     Ok(RuntimeRefreshCheckpoint {
         summary,
         metadata_refresh,
+        collection_complete,
+        measurement_complete,
         report_path,
         refreshed_baseline,
         matrix_after_refresh,
@@ -1956,33 +11147,694 @@ fn write_runtime_refresh_checkpoint(
 #[derive(Clone, Debug, Serialize)]
 pub(super) struct RuntimeEvidenceReport {
     schema: &'static str,
+    evidence_set_id: String,
+    evidence_payload: Value,
+    min_runtime_speedup: f64,
+    max_memory_ratio: f64,
+    minimum_paired_runs: usize,
+    paired_statistic: &'static str,
+    paired_schedule: &'static str,
+    memory_metric: &'static str,
     baseline: PathBuf,
     output_dir: PathBuf,
     refreshed_baseline: PathBuf,
     matrix_after_refresh: PathBuf,
     timeout_seconds: u64,
+    runs: usize,
     limit: Option<usize>,
     runtime_batch_plan: PathBuf,
+    runtime_batch_plan_provenance: RuntimeFileProvenance,
     selected_runtime_specs: Vec<String>,
     selected_runtime_spec_count: usize,
     collected_runtime_specs: Vec<String>,
     collected_runtime_spec_count: usize,
     attempted_all_selected_runtime_specs: bool,
+    collection_complete: bool,
+    measurement_complete: bool,
     complete: bool,
+    finalization_pending: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    final_receipt_path: Option<PathBuf>,
+    refreshed_specs_jcs_sha256: String,
     uncollected_selected_runtime_specs: Vec<String>,
     incomplete_runtime_specs: Vec<String>,
     blocked_runtime_specs: Vec<String>,
     allow_debug_runtime: bool,
+    observation_storage_contract: Option<ObservationStorageContract>,
+    provenance_qualified: bool,
+    provenance_errors: Vec<String>,
     metadata: RuntimeEvidenceMetadata,
     rows: Vec<RuntimeEvidenceRow>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    artifact_digests: Vec<RuntimeArtifactDigest>,
+    artifact_errors: Vec<String>,
     errors: Vec<RuntimeEvidenceError>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    campaign: Option<RuntimeCampaignReportBinding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    corpus_claim_complete: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    corpus_claim_pass: Option<bool>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+struct RuntimeArtifactDigest {
+    spec: String,
+    arm: String,
+    run_index: usize,
+    artifact_dir: PathBuf,
+    command: RuntimeFileProvenance,
+    stdout: RuntimeFileProvenance,
+    stderr: RuntimeFileProvenance,
+    retention: RuntimeFileProvenance,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload_manifest: Option<RuntimeFileProvenance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    storage_capability: Option<RuntimeFileProvenance>,
+    payload_final_state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    storage_limit_trigger: Option<StorageLimitTrigger>,
+    process_tree_lifetime_complete: bool,
+    process_tree_forced_quiescence_complete: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct RuntimeEvidenceError {
     spec: String,
     error: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn runtime_evidence_payload(
+    baseline_path: &Path,
+    config: &RuntimeCollectionConfig,
+    refreshed_baseline: &Path,
+    matrix_after_refresh: &Path,
+    runtime_batch_plan: &RuntimeFileProvenance,
+    selection: &RuntimeBatchSelection<'_>,
+    collected_runtime_specs: &[String],
+    attempted_all_selected_runtime_specs: bool,
+    uncollected_selected_runtime_specs: &[String],
+    incomplete_runtime_specs: &[String],
+    blocked_runtime_specs: &[String],
+    collection_complete: bool,
+    measurement_complete: bool,
+    provenance_qualified: bool,
+    provenance_errors: &[String],
+    metadata: &RuntimeEvidenceMetadata,
+    rows: &[RuntimeEvidenceRow],
+    artifact_digests: &[RuntimeArtifactDigest],
+    artifact_errors: &[String],
+    errors: &[RuntimeEvidenceError],
+    refreshed_specs_jcs_sha256: &str,
+    campaign: Option<&RuntimeCampaignReportBinding>,
+) -> Value {
+    let mut payload = json!({
+        "schema": if campaign.is_some() {
+            RUNTIME_CAMPAIGN_EVIDENCE_PAYLOAD_SCHEMA
+        } else {
+            RUNTIME_EVIDENCE_PAYLOAD_SCHEMA
+        },
+        "contract": {
+            "min_runtime_speedup": STRICT_MIN_RUNTIME_SPEEDUP,
+            "max_memory_ratio": STRICT_MAX_MEMORY_RATIO,
+            "minimum_paired_runs": STRICT_MIN_PAIRED_RUNS,
+            "paired_statistic": STRICT_PAIRED_STATISTIC,
+            "paired_schedule": STRICT_PAIRED_SCHEDULE,
+            "os_cache_policy": strict_os_cache_policy(),
+            "memory_metric": "process_tree_peak_memory_bytes",
+            "timeout_seconds": config.timeout_seconds,
+            "runs": config.runs,
+            "limit": config.limit,
+            "allow_debug_runtime": config.allow_debug_runtime,
+            "observation_storage_contract": config.observation_storage_contract,
+        },
+        "paths": {
+            "baseline": baseline_path,
+            "output_dir": config.output_dir,
+            "refreshed_baseline": refreshed_baseline,
+            "matrix_after_refresh": matrix_after_refresh,
+            "final_receipt": metadata.benchmark.final_receipt_path,
+        },
+        "runtime_batch_plan": runtime_batch_plan,
+        "coverage": {
+            "selected_runtime_specs": selection.selected_specs,
+            "selected_runtime_spec_count": selection.selected_specs.len(),
+            "collected_runtime_specs": collected_runtime_specs,
+            "collected_runtime_spec_count": rows.len(),
+            "attempted_all_selected_runtime_specs": attempted_all_selected_runtime_specs,
+            "uncollected_selected_runtime_specs": uncollected_selected_runtime_specs,
+            "incomplete_runtime_specs": incomplete_runtime_specs,
+            "blocked_runtime_specs": blocked_runtime_specs,
+            "collection_complete": collection_complete,
+            "measurement_complete": measurement_complete,
+        },
+        "provenance": {
+            "qualified": provenance_qualified,
+            "errors": provenance_errors,
+        },
+        "metadata": metadata,
+        "rows": rows,
+        "artifact_digests": artifact_digests,
+        "artifact_errors": artifact_errors,
+        "errors": errors,
+        "refreshed_specs_jcs_sha256": refreshed_specs_jcs_sha256,
+    });
+    if let Some(campaign) = campaign {
+        let root = payload
+            .as_object_mut()
+            .expect("runtime evidence payload is an object");
+        root.insert("campaign".to_string(), json!(campaign));
+        root.insert(
+            "corpus_claim_complete".to_string(),
+            json!(campaign.corpus_claim_complete),
+        );
+        root.insert(
+            "corpus_claim_pass".to_string(),
+            json!(campaign.corpus_claim_pass),
+        );
+    }
+    payload
+}
+
+fn runtime_artifact_digests(
+    rows: &[RuntimeEvidenceRow],
+) -> (Vec<RuntimeArtifactDigest>, Vec<String>) {
+    let mut digests = Vec::new();
+    let mut errors = Vec::new();
+    for row in rows {
+        if let Some(event) = row.resource_limit_event.as_ref() {
+            match runtime_artifact_digest(
+                &row.spec,
+                &format!("resource_limited_{}", event.arm),
+                event.run_index,
+                &event.artifact_dir,
+                event.arm == "tlc",
+                true,
+            ) {
+                Ok(digest)
+                    if digest.storage_limit_trigger.as_ref() == Some(&event.trigger)
+                        && digest.process_tree_lifetime_complete
+                        && digest.process_tree_forced_quiescence_complete =>
+                {
+                    digests.push(digest);
+                }
+                Ok(_) => errors.push(format!(
+                    "{}/resource_limited_{}/run-{} trigger or containment differs from its artifact",
+                    row.spec, event.arm, event.run_index
+                )),
+                Err(error) => errors.push(format!(
+                    "{}/resource_limited_{}/run-{} artifact is invalid: {error:#}",
+                    row.spec, event.arm, event.run_index
+                )),
+            }
+            continue;
+        }
+        collect_runtime_mode_artifact_digests(
+            &row.spec,
+            "production_tlc",
+            &row.tlc,
+            RuntimeArtifactAxis::Primary,
+            &mut digests,
+            &mut errors,
+        );
+        collect_runtime_mode_artifact_digests(
+            &row.spec,
+            "warmup_production_tlc",
+            &row.tlc,
+            RuntimeArtifactAxis::CacheWarmupPrimary,
+            &mut digests,
+            &mut errors,
+        );
+        collect_runtime_mode_artifact_digests(
+            &row.spec,
+            "count_tlc",
+            &row.tlc,
+            RuntimeArtifactAxis::CountVerification,
+            &mut digests,
+            &mut errors,
+        );
+        collect_runtime_mode_artifact_digests(
+            &row.spec,
+            "warmup_count_tlc",
+            &row.tlc,
+            RuntimeArtifactAxis::CacheWarmupCountVerification,
+            &mut digests,
+            &mut errors,
+        );
+        collect_runtime_mode_artifact_digests(
+            &row.spec,
+            "count_ty",
+            &row.ty,
+            RuntimeArtifactAxis::Primary,
+            &mut digests,
+            &mut errors,
+        );
+        collect_runtime_mode_artifact_digests(
+            &row.spec,
+            "warmup_count_ty",
+            &row.ty,
+            RuntimeArtifactAxis::CacheWarmupPrimary,
+            &mut digests,
+            &mut errors,
+        );
+        collect_runtime_mode_artifact_digests(
+            &row.spec,
+            "production_ty",
+            &row.ty,
+            RuntimeArtifactAxis::Production,
+            &mut digests,
+            &mut errors,
+        );
+        collect_runtime_mode_artifact_digests(
+            &row.spec,
+            "warmup_production_ty",
+            &row.ty,
+            RuntimeArtifactAxis::CacheWarmupProduction,
+            &mut digests,
+            &mut errors,
+        );
+    }
+    let mut identities = BTreeSet::new();
+    let mut artifact_dirs = BTreeSet::new();
+    for digest in &digests {
+        if !identities.insert((
+            digest.spec.clone(),
+            digest.arm.clone(),
+            digest.run_index,
+            digest.artifact_dir.clone(),
+        )) {
+            errors.push(format!(
+                "duplicate artifact identity {}/{}/run-{} at {}",
+                digest.spec,
+                digest.arm,
+                digest.run_index,
+                digest.artifact_dir.display()
+            ));
+        }
+        if !artifact_dirs.insert(digest.artifact_dir.clone()) {
+            errors.push(format!(
+                "artifact directory is reused by more than one runtime observation: {}",
+                digest.artifact_dir.display()
+            ));
+        }
+    }
+    digests.sort_by(|left, right| {
+        (&left.spec, &left.arm, left.run_index, &left.artifact_dir).cmp(&(
+            &right.spec,
+            &right.arm,
+            right.run_index,
+            &right.artifact_dir,
+        ))
+    });
+    errors.sort();
+    (digests, errors)
+}
+
+#[derive(Clone, Copy)]
+enum RuntimeArtifactAxis {
+    Primary,
+    Production,
+    CountVerification,
+    CacheWarmupPrimary,
+    CacheWarmupProduction,
+    CacheWarmupCountVerification,
+}
+
+fn collect_runtime_mode_artifact_digests(
+    spec: &str,
+    arm: &str,
+    mode: &RuntimeModeEvidence,
+    axis: RuntimeArtifactAxis,
+    digests: &mut Vec<RuntimeArtifactDigest>,
+    errors: &mut Vec<String>,
+) {
+    let samples = match axis {
+        RuntimeArtifactAxis::Primary => &mode.samples,
+        RuntimeArtifactAxis::Production => &mode.production_samples,
+        RuntimeArtifactAxis::CountVerification => &mode.count_verification_samples,
+        RuntimeArtifactAxis::CacheWarmupPrimary => &mode.cache_warmup_samples,
+        RuntimeArtifactAxis::CacheWarmupProduction => &mode.production_cache_warmup_samples,
+        RuntimeArtifactAxis::CacheWarmupCountVerification => {
+            &mode.count_verification_cache_warmup_samples
+        }
+    };
+    if !samples.is_empty() {
+        for sample in samples {
+            let Some(artifact_dir) = sample.artifact_dir.as_deref() else {
+                errors.push(format!(
+                    "{spec}/{arm}/run-{} has no artifact directory",
+                    sample.run_index
+                ));
+                continue;
+            };
+            match runtime_artifact_digest(
+                spec,
+                arm,
+                sample.run_index,
+                artifact_dir,
+                arm.ends_with("tlc"),
+                false,
+            ) {
+                Ok(digest) => digests.push(digest),
+                Err(error) => errors.push(format!(
+                    "{spec}/{arm}/run-{} artifact is invalid: {error:#}",
+                    sample.run_index
+                )),
+            }
+        }
+        return;
+    }
+
+    let (artifact_dir, marker_present) = match axis {
+        RuntimeArtifactAxis::Primary => (Some(mode.artifact_dir.as_path()), true),
+        RuntimeArtifactAxis::Production => (
+            mode.production_artifact_dir.as_deref(),
+            mode.production_status.is_some(),
+        ),
+        RuntimeArtifactAxis::CountVerification => (
+            mode.count_verification_artifact_dir.as_deref(),
+            mode.count_verification_status.is_some(),
+        ),
+        RuntimeArtifactAxis::CacheWarmupPrimary
+        | RuntimeArtifactAxis::CacheWarmupProduction
+        | RuntimeArtifactAxis::CacheWarmupCountVerification => return,
+    };
+    let Some(artifact_dir) = artifact_dir.filter(|path| !path.as_os_str().is_empty()) else {
+        if !marker_present {
+            return;
+        }
+        errors.push(format!("{spec}/{arm} has no artifact directory"));
+        return;
+    };
+    match runtime_artifact_digest(spec, arm, 0, artifact_dir, arm.ends_with("tlc"), false) {
+        Ok(digest) => digests.push(digest),
+        Err(error) => errors.push(format!("{spec}/{arm} artifact is invalid: {error:#}")),
+    }
+}
+
+fn runtime_artifact_digest(
+    spec: &str,
+    arm: &str,
+    run_index: usize,
+    artifact_dir: &Path,
+    expected_tlc: bool,
+    allow_resource_limit: bool,
+) -> Result<RuntimeArtifactDigest> {
+    let metadata = fs::symlink_metadata(artifact_dir)
+        .with_context(|| format!("stat artifact directory {}", artifact_dir.display()))?;
+    if !artifact_dir.is_absolute() || !metadata.file_type().is_dir() {
+        bail!(
+            "artifact directory must be an absolute non-symlink directory: {}",
+            artifact_dir.display()
+        );
+    }
+    let artifact_dir = artifact_dir
+        .canonicalize()
+        .with_context(|| format!("canonicalize artifact directory {}", artifact_dir.display()))?;
+    let retention_path = artifact_dir.join("artifact-retention.json");
+    let retention = RuntimeFileProvenance::new(&retention_path)?;
+    let (retention_value, _, _) = read_regular_json_nofollow_bounded(&retention_path, 1_048_576)?;
+    let retention_evidence: ArtifactRetentionEvidence =
+        serde_json::from_value(retention_value).context("parse artifact-retention.json")?;
+    if retention_evidence.schema != "ty.supremacy.artifact-retention.v2"
+        || !retention_evidence.command_artifacts_retained
+        || !retention_evidence.cleanup_complete
+        || !retention_evidence.process_tree_quiescent
+        || retention_evidence.capability_revalidation_error.is_some()
+    {
+        bail!("artifact retention evidence is incomplete");
+    }
+    match (
+        retention_evidence.storage_contract.as_ref(),
+        retention_evidence.storage_binding.as_ref(),
+    ) {
+        (Some(contract), Some(binding)) => {
+            contract.validate()?;
+            let contract_sha256 =
+                sha256_ty_canonical_json_v1_value(&serde_json::to_value(contract)?)?;
+            if binding.contract_sha256 != contract_sha256 {
+                bail!("artifact retention storage binding has the wrong contract digest");
+            }
+        }
+        (None, None) => {}
+        _ => bail!("artifact retention storage contract and binding are not paired"),
+    }
+    match (
+        allow_resource_limit,
+        retention_evidence.trigger.as_ref(),
+        retention_evidence.strict_qualified,
+    ) {
+        (true, Some(trigger), false) if trigger.process_group_killed && trigger.child_reaped => {}
+        (false, None, true) => {}
+        (true, _, _) => bail!("resource-limit artifact has no unique nonqualifying trigger"),
+        (false, _, _) => bail!("complete observation retention is not strictly qualified"),
+    }
+    let storage_capability = retention_evidence
+        .capability_path
+        .as_deref()
+        .map(RuntimeFileProvenance::new)
+        .transpose()
+        .context("rehash retained observation storage capability")?;
+    if let Some(capability) = storage_capability.as_ref() {
+        if retention_evidence.capability_sha256.as_deref() != Some(&capability.sha256) {
+            bail!("retention capability digest differs from the retained capability file");
+        }
+    } else if retention_evidence.storage_contract.is_some() {
+        bail!("plan-bound observation has no retained storage capability");
+    }
+    let command_path = artifact_dir.join("command.json");
+    let command = RuntimeFileProvenance::new(&command_path)?;
+    let (command_value, _, _) = read_regular_json_nofollow_bounded(&command_path, 1_048_576)
+        .context("parse retained command.json")?;
+    let command_argv = command_value
+        .get("argv")
+        .and_then(Value::as_array)
+        .context("retained command argv is not an array")?;
+    let command_trigger = command_value
+        .pointer("/resource_evidence/disk/storage_limit_trigger")
+        .cloned()
+        .map(serde_json::from_value::<StorageLimitTrigger>)
+        .transpose()
+        .context("parse command storage-limit trigger")?;
+    let process_tree_lifetime_complete = command_value
+        .pointer("/resource_evidence/disk/process_tree_lifetime_complete")
+        .and_then(Value::as_bool)
+        .context("retained command has no process-tree lifetime proof")?;
+    let process_tree_forced_quiescence_complete = command_value
+        .pointer("/resource_evidence/disk/process_tree_forced_quiescence_complete")
+        .and_then(Value::as_bool)
+        .context("retained command has no forced process-tree quiescence proof")?;
+    if command_trigger.as_ref() != retention_evidence.trigger.as_ref()
+        || (allow_resource_limit
+            && (!process_tree_lifetime_complete || !process_tree_forced_quiescence_complete))
+        || (!allow_resource_limit && command_trigger.is_some())
+    {
+        bail!("command and retention storage-limit containment evidence do not agree");
+    }
+    let exact_payload_dir = retention_evidence
+        .storage_binding
+        .as_ref()
+        .map(|binding| {
+            let relative = artifact_dir
+                .strip_prefix(&binding.segment_output_dir)
+                .context("retained artifact directory escapes its segment E root")?;
+            if relative.as_os_str().is_empty()
+                || relative
+                    .components()
+                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            {
+                bail!("retained artifact directory has no safe segment-relative path");
+            }
+            Ok::<PathBuf, anyhow::Error>(binding.segment_payload_dir.join(relative))
+        })
+        .transpose()?;
+    let exact_metadir = exact_payload_dir
+        .as_ref()
+        .map(|payload| payload.join("tlc-metadir"));
+    let metadir_bindings = command_argv
+        .windows(2)
+        .filter(|window| {
+            window[0].as_str() == Some("-metadir")
+                && window[1].as_str().map(Path::new) == exact_metadir.as_deref()
+        })
+        .count();
+    let plan_bound = retention_evidence.storage_contract.is_some();
+    let (payload_manifest, payload_final_state) = if plan_bound {
+        let contract = retention_evidence
+            .storage_contract
+            .as_ref()
+            .context("plan-bound retention has no storage contract")?;
+        let payload_dir = exact_payload_dir
+            .as_ref()
+            .context("plan-bound retention has no exact P directory")?;
+        let payload_relative = payload_dir
+            .strip_prefix(
+                &retention_evidence
+                    .storage_binding
+                    .as_ref()
+                    .context("plan-bound retention has no storage binding")?
+                    .segment_payload_dir,
+            )
+            .context("plan-bound payload directory escapes its segment P root")?;
+        let payload_relative = payload_relative
+            .to_str()
+            .context("plan-bound payload-relative path is not UTF-8")?;
+        if retention_evidence.action != "metadata_commitment_then_prune"
+            || retention_evidence.payload_final_state != "absent"
+            || retention_evidence.payload_final_allocated_bytes != Some(0)
+            || retention_evidence.payload_final_apparent_bytes != Some(0)
+            || retention_evidence.payload_final_entries != Some(0)
+            || fs::symlink_metadata(payload_dir).is_ok()
+            || payload_dir
+                .parent()
+                .is_some_and(|parent| parent.join(".payload-prune-v2").exists())
+        {
+            bail!("plan-bound retention is not exact commitment-then-prune with an absent payload");
+        }
+        if (expected_tlc && metadir_bindings != 1) || (!expected_tlc && metadir_bindings != 0) {
+            bail!("plan-bound command has the wrong exact TLC metadir binding count");
+        }
+        let manifest_path = retention_evidence
+            .payload_manifest
+            .as_deref()
+            .context("plan-bound retention has no payload commitment path")?;
+        if manifest_path != artifact_dir.join("payload-manifest.json") {
+            bail!("payload metadata commitment is not the exact artifact sibling");
+        }
+        validate_payload_metadata_commitment(manifest_path, payload_relative, contract)?;
+        let provenance = RuntimeFileProvenance::new(manifest_path)?;
+        if retention_evidence.payload_manifest_sha256.as_deref() != Some(&provenance.sha256) {
+            bail!("payload metadata commitment digest differs from artifact retention");
+        }
+        (Some(provenance), "absent".to_string())
+    } else {
+        if retention_evidence.action != "none"
+            || retention_evidence.payload_manifest.is_some()
+            || retention_evidence.payload_manifest_sha256.is_some()
+        {
+            bail!("non-pruned observation has an invalid retention action");
+        }
+        if metadir_bindings != 0 {
+            bail!("non-plan-bound retention unexpectedly binds the plan P metadir");
+        }
+        (None, retention_evidence.payload_final_state.clone())
+    };
+    Ok(RuntimeArtifactDigest {
+        spec: spec.to_string(),
+        arm: arm.to_string(),
+        run_index,
+        command,
+        stdout: RuntimeFileProvenance::new(&artifact_dir.join("stdout.txt"))?,
+        stderr: RuntimeFileProvenance::new(&artifact_dir.join("stderr.txt"))?,
+        retention,
+        payload_manifest,
+        storage_capability,
+        payload_final_state,
+        storage_limit_trigger: retention_evidence.trigger,
+        process_tree_lifetime_complete,
+        process_tree_forced_quiescence_complete,
+        artifact_dir,
+    })
+}
+
+fn validate_payload_metadata_commitment(
+    path: &Path,
+    expected_target_relative_path: &str,
+    contract: &ObservationStorageContract,
+) -> Result<()> {
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("lstat {}", path.display()))?;
+    if metadata.len() > contract.maximum_payload_manifest_bytes {
+        bail!("payload metadata commitment exceeds its frozen serialized-byte cap");
+    }
+    let (value, _, _) =
+        read_regular_json_nofollow_bounded(path, contract.maximum_payload_manifest_bytes)?;
+    if value.get("schema").and_then(Value::as_str)
+        != Some("ty.supremacy.payload-metadata-commitment.v2")
+        || value.get("target_relative_path").and_then(Value::as_str)
+            != Some(expected_target_relative_path)
+        || value.get("content_digest").and_then(Value::as_bool) != Some(false)
+        || value.get("root_present").and_then(Value::as_bool) != Some(true)
+        || value.get("canonicalization").and_then(Value::as_str)
+            != Some("length_prefixed_raw_relative_path_and_metadata_v1")
+        || value.get("sample_strategy").and_then(Value::as_str)
+            != Some("first_and_last_8_sorted_raw_paths_v1")
+    {
+        bail!("payload metadata commitment contract is invalid");
+    }
+    let entry_count = value
+        .get("entry_count")
+        .and_then(Value::as_u64)
+        .context("payload metadata commitment has no entry count")?;
+    let file_count = value
+        .get("file_count")
+        .and_then(Value::as_u64)
+        .context("payload metadata commitment has no file count")?;
+    let directory_count = value
+        .get("directory_count")
+        .and_then(Value::as_u64)
+        .context("payload metadata commitment has no directory count")?;
+    let total_apparent_bytes = value
+        .get("total_apparent_bytes")
+        .and_then(Value::as_u64)
+        .context("payload metadata commitment has no apparent-byte total")?;
+    let total_allocated_bytes = value
+        .get("total_allocated_bytes")
+        .and_then(Value::as_u64)
+        .context("payload metadata commitment has no allocated-byte total")?;
+    let metadata_sha256 = value
+        .get("metadata_sha256")
+        .and_then(Value::as_str)
+        .context("payload metadata commitment has no metadata digest")?;
+    let sample = value
+        .get("sample")
+        .and_then(Value::as_array)
+        .context("payload metadata commitment has no bounded sample")?;
+    let expected_sample_len = usize::try_from(entry_count.min(16)).unwrap_or(usize::MAX);
+    let mut previous_ordinal = None;
+    for entry in sample {
+        let ordinal = entry
+            .get("ordinal")
+            .and_then(Value::as_u64)
+            .context("payload metadata sample has no ordinal")?;
+        let path_sha256 = entry
+            .get("relative_path_sha256")
+            .and_then(Value::as_str)
+            .context("payload metadata sample has no path digest")?;
+        let entry_sha256 = entry
+            .get("entry_metadata_sha256")
+            .and_then(Value::as_str)
+            .context("payload metadata sample has no entry digest")?;
+        if ordinal >= entry_count
+            || previous_ordinal.is_some_and(|previous| previous >= ordinal)
+            || !matches!(
+                entry.get("entry_type").and_then(Value::as_str),
+                Some("directory" | "regular_file")
+            )
+            || [path_sha256, entry_sha256].into_iter().any(|digest| {
+                digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        {
+            bail!("payload metadata commitment sample is invalid");
+        }
+        previous_ordinal = Some(ordinal);
+    }
+    if value.get("entries").is_some()
+        || sample.len() != expected_sample_len
+        || entry_count == 0
+        || directory_count == 0
+        || file_count.checked_add(directory_count) != Some(entry_count)
+        || total_allocated_bytes > contract.hard_observation_allocated_bytes
+        || entry_count > contract.hard_observation_inodes
+        || metadata_sha256.len() != 64
+        || !metadata_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || u64::try_from(expected_target_relative_path.len()).unwrap_or(u64::MAX)
+            > contract.maximum_payload_relative_path_bytes
+    {
+        bail!("payload metadata commitment declared summary is invalid");
+    }
+    let _ = total_apparent_bytes;
+    Ok(())
 }
 
 fn uncollected_selected_runtime_specs(
@@ -2019,8 +11871,17 @@ struct RuntimeEvidenceMetadata {
     generated_at: String,
     ty: RuntimeTyProvenance,
     tlc: RuntimeTlcProvenance,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    community_modules: Option<RuntimeFileProvenance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tla_library: Option<RuntimeDirectoryProvenance>,
     java: RuntimeCommandVersionProvenance,
     examples_checkout: RuntimeGitCheckoutProvenance,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    machine: Option<RuntimeMachineProvenance>,
+    benchmark: RuntimeBenchmarkProvenance,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    input_revalidation_errors: Vec<String>,
 }
 
 impl RuntimeEvidenceMetadata {
@@ -2029,13 +11890,72 @@ impl RuntimeEvidenceMetadata {
         examples_dir: &Path,
         ty_bin: &Path,
         tlc_jar: &Path,
+        community_modules: Option<&Path>,
+        tla_library: Option<&Path>,
+        baseline_path: &Path,
+        config: &RuntimeCollectionConfig,
         generated_at: String,
     ) -> Result<Self> {
+        Self::collect_with_launcher_provenance(
+            repo_root,
+            examples_dir,
+            ty_bin,
+            tlc_jar,
+            community_modules,
+            tla_library,
+            baseline_path,
+            config,
+            generated_at,
+            true,
+        )
+    }
+
+    fn collect_campaign_attestations(
+        repo_root: &Path,
+        examples_dir: &Path,
+        ty_bin: &Path,
+        tlc_jar: &Path,
+        community_modules: Option<&Path>,
+        tla_library: Option<&Path>,
+        baseline_path: &Path,
+        config: &RuntimeCollectionConfig,
+        generated_at: String,
+    ) -> Result<Self> {
+        Self::collect_with_launcher_provenance(
+            repo_root,
+            examples_dir,
+            ty_bin,
+            tlc_jar,
+            community_modules,
+            tla_library,
+            baseline_path,
+            config,
+            generated_at,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn collect_with_launcher_provenance(
+        repo_root: &Path,
+        examples_dir: &Path,
+        ty_bin: &Path,
+        tlc_jar: &Path,
+        community_modules: Option<&Path>,
+        tla_library: Option<&Path>,
+        baseline_path: &Path,
+        config: &RuntimeCollectionConfig,
+        generated_at: String,
+        include_launcher_provenance: bool,
+    ) -> Result<Self> {
+        let strict_manifest = repo_root.join("tests/tlc_comparison/strict_corpus_manifest.json");
         Ok(Self {
             generated_at,
             ty: RuntimeTyProvenance {
                 git_commit: current_ty_git_commit(repo_root),
+                build_worktree_dirty: current_ty_build_worktree_dirty(),
                 workspace_git_commit: git_command_text(repo_root, &["rev-parse", "HEAD"]).ok(),
+                workspace_checkout: git_checkout_provenance(repo_root),
                 binary: RuntimeFileProvenance::new(ty_bin)
                     .with_context(|| format!("hash TY binary {}", ty_bin.display()))?,
             },
@@ -2043,8 +11963,53 @@ impl RuntimeEvidenceMetadata {
                 jar: RuntimeFileProvenance::new(tlc_jar)
                     .with_context(|| format!("hash TLC jar {}", tlc_jar.display()))?,
             },
-            java: java_version_provenance(),
+            community_modules: community_modules
+                .map(RuntimeFileProvenance::new)
+                .transpose()
+                .context("hash CommunityModules jar")?,
+            tla_library: tla_library
+                .map(RuntimeDirectoryProvenance::new)
+                .transpose()
+                .context("hash TLA library tree")?,
+            java: config.java.provenance.clone(),
             examples_checkout: git_checkout_provenance(examples_dir),
+            machine: if include_launcher_provenance {
+                runtime_machine_provenance_from_env()
+                    .context("read strict Linux machine provenance")?
+            } else {
+                None
+            },
+            benchmark: RuntimeBenchmarkProvenance {
+                mode: match config.mode {
+                    SupremacyMode::Warn => "warn",
+                    SupremacyMode::Enforce => "enforce",
+                },
+                timeout_seconds: config.timeout_seconds,
+                runs: config.runs,
+                limit: config.limit,
+                production_runtime: config.production_runtime,
+                paired_statistic: STRICT_PAIRED_STATISTIC,
+                paired_schedule: STRICT_PAIRED_SCHEDULE,
+                os_cache_policy: strict_os_cache_policy(),
+                memory_metric: "cgroup_v2_memory_peak_process_tree",
+                min_runtime_speedup: STRICT_MIN_RUNTIME_SPEEDUP,
+                max_memory_ratio: STRICT_MAX_MEMORY_RATIO,
+                tlc_jvm_args: super::tlc_java_single_thread_args()
+                    .iter()
+                    .map(|arg| (*arg).to_string())
+                    .collect(),
+                ty_environment: config.ty_base_env.clone(),
+                baseline: RuntimeFileProvenance::new(baseline_path)
+                    .context("hash input matrix baseline")?,
+                strict_corpus_manifest: RuntimeFileProvenance::new(&strict_manifest)
+                    .context("hash normalized strict-corpus manifest")?,
+                final_receipt_path: if include_launcher_provenance {
+                    runtime_final_receipt_path_from_env()?
+                } else {
+                    None
+                },
+            },
+            input_revalidation_errors: Vec::new(),
         })
     }
 }
@@ -2053,7 +12018,10 @@ impl RuntimeEvidenceMetadata {
 struct RuntimeTyProvenance {
     git_commit: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    build_worktree_dirty: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     workspace_git_commit: Option<String>,
+    workspace_checkout: RuntimeGitCheckoutProvenance,
     binary: RuntimeFileProvenance,
 }
 
@@ -2062,19 +12030,260 @@ struct RuntimeTlcProvenance {
     jar: RuntimeFileProvenance,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct RuntimeFileProvenance {
     path: PathBuf,
     sha256: String,
+    size_bytes: u64,
 }
 
 impl RuntimeFileProvenance {
     fn new(path: &Path) -> Result<Self> {
+        let (path, sha256, size_bytes) = sha256_regular_file_nofollow(path)?;
         Ok(Self {
-            path: canonicalize_lossy(path),
-            sha256: sha256_file(path)?,
+            sha256,
+            path,
+            size_bytes,
         })
     }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeDirectoryProvenance {
+    path: PathBuf,
+    tree_sha256: String,
+    file_count: usize,
+    total_bytes: u64,
+}
+
+impl RuntimeDirectoryProvenance {
+    fn new(path: &Path) -> Result<Self> {
+        validate_dir(path)?;
+        let path = canonicalize_lossy(path);
+        let (tree_sha256, file_count, total_bytes) = sha256_directory_tree(&path)?;
+        Ok(Self {
+            path,
+            tree_sha256,
+            file_count,
+            total_bytes,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeJavaHomeProvenance {
+    path: PathBuf,
+    tree_sha256: String,
+    file_count: usize,
+    total_bytes: u64,
+    symlink_count: usize,
+    external_target_count: usize,
+}
+
+impl RuntimeJavaHomeProvenance {
+    fn new(path: &Path) -> Result<Self> {
+        validate_canonical_runtime_directory(path, "java.home")?;
+        let first = sha256_java_runtime_tree(path)?;
+        let second = sha256_java_runtime_tree(path)?;
+        if first != second {
+            bail!(
+                "java.home runtime tree changed while it was being attested: {}",
+                path.display()
+            );
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            tree_sha256: first.tree_sha256,
+            file_count: first.file_count,
+            total_bytes: first.total_bytes,
+            symlink_count: first.symlink_count,
+            external_target_count: first.external_target_count,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeCampaignPlan {
+    schema: String,
+    campaign_id: String,
+    payload: RuntimeCampaignPlanPayload,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeCampaignPlanPayload {
+    artifacts: RuntimeCampaignArtifactLayout,
+    baseline: RuntimeFileProvenance,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy: Option<RuntimeFileProvenance>,
+    runtime: RuntimeCampaignRuntimeConfig,
+    observation_storage_contract: ObservationStorageContract,
+    contract_attestations: Value,
+    segment_size: usize,
+    runtime_specs: Vec<String>,
+    blocked_runtime_specs: Vec<String>,
+    segments: Vec<RuntimeCampaignPlanSegment>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeCampaignRuntimeConfig {
+    timeout_seconds: u64,
+    runs: usize,
+    production_runtime: bool,
+    allow_debug_runtime: bool,
+    ty_binary: RuntimeFileProvenance,
+    java_executable: RuntimeFileProvenance,
+    java_home: RuntimeJavaHomeProvenance,
+    tlc_jar: RuntimeFileProvenance,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    community_modules: Option<RuntimeFileProvenance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tla_library: Option<RuntimeDirectoryProvenance>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeCampaignPlanSegment {
+    segment_id: String,
+    runtime_specs: Vec<String>,
+    output_dir: PathBuf,
+    report_path: PathBuf,
+    attempt_marker: PathBuf,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeCampaignArtifactLayout {
+    root: PathBuf,
+    campaign_plan: PathBuf,
+    attempts_dir: PathBuf,
+    inventory_output_dir: PathBuf,
+    inventory_report_path: PathBuf,
+    inventory_attempt_marker: PathBuf,
+    superiority_output_dir: PathBuf,
+    superiority_report_path: PathBuf,
+    superiority_attempt_marker: PathBuf,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeCampaignSegmentManifest {
+    segment_id: String,
+    runtime_specs: Vec<String>,
+    evidence_set_id: String,
+    report: RuntimeFileProvenance,
+    refreshed_baseline: RuntimeFileProvenance,
+    final_receipt: RuntimeFileProvenance,
+    machine_provenance: RuntimeFileProvenance,
+    machine_provenance_id: String,
+    machine_compatibility_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeCampaignReportBinding {
+    role: String,
+    campaign_id: String,
+    campaign_plan: RuntimeFileProvenance,
+    contract_attestations_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    segment_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    merge_purpose: Option<String>,
+    planned_runtime_specs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    segments: Vec<RuntimeCampaignSegmentManifest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    machine_compatibility_sha256: Option<String>,
+    corpus_claim_complete: bool,
+    corpus_claim_pass: bool,
+}
+
+impl RuntimeCampaignReportBinding {
+    fn validate_claim_role(&self) -> Result<()> {
+        match self.role.as_str() {
+            "segment" => {
+                if self.segment_id.is_none()
+                    || self.merge_purpose.is_some()
+                    || !self.segments.is_empty()
+                    || self.machine_compatibility_sha256.is_some()
+                    || self.corpus_claim_complete
+                    || self.corpus_claim_pass
+                {
+                    bail!(
+                        "campaign segment evidence must identify one segment and may not claim corpus completion or pass"
+                    );
+                }
+            }
+            "aggregate" => {
+                if self.segment_id.is_some() {
+                    bail!("campaign aggregate evidence may not identify one segment");
+                }
+                match self.merge_purpose.as_deref() {
+                    Some("inventory") if self.corpus_claim_complete && !self.corpus_claim_pass => {}
+                    Some("inventory") => {
+                        bail!(
+                            "campaign inventory aggregate must claim complete coverage but never superiority"
+                        )
+                    }
+                    Some("superiority") => {}
+                    _ => bail!("campaign aggregate evidence has no valid merge purpose"),
+                }
+                if !self
+                    .machine_compatibility_sha256
+                    .as_deref()
+                    .is_some_and(valid_sha256)
+                {
+                    bail!("campaign aggregate evidence has no machine compatibility digest");
+                }
+                if self.corpus_claim_pass && !self.corpus_claim_complete {
+                    bail!("campaign aggregate pass requires corpus_claim_complete");
+                }
+            }
+            role => bail!("unsupported runtime campaign evidence role {role:?}"),
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RuntimeMachineProvenance {
+    path: PathBuf,
+    provenance_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_device: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_inode: Option<u64>,
+    schema: Option<String>,
+    status: Option<String>,
+    qualified: bool,
+    snapshot: Value,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RuntimeBenchmarkProvenance {
+    mode: &'static str,
+    timeout_seconds: u64,
+    runs: usize,
+    limit: Option<usize>,
+    production_runtime: bool,
+    paired_statistic: &'static str,
+    paired_schedule: &'static str,
+    os_cache_policy: Value,
+    memory_metric: &'static str,
+    min_runtime_speedup: f64,
+    max_memory_ratio: f64,
+    tlc_jvm_args: Vec<String>,
+    ty_environment: BTreeMap<String, String>,
+    baseline: RuntimeFileProvenance,
+    strict_corpus_manifest: RuntimeFileProvenance,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    final_receipt_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -2083,22 +12292,60 @@ struct RuntimeBaselineProvenance {
     ty_git_commit: String,
     ty_binary: RuntimeFileProvenance,
     allow_debug_runtime: bool,
+    evidence_set_id: String,
+    runtime_evidence_path: PathBuf,
+    refreshed_specs_jcs_sha256: String,
+    machine_provenance_path: Option<PathBuf>,
+    machine_provenance_id: Option<String>,
+    final_receipt_path: Option<PathBuf>,
+    campaign: Option<RuntimeCampaignReportBinding>,
 }
 
 impl RuntimeBaselineProvenance {
-    fn from_metadata(metadata: &RuntimeEvidenceMetadata, allow_debug_runtime: bool) -> Self {
-        Self {
+    fn from_metadata(
+        metadata: &RuntimeEvidenceMetadata,
+        allow_debug_runtime: bool,
+        repo_root: &Path,
+        output_dir: &Path,
+        campaign: Option<&RuntimeCampaignReportBinding>,
+    ) -> Result<Self> {
+        Ok(Self {
             timestamp: metadata.generated_at.clone(),
             ty_git_commit: metadata.ty.git_commit.clone(),
             ty_binary: metadata.ty.binary.clone(),
             allow_debug_runtime,
-        }
+            evidence_set_id: "pending".to_string(),
+            runtime_evidence_path: absolutize(repo_root, &output_dir.join("runtime_evidence.json")),
+            refreshed_specs_jcs_sha256: "pending".to_string(),
+            machine_provenance_path: metadata
+                .machine
+                .as_ref()
+                .map(|machine| machine.path.clone()),
+            machine_provenance_id: metadata
+                .machine
+                .as_ref()
+                .map(|machine| machine.provenance_id.clone()),
+            final_receipt_path: metadata.benchmark.final_receipt_path.clone(),
+            campaign: campaign.cloned(),
+        })
+    }
+
+    fn bind_evidence(&self, evidence_set_id: String, refreshed_specs_jcs_sha256: String) -> Self {
+        let mut bound = self.clone();
+        bound.evidence_set_id = evidence_set_id;
+        bound.refreshed_specs_jcs_sha256 = refreshed_specs_jcs_sha256;
+        bound
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct RuntimeCommandVersionProvenance {
     argv: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    executable: Option<RuntimeFileProvenance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    java_home: Option<RuntimeJavaHomeProvenance>,
     #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -2107,9 +12354,15 @@ struct RuntimeCommandVersionProvenance {
     status: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    settings_argv: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    settings_output: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    settings_status: Option<i32>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 struct RuntimeGitCheckoutProvenance {
     path: PathBuf,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2126,7 +12379,7 @@ struct RuntimeGitCheckoutProvenance {
     error: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct RuntimeEvidenceRow {
     spec: String,
     tlc: RuntimeModeEvidence,
@@ -2135,17 +12388,112 @@ struct RuntimeEvidenceRow {
     refreshed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     required_flags: Vec<String>,
+    #[serde(default = "default_runtime_collection_outcome")]
+    collection_outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resource_limit_event: Option<RuntimeResourceLimitEvent>,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+fn default_runtime_collection_outcome() -> String {
+    "complete_measurement".to_string()
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeResourceLimitEvent {
+    arm: String,
+    run_index: usize,
+    phase: String,
+    trigger: StorageLimitTrigger,
+    artifact_dir: PathBuf,
+}
+
+fn validate_campaign_runtime_row_outcome(row: &RuntimeEvidenceRow) -> Result<()> {
+    match row.collection_outcome.as_str() {
+        "complete_measurement" => {
+            if row.resource_limit_event.is_some() {
+                bail!("complete_measurement carries a resource_limit_event");
+            }
+        }
+        "resource_limited" => {
+            let event = row
+                .resource_limit_event
+                .as_ref()
+                .context("resource_limited row has no resource_limit_event")?;
+            if !matches!(event.arm.as_str(), "tlc" | "ty")
+                || !matches!(event.phase.as_str(), "warmup" | "scored")
+                || !event.trigger.process_group_killed
+                || !event.trigger.child_reaped
+                || row.refreshed
+                || row.verified_match
+            {
+                bail!("resource_limited row has an invalid typed event");
+            }
+            let triggered_mode = match event.arm.as_str() {
+                "tlc" => &row.tlc,
+                "ty" => &row.ty,
+                _ => unreachable!("validated resource-limited arm"),
+            };
+            if triggered_mode.status != "resource_limited"
+                || triggered_mode.error_type.as_deref() != Some(RUNTIME_RESOURCE_LIMIT_ERROR_TYPE)
+                || triggered_mode.artifact_dir != event.artifact_dir
+            {
+                bail!("resource_limited row event does not match its triggered arm evidence");
+            }
+        }
+        outcome => bail!("unsupported campaign collection_outcome {outcome:?}"),
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct RuntimeModeEvidence {
     status: String,
     runtime_seconds: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    process_tree_peak_memory_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    samples: Vec<SupremacyMatrixPerformanceSample>,
+    /// Retained OS-cache warmups. These observations are never summarized
+    /// into runtime or memory medians.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    cache_warmup_samples: Vec<SupremacyMatrixPerformanceSample>,
     states: Option<u64>,
+    /// Admitted/internal transition diagnostic; not strict work evidence.
+    transitions: Option<u64>,
+    raw_initial_states_generated: Option<u64>,
+    raw_successors_generated: Option<u64>,
+    states_generated: Option<u64>,
     error_type: Option<String>,
     artifact_dir: PathBuf,
+    /// Independent TLC arm paired with the pinned count-verification TY arm.
+    /// These fields are populated on TLC evidence only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    count_verification_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    count_verification_error_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    count_verification_runtime_seconds: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    count_verification_process_tree_peak_memory_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    count_verification_samples: Vec<SupremacyMatrixPerformanceSample>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    count_verification_cache_warmup_samples: Vec<SupremacyMatrixPerformanceSample>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    count_verification_states: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    count_verification_transitions: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    count_verification_raw_initial_states_generated: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    count_verification_raw_successors_generated: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    count_verification_states_generated: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    count_verification_artifact_dir: Option<PathBuf>,
     /// Production-default measurement axis (auto-POR/auto-symmetry free to
     /// engage), collected only for the TY side of check-mode rows when
     /// `--production-runtime true`. `production_status` marks presence.
@@ -2156,7 +12504,21 @@ struct RuntimeModeEvidence {
     #[serde(skip_serializing_if = "Option::is_none")]
     production_runtime_seconds: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    production_process_tree_peak_memory_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    production_samples: Vec<SupremacyMatrixPerformanceSample>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    production_cache_warmup_samples: Vec<SupremacyMatrixPerformanceSample>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     production_states: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    production_transitions: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    production_raw_initial_states_generated: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    production_raw_successors_generated: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    production_states_generated: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     production_artifact_dir: Option<PathBuf>,
 }
@@ -2170,45 +12532,129 @@ fn attach_production_runtime_evidence(
     ty.production_status = Some(production.status);
     ty.production_error_type = production.error_type;
     ty.production_runtime_seconds = production.runtime_seconds;
+    ty.production_process_tree_peak_memory_bytes = production.process_tree_peak_memory_bytes;
+    ty.production_samples = production.samples;
     ty.production_states = production.states;
+    ty.production_transitions = production.transitions;
+    ty.production_raw_initial_states_generated = production.raw_initial_states_generated;
+    ty.production_raw_successors_generated = production.raw_successors_generated;
+    ty.production_states_generated = production.states_generated;
     ty.production_artifact_dir = Some(production.artifact_dir);
     ty
 }
 
+fn attach_count_verification_runtime_evidence(
+    mut tlc: RuntimeModeEvidence,
+    count_verification: RuntimeModeEvidence,
+) -> RuntimeModeEvidence {
+    tlc.count_verification_status = Some(count_verification.status);
+    tlc.count_verification_error_type = count_verification.error_type;
+    tlc.count_verification_runtime_seconds = count_verification.runtime_seconds;
+    tlc.count_verification_process_tree_peak_memory_bytes =
+        count_verification.process_tree_peak_memory_bytes;
+    tlc.count_verification_samples = count_verification.samples;
+    tlc.count_verification_states = count_verification.states;
+    tlc.count_verification_transitions = count_verification.transitions;
+    tlc.count_verification_raw_initial_states_generated =
+        count_verification.raw_initial_states_generated;
+    tlc.count_verification_raw_successors_generated = count_verification.raw_successors_generated;
+    tlc.count_verification_states_generated = count_verification.states_generated;
+    tlc.count_verification_artifact_dir = Some(count_verification.artifact_dir);
+    tlc
+}
+
 const RUNTIME_COLLECTION_FAILED_ERROR_TYPE: &str = "runtime_collection_failed";
+const RUNTIME_RESOURCE_LIMIT_ERROR_TYPE: &str = "resource_limit";
+
+fn runtime_resource_limit_row(
+    spec_name: &str,
+    output_dir: &Path,
+    limit: &ObservationStorageLimitError,
+) -> Result<RuntimeEvidenceRow> {
+    let phase = if limit
+        .artifact_dir
+        .components()
+        .any(|component| component.as_os_str() == "cache-warmup")
+    {
+        "warmup"
+    } else {
+        "scored"
+    };
+    let mut tlc = runtime_collection_error_mode(output_dir, spec_name, "tlc")?;
+    let mut ty = runtime_collection_error_mode(output_dir, spec_name, "ty")?;
+    let triggered = RuntimeModeEvidence {
+        status: "resource_limited".to_string(),
+        runtime_seconds: None,
+        states: None,
+        error_type: Some(RUNTIME_RESOURCE_LIMIT_ERROR_TYPE.to_string()),
+        artifact_dir: limit.artifact_dir.clone(),
+        ..RuntimeModeEvidence::default()
+    };
+    let arm = match limit.arm {
+        RuntimeOutputKind::Tlc => {
+            tlc = triggered;
+            "tlc"
+        }
+        RuntimeOutputKind::Ty => {
+            ty = triggered;
+            "ty"
+        }
+    };
+    Ok(RuntimeEvidenceRow {
+        spec: spec_name.to_string(),
+        tlc,
+        ty,
+        verified_match: false,
+        refreshed: false,
+        note: Some(format!(
+            "resource-limited inventory outcome: {:?} observed {} against {}",
+            limit.trigger.kind, limit.trigger.observed, limit.trigger.limit
+        )),
+        required_flags: Vec::new(),
+        collection_outcome: "resource_limited".to_string(),
+        resource_limit_event: Some(RuntimeResourceLimitEvent {
+            arm: arm.to_string(),
+            run_index: limit.run_index,
+            phase: phase.to_string(),
+            trigger: limit.trigger.clone(),
+            artifact_dir: limit.artifact_dir.clone(),
+        }),
+    })
+}
 
 fn runtime_collection_error_row(
     spec_name: &str,
     output_dir: &Path,
     error: &anyhow::Error,
-) -> RuntimeEvidenceRow {
-    RuntimeEvidenceRow {
+) -> Result<RuntimeEvidenceRow> {
+    Ok(RuntimeEvidenceRow {
         spec: spec_name.to_string(),
-        tlc: runtime_collection_error_mode(output_dir, spec_name, "tlc"),
-        ty: runtime_collection_error_mode(output_dir, spec_name, "ty"),
+        tlc: runtime_collection_error_mode(output_dir, spec_name, "tlc")?,
+        ty: runtime_collection_error_mode(output_dir, spec_name, "ty")?,
         verified_match: false,
         refreshed: false,
         note: Some(format!("runtime evidence collection failed: {error:#}")),
         required_flags: Vec::new(),
-    }
+        collection_outcome: "unclassified_failure".to_string(),
+        resource_limit_event: None,
+    })
 }
 
 fn runtime_collection_error_mode(
     output_dir: &Path,
     spec_name: &str,
     mode: &str,
-) -> RuntimeModeEvidence {
-    RuntimeModeEvidence {
+) -> Result<RuntimeModeEvidence> {
+    Ok(RuntimeModeEvidence {
         status: "fail".to_string(),
         runtime_seconds: None,
         states: None,
         error_type: Some(RUNTIME_COLLECTION_FAILED_ERROR_TYPE.to_string()),
-        artifact_dir: output_dir
-            .join(spec_name)
+        artifact_dir: runtime_spec_artifact_dir(output_dir, spec_name)?
             .join("collection-failed")
             .join(mode),
         ..RuntimeModeEvidence::default()
-    }
+    })
 }
 
 fn runtime_evidence_errors(rows: &[RuntimeEvidenceRow]) -> Vec<RuntimeEvidenceError> {
@@ -2224,8 +12670,9 @@ fn runtime_evidence_errors(rows: &[RuntimeEvidenceRow]) -> Vec<RuntimeEvidenceEr
 }
 
 fn runtime_row_is_collection_error(row: &RuntimeEvidenceRow) -> bool {
-    row.tlc.error_type.as_deref() == Some(RUNTIME_COLLECTION_FAILED_ERROR_TYPE)
-        || row.ty.error_type.as_deref() == Some(RUNTIME_COLLECTION_FAILED_ERROR_TYPE)
+    row.collection_outcome == "unclassified_failure"
+        && (row.tlc.error_type.as_deref() == Some(RUNTIME_COLLECTION_FAILED_ERROR_TYPE)
+            || row.ty.error_type.as_deref() == Some(RUNTIME_COLLECTION_FAILED_ERROR_TYPE))
 }
 
 fn collect_spec_runtime(
@@ -2266,7 +12713,6 @@ fn collect_spec_runtime(
             repo_root,
             tlc_classpath,
             no_config_flags,
-            timeout_seconds,
         );
     }
 
@@ -2294,45 +12740,17 @@ fn collect_spec_runtime(
     }
 
     eprintln!("[supremacy] {spec_name}: collecting matrix runtime evidence");
-    let spec_dir = config.output_dir.join(spec_name);
-    let tlc = run_tlc_runtime(
+    let spec_dir = runtime_spec_artifact_dir(&config.output_dir, spec_name)?;
+    let (tlc, ty) = collect_check_runtime_repetitions(
         spec_name,
         &tla_path,
         &cfg_path,
+        None,
+        config,
+        repo_root,
+        &spec_dir,
         tlc_classpath,
-        config.tla_library.as_deref(),
-        repo_root,
-        &spec_dir,
-        timeout_seconds,
     )?;
-    let ty = run_ty_runtime(
-        spec_name,
-        &tla_path,
-        &cfg_path,
-        &config.ty_bin,
-        repo_root,
-        &spec_dir,
-        timeout_seconds,
-        &config.ty_base_env,
-        config.allow_debug_runtime,
-    )?;
-    let ty = if config.production_runtime {
-        eprintln!("[supremacy] {spec_name}: collecting production-default runtime evidence");
-        let production = run_ty_production_runtime(
-            spec_name,
-            &tla_path,
-            &cfg_path,
-            &config.ty_bin,
-            repo_root,
-            &spec_dir,
-            timeout_seconds,
-            &config.ty_base_env,
-            config.allow_debug_runtime,
-        )?;
-        attach_production_runtime_evidence(ty, production)
-    } else {
-        ty
-    };
     let verified_match = runtime_modes_verified_match(&tlc, &ty);
     let refreshed = runtime_modes_have_fresh_evidence(&tlc, &ty);
     Ok(RuntimeEvidenceRow {
@@ -2343,6 +12761,8 @@ fn collect_spec_runtime(
         refreshed,
         note: None,
         required_flags: Vec::new(),
+        collection_outcome: default_runtime_collection_outcome(),
+        resource_limit_event: None,
     })
 }
 
@@ -2356,17 +12776,19 @@ fn collect_simulation_spec_runtime(
     timeout_seconds: u64,
 ) -> Result<RuntimeEvidenceRow> {
     eprintln!("[supremacy] {spec_name}: collecting simulation runtime evidence");
-    let spec_dir = config.output_dir.join(spec_name);
+    let spec_dir = runtime_spec_artifact_dir(&config.output_dir, spec_name)?;
     let simulation_cfg_path = write_simulation_runtime_config(cfg_path, repo_root, &spec_dir)?;
     let tlc = run_tlc_simulation_runtime(
         spec_name,
         tla_path,
         &simulation_cfg_path,
+        &config.java.executable.path,
         tlc_classpath,
         config.tla_library.as_deref(),
         repo_root,
         &spec_dir,
         timeout_seconds,
+        config,
     )?;
     let ty = run_ty_simulation_runtime(
         spec_name,
@@ -2377,6 +12799,7 @@ fn collect_simulation_spec_runtime(
         &spec_dir,
         timeout_seconds,
         config.allow_debug_runtime,
+        config,
     )?;
     let verified_match = ty.status == SUPREMACY_STATUS_PASS;
     let has_ty_runtime = has_finite_positive_runtime(ty.runtime_seconds);
@@ -2393,6 +12816,8 @@ fn collect_simulation_spec_runtime(
                 .to_string(),
         ),
         required_flags: vec!["simulate".to_string()],
+        collection_outcome: default_runtime_collection_outcome(),
+        resource_limit_event: None,
     })
 }
 
@@ -2422,49 +12847,20 @@ fn collect_no_config_spec_runtime(
     repo_root: &Path,
     tlc_classpath: &str,
     no_config_flags: &[String],
-    timeout_seconds: u64,
 ) -> Result<RuntimeEvidenceRow> {
     eprintln!("[supremacy] {spec_name}: collecting config-free matrix runtime evidence");
-    let spec_dir = config.output_dir.join(spec_name);
+    let spec_dir = runtime_spec_artifact_dir(&config.output_dir, spec_name)?;
     let generated_cfg_path = write_no_config_tlc_config(repo_root, &spec_dir, no_config_flags)?;
-    let tlc = run_tlc_runtime(
+    let (tlc, ty) = collect_check_runtime_repetitions(
         spec_name,
         tla_path,
         &generated_cfg_path,
+        Some(no_config_flags),
+        config,
+        repo_root,
+        &spec_dir,
         tlc_classpath,
-        config.tla_library.as_deref(),
-        repo_root,
-        &spec_dir,
-        timeout_seconds,
     )?;
-    let ty = run_ty_no_config_runtime(
-        spec_name,
-        tla_path,
-        &config.ty_bin,
-        repo_root,
-        &spec_dir,
-        timeout_seconds,
-        &config.ty_base_env,
-        config.allow_debug_runtime,
-        no_config_flags,
-    )?;
-    let ty = if config.production_runtime {
-        eprintln!("[supremacy] {spec_name}: collecting production-default runtime evidence");
-        let production = run_ty_no_config_production_runtime(
-            spec_name,
-            tla_path,
-            &config.ty_bin,
-            repo_root,
-            &spec_dir,
-            timeout_seconds,
-            &config.ty_base_env,
-            config.allow_debug_runtime,
-            no_config_flags,
-        )?;
-        attach_production_runtime_evidence(ty, production)
-    } else {
-        ty
-    };
     let verified_match = runtime_modes_verified_match(&tlc, &ty);
     let refreshed = runtime_modes_have_fresh_evidence(&tlc, &ty);
     Ok(RuntimeEvidenceRow {
@@ -2475,6 +12871,8 @@ fn collect_no_config_spec_runtime(
         refreshed,
         note: Some("TLC used a generated config; TY used config-free CLI flags".to_string()),
         required_flags: no_config_runtime_required_flags(no_config_flags),
+        collection_outcome: default_runtime_collection_outcome(),
+        resource_limit_event: None,
     })
 }
 
@@ -2482,19 +12880,221 @@ fn no_config_runtime_required_flags(no_config_flags: &[String]) -> Vec<String> {
     no_config_flags.to_vec()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MatrixPerformanceSchedule {
+    production_tool_order: &'static str,
+    count_tool_order: &'static str,
+    pair_block_order: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+struct CacheWarmupScheduleEntry {
+    sequence_index: usize,
+    arm: &'static str,
+    tool_order: &'static str,
+    pair_block_order: &'static str,
+}
+
+/// Fixed, retained, unscored crossover that brings the guest page cache to a
+/// balanced steady state before any scored observation. Each tool and axis
+/// appears once in each half, and both TLC→TY and TY→TLC transitions occur for
+/// both production and count-verification work.
+const STRICT_CACHE_WARMUP_SCHEDULE: [CacheWarmupScheduleEntry;
+    STRICT_CACHE_WARMUP_OBSERVATIONS_PER_ROW] = [
+    CacheWarmupScheduleEntry {
+        sequence_index: 1,
+        arm: "production_tlc",
+        tool_order: "tlc_then_ty",
+        pair_block_order: "production_then_count",
+    },
+    CacheWarmupScheduleEntry {
+        sequence_index: 2,
+        arm: "production_ty",
+        tool_order: "tlc_then_ty",
+        pair_block_order: "production_then_count",
+    },
+    CacheWarmupScheduleEntry {
+        sequence_index: 3,
+        arm: "count_ty",
+        tool_order: "ty_then_tlc",
+        pair_block_order: "production_then_count",
+    },
+    CacheWarmupScheduleEntry {
+        sequence_index: 4,
+        arm: "count_tlc",
+        tool_order: "ty_then_tlc",
+        pair_block_order: "production_then_count",
+    },
+    CacheWarmupScheduleEntry {
+        sequence_index: 5,
+        arm: "count_tlc",
+        tool_order: "tlc_then_ty",
+        pair_block_order: "count_then_production",
+    },
+    CacheWarmupScheduleEntry {
+        sequence_index: 6,
+        arm: "count_ty",
+        tool_order: "tlc_then_ty",
+        pair_block_order: "count_then_production",
+    },
+    CacheWarmupScheduleEntry {
+        sequence_index: 7,
+        arm: "production_ty",
+        tool_order: "ty_then_tlc",
+        pair_block_order: "count_then_production",
+    },
+    CacheWarmupScheduleEntry {
+        sequence_index: 8,
+        arm: "production_tlc",
+        tool_order: "ty_then_tlc",
+        pair_block_order: "count_then_production",
+    },
+];
+
+#[derive(Default)]
+struct CacheWarmupSamples {
+    production_tlc: Vec<SupremacyMatrixPerformanceSample>,
+    production_ty: Vec<SupremacyMatrixPerformanceSample>,
+    count_tlc: Vec<SupremacyMatrixPerformanceSample>,
+    count_ty: Vec<SupremacyMatrixPerformanceSample>,
+}
+
+fn strict_os_cache_policy() -> Value {
+    json!({
+        "schema": STRICT_OS_CACHE_POLICY_SCHEMA,
+        "cache_state": "steady_guest_page_cache_after_balanced_crossover_warmups",
+        "host_page_cache": {
+            "dropped": false,
+            "reset_between_observations": false,
+        },
+        "application_caches": {
+            "artifact_directories": "unique_per_observation",
+            "ty_native_artifact_cache": "disabled",
+            "post_observation_retention": "command_stream_sample_evidence_retained",
+            "command_payload_lifecycle": "metadata_commitment_then_prune_v2",
+            "command_payload_content_digest": false,
+            "command_payload_scope": "whole_plan_bound_ty_or_tlc_payload_tree",
+            "cleanup_timing": "after_process_tree_quiescence_and_measured_interval",
+        },
+        "warmups": {
+            "observations_per_row": STRICT_CACHE_WARMUP_OBSERVATIONS_PER_ROW,
+            "schedule": STRICT_CACHE_WARMUP_SCHEDULE,
+            "retained": true,
+            "retained_meaning": "observation command, streams, resource evidence, retention record, and compact payload metadata commitment; not payload bytes",
+            "included_in_scoring": false,
+        },
+        "strict_rejection_conditions": [
+            "missing_warmup",
+            "reordered_warmup",
+            "failed_warmup",
+            "timed_out_warmup",
+            "semantic_or_engine_drift",
+            "artifact_reuse",
+        ],
+    })
+}
+
+/// Two-period crossover shared by collection and strict validation. For every
+/// even repetition count, both launch orders within both pairs and both pair
+/// block orders have equal representation.
+fn matrix_performance_schedule(run_index: usize) -> MatrixPerformanceSchedule {
+    debug_assert!(run_index > 0);
+    if run_index % 2 == 1 {
+        MatrixPerformanceSchedule {
+            production_tool_order: "tlc_then_ty",
+            count_tool_order: "ty_then_tlc",
+            pair_block_order: "production_then_count",
+        }
+    } else {
+        MatrixPerformanceSchedule {
+            production_tool_order: "ty_then_tlc",
+            count_tool_order: "tlc_then_ty",
+            pair_block_order: "count_then_production",
+        }
+    }
+}
+
 fn runtime_modes_verified_match(tlc: &RuntimeModeEvidence, ty: &RuntimeModeEvidence) -> bool {
+    if !ty.production_samples.is_empty() || !tlc.count_verification_samples.is_empty() {
+        let run_count = tlc.samples.len();
+        if run_count == 0
+            || tlc.count_verification_samples.len() != run_count
+            || ty.samples.len() != run_count
+            || ty.production_samples.len() != run_count
+            || !performance_samples_are_deterministic(&tlc.samples)
+            || !performance_samples_are_deterministic(&tlc.count_verification_samples)
+            || !performance_samples_are_deterministic(&ty.samples)
+            || !performance_samples_are_deterministic(&ty.production_samples)
+        {
+            return false;
+        }
+        let production_tlc_by_run = samples_by_run(&tlc.samples);
+        let count_tlc_by_run = samples_by_run(&tlc.count_verification_samples);
+        let count_ty_by_run = samples_by_run(&ty.samples);
+        let production_ty_by_run = samples_by_run(&ty.production_samples);
+        let (
+            Some(production_tlc_by_run),
+            Some(count_tlc_by_run),
+            Some(count_ty_by_run),
+            Some(production_ty_by_run),
+        ) = (
+            production_tlc_by_run,
+            count_tlc_by_run,
+            count_ty_by_run,
+            production_ty_by_run,
+        )
+        else {
+            return false;
+        };
+        if production_tlc_by_run.keys().ne(count_tlc_by_run.keys())
+            || production_tlc_by_run.keys().ne(count_ty_by_run.keys())
+            || production_tlc_by_run.keys().ne(production_ty_by_run.keys())
+        {
+            return false;
+        }
+        for (run_index, production_tlc) in production_tlc_by_run {
+            let Some(count_tlc) = count_tlc_by_run.get(&run_index).copied() else {
+                return false;
+            };
+            let Some(count_ty) = count_ty_by_run.get(&run_index).copied() else {
+                return false;
+            };
+            let Some(production_ty) = production_ty_by_run.get(&run_index).copied() else {
+                return false;
+            };
+            if !runtime_sample_count_parity(count_tlc, count_ty)
+                || !runtime_sample_count_parity(production_tlc, count_tlc)
+                || !runtime_sample_verdicts_equal(production_ty, count_ty)
+            {
+                return false;
+            }
+        }
+    } else if !tlc.samples.is_empty() || !ty.samples.is_empty() {
+        if !performance_samples_are_deterministic(&tlc.samples)
+            || !performance_samples_are_deterministic(&ty.samples)
+            || tlc.samples.len() != ty.samples.len()
+        {
+            return false;
+        }
+        let Some(count_by_run) = samples_by_run(&ty.samples) else {
+            return false;
+        };
+        for tlc_sample in &tlc.samples {
+            let Some(count_sample) = count_by_run.get(&tlc_sample.run_index).copied() else {
+                return false;
+            };
+            if !runtime_sample_count_parity(tlc_sample, count_sample) {
+                return false;
+            }
+        }
+    }
+
     if tlc.status == SUPREMACY_STATUS_PASS
         && ty.status == SUPREMACY_STATUS_PASS
         && tlc.error_type.is_none()
         && ty.error_type.is_none()
     {
-        return match (tlc.states, ty.states) {
-            (Some(tlc_states), Some(ty_states)) if tlc_states == ty_states => true,
-            (Some(tlc_states), Some(ty_states)) if tlc_states != ty_states => {
-                runtime_artifacts_have_randomized_count_policy(tlc, ty)
-            }
-            _ => false,
-        };
+        return runtime_mode_count_parity(tlc, ty);
     }
 
     let Some(tlc_identity) = expected_violation_identity(tlc) else {
@@ -2504,6 +13104,37 @@ fn runtime_modes_verified_match(tlc: &RuntimeModeEvidence, ty: &RuntimeModeEvide
         return false;
     };
     tlc_identity.matches(&ty_identity, tlc.states, ty.states)
+        && runtime_mode_generated_work_parity(tlc, ty)
+}
+
+fn runtime_mode_count_parity(left: &RuntimeModeEvidence, right: &RuntimeModeEvidence) -> bool {
+    left.states.is_some()
+        && left.states == right.states
+        && runtime_mode_generated_work_parity(left, right)
+}
+
+fn runtime_mode_generated_work_parity(
+    left: &RuntimeModeEvidence,
+    right: &RuntimeModeEvidence,
+) -> bool {
+    left.raw_initial_states_generated.is_some()
+        && left.raw_initial_states_generated == right.raw_initial_states_generated
+        && left.raw_successors_generated.is_some()
+        && left.raw_successors_generated == right.raw_successors_generated
+        && left.states_generated.is_some()
+        && left.states_generated == right.states_generated
+}
+
+fn samples_by_run(
+    samples: &[SupremacyMatrixPerformanceSample],
+) -> Option<BTreeMap<usize, &SupremacyMatrixPerformanceSample>> {
+    let mut by_run = BTreeMap::new();
+    for sample in samples {
+        if sample.run_index == 0 || by_run.insert(sample.run_index, sample).is_some() {
+            return None;
+        }
+    }
+    Some(by_run)
 }
 
 fn runtime_states_are_compatible(tlc_states: Option<u64>, ty_states: Option<u64>) -> bool {
@@ -2535,98 +13166,81 @@ fn runtime_artifact_text(evidence: &RuntimeModeEvidence) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-fn runtime_artifacts_have_randomized_count_policy(
-    tlc: &RuntimeModeEvidence,
-    ty: &RuntimeModeEvidence,
-) -> bool {
-    let mut operators = BTreeSet::new();
-    let mut evidence_sources = BTreeSet::new();
-    collect_randomized_operator_evidence_from_runtime_artifact(
-        &tlc.artifact_dir,
-        &mut operators,
-        &mut evidence_sources,
-    );
-    collect_randomized_operator_evidence_from_runtime_artifact(
-        &ty.artifact_dir,
-        &mut operators,
-        &mut evidence_sources,
-    );
-    !operators.is_empty()
-}
-
-fn collect_randomized_operator_evidence_from_runtime_artifact(
-    artifact_dir: &Path,
-    operators: &mut BTreeSet<String>,
-    evidence_sources: &mut BTreeSet<String>,
-) {
-    let Ok(text) = fs::read_to_string(artifact_dir.join("command.json")) else {
-        return;
-    };
-    let Ok(command) = serde_json::from_str::<Value>(&text) else {
-        return;
-    };
-    collect_randomized_operator_evidence_from_metadata_value(
-        &format!("runtime artifact {}", artifact_dir.display()),
-        &command,
-        operators,
-        evidence_sources,
-    );
-
-    let cwd = command
-        .get("cwd")
-        .and_then(Value::as_str)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| artifact_dir.to_path_buf());
-    let Some(argv) = command.get("argv").and_then(Value::as_array) else {
-        return;
-    };
-    for arg in argv.iter().filter_map(Value::as_str) {
-        let path = Path::new(arg);
-        if path.extension().and_then(|extension| extension.to_str()) != Some("tla") {
-            continue;
-        }
-        let resolved = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            cwd.join(path)
-        };
-        collect_randomized_operator_evidence_from_source_path(
-            &resolved,
-            &format!("runtime source {}", resolved.display()),
-            operators,
-            evidence_sources,
-        );
-    }
-}
-
-fn collect_randomized_operator_evidence_from_metadata_value(
-    label: &str,
-    value: &Value,
-    operators: &mut BTreeSet<String>,
-    evidence_sources: &mut BTreeSet<String>,
-) {
-    let Some(map) = value.as_object() else {
-        return;
-    };
-    for (key, item) in map {
-        if !metadata_key_may_report_randomized_operator(key) {
-            continue;
-        }
-        for operator in RANDOMIZED_EXTERNAL_OPERATORS {
-            if json_value_contains_operator(item, operator) {
-                operators.insert((*operator).to_string());
-                evidence_sources.insert(format!("{label}.{key}"));
-            }
-        }
-    }
-}
-
 fn runtime_modes_have_fresh_evidence(tlc: &RuntimeModeEvidence, ty: &RuntimeModeEvidence) -> bool {
-    runtime_mode_has_fresh_evidence(tlc) && runtime_mode_has_fresh_evidence(ty)
+    let count_axis_present = tlc.count_verification_status.is_some()
+        || tlc.count_verification_error_type.is_some()
+        || tlc.count_verification_runtime_seconds.is_some()
+        || tlc
+            .count_verification_process_tree_peak_memory_bytes
+            .is_some()
+        || !tlc.count_verification_samples.is_empty()
+        || tlc.count_verification_states.is_some()
+        || tlc.count_verification_transitions.is_some()
+        || tlc
+            .count_verification_raw_initial_states_generated
+            .is_some()
+        || tlc.count_verification_raw_successors_generated.is_some()
+        || tlc.count_verification_states_generated.is_some()
+        || tlc.count_verification_artifact_dir.is_some();
+    let production_axis_present = ty.production_status.is_some()
+        || ty.production_error_type.is_some()
+        || ty.production_runtime_seconds.is_some()
+        || ty.production_process_tree_peak_memory_bytes.is_some()
+        || !ty.production_samples.is_empty()
+        || ty.production_states.is_some()
+        || ty.production_transitions.is_some()
+        || ty.production_raw_initial_states_generated.is_some()
+        || ty.production_raw_successors_generated.is_some()
+        || ty.production_states_generated.is_some()
+        || ty.production_artifact_dir.is_some();
+    let attached_axes_are_fresh = match (count_axis_present, production_axis_present) {
+        (false, false) => true,
+        (true, true) => {
+            tlc.samples.len() == ty.samples.len()
+                && attached_runtime_axis_has_fresh_evidence(
+                    tlc.count_verification_status.as_deref(),
+                    tlc.count_verification_runtime_seconds,
+                    &tlc.count_verification_samples,
+                    tlc.samples.len(),
+                )
+                && attached_runtime_axis_has_fresh_evidence(
+                    ty.production_status.as_deref(),
+                    ty.production_runtime_seconds,
+                    &ty.production_samples,
+                    ty.samples.len(),
+                )
+        }
+        _ => false,
+    };
+    runtime_mode_has_fresh_evidence(tlc)
+        && runtime_mode_has_fresh_evidence(ty)
+        && attached_axes_are_fresh
+}
+
+fn attached_runtime_axis_has_fresh_evidence(
+    status: Option<&str>,
+    runtime_seconds: Option<f64>,
+    samples: &[SupremacyMatrixPerformanceSample],
+    expected_sample_count: usize,
+) -> bool {
+    status.is_some()
+        && has_finite_positive_runtime(runtime_seconds)
+        && (samples.is_empty()
+            || (samples.len() == expected_sample_count
+                && performance_samples_are_deterministic(samples)
+                && samples
+                    .iter()
+                    .all(|sample| has_finite_positive_runtime(sample.runtime_seconds))))
 }
 
 fn runtime_mode_has_fresh_evidence(evidence: &RuntimeModeEvidence) -> bool {
     has_finite_positive_runtime(evidence.runtime_seconds)
+        && (evidence.samples.is_empty()
+            || (performance_samples_are_deterministic(&evidence.samples)
+                && evidence
+                    .samples
+                    .iter()
+                    .all(|sample| has_finite_positive_runtime(sample.runtime_seconds))))
 }
 
 fn write_no_config_tlc_config(
@@ -2644,19 +13258,403 @@ fn write_no_config_tlc_config(
     Ok(cfg_path)
 }
 
-fn run_tlc_runtime(
+#[derive(Clone, Copy, Debug)]
+enum RuntimeOutputKind {
+    Tlc,
+    Ty,
+}
+
+#[derive(Debug)]
+struct ObservationStorageLimitError {
+    arm: RuntimeOutputKind,
+    run_index: usize,
+    trigger: StorageLimitTrigger,
+    artifact_dir: PathBuf,
+}
+
+impl std::fmt::Display for ObservationStorageLimitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "observation storage limit {:?} triggered for {:?} run {} at {}",
+            self.trigger.kind,
+            self.arm,
+            self.run_index,
+            self.artifact_dir.display()
+        )
+    }
+}
+
+impl std::error::Error for ObservationStorageLimitError {}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_check_runtime_repetitions(
     spec_name: &str,
+    tla_path: &Path,
+    cfg_path: &Path,
+    no_config_flags: Option<&[String]>,
+    config: &RuntimeCollectionConfig,
+    repo_root: &Path,
+    spec_dir: &Path,
+    tlc_classpath: &str,
+) -> Result<(RuntimeModeEvidence, RuntimeModeEvidence)> {
+    let envelope = if config.mode == SupremacyMode::Enforce {
+        ExecutionEnvelope::strict_single_core_process_tree()
+    } else {
+        ExecutionEnvelope::diagnostic()
+    };
+    let mut production_tlc_samples = Vec::with_capacity(config.runs);
+    let mut production_samples = Vec::with_capacity(config.runs);
+    let mut count_tlc_samples = Vec::with_capacity(config.runs);
+    let mut count_samples = Vec::with_capacity(config.runs);
+    let cache_warmups = if config.production_runtime {
+        collect_cache_warmup_samples(
+            spec_name,
+            tla_path,
+            cfg_path,
+            no_config_flags,
+            config,
+            repo_root,
+            spec_dir,
+            tlc_classpath,
+            envelope,
+        )?
+    } else {
+        CacheWarmupSamples::default()
+    };
+
+    for run_index in 1..=config.runs {
+        let run_dir = spec_dir.join(format!("run-{run_index:04}"));
+        let schedule = matrix_performance_schedule(run_index);
+        let pair_block_order = if config.production_runtime {
+            schedule.pair_block_order
+        } else {
+            "count_only"
+        };
+        let production_tlc_artifact = run_dir.join("production-tlc");
+        let production_artifact = run_dir.join("production-ty");
+        let count_tlc_artifact = run_dir.join("count-tlc");
+        let count_artifact = run_dir.join("count-ty");
+        let production_tlc_spec = bind_observation_storage_contract(
+            tlc_check_command_spec(
+                &config.java.executable.path,
+                tla_path,
+                cfg_path,
+                tlc_classpath,
+                config.tla_library.as_deref(),
+                repo_root,
+                &production_tlc_artifact,
+                config.timeout_seconds,
+            ),
+            config,
+        )?;
+        let count_tlc_spec = bind_observation_storage_contract(
+            tlc_check_command_spec(
+                &config.java.executable.path,
+                tla_path,
+                cfg_path,
+                tlc_classpath,
+                config.tla_library.as_deref(),
+                repo_root,
+                &count_tlc_artifact,
+                config.timeout_seconds,
+            ),
+            config,
+        )?;
+        let production_spec = bind_observation_storage_contract(
+            ty_check_command_spec(
+                &config.ty_bin,
+                tla_path,
+                cfg_path,
+                no_config_flags,
+                false,
+                repo_root,
+                &production_artifact,
+                config.timeout_seconds,
+                &config.ty_base_env,
+            ),
+            config,
+        )?;
+        let count_spec = bind_observation_storage_contract(
+            ty_check_command_spec(
+                &config.ty_bin,
+                tla_path,
+                cfg_path,
+                no_config_flags,
+                true,
+                repo_root,
+                &count_artifact,
+                config.timeout_seconds,
+                &config.ty_base_env,
+            ),
+            config,
+        )?;
+
+        if config.production_runtime && pair_block_order == "production_then_count" {
+            let (tlc, ty) = run_tlc_ty_runtime_pair(
+                spec_name,
+                &production_tlc_spec,
+                &production_spec,
+                envelope,
+                config.allow_debug_runtime,
+                run_index,
+                schedule.production_tool_order,
+                pair_block_order,
+            )?;
+            production_tlc_samples.push(tlc);
+            production_samples.push(ty);
+        }
+
+        let (tlc, ty) = run_tlc_ty_runtime_pair(
+            spec_name,
+            &count_tlc_spec,
+            &count_spec,
+            envelope,
+            config.allow_debug_runtime,
+            run_index,
+            schedule.count_tool_order,
+            pair_block_order,
+        )?;
+        count_tlc_samples.push(tlc);
+        count_samples.push(ty);
+
+        if config.production_runtime && pair_block_order == "count_then_production" {
+            let (tlc, ty) = run_tlc_ty_runtime_pair(
+                spec_name,
+                &production_tlc_spec,
+                &production_spec,
+                envelope,
+                config.allow_debug_runtime,
+                run_index,
+                schedule.production_tool_order,
+                pair_block_order,
+            )?;
+            production_tlc_samples.push(tlc);
+            production_samples.push(ty);
+        }
+    }
+
+    let count_tlc = summarize_performance_samples(count_tlc_samples);
+    let count = summarize_performance_samples(count_samples);
+    let (mut tlc, mut ty) = if config.production_runtime {
+        (
+            attach_count_verification_runtime_evidence(
+                summarize_performance_samples(production_tlc_samples),
+                count_tlc,
+            ),
+            attach_production_runtime_evidence(
+                count,
+                summarize_performance_samples(production_samples),
+            ),
+        )
+    } else {
+        (count_tlc, count)
+    };
+    if config.production_runtime {
+        tlc.cache_warmup_samples = cache_warmups.production_tlc;
+        tlc.count_verification_cache_warmup_samples = cache_warmups.count_tlc;
+        ty.cache_warmup_samples = cache_warmups.count_ty;
+        ty.production_cache_warmup_samples = cache_warmups.production_ty;
+        if config.mode == SupremacyMode::Enforce {
+            if !strict_performance_evidence_qualified(
+                &tlc.samples,
+                &ty.production_samples,
+                &tlc.count_verification_samples,
+                &ty.samples,
+            ) {
+                bail!(
+                    "{spec_name}: scored production/count evidence was not strict, complete, paired, deterministic, parity-equivalent, and provenance-qualified"
+                );
+            }
+            if !strict_cache_warmups_qualified(
+                &tlc.cache_warmup_samples,
+                &ty.production_cache_warmup_samples,
+                &tlc.count_verification_cache_warmup_samples,
+                &ty.cache_warmup_samples,
+                &tlc.samples,
+                &ty.production_samples,
+                &tlc.count_verification_samples,
+                &ty.samples,
+            ) {
+                bail!(
+                    "{spec_name}: balanced steady-cache warmups were not strict, complete, ordered, drift-free, and artifact-unique"
+                );
+            }
+        }
+    }
+    Ok((tlc, ty))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_cache_warmup_samples(
+    spec_name: &str,
+    tla_path: &Path,
+    cfg_path: &Path,
+    no_config_flags: Option<&[String]>,
+    config: &RuntimeCollectionConfig,
+    repo_root: &Path,
+    spec_dir: &Path,
+    tlc_classpath: &str,
+    envelope: ExecutionEnvelope,
+) -> Result<CacheWarmupSamples> {
+    let mut samples = CacheWarmupSamples {
+        production_tlc: Vec::with_capacity(2),
+        production_ty: Vec::with_capacity(2),
+        count_tlc: Vec::with_capacity(2),
+        count_ty: Vec::with_capacity(2),
+    };
+    for entry in STRICT_CACHE_WARMUP_SCHEDULE {
+        let artifact_dir = spec_dir.join("cache-warmup").join(format!(
+            "observation-{:04}-{}",
+            entry.sequence_index,
+            entry.arm.replace('_', "-")
+        ));
+        let (command, output_kind) = match entry.arm {
+            "production_tlc" | "count_tlc" => (
+                bind_observation_storage_contract(
+                    tlc_check_command_spec(
+                        &config.java.executable.path,
+                        tla_path,
+                        cfg_path,
+                        tlc_classpath,
+                        config.tla_library.as_deref(),
+                        repo_root,
+                        &artifact_dir,
+                        config.timeout_seconds,
+                    ),
+                    config,
+                )?,
+                RuntimeOutputKind::Tlc,
+            ),
+            "production_ty" => (
+                bind_observation_storage_contract(
+                    ty_check_command_spec(
+                        &config.ty_bin,
+                        tla_path,
+                        cfg_path,
+                        no_config_flags,
+                        false,
+                        repo_root,
+                        &artifact_dir,
+                        config.timeout_seconds,
+                        &config.ty_base_env,
+                    ),
+                    config,
+                )?,
+                RuntimeOutputKind::Ty,
+            ),
+            "count_ty" => (
+                bind_observation_storage_contract(
+                    ty_check_command_spec(
+                        &config.ty_bin,
+                        tla_path,
+                        cfg_path,
+                        no_config_flags,
+                        true,
+                        repo_root,
+                        &artifact_dir,
+                        config.timeout_seconds,
+                        &config.ty_base_env,
+                    ),
+                    config,
+                )?,
+                RuntimeOutputKind::Ty,
+            ),
+            arm => bail!("unsupported cache-warmup arm {arm:?}"),
+        };
+        let sample = run_runtime_observation(
+            spec_name,
+            command,
+            envelope,
+            output_kind,
+            config.allow_debug_runtime,
+            entry.sequence_index,
+            entry.tool_order,
+            entry.pair_block_order,
+        )?;
+        if config.mode == SupremacyMode::Enforce
+            && !strict_single_runtime_observation_qualified(&sample)
+        {
+            bail!(
+                "{spec_name}: cache-warmup observation {} ({}) failed the strict execution envelope",
+                entry.sequence_index,
+                entry.arm
+            );
+        }
+        match entry.arm {
+            "production_tlc" => samples.production_tlc.push(sample),
+            "production_ty" => samples.production_ty.push(sample),
+            "count_tlc" => samples.count_tlc.push(sample),
+            "count_ty" => samples.count_ty.push(sample),
+            _ => unreachable!("cache-warmup arm was validated above"),
+        }
+    }
+    Ok(samples)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_tlc_ty_runtime_pair(
+    spec_name: &str,
+    tlc_spec: &CommandSpec,
+    ty_spec: &CommandSpec,
+    envelope: ExecutionEnvelope,
+    allow_debug_runtime: bool,
+    run_index: usize,
+    tool_order: &str,
+    pair_block_order: &str,
+) -> Result<(
+    SupremacyMatrixPerformanceSample,
+    SupremacyMatrixPerformanceSample,
+)> {
+    let run_tlc = || {
+        run_runtime_observation(
+            spec_name,
+            tlc_spec.clone(),
+            envelope,
+            RuntimeOutputKind::Tlc,
+            allow_debug_runtime,
+            run_index,
+            tool_order,
+            pair_block_order,
+        )
+    };
+    let run_ty = || {
+        run_runtime_observation(
+            spec_name,
+            ty_spec.clone(),
+            envelope,
+            RuntimeOutputKind::Ty,
+            allow_debug_runtime,
+            run_index,
+            tool_order,
+            pair_block_order,
+        )
+    };
+    match tool_order {
+        "tlc_then_ty" => Ok((run_tlc()?, run_ty()?)),
+        "ty_then_tlc" => {
+            let ty = run_ty()?;
+            let tlc = run_tlc()?;
+            Ok((tlc, ty))
+        }
+        _ => bail!("unsupported matrix runtime pair order {tool_order:?}"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tlc_check_command_spec(
+    java_executable: &Path,
     tla_path: &Path,
     cfg_path: &Path,
     tlc_classpath: &str,
     tla_library: Option<&Path>,
     repo_root: &Path,
-    spec_dir: &Path,
+    artifact_dir: &Path,
     timeout_seconds: u64,
-) -> Result<RuntimeModeEvidence> {
-    let artifact_dir = spec_dir.join("tlc-run1");
+) -> CommandSpec {
+    let artifact_dir = absolutize(repo_root, artifact_dir);
     let metadir = artifact_dir.join("tlc-metadir");
-    let mut argv = tlc_matrix_runtime_base_argv(tlc_classpath, tla_library);
+    let mut argv = tlc_matrix_runtime_base_argv(java_executable, tlc_classpath, tla_library);
     argv.extend([
         tla_path.display().to_string(),
         "-config".to_string(),
@@ -2666,7 +13664,7 @@ fn run_tlc_runtime(
         "-workers".to_string(),
         "1".to_string(),
     ]);
-    let result = run_command(CommandSpec {
+    CommandSpec {
         argv,
         cwd: tla_path
             .parent()
@@ -2674,45 +13672,400 @@ fn run_tlc_runtime(
             .to_path_buf(),
         env_overrides: BTreeMap::new(),
         timeout_seconds,
-        artifact_dir: absolutize(repo_root, &artifact_dir),
-    })
-    .with_context(|| format!("{spec_name}: run TLC"))?;
+        capture_limits: None,
+        artifact_dir,
+        payload_dir: None,
+        observation_storage_contract: None,
+        observation_storage_binding: None,
+        tlc_metadir: None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ty_check_command_spec(
+    ty_bin: &Path,
+    tla_path: &Path,
+    cfg_path: &Path,
+    no_config_flags: Option<&[String]>,
+    count_equivalence: bool,
+    repo_root: &Path,
+    artifact_dir: &Path,
+    timeout_seconds: u64,
+    ty_base_env: &BTreeMap<String, String>,
+) -> CommandSpec {
+    let mut argv = if let Some(no_config_flags) = no_config_flags {
+        ty_no_config_runtime_argv(ty_bin, tla_path, no_config_flags)
+    } else {
+        ty_config_runtime_argv(ty_bin, tla_path, cfg_path)
+    };
+    if count_equivalence {
+        argv.extend([
+            "--bfs-only".to_string(),
+            "--no-reduction".to_string(),
+            "--workers".to_string(),
+            "1".to_string(),
+        ]);
+    }
+    let artifact_dir = absolutize(repo_root, artifact_dir);
+    CommandSpec {
+        argv,
+        cwd: repo_root.to_path_buf(),
+        env_overrides: ty_matrix_runtime_refresh_env(&artifact_dir, ty_base_env),
+        timeout_seconds,
+        capture_limits: None,
+        artifact_dir,
+        payload_dir: None,
+        observation_storage_contract: None,
+        observation_storage_binding: None,
+        tlc_metadir: None,
+    }
+}
+
+fn bind_observation_storage_contract(
+    mut command: CommandSpec,
+    config: &RuntimeCollectionConfig,
+) -> Result<CommandSpec> {
+    command.observation_storage_contract = config.observation_storage_contract.clone();
+    command.observation_storage_binding = config.observation_storage_binding.clone();
+    let Some(binding) = command.observation_storage_binding.as_ref() else {
+        return Ok(command);
+    };
+    if binding.segment_payload_dir
+        != binding
+            .segment_output_dir
+            .join(OBSERVATION_PAYLOAD_DIRECTORY_NAME)
+    {
+        bail!("campaign payload root is not the exact segment observation-payload child");
+    }
+    let relative = command
+        .artifact_dir
+        .strip_prefix(&binding.segment_output_dir)
+        .context("command evidence directory escapes the campaign segment output")?;
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        bail!("command evidence directory has no safe segment-relative path");
+    }
+    let payload_dir = binding.segment_payload_dir.join(relative);
+    if !payload_dir.starts_with(&binding.segment_payload_dir) {
+        bail!("command payload directory escapes the campaign payload project");
+    }
+    command.payload_dir = Some(payload_dir.clone());
+    command.cwd = payload_dir.join(COMMAND_SCRATCH_DIR_NAME);
+    command.env_overrides.insert(
+        "TY_CACHE_DIR".to_string(),
+        payload_dir
+            .join("trust_cg-artifact-cache")
+            .display()
+            .to_string(),
+    );
+
+    let metadir_indices = command
+        .argv
+        .iter()
+        .enumerate()
+        .filter_map(|(index, argument)| (argument == "-metadir").then_some(index))
+        .collect::<Vec<_>>();
+    if !metadir_indices.is_empty() {
+        let [index] = metadir_indices.as_slice() else {
+            bail!("plan-bound TLC command must contain exactly one -metadir");
+        };
+        let metadir_value = index
+            .checked_add(1)
+            .filter(|next| *next < command.argv.len())
+            .context("plan-bound TLC -metadir has no value")?;
+        let metadir = payload_dir.join("tlc-metadir");
+        command.argv[metadir_value] = metadir.display().to_string();
+        command.tlc_metadir = Some(metadir);
+
+        for prefix in ["-Djava.io.tmpdir=", "-Duser.home="] {
+            if command
+                .argv
+                .iter()
+                .any(|argument| argument.starts_with(prefix))
+            {
+                bail!("plan-bound TLC command already contains a dynamic JVM path option");
+            }
+        }
+        if command
+            .argv
+            .iter()
+            .any(|argument| argument == "-XX:+PerfDisableSharedMem")
+        {
+            bail!("plan-bound TLC command already contains the pinned JVM perf option");
+        }
+        let scratch = payload_dir.join(COMMAND_SCRATCH_DIR_NAME);
+        command.argv.splice(
+            1..1,
+            [
+                "-XX:+PerfDisableSharedMem".to_string(),
+                format!("-Djava.io.tmpdir={}", scratch.display()),
+                format!("-Duser.home={}", scratch.display()),
+            ],
+        );
+    }
+    Ok(command)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_runtime_observation(
+    spec_name: &str,
+    command: CommandSpec,
+    envelope: ExecutionEnvelope,
+    output_kind: RuntimeOutputKind,
+    allow_debug_runtime: bool,
+    run_index: usize,
+    tool_order: &str,
+    pair_block_order: &str,
+) -> Result<SupremacyMatrixPerformanceSample> {
+    let context = match output_kind {
+        RuntimeOutputKind::Tlc => "run TLC",
+        RuntimeOutputKind::Ty => "run TY",
+    };
+    let result = run_command_with_envelope(command, envelope)
+        .with_context(|| format!("{spec_name}: {context} repetition {run_index}"))?;
+    if let Some(trigger) = qualifying_live_storage_limit_trigger(&result)? {
+        return Err(anyhow::Error::new(ObservationStorageLimitError {
+            arm: output_kind,
+            run_index,
+            trigger,
+            artifact_dir: result.artifact_dir.clone(),
+        }));
+    }
+    performance_sample_from_result(
+        &result,
+        output_kind,
+        allow_debug_runtime,
+        run_index,
+        tool_order,
+        pair_block_order,
+    )
+}
+
+fn qualifying_live_storage_limit_trigger(
+    result: &CommandResult,
+) -> Result<Option<StorageLimitTrigger>> {
+    match (
+        result.disk_high_water.storage_limit_trigger.as_ref(),
+        result.artifact_retention.trigger.as_ref(),
+    ) {
+        (None, None) => Ok(None),
+        (Some(disk), Some(retention))
+            if disk == retention
+                && disk.process_group_killed
+                && disk.child_reaped
+                && result
+                    .disk_high_water
+                    .process_tree_forced_quiescence_complete
+                && result.disk_high_water.process_tree_lifetime_complete =>
+        {
+            Ok(Some(disk.clone()))
+        }
+        (Some(_), Some(_)) => {
+            bail!("storage-limit trigger lacks exact forced containment and retention agreement")
+        }
+        _ => bail!("storage-limit trigger differs between command and retention evidence"),
+    }
+}
+
+/// Extract the final tier report: AUTO may tier up and re-report during a run.
+fn parse_engine_tier(stderr: &str) -> Option<String> {
+    stderr
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("[engine] execution tier: "))
+        .map(str::trim)
+        .filter(|tier| !tier.is_empty())
+        .map(str::to_string)
+}
+
+fn performance_sample_from_result(
+    result: &CommandResult,
+    output_kind: RuntimeOutputKind,
+    allow_debug_runtime: bool,
+    run_index: usize,
+    tool_order: &str,
+    pair_block_order: &str,
+) -> Result<SupremacyMatrixPerformanceSample> {
     let stdout = String::from_utf8_lossy(&result.stdout);
     let stderr = String::from_utf8_lossy(&result.stderr);
-    let counts = parse::parse_tlc_final_counts(&stdout, &stderr);
-    let error_type =
-        runtime_error_with_output(result.returncode, result.timed_out, &stdout, &stderr).or_else(
-            || {
-                counts
-                    .states_found
-                    .is_none()
-                    .then(|| "missing_state_count".to_string())
-            },
-        );
-    let runtime_seconds = runtime_seconds_for_evidence(&error_type, result.elapsed_seconds);
-    Ok(RuntimeModeEvidence {
-        status: status_for_result(result.returncode, result.timed_out),
-        runtime_seconds,
-        states: counts.states_found,
-        error_type,
-        artifact_dir: result.artifact_dir,
-        ..RuntimeModeEvidence::default()
+    let counts = match output_kind {
+        RuntimeOutputKind::Tlc => parse::parse_tlc_final_counts(&stdout, &stderr),
+        RuntimeOutputKind::Ty => parse::parse_ty_final_counts(&stdout, &stderr),
+    };
+    let engine_tier = match output_kind {
+        RuntimeOutputKind::Tlc => None,
+        RuntimeOutputKind::Ty => parse_engine_tier(&stderr),
+    };
+    let error_type = match output_kind {
+        RuntimeOutputKind::Tlc => {
+            runtime_error_with_output(result.returncode, result.timed_out, &stdout, &stderr)
+        }
+        RuntimeOutputKind::Ty => ty_runtime_error(
+            result.returncode,
+            result.timed_out,
+            &stdout,
+            &stderr,
+            allow_debug_runtime,
+        ),
+    }
+    .or_else(|| {
+        counts
+            .states_found
+            .is_none()
+            .then(|| "missing_state_count".to_string())
     })
+    .or_else(|| {
+        counts
+            .raw_initial_states_generated
+            .is_none()
+            .then(|| "missing_raw_initial_state_generation_count".to_string())
+    })
+    .or_else(|| {
+        counts
+            .raw_successors_generated
+            .is_none()
+            .then(|| "missing_raw_successor_generation_count".to_string())
+    })
+    .or_else(|| {
+        counts
+            .states_generated
+            .is_none()
+            .then(|| "missing_total_state_generation_count".to_string())
+    });
+    let combined_output = format!("{stdout}\n{stderr}");
+    let violated_obligation = expected_violation_kind(error_type.as_deref())
+        .and_then(|kind| expected_violation_name(kind, &combined_output));
+    let runtime_seconds = runtime_seconds_for_evidence(&error_type, result.elapsed_seconds);
+    let memory = &result.resource_evidence.memory;
+    let process_tree_peak_memory_bytes = (memory.scope == PeakMemoryScope::ProcessTree)
+        .then_some(memory.peak_bytes)
+        .flatten();
+    let strict_cpu_qualified = result.resource_evidence.cpu.method
+        == CpuConfinementMethod::LinuxSchedSetaffinityInherited
+        && result.resource_evidence.cpu.process_tree_inherited
+        && result.resource_evidence.cpu.confined
+        && result.resource_evidence.cpu.isolation.isolated
+        && result
+            .resource_evidence
+            .cpu
+            .effective_cpu_ids
+            .as_ref()
+            .is_some_and(|ids| ids.len() == 1);
+    let strict_memory_qualified = memory.metric == PeakMemoryMetric::CgroupAccountedMemory
+        && memory.scope == PeakMemoryScope::ProcessTree
+        && memory.method == PeakMemoryMethod::LinuxCgroupV2MemoryPeak
+        && memory.complete
+        && memory.peak_bytes.is_some()
+        && result.resource_evidence.cgroup.parent_verified;
+    Ok(SupremacyMatrixPerformanceSample {
+        run_index,
+        runtime_seconds,
+        process_tree_peak_memory_bytes,
+        status: Some(status_for_result(result.returncode, result.timed_out)),
+        error_type,
+        violated_obligation,
+        states: counts.states_found,
+        transitions: counts.transitions,
+        raw_initial_states_generated: counts.raw_initial_states_generated,
+        raw_successors_generated: counts.raw_successors_generated,
+        states_generated: counts.states_generated,
+        tool_order: Some(tool_order.to_string()),
+        artifact_dir: Some(result.artifact_dir.clone()),
+        pair_block_order: Some(pair_block_order.to_string()),
+        engine_tier,
+        strict_cpu_qualified,
+        strict_memory_qualified,
+        strict_qualified: result.resource_evidence.strict_qualified
+            && strict_cpu_qualified
+            && strict_memory_qualified
+            && result.artifact_retention.strict_qualified,
+        requested_execution_envelope: Some(serde_json::to_value(
+            result.requested_execution_envelope,
+        )?),
+        resource_evidence: Some(serde_json::to_value(&result.resource_evidence)?),
+        machine_provenance: Some(serde_json::to_value(&result.machine_provenance)?),
+    })
+}
+
+fn summarize_performance_samples(
+    samples: Vec<SupremacyMatrixPerformanceSample>,
+) -> RuntimeModeEvidence {
+    let deterministic = performance_samples_are_deterministic(&samples);
+    let first = samples.first();
+    let status = if deterministic {
+        first
+            .and_then(|sample| sample.status.clone())
+            .unwrap_or_else(|| "fail".to_string())
+    } else {
+        "fail".to_string()
+    };
+    let error_type = if deterministic {
+        first.and_then(|sample| sample.error_type.clone())
+    } else {
+        Some("nondeterministic_repetition".to_string())
+    };
+    let runtime_seconds = samples
+        .iter()
+        .map(|sample| sample.runtime_seconds)
+        .collect::<Option<Vec<_>>>()
+        .and_then(median_f64);
+    let process_tree_peak_memory_bytes = samples
+        .iter()
+        .map(|sample| sample.process_tree_peak_memory_bytes)
+        .collect::<Option<Vec<_>>>()
+        .and_then(median_u64);
+    let states = deterministic
+        .then(|| first.and_then(|sample| sample.states))
+        .flatten();
+    let transitions = deterministic
+        .then(|| first.and_then(|sample| sample.transitions))
+        .flatten();
+    let raw_initial_states_generated = deterministic
+        .then(|| first.and_then(|sample| sample.raw_initial_states_generated))
+        .flatten();
+    let raw_successors_generated = deterministic
+        .then(|| first.and_then(|sample| sample.raw_successors_generated))
+        .flatten();
+    let states_generated = deterministic
+        .then(|| first.and_then(|sample| sample.states_generated))
+        .flatten();
+    let artifact_dir = first
+        .and_then(|sample| sample.artifact_dir.clone())
+        .unwrap_or_default();
+    RuntimeModeEvidence {
+        status,
+        runtime_seconds,
+        process_tree_peak_memory_bytes,
+        samples,
+        states,
+        transitions,
+        raw_initial_states_generated,
+        raw_successors_generated,
+        states_generated,
+        error_type,
+        artifact_dir,
+        ..RuntimeModeEvidence::default()
+    }
 }
 
 fn run_tlc_simulation_runtime(
     spec_name: &str,
     tla_path: &Path,
     simulation_cfg_path: &Path,
+    java_executable: &Path,
     tlc_classpath: &str,
     tla_library: Option<&Path>,
     repo_root: &Path,
     spec_dir: &Path,
     timeout_seconds: u64,
+    config: &RuntimeCollectionConfig,
 ) -> Result<RuntimeModeEvidence> {
-    let artifact_dir = spec_dir.join("tlc-simulate-run1");
+    let artifact_dir = absolutize(repo_root, &spec_dir.join("tlc-simulate-run1"));
     let metadir = artifact_dir.join("tlc-metadir");
-    let mut argv = tlc_matrix_runtime_base_argv(tlc_classpath, tla_library);
+    let mut argv = tlc_matrix_runtime_base_argv(java_executable, tlc_classpath, tla_library);
     argv.extend([
         tlc_simulation_mode_arg(tla_path),
         format!("num={MATRIX_SIMULATION_TRACES}"),
@@ -2728,17 +14081,41 @@ fn run_tlc_simulation_runtime(
         "1".to_string(),
         tla_path.display().to_string(),
     ]);
-    let result = run_command(CommandSpec {
-        argv,
-        cwd: tla_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf(),
-        env_overrides: BTreeMap::new(),
-        timeout_seconds,
-        artifact_dir: absolutize(repo_root, &artifact_dir),
-    })
+    let command = bind_observation_storage_contract(
+        CommandSpec {
+            argv,
+            cwd: tla_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf(),
+            env_overrides: BTreeMap::new(),
+            timeout_seconds,
+            capture_limits: None,
+            artifact_dir,
+            payload_dir: None,
+            observation_storage_contract: None,
+            observation_storage_binding: None,
+            tlc_metadir: None,
+        },
+        config,
+    )?;
+    let result = run_command_with_envelope(
+        command,
+        if config.mode == SupremacyMode::Enforce {
+            ExecutionEnvelope::strict_single_core_process_tree()
+        } else {
+            ExecutionEnvelope::diagnostic()
+        },
+    )
     .with_context(|| format!("{spec_name}: run TLC simulation"))?;
+    if let Some(trigger) = qualifying_live_storage_limit_trigger(&result)? {
+        return Err(anyhow::Error::new(ObservationStorageLimitError {
+            arm: RuntimeOutputKind::Tlc,
+            run_index: 1,
+            trigger,
+            artifact_dir: result.artifact_dir.clone(),
+        }));
+    }
     let stdout = String::from_utf8_lossy(&result.stdout);
     let stderr = String::from_utf8_lossy(&result.stderr);
     let counts = parse::parse_tlc_final_counts(&stdout, &stderr);
@@ -2749,14 +14126,23 @@ fn run_tlc_simulation_runtime(
         status: status_for_result(result.returncode, result.timed_out),
         runtime_seconds,
         states: counts.states_found,
+        transitions: counts.transitions,
+        raw_initial_states_generated: counts.raw_initial_states_generated,
+        raw_successors_generated: counts.raw_successors_generated,
+        states_generated: counts.states_generated,
         error_type,
         artifact_dir: result.artifact_dir,
         ..RuntimeModeEvidence::default()
     })
 }
 
-fn tlc_matrix_runtime_base_argv(tlc_classpath: &str, tla_library: Option<&Path>) -> Vec<String> {
+fn tlc_matrix_runtime_base_argv(
+    java_executable: &Path,
+    tlc_classpath: &str,
+    tla_library: Option<&Path>,
+) -> Vec<String> {
     let mut argv = tlc_java_single_thread_base_argv();
+    argv[0] = java_executable.display().to_string();
     if let Some(tla_library) = tla_library {
         argv.push(format!("-DTLA-Library={}", tla_library.display()));
     }
@@ -2862,102 +14248,6 @@ fn source_text_requires_tlc_generate(tla_path: &Path) -> bool {
     compact_text.contains("TLCGet(\"config\").mode=\"generate\"")
 }
 
-fn run_ty_runtime(
-    spec_name: &str,
-    tla_path: &Path,
-    cfg_path: &Path,
-    ty_bin: &Path,
-    repo_root: &Path,
-    spec_dir: &Path,
-    timeout_seconds: u64,
-    ty_base_env: &BTreeMap<String, String>,
-    allow_debug_runtime: bool,
-) -> Result<RuntimeModeEvidence> {
-    run_ty_check_runtime_command(
-        spec_name,
-        with_count_verify_flag(ty_config_runtime_argv(ty_bin, tla_path, cfg_path)),
-        ty_matrix_runtime_refresh_env(spec_dir, ty_base_env),
-        repo_root,
-        &spec_dir.join("ty-trust_cg-run1"),
-        timeout_seconds,
-        allow_debug_runtime,
-        "run TY trust-cg",
-    )
-}
-
-/// Production-default speed measurement: same env as the pinned count-verify
-/// run; only the count-parity `--no-reduction` flag is removed from the argv,
-/// so auto-POR/auto-symmetry are free to engage — this run measures what users
-/// actually get.
-fn run_ty_production_runtime(
-    spec_name: &str,
-    tla_path: &Path,
-    cfg_path: &Path,
-    ty_bin: &Path,
-    repo_root: &Path,
-    spec_dir: &Path,
-    timeout_seconds: u64,
-    ty_base_env: &BTreeMap<String, String>,
-    allow_debug_runtime: bool,
-) -> Result<RuntimeModeEvidence> {
-    run_ty_check_runtime_command(
-        spec_name,
-        ty_config_runtime_argv(ty_bin, tla_path, cfg_path),
-        ty_matrix_runtime_refresh_env(spec_dir, ty_base_env),
-        repo_root,
-        &spec_dir.join("ty-trust_cg-production-run1"),
-        timeout_seconds,
-        allow_debug_runtime,
-        "run TY trust-cg production-default",
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_ty_check_runtime_command(
-    spec_name: &str,
-    argv: Vec<String>,
-    env_overrides: BTreeMap<String, String>,
-    repo_root: &Path,
-    artifact_dir: &Path,
-    timeout_seconds: u64,
-    allow_debug_runtime: bool,
-    context_label: &str,
-) -> Result<RuntimeModeEvidence> {
-    let result = run_command(CommandSpec {
-        argv,
-        cwd: repo_root.to_path_buf(),
-        env_overrides,
-        timeout_seconds,
-        artifact_dir: absolutize(repo_root, artifact_dir),
-    })
-    .with_context(|| format!("{spec_name}: {context_label}"))?;
-    let stdout = String::from_utf8_lossy(&result.stdout);
-    let stderr = String::from_utf8_lossy(&result.stderr);
-    let counts = parse::parse_ty_final_counts(&stdout, &stderr);
-    let error_type = ty_runtime_error(
-        result.returncode,
-        result.timed_out,
-        &stdout,
-        &stderr,
-        allow_debug_runtime,
-    )
-    .or_else(|| {
-        counts
-            .states_found
-            .is_none()
-            .then(|| "missing_state_count".to_string())
-    });
-    let runtime_seconds = runtime_seconds_for_evidence(&error_type, result.elapsed_seconds);
-    Ok(RuntimeModeEvidence {
-        status: status_for_result(result.returncode, result.timed_out),
-        runtime_seconds,
-        states: counts.states_found,
-        error_type,
-        artifact_dir: result.artifact_dir,
-        ..RuntimeModeEvidence::default()
-    })
-}
-
 fn run_ty_simulation_runtime(
     spec_name: &str,
     tla_path: &Path,
@@ -2967,16 +14257,41 @@ fn run_ty_simulation_runtime(
     spec_dir: &Path,
     timeout_seconds: u64,
     allow_debug_runtime: bool,
+    config: &RuntimeCollectionConfig,
 ) -> Result<RuntimeModeEvidence> {
     let artifact_dir = spec_dir.join("ty-simulate-run1");
-    let result = run_command(CommandSpec {
-        argv: ty_simulation_runtime_argv(ty_bin, tla_path, cfg_path),
-        cwd: repo_root.to_path_buf(),
-        env_overrides: BTreeMap::new(),
-        timeout_seconds,
-        artifact_dir: absolutize(repo_root, &artifact_dir),
-    })
+    let command = bind_observation_storage_contract(
+        CommandSpec {
+            argv: ty_simulation_runtime_argv(ty_bin, tla_path, cfg_path),
+            cwd: repo_root.to_path_buf(),
+            env_overrides: BTreeMap::new(),
+            timeout_seconds,
+            capture_limits: None,
+            artifact_dir: absolutize(repo_root, &artifact_dir),
+            payload_dir: None,
+            observation_storage_contract: None,
+            observation_storage_binding: None,
+            tlc_metadir: None,
+        },
+        config,
+    )?;
+    let result = run_command_with_envelope(
+        command,
+        if config.mode == SupremacyMode::Enforce {
+            ExecutionEnvelope::strict_single_core_process_tree()
+        } else {
+            ExecutionEnvelope::diagnostic()
+        },
+    )
     .with_context(|| format!("{spec_name}: run TY simulation"))?;
+    if let Some(trigger) = qualifying_live_storage_limit_trigger(&result)? {
+        return Err(anyhow::Error::new(ObservationStorageLimitError {
+            arm: RuntimeOutputKind::Ty,
+            run_index: 1,
+            trigger,
+            artifact_dir: result.artifact_dir.clone(),
+        }));
+    }
     let stdout = String::from_utf8_lossy(&result.stdout);
     let stderr = String::from_utf8_lossy(&result.stderr);
     let error_type = ty_runtime_error(
@@ -2997,54 +14312,6 @@ fn run_ty_simulation_runtime(
     })
 }
 
-fn run_ty_no_config_runtime(
-    spec_name: &str,
-    tla_path: &Path,
-    ty_bin: &Path,
-    repo_root: &Path,
-    spec_dir: &Path,
-    timeout_seconds: u64,
-    ty_base_env: &BTreeMap<String, String>,
-    allow_debug_runtime: bool,
-    no_config_flags: &[String],
-) -> Result<RuntimeModeEvidence> {
-    run_ty_check_runtime_command(
-        spec_name,
-        ty_no_config_runtime_argv(ty_bin, tla_path, no_config_flags),
-        ty_matrix_runtime_refresh_env(spec_dir, ty_base_env),
-        repo_root,
-        &spec_dir.join("ty-trust_cg-no-config-run1"),
-        timeout_seconds,
-        allow_debug_runtime,
-        "run TY trust-codegen no-config",
-    )
-}
-
-/// Production-default speed measurement for config-free rows: same argv as the
-/// pinned count-verify run; only the count-parity env pins are removed.
-fn run_ty_no_config_production_runtime(
-    spec_name: &str,
-    tla_path: &Path,
-    ty_bin: &Path,
-    repo_root: &Path,
-    spec_dir: &Path,
-    timeout_seconds: u64,
-    ty_base_env: &BTreeMap<String, String>,
-    allow_debug_runtime: bool,
-    no_config_flags: &[String],
-) -> Result<RuntimeModeEvidence> {
-    run_ty_check_runtime_command(
-        spec_name,
-        ty_no_config_runtime_argv(ty_bin, tla_path, no_config_flags),
-        ty_matrix_runtime_refresh_env(spec_dir, ty_base_env),
-        repo_root,
-        &spec_dir.join("ty-trust_cg-no-config-production-run1"),
-        timeout_seconds,
-        allow_debug_runtime,
-        "run TY trust-codegen no-config production-default",
-    )
-}
-
 fn ty_config_runtime_argv(ty_bin: &Path, tla_path: &Path, cfg_path: &Path) -> Vec<String> {
     vec![
         ty_bin.display().to_string(),
@@ -3052,11 +14319,7 @@ fn ty_config_runtime_argv(ty_bin: &Path, tla_path: &Path, cfg_path: &Path) -> Ve
         tla_path.display().to_string(),
         "--config".to_string(),
         cfg_path.display().to_string(),
-        "--workers".to_string(),
-        "1".to_string(),
         "--force".to_string(),
-        "--backend".to_string(),
-        "trust-cg".to_string(),
     ]
 }
 
@@ -3089,13 +14352,7 @@ fn ty_no_config_runtime_argv(
         tla_path.display().to_string(),
     ];
     argv.extend(no_config_flags.iter().cloned());
-    argv.extend([
-        "--workers".to_string(),
-        "1".to_string(),
-        "--force".to_string(),
-        "--backend".to_string(),
-        "trust-cg".to_string(),
-    ]);
+    argv.push("--force".to_string());
     argv
 }
 
@@ -3103,8 +14360,7 @@ fn preflight_runtime_ty_trust_cg_for_refresh(
     ty_bin: &Path,
     output_dir: &Path,
     repo_root: &Path,
-    timeout_seconds: u64,
-    ty_base_env: &BTreeMap<String, String>,
+    config: &RuntimeCollectionConfig,
 ) -> Result<()> {
     let preflight_dir = output_dir.join("runtime-ty-trust_cg-preflight");
     let spec_path = preflight_dir.join("SupremacyMatrixRuntimePreflight.tla");
@@ -3113,15 +14369,30 @@ fn preflight_runtime_ty_trust_cg_for_refresh(
     fs::write(&spec_path, runtime_ty_trust_cg_preflight_spec())
         .with_context(|| format!("write {}", spec_path.display()))?;
 
-    let command = ty_runtime_preflight_command_spec(
+    let mut command = ty_runtime_preflight_command_spec(
         ty_bin,
         &spec_path,
         repo_root,
         &preflight_dir,
-        timeout_seconds,
-        ty_base_env,
+        config.timeout_seconds,
+        &config.ty_base_env,
     );
-    let result = run_command(command).with_context(|| {
+    command = bind_observation_storage_contract(command, config)?;
+    if let Some(contract) = config.observation_storage_contract.as_ref() {
+        command.capture_limits = Some((
+            contract.maximum_preflight_stdout_bytes,
+            contract.maximum_preflight_stderr_bytes,
+        ));
+    }
+    let result = run_command_with_envelope(
+        command,
+        if config.observation_storage_contract.is_some() {
+            ExecutionEnvelope::strict_single_core_process_tree()
+        } else {
+            ExecutionEnvelope::diagnostic()
+        },
+    )
+    .with_context(|| {
         format!(
             "preflight --runtime-ty-bin {} for trust-codegen matrix runtime refresh",
             ty_bin.display()
@@ -3166,7 +14437,12 @@ fn ty_runtime_preflight_command_spec(
         cwd: repo_root.to_path_buf(),
         env_overrides: ty_matrix_runtime_refresh_env(preflight_dir, ty_base_env),
         timeout_seconds: timeout_seconds.clamp(1, 10),
+        capture_limits: None,
         artifact_dir: absolutize(repo_root, &preflight_dir.join("run")),
+        payload_dir: None,
+        observation_storage_contract: None,
+        observation_storage_binding: None,
+        tlc_metadir: None,
     }
 }
 
@@ -3178,13 +14454,13 @@ fn ty_no_config_preflight_argv(ty_bin: &Path, tla_path: &Path) -> Vec<String> {
     ];
     argv.extend(matrix_refresh::no_config_cli_flags());
     argv.extend([
+        "--bfs-only".to_string(),
+        "--no-reduction".to_string(),
         "--workers".to_string(),
         "1".to_string(),
         "--force".to_string(),
         "--output".to_string(),
         "json".to_string(),
-        "--backend".to_string(),
-        "trust-cg".to_string(),
     ]);
     argv
 }
@@ -3225,24 +14501,14 @@ fn runtime_refresh_compile_jobs_value_from_env(value: Option<String>) -> String 
 fn matrix_runtime_refresh_base_env_with_compile_jobs(
     compile_jobs: &str,
 ) -> BTreeMap<String, String> {
-    // Auto-POR/auto-symmetry are NOT pinned here: those semantic levers are
-    // controlled by CLI flags only (the child `ty check` ignores ambient
-    // TY_AUTO_POR / TY_AUTO_SYMMETRY). The pinned count-verify runs pass the
-    // `--no-reduction` flag (see `COUNT_VERIFY_FLAG`); production-default runs
-    // omit it.
+    // Keep application artifacts observation-local and compilation serialized
+    // without selecting a backend or traversal implementation. OS page-cache
+    // temperature is controlled by the balanced warmup protocol. AUTO routing
+    // must see no TY_trust_cg/TY_TRUST_CG_BFS/TY_BYTECODE_VM-style overrides.
     BTreeMap::from([
-        ("TY_trust_cg".to_string(), "1".to_string()),
-        ("TY_TRUST_CG_BFS".to_string(), "1".to_string()),
-        ("TY_TRUST_CG_EXISTS".to_string(), "1".to_string()),
-        ("TY_BYTECODE_VM".to_string(), "1".to_string()),
-        ("TY_BYTECODE_VM_STATS".to_string(), "1".to_string()),
         (
             RUNTIME_REFRESH_COMPILE_JOBS_ENV.to_string(),
             compile_jobs.to_string(),
-        ),
-        (
-            "TY_TRUST_CG_NATIVE_FUSED_ENABLE_LOCAL_DEDUP".to_string(),
-            "1".to_string(),
         ),
         ("TY_DISABLE_ARTIFACT_CACHE".to_string(), "1".to_string()),
     ])
@@ -3253,6 +14519,9 @@ fn ty_matrix_runtime_refresh_env(
     base_env: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
     let mut env = base_env.clone();
+    // Diagnostic-only provenance. Strict evidence requires the final tier
+    // report and rejects a missing or unstable report across repetitions.
+    env.insert("TY_ENGINE_TIER".to_string(), "1".to_string());
     env.insert(
         "TY_CACHE_DIR".to_string(),
         spec_dir
@@ -3261,24 +14530,6 @@ fn ty_matrix_runtime_refresh_env(
             .to_string(),
     );
     env
-}
-
-/// CLI flag passed ONLY for the count-verify axis: it forces off the sound
-/// state-count-reducing production defaults (auto-POR, auto-symmetry) so the
-/// pinned run's `States found` stays unreduced-parity comparable with TLC.
-/// This is a CLI flag (not the retired TY_AUTO_POR/TY_AUTO_SYMMETRY env pins)
-/// because the child `ty check` ignores ambient env for these semantic levers.
-const COUNT_VERIFY_FLAG: &str = "--no-reduction";
-
-/// Append the count-verify lever to a planned `ty check` argv, keeping the
-/// trailing `--backend <name>` pair last for readability of recorded commands.
-fn with_count_verify_flag(mut argv: Vec<String>) -> Vec<String> {
-    let backend_position = argv
-        .iter()
-        .position(|arg| arg == "--backend")
-        .unwrap_or(argv.len());
-    argv.insert(backend_position, COUNT_VERIFY_FLAG.to_string());
-    argv
 }
 
 fn runtime_error_with_output(
@@ -3520,7 +14771,101 @@ fn update_mode_value(
         "runtime_seconds".to_string(),
         json!(evidence.runtime_seconds),
     );
+    mode.insert(
+        "process_tree_peak_memory_bytes".to_string(),
+        json!(evidence.process_tree_peak_memory_bytes),
+    );
+    mode.remove("peak_process_tree_rss_bytes");
+    mode.remove("process_tree_peak_rss_bytes");
+    mode.insert("samples".to_string(), json!(evidence.samples));
+    if evidence.cache_warmup_samples.is_empty() {
+        mode.remove("cache_warmup_samples");
+    } else {
+        mode.insert(
+            "cache_warmup_samples".to_string(),
+            json!(evidence.cache_warmup_samples),
+        );
+    }
     mode.insert("states".to_string(), json!(evidence.states));
+    mode.insert("transitions".to_string(), json!(evidence.transitions));
+    mode.insert(
+        "raw_initial_states_generated".to_string(),
+        json!(evidence.raw_initial_states_generated),
+    );
+    mode.insert(
+        "raw_successors_generated".to_string(),
+        json!(evidence.raw_successors_generated),
+    );
+    mode.insert(
+        "states_generated".to_string(),
+        json!(evidence.states_generated),
+    );
+    if evidence.count_verification_status.is_some() {
+        mode.insert(
+            "count_verification_status".to_string(),
+            json!(evidence.count_verification_status),
+        );
+        mode.insert(
+            "count_verification_error_type".to_string(),
+            json!(evidence.count_verification_error_type),
+        );
+        mode.insert(
+            "count_verification_runtime_seconds".to_string(),
+            json!(evidence.count_verification_runtime_seconds),
+        );
+        mode.insert(
+            "count_verification_process_tree_peak_memory_bytes".to_string(),
+            json!(evidence.count_verification_process_tree_peak_memory_bytes),
+        );
+        mode.remove("count_verification_peak_process_tree_rss_bytes");
+        mode.remove("count_verification_process_tree_peak_rss_bytes");
+        mode.insert(
+            "count_verification_samples".to_string(),
+            json!(evidence.count_verification_samples),
+        );
+        mode.insert(
+            "count_verification_cache_warmup_samples".to_string(),
+            json!(evidence.count_verification_cache_warmup_samples),
+        );
+        mode.insert(
+            "count_verification_states".to_string(),
+            json!(evidence.count_verification_states),
+        );
+        mode.insert(
+            "count_verification_transitions".to_string(),
+            json!(evidence.count_verification_transitions),
+        );
+        mode.insert(
+            "count_verification_raw_initial_states_generated".to_string(),
+            json!(evidence.count_verification_raw_initial_states_generated),
+        );
+        mode.insert(
+            "count_verification_raw_successors_generated".to_string(),
+            json!(evidence.count_verification_raw_successors_generated),
+        );
+        mode.insert(
+            "count_verification_states_generated".to_string(),
+            json!(evidence.count_verification_states_generated),
+        );
+    } else {
+        for field in [
+            "count_verification_status",
+            "count_verification_error_type",
+            "count_verification_runtime_seconds",
+            "count_verification_process_tree_peak_memory_bytes",
+            "count_verification_peak_process_tree_rss_bytes",
+            "count_verification_process_tree_peak_rss_bytes",
+            "count_verification_samples",
+            "count_verification_cache_warmup_samples",
+            "count_verification_states",
+            "count_verification_transitions",
+            "count_verification_raw_initial_states_generated",
+            "count_verification_raw_successors_generated",
+            "count_verification_states_generated",
+        ] {
+            mode.remove(field);
+        }
+    }
     // Production-default axis (schema addition, backward-compatible):
     // `production_status` marks presence. When this refresh did not collect a
     // production run, remove any stale production fields so an older production
@@ -3539,15 +14884,51 @@ fn update_mode_value(
             json!(evidence.production_runtime_seconds),
         );
         mode.insert(
+            "production_process_tree_peak_memory_bytes".to_string(),
+            json!(evidence.production_process_tree_peak_memory_bytes),
+        );
+        mode.insert(
+            "production_samples".to_string(),
+            json!(evidence.production_samples),
+        );
+        mode.insert(
+            "production_cache_warmup_samples".to_string(),
+            json!(evidence.production_cache_warmup_samples),
+        );
+        mode.insert(
             "production_states".to_string(),
             json!(evidence.production_states),
+        );
+        mode.insert(
+            "production_transitions".to_string(),
+            json!(evidence.production_transitions),
+        );
+        mode.insert(
+            "production_raw_initial_states_generated".to_string(),
+            json!(evidence.production_raw_initial_states_generated),
+        );
+        mode.insert(
+            "production_raw_successors_generated".to_string(),
+            json!(evidence.production_raw_successors_generated),
+        );
+        mode.insert(
+            "production_states_generated".to_string(),
+            json!(evidence.production_states_generated),
         );
     } else {
         for field in [
             "production_status",
             "production_error_type",
             "production_runtime_seconds",
+            "production_process_tree_peak_memory_bytes",
+            "production_peak_process_tree_rss_bytes",
+            "production_samples",
+            "production_cache_warmup_samples",
             "production_states",
+            "production_transitions",
+            "production_raw_initial_states_generated",
+            "production_raw_successors_generated",
+            "production_states_generated",
         ] {
             mode.remove(field);
         }
@@ -3594,6 +14975,30 @@ fn validate_runtime_refresh_rows_promoted(rows: &[RuntimeEvidenceRow]) -> Result
     )
 }
 
+fn validate_strict_runtime_collection_outcomes(
+    rows: &[RuntimeEvidenceRow],
+    measurement_complete: bool,
+) -> Result<()> {
+    for row in rows {
+        validate_campaign_runtime_row_outcome(row)
+            .with_context(|| format!("validate strict runtime row {}", row.spec))?;
+    }
+    let complete_rows = rows
+        .iter()
+        .filter(|row| row.collection_outcome == "complete_measurement")
+        .cloned()
+        .collect::<Vec<_>>();
+    validate_runtime_refresh_rows_promoted(&complete_rows)?;
+    let resource_limited = rows
+        .iter()
+        .filter(|row| row.collection_outcome == "resource_limited")
+        .count();
+    if measurement_complete != (resource_limited == 0) {
+        bail!("strict matrix measurement completeness disagrees with typed resource outcomes");
+    }
+    Ok(())
+}
+
 fn runtime_mode_is_timeout_evidence(evidence: &RuntimeModeEvidence) -> bool {
     evidence.status.eq_ignore_ascii_case("timeout")
         || evidence
@@ -3634,12 +15039,13 @@ fn refresh_runtime_baseline_metadata(
         .map(|categories| categories.keys().cloned().collect::<BTreeSet<_>>())
         .unwrap_or_default();
     let has_categories = root.contains_key("categories");
+    let extended_tlc_stats = baseline_has_extended_tlc_stats(root);
     let (total_specs, stats, categories, specs_digest) = {
         let specs_obj = root
             .get("specs")
             .and_then(Value::as_object)
             .expect("validated specs object");
-        let stats = compute_baseline_stats(specs_obj);
+        let stats = compute_baseline_stats(specs_obj, extended_tlc_stats);
         let categories = compute_baseline_categories(specs_obj, existing_category_keys);
         let specs_digest = sha256_jcs_value(&Value::Object(specs_obj.clone()))?;
         (specs_obj.len(), stats, categories, specs_digest)
@@ -3696,6 +15102,40 @@ fn runtime_ty_refresh(
         "binary_sha256".to_string(),
         Value::String(provenance.ty_binary.sha256.clone()),
     );
+    refresh.insert(
+        "evidence_set_id".to_string(),
+        Value::String(provenance.evidence_set_id.clone()),
+    );
+    refresh.insert(
+        "runtime_evidence_path".to_string(),
+        Value::String(provenance.runtime_evidence_path.display().to_string()),
+    );
+    refresh.insert(
+        "refreshed_specs_jcs_sha256".to_string(),
+        Value::String(provenance.refreshed_specs_jcs_sha256.clone()),
+    );
+    if let (Some(path), Some(provenance_id)) = (
+        provenance.machine_provenance_path.as_ref(),
+        provenance.machine_provenance_id.as_ref(),
+    ) {
+        refresh.insert(
+            "machine_provenance_path".to_string(),
+            Value::String(path.display().to_string()),
+        );
+        refresh.insert(
+            "machine_provenance_id".to_string(),
+            Value::String(provenance_id.clone()),
+        );
+    }
+    if let Some(path) = provenance.final_receipt_path.as_ref() {
+        refresh.insert(
+            "final_receipt_path".to_string(),
+            Value::String(path.display().to_string()),
+        );
+    }
+    if let Some(campaign) = provenance.campaign.as_ref() {
+        refresh.insert("campaign".to_string(), json!(campaign));
+    }
     refresh
 }
 
@@ -3740,10 +15180,21 @@ fn runtime_metadata_warning(root: &Map<String, Value>, rows: &[RuntimeEvidenceRo
     })
 }
 
-fn compute_baseline_stats(specs_obj: &Map<String, Value>) -> Map<String, Value> {
+fn baseline_has_extended_tlc_stats(root: &Map<String, Value>) -> bool {
+    root.get("schema_version")
+        .and_then(Value::as_u64)
+        .is_some_and(|schema_version| schema_version >= 4)
+}
+
+fn compute_baseline_stats(
+    specs_obj: &Map<String, Value>,
+    extended_tlc_stats: bool,
+) -> Map<String, Value> {
     let mut tlc_pass = 0usize;
     let mut tlc_timeout = 0usize;
     let mut tlc_error = 0usize;
+    let mut tlc_unsupported = 0usize;
+    let mut tlc_uncollected = 0usize;
     let mut ty_match = 0usize;
     let mut ty_mismatch = 0usize;
     let mut ty_fail = 0usize;
@@ -3759,6 +15210,8 @@ fn compute_baseline_stats(specs_obj: &Map<String, Value>) -> Map<String, Value> 
         match tlc_status {
             "pass" => tlc_pass += 1,
             "timeout" => tlc_timeout += 1,
+            "unsupported" if extended_tlc_stats => tlc_unsupported += 1,
+            "uncollected" if extended_tlc_stats => tlc_uncollected += 1,
             _ => tlc_error += 1,
         }
 
@@ -3791,6 +15244,10 @@ fn compute_baseline_stats(specs_obj: &Map<String, Value>) -> Map<String, Value> 
     stats.insert("tlc_error".to_string(), json!(tlc_error));
     stats.insert("tlc_pass".to_string(), json!(tlc_pass));
     stats.insert("tlc_timeout".to_string(), json!(tlc_timeout));
+    if extended_tlc_stats {
+        stats.insert("tlc_uncollected".to_string(), json!(tlc_uncollected));
+        stats.insert("tlc_unsupported".to_string(), json!(tlc_unsupported));
+    }
     stats
 }
 
@@ -3837,9 +15294,298 @@ fn sha256_jcs_value(value: &Value) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+// Campaign schema v1 deliberately versions TY's established canonical JSON
+// writer. This is an internal compatibility format, not an RFC 8785 JCS claim.
+fn sha256_ty_canonical_json_v1_value(value: &Value) -> Result<String> {
+    sha256_jcs_value(value)
+}
+
+#[cfg(not(unix))]
 fn sha256_file(path: &Path) -> Result<String> {
     let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
     Ok(sha256_bytes(&bytes))
+}
+
+#[cfg(unix)]
+fn sha256_regular_file_nofollow(path: &Path) -> Result<(PathBuf, String, u64)> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("open non-symlink regular file {}", path.display()))?;
+    let before = file
+        .metadata()
+        .with_context(|| format!("fstat {}", path.display()))?;
+    if !before.file_type().is_file() {
+        bail!(
+            "runtime provenance requires a non-symlink regular file: {}",
+            path.display()
+        );
+    }
+
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("read {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let after = file
+        .metadata()
+        .with_context(|| format!("re-fstat {}", path.display()))?;
+    let linked =
+        fs::symlink_metadata(path).with_context(|| format!("re-lstat {}", path.display()))?;
+    let stable = before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.len() == after.len()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+        && before.ctime() == after.ctime()
+        && before.ctime_nsec() == after.ctime_nsec()
+        && linked.file_type().is_file()
+        && linked.dev() == after.dev()
+        && linked.ino() == after.ino();
+    if !stable {
+        bail!(
+            "runtime provenance file changed or was replaced while hashing: {}",
+            path.display()
+        );
+    }
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("canonicalize {}", path.display()))?;
+    Ok((canonical, format!("{:x}", hasher.finalize()), after.len()))
+}
+
+#[cfg(not(unix))]
+fn sha256_regular_file_nofollow(path: &Path) -> Result<(PathBuf, String, u64)> {
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!(
+            "runtime provenance requires a non-symlink regular file: {}",
+            path.display()
+        );
+    }
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("canonicalize {}", path.display()))?;
+    Ok((canonical.clone(), sha256_file(&canonical)?, metadata.len()))
+}
+
+#[cfg(unix)]
+fn read_regular_json_nofollow_bounded(
+    path: &Path,
+    maximum_bytes: u64,
+) -> Result<(Value, Option<u64>, Option<u64>)> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let linked_before =
+        fs::symlink_metadata(path).with_context(|| format!("lstat {}", path.display()))?;
+    if !linked_before.file_type().is_file() {
+        bail!(
+            "JSON provenance path is not a regular file: {}",
+            path.display()
+        );
+    }
+    if linked_before.len() > maximum_bytes {
+        bail!("JSON provenance exceeds its read cap: {}", path.display());
+    }
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("open without following symlinks {}", path.display()))?;
+    let before = file
+        .metadata()
+        .with_context(|| format!("fstat {}", path.display()))?;
+    if !before.file_type().is_file()
+        || linked_before.dev() != before.dev()
+        || linked_before.ino() != before.ino()
+        || before.len() > maximum_bytes
+    {
+        bail!(
+            "JSON provenance path identity changed before read: {}",
+            path.display()
+        );
+    }
+    let mut bytes = Vec::new();
+    {
+        let mut bounded = (&mut file).take(maximum_bytes.saturating_add(1));
+        bounded
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("read {}", path.display()))?;
+    }
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > maximum_bytes {
+        bail!(
+            "JSON provenance grew beyond its read cap: {}",
+            path.display()
+        );
+    }
+    let after = file
+        .metadata()
+        .with_context(|| format!("re-fstat {}", path.display()))?;
+    let linked_after =
+        fs::symlink_metadata(path).with_context(|| format!("re-lstat {}", path.display()))?;
+    let stable = before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.len() == after.len()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+        && before.ctime() == after.ctime()
+        && before.ctime_nsec() == after.ctime_nsec()
+        && linked_after.file_type().is_file()
+        && linked_after.dev() == after.dev()
+        && linked_after.ino() == after.ino();
+    if !stable {
+        bail!(
+            "JSON provenance file changed or was replaced while reading: {}",
+            path.display()
+        );
+    }
+    let value = parse_unique_json(&bytes)
+        .with_context(|| format!("parse JSON provenance {}", path.display()))?;
+    Ok((value, Some(after.dev()), Some(after.ino())))
+}
+
+#[cfg(not(unix))]
+fn read_regular_json_nofollow_bounded(
+    path: &Path,
+    maximum_bytes: u64,
+) -> Result<(Value, Option<u64>, Option<u64>)> {
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!(
+            "JSON provenance path is not a regular file: {}",
+            path.display()
+        );
+    }
+    if metadata.len() > maximum_bytes {
+        bail!("JSON provenance exceeds its read cap: {}", path.display());
+    }
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .with_context(|| format!("open {}", path.display()))?
+        .take(maximum_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read {}", path.display()))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > maximum_bytes {
+        bail!(
+            "JSON provenance grew beyond its read cap: {}",
+            path.display()
+        );
+    }
+    let value = parse_unique_json(&bytes)
+        .with_context(|| format!("parse JSON provenance {}", path.display()))?;
+    Ok((value, None, None))
+}
+
+fn read_regular_json_nofollow(path: &Path) -> Result<(Value, Option<u64>, Option<u64>)> {
+    read_regular_json_nofollow_bounded(path, 134_217_728)
+}
+
+struct UniqueJsonValue(Value);
+
+impl<'de> Deserialize<'de> for UniqueJsonValue {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UniqueJsonVisitor)
+    }
+}
+
+struct UniqueJsonVisitor;
+
+impl<'de> Visitor<'de> for UniqueJsonVisitor {
+    type Value = UniqueJsonValue;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("JSON without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::Number(value.into())))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::Number(value.into())))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .map(UniqueJsonValue)
+            .ok_or_else(|| E::custom("JSON number is not finite"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::String(value.to_string())))
+    }
+
+    fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::String(value)))
+    }
+
+    fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::Null))
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::Null))
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element::<UniqueJsonValue>()? {
+            values.push(value.0);
+        }
+        Ok(UniqueJsonValue(Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut object: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = Map::new();
+        while let Some(key) = object.next_key::<String>()? {
+            if values.contains_key(&key) {
+                return Err(<A::Error as serde::de::Error>::custom(format!(
+                    "duplicate JSON object key {key:?}"
+                )));
+            }
+            let value = object.next_value::<UniqueJsonValue>()?;
+            values.insert(key, value.0);
+        }
+        Ok(UniqueJsonValue(Value::Object(values)))
+    }
+}
+
+fn parse_unique_json(bytes: &[u8]) -> Result<Value> {
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let value = UniqueJsonValue::deserialize(&mut deserializer)
+        .context("parse duplicate-free JSON document")?;
+    deserializer
+        .end()
+        .context("reject trailing non-whitespace JSON content")?;
+    Ok(value.0)
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
@@ -3848,8 +15594,870 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+fn sha256_directory_tree(path: &Path) -> Result<(String, usize, u64)> {
+    fn update_field(hasher: &mut Sha256, value: &[u8]) {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value);
+    }
+
+    fn visit(
+        root: &Path,
+        path: &Path,
+        hasher: &mut Sha256,
+        file_count: &mut usize,
+        total_bytes: &mut u64,
+    ) -> Result<()> {
+        let mut entries = fs::read_dir(path)
+            .with_context(|| format!("read directory {}", path.display()))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .with_context(|| format!("enumerate directory {}", path.display()))?;
+        entries.sort_by_key(|entry| entry.file_name());
+
+        for entry in entries {
+            let entry_path = entry.path();
+            let relative = entry_path
+                .strip_prefix(root)
+                .expect("recursive directory entry remains under root");
+            let relative = relative
+                .to_str()
+                .with_context(|| format!("non-UTF-8 TLA library path {}", entry_path.display()))?;
+            let metadata = fs::symlink_metadata(&entry_path)
+                .with_context(|| format!("stat {}", entry_path.display()))?;
+            if metadata.is_dir() {
+                update_field(hasher, b"directory");
+                update_field(hasher, relative.as_bytes());
+                visit(root, &entry_path, hasher, file_count, total_bytes)?;
+            } else if metadata.is_file() {
+                update_field(hasher, b"file");
+                update_field(hasher, relative.as_bytes());
+                update_field(hasher, &metadata.len().to_be_bytes());
+                let mut file = fs::File::open(&entry_path)
+                    .with_context(|| format!("open {}", entry_path.display()))?;
+                let mut buffer = [0_u8; 1024 * 1024];
+                loop {
+                    let read = file
+                        .read(&mut buffer)
+                        .with_context(|| format!("read {}", entry_path.display()))?;
+                    if read == 0 {
+                        break;
+                    }
+                    hasher.update(&buffer[..read]);
+                }
+                *file_count += 1;
+                *total_bytes = total_bytes
+                    .checked_add(metadata.len())
+                    .context("TLA library byte count overflow")?;
+            } else if metadata.file_type().is_symlink() {
+                bail!(
+                    "TLA library provenance rejects symlinks because the tool may follow mutable external content: {}",
+                    entry_path.display()
+                );
+            } else {
+                bail!(
+                    "unsupported special file in TLA library tree: {}",
+                    entry_path.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"ty.runtime-directory-provenance.v1\0");
+    let mut file_count = 0;
+    let mut total_bytes = 0;
+    visit(path, path, &mut hasher, &mut file_count, &mut total_bytes)?;
+    Ok((format!("{:x}", hasher.finalize()), file_count, total_bytes))
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct JavaRuntimeTreeDigest {
+    tree_sha256: String,
+    file_count: usize,
+    total_bytes: u64,
+    symlink_count: usize,
+    external_target_count: usize,
+}
+
+fn sha256_java_runtime_tree(root: &Path) -> Result<JavaRuntimeTreeDigest> {
+    struct State {
+        hasher: Sha256,
+        file_count: usize,
+        total_bytes: u64,
+        symlink_count: usize,
+        external_target_count: usize,
+        directory_stack: BTreeSet<PathBuf>,
+    }
+
+    fn update_field(hasher: &mut Sha256, value: &[u8]) {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value);
+    }
+
+    fn path_text<'a>(path: &'a Path, label: &str) -> Result<&'a str> {
+        path.to_str()
+            .with_context(|| format!("non-UTF-8 {label} path {}", path.display()))
+    }
+
+    fn add_file(
+        state: &mut State,
+        logical_path: &Path,
+        actual_path: &Path,
+        metadata: &fs::Metadata,
+        kind: &[u8],
+    ) -> Result<()> {
+        update_field(&mut state.hasher, kind);
+        update_field(
+            &mut state.hasher,
+            path_text(logical_path, "Java runtime logical")?.as_bytes(),
+        );
+        update_field(
+            &mut state.hasher,
+            &runtime_metadata_mode(metadata).to_be_bytes(),
+        );
+        update_field(&mut state.hasher, &metadata.len().to_be_bytes());
+        let file = RuntimeFileProvenance::new(actual_path)
+            .with_context(|| format!("hash Java runtime file {}", actual_path.display()))?;
+        if file.path != actual_path {
+            bail!(
+                "Java runtime file did not retain its canonical path: expected {}, found {}",
+                actual_path.display(),
+                file.path.display()
+            );
+        }
+        update_field(&mut state.hasher, file.sha256.as_bytes());
+        state.file_count = state
+            .file_count
+            .checked_add(1)
+            .context("Java runtime file count overflow")?;
+        state.total_bytes = state
+            .total_bytes
+            .checked_add(metadata.len())
+            .context("Java runtime byte count overflow")?;
+        Ok(())
+    }
+
+    fn target_identity(root: &Path, target: &Path) -> Result<(String, bool)> {
+        match target.strip_prefix(root) {
+            Ok(relative) => Ok((
+                format!("internal:{}", path_text(relative, "Java runtime target")?),
+                false,
+            )),
+            Err(_) => Ok((
+                format!(
+                    "external:{}",
+                    path_text(target, "external Java runtime target")?
+                ),
+                true,
+            )),
+        }
+    }
+
+    fn visit_directory(
+        root: &Path,
+        actual_dir: &Path,
+        logical_dir: &Path,
+        state: &mut State,
+    ) -> Result<()> {
+        if !state.directory_stack.insert(actual_dir.to_path_buf()) {
+            bail!(
+                "Java runtime directory symlink cycle reaches {}",
+                actual_dir.display()
+            );
+        }
+        let result = (|| {
+            let mut entries = fs::read_dir(actual_dir)
+                .with_context(|| format!("read Java runtime directory {}", actual_dir.display()))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .with_context(|| {
+                    format!("enumerate Java runtime directory {}", actual_dir.display())
+                })?;
+            entries.sort_by_key(|entry| entry.file_name());
+
+            for entry in entries {
+                let name = entry.file_name();
+                let name = name.to_str().with_context(|| {
+                    format!(
+                        "non-UTF-8 Java runtime entry under {}",
+                        actual_dir.display()
+                    )
+                })?;
+                let actual_path = actual_dir.join(name);
+                let logical_path = logical_dir.join(name);
+                let metadata = fs::symlink_metadata(&actual_path)
+                    .with_context(|| format!("lstat Java runtime {}", actual_path.display()))?;
+                if metadata.file_type().is_dir() {
+                    let canonical = actual_path.canonicalize().with_context(|| {
+                        format!(
+                            "canonicalize Java runtime directory {}",
+                            actual_path.display()
+                        )
+                    })?;
+                    if canonical != actual_path {
+                        bail!(
+                            "Java runtime directory is not canonical: expected {}, found {}",
+                            actual_path.display(),
+                            canonical.display()
+                        );
+                    }
+                    update_field(&mut state.hasher, b"directory");
+                    update_field(
+                        &mut state.hasher,
+                        path_text(&logical_path, "Java runtime logical")?.as_bytes(),
+                    );
+                    update_field(
+                        &mut state.hasher,
+                        &runtime_metadata_mode(&metadata).to_be_bytes(),
+                    );
+                    visit_directory(root, &actual_path, &logical_path, state)?;
+                } else if metadata.file_type().is_file() {
+                    add_file(state, &logical_path, &actual_path, &metadata, b"file")?;
+                } else if metadata.file_type().is_symlink() {
+                    let link_text = fs::read_link(&actual_path).with_context(|| {
+                        format!("read Java runtime symlink {}", actual_path.display())
+                    })?;
+                    let link_text_utf8 = path_text(&link_text, "Java runtime symlink target")?;
+                    let target = actual_path.canonicalize().with_context(|| {
+                        format!(
+                            "resolve Java runtime symlink {} -> {}",
+                            actual_path.display(),
+                            link_text.display()
+                        )
+                    })?;
+                    let target_metadata = fs::symlink_metadata(&target).with_context(|| {
+                        format!(
+                            "lstat resolved Java runtime symlink target {}",
+                            target.display()
+                        )
+                    })?;
+                    let (identity, external) = target_identity(root, &target)?;
+                    state.symlink_count = state
+                        .symlink_count
+                        .checked_add(1)
+                        .context("Java runtime symlink count overflow")?;
+                    if external {
+                        state.external_target_count = state
+                            .external_target_count
+                            .checked_add(1)
+                            .context("Java runtime external target count overflow")?;
+                    }
+                    update_field(&mut state.hasher, b"symlink");
+                    update_field(
+                        &mut state.hasher,
+                        path_text(&logical_path, "Java runtime logical")?.as_bytes(),
+                    );
+                    update_field(&mut state.hasher, link_text_utf8.as_bytes());
+                    update_field(&mut state.hasher, identity.as_bytes());
+                    if target_metadata.file_type().is_file() {
+                        add_file(
+                            state,
+                            &logical_path,
+                            &target,
+                            &target_metadata,
+                            b"symlink-target-file",
+                        )?;
+                    } else if target_metadata.file_type().is_dir() {
+                        update_field(&mut state.hasher, b"symlink-target-directory");
+                        update_field(
+                            &mut state.hasher,
+                            &runtime_metadata_mode(&target_metadata).to_be_bytes(),
+                        );
+                        visit_directory(root, &target, &logical_path, state)?;
+                    } else {
+                        bail!(
+                            "Java runtime symlink resolves to an unsupported special file: {} -> {}",
+                            actual_path.display(),
+                            target.display()
+                        );
+                    }
+                } else {
+                    bail!(
+                        "Java runtime contains an unsupported special file: {}",
+                        actual_path.display()
+                    );
+                }
+            }
+            Ok(())
+        })();
+        state.directory_stack.remove(actual_dir);
+        result
+    }
+
+    validate_canonical_runtime_directory(root, "java.home")?;
+    let root_metadata = fs::symlink_metadata(root)
+        .with_context(|| format!("lstat java.home {}", root.display()))?;
+    let mut state = State {
+        hasher: Sha256::new(),
+        file_count: 0,
+        total_bytes: 0,
+        symlink_count: 0,
+        external_target_count: 0,
+        directory_stack: BTreeSet::new(),
+    };
+    state.hasher.update(b"ty.java-runtime-tree-provenance.v1\0");
+    update_field(
+        &mut state.hasher,
+        &runtime_metadata_mode(&root_metadata).to_be_bytes(),
+    );
+    visit_directory(root, root, Path::new(""), &mut state)?;
+    Ok(JavaRuntimeTreeDigest {
+        tree_sha256: format!("{:x}", state.hasher.finalize()),
+        file_count: state.file_count,
+        total_bytes: state.total_bytes,
+        symlink_count: state.symlink_count,
+        external_target_count: state.external_target_count,
+    })
+}
+
+#[cfg(unix)]
+fn runtime_metadata_mode(metadata: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+
+    metadata.mode()
+}
+
+#[cfg(not(unix))]
+fn runtime_metadata_mode(metadata: &fs::Metadata) -> u32 {
+    u32::from(metadata.permissions().readonly())
+}
+
+fn runtime_machine_provenance_from_env() -> Result<Option<RuntimeMachineProvenance>> {
+    let path = env::var_os(MACHINE_PROVENANCE_PATH_ENV);
+    let provenance_id = env::var(MACHINE_PROVENANCE_ID_ENV).ok();
+    let (path, provenance_id) = match (path, provenance_id) {
+        (None, None) => return Ok(None),
+        (Some(path), Some(provenance_id)) => (path, provenance_id),
+        _ => {
+            bail!(
+                "{MACHINE_PROVENANCE_PATH_ENV} and {MACHINE_PROVENANCE_ID_ENV} must be set together"
+            )
+        }
+    };
+    let path = PathBuf::from(path);
+    let delegated_parent = env::var(MACHINE_CGROUP_PARENT_ENV).ok();
+    runtime_machine_provenance(path, provenance_id, delegated_parent.as_deref()).map(Some)
+}
+
+fn runtime_final_receipt_path_from_env() -> Result<Option<PathBuf>> {
+    let Some(path) = env::var_os(FINAL_RECEIPT_PATH_ENV).map(PathBuf::from) else {
+        return Ok(None);
+    };
+    if !path.is_absolute() {
+        bail!(
+            "{FINAL_RECEIPT_PATH_ENV} must name the absolute receipt path reserved by the strict Linux launcher, got {}",
+            path.display()
+        );
+    }
+    if path.exists() || path.is_symlink() {
+        bail!(
+            "{FINAL_RECEIPT_PATH_ENV} must not exist while the evidence child is running: {}",
+            path.display()
+        );
+    }
+    Ok(Some(path))
+}
+
+fn runtime_machine_provenance(
+    path: PathBuf,
+    provenance_id: String,
+    delegated_parent: Option<&str>,
+) -> Result<RuntimeMachineProvenance> {
+    if !path.is_absolute() {
+        bail!(
+            "{MACHINE_PROVENANCE_PATH_ENV} must name an absolute regular file, got {}",
+            path.display()
+        );
+    }
+    if provenance_id.is_empty() || provenance_id.trim() != provenance_id {
+        bail!("{MACHINE_PROVENANCE_ID_ENV} must be a nonempty trimmed opaque id");
+    }
+    let (snapshot, file_device, file_inode) = read_regular_json_nofollow(&path)
+        .with_context(|| format!("read machine provenance {}", path.display()))?;
+    let schema = snapshot
+        .get("schema")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let status = snapshot
+        .get("status")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let qualification_cpu = snapshot
+        .pointer("/qualification/selected_cpu")
+        .and_then(Value::as_u64);
+    let cgroup_cpu = snapshot
+        .pointer("/cgroup/cpu/selected_logical_cpu")
+        .and_then(Value::as_u64);
+    let document_parent = snapshot
+        .pointer("/cgroup/delegated_parent")
+        .and_then(Value::as_str);
+    let delegated_parent_matches =
+        document_parent
+            .zip(delegated_parent)
+            .is_some_and(|(document_parent, requested_parent)| {
+                Path::new(document_parent).is_absolute()
+                    && Path::new(requested_parent).is_absolute()
+                    && document_parent == requested_parent
+            });
+    let controls = snapshot
+        .pointer("/qualification/controls")
+        .and_then(Value::as_object);
+    let qualified = schema.as_deref() == Some(MACHINE_PROVENANCE_SCHEMA)
+        && snapshot.get("provenance_id").and_then(Value::as_str) == Some(provenance_id.as_str())
+        && status.as_deref() == Some("running")
+        && snapshot
+            .pointer("/qualification/state")
+            .and_then(Value::as_str)
+            == Some("qualified")
+        && snapshot.pointer("/qualification/succeeded") == Some(&Value::Bool(true))
+        && qualification_cpu.is_some()
+        && qualification_cpu == cgroup_cpu
+        && controls.is_some_and(|controls| {
+            validate_required_machine_qualification_controls(controls).is_ok()
+        })
+        && delegated_parent_matches
+        && snapshot.get("machine").is_some_and(Value::is_object);
+    Ok(RuntimeMachineProvenance {
+        path,
+        provenance_id,
+        file_device,
+        file_inode,
+        schema,
+        status,
+        qualified,
+        snapshot,
+    })
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn valid_full_git_commit(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn strict_runtime_provenance_errors(metadata: &RuntimeEvidenceMetadata) -> Vec<String> {
+    strict_runtime_provenance_errors_with_launcher(metadata, true)
+}
+
+fn strict_campaign_plan_provenance_errors(metadata: &RuntimeEvidenceMetadata) -> Vec<String> {
+    strict_runtime_provenance_errors_with_launcher(metadata, false)
+}
+
+fn strict_runtime_provenance_errors_with_launcher(
+    metadata: &RuntimeEvidenceMetadata,
+    require_launcher_provenance: bool,
+) -> Vec<String> {
+    let mut errors = metadata.input_revalidation_errors.clone();
+    if metadata.benchmark.mode != "enforce" {
+        errors.push("benchmark mode is not enforce".to_string());
+    }
+    if !valid_full_git_commit(&metadata.ty.git_commit) {
+        errors.push("TY binary full Git commit is unavailable or invalid".to_string());
+    }
+    if metadata.ty.build_worktree_dirty != Some(false) {
+        errors.push("TY binary was not proven to be built from a clean worktree".to_string());
+    }
+    if !valid_sha256(&metadata.ty.binary.sha256) {
+        errors.push("TY binary SHA-256 is invalid".to_string());
+    }
+    let workspace = &metadata.ty.workspace_checkout;
+    match workspace.head.as_deref() {
+        Some(head) if head == metadata.ty.git_commit => {}
+        Some(head) => errors.push(format!(
+            "TY binary Git commit {} does not match workspace HEAD {head}",
+            metadata.ty.git_commit
+        )),
+        None => errors.push("TY workspace HEAD is unavailable".to_string()),
+    }
+    if workspace.is_dirty != Some(false) {
+        errors.push("TY workspace is not proven clean".to_string());
+    }
+    if !valid_sha256(&metadata.tlc.jar.sha256) {
+        errors.push("TLC jar SHA-256 is invalid".to_string());
+    }
+    match &metadata.community_modules {
+        Some(module) if valid_sha256(&module.sha256) => {}
+        Some(_) => errors.push("CommunityModules jar SHA-256 is invalid".to_string()),
+        None => errors.push("CommunityModules jar provenance is missing".to_string()),
+    }
+    if metadata
+        .tla_library
+        .as_ref()
+        .is_some_and(|library| !valid_sha256(&library.tree_sha256))
+    {
+        errors.push("TLA library tree SHA-256 is invalid".to_string());
+    }
+    let java_executable = metadata.java.executable.as_ref();
+    let java_home = metadata.java.java_home.as_ref();
+    if metadata.java.status != Some(0)
+        || metadata.java.version.as_deref().is_none_or(str::is_empty)
+        || metadata.java.error.is_some()
+        || metadata.java.settings_status != Some(0)
+        || metadata.java.settings_output.is_empty()
+        || java_executable.is_none_or(|java| {
+            !java.path.is_absolute()
+                || !valid_sha256(&java.sha256)
+                || metadata.java.argv.first().map(Path::new) != Some(java.path.as_path())
+                || metadata.java.settings_argv.first().map(Path::new) != Some(java.path.as_path())
+        })
+        || java_home.is_none_or(|home| {
+            !home.path.is_absolute()
+                || !valid_sha256(&home.tree_sha256)
+                || home.file_count == 0
+                || home.total_bytes == 0
+        })
+    {
+        errors.push(
+            "JDK version, exact executable, settings, or java.home tree provenance is incomplete"
+                .to_string(),
+        );
+    }
+    if metadata.examples_checkout.head.is_none()
+        || metadata.examples_checkout.is_dirty != Some(false)
+        || metadata.examples_checkout.error.is_some()
+    {
+        errors.push("Examples checkout provenance is incomplete or dirty".to_string());
+    }
+    if !valid_sha256(&metadata.benchmark.baseline.sha256) {
+        errors.push("input baseline SHA-256 is invalid".to_string());
+    }
+    if !valid_sha256(&metadata.benchmark.strict_corpus_manifest.sha256) {
+        errors.push("strict-corpus manifest SHA-256 is invalid".to_string());
+    }
+    if require_launcher_provenance {
+        match &metadata.machine {
+            Some(machine) if machine.qualified => {}
+            Some(_) => errors.push("Linux machine provenance did not qualify".to_string()),
+            None => errors.push("Linux machine provenance link is missing".to_string()),
+        }
+        match metadata.benchmark.final_receipt_path.as_ref() {
+            Some(path) if path.is_absolute() && !path.exists() && !path.is_symlink() => {
+                if let Some(machine) = metadata.machine.as_ref() {
+                    if machine
+                        .snapshot
+                        .pointer("/final_receipt/path")
+                        .and_then(Value::as_str)
+                        != path.to_str()
+                    {
+                        errors.push(
+                            "machine provenance final receipt path does not match launcher environment"
+                                .to_string(),
+                        );
+                    }
+                    if machine
+                        .snapshot
+                        .pointer("/final_receipt/schema")
+                        .and_then(Value::as_str)
+                        != Some(FINAL_RECEIPT_SCHEMA)
+                    {
+                        errors.push(
+                            "machine provenance final receipt schema is missing or invalid"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            Some(_) => errors.push(
+                "strict final receipt path is not absolute or already exists before finalization"
+                    .to_string(),
+            ),
+            None => errors.push("strict final receipt path is missing".to_string()),
+        }
+    }
+    errors
+}
+
+fn runtime_sample_machine_provenance_errors(
+    rows: &[RuntimeEvidenceRow],
+    metadata: &RuntimeEvidenceMetadata,
+) -> Vec<String> {
+    let Some(expected_machine) = metadata.machine.as_ref() else {
+        return vec!["runtime samples cannot be linked without machine provenance".to_string()];
+    };
+    let expected_path = expected_machine.path.to_str();
+    let expected_id = expected_machine.provenance_id.as_str();
+    let required_true = [
+        "path_is_absolute",
+        "regular_file",
+        "readable_json",
+        "file_identity_verified",
+        "schema_matches",
+        "provenance_id_matches",
+        "machine_present",
+        "status_running",
+        "qualification_state_matches",
+        "qualification_succeeded",
+        "selected_cpu_matches",
+        "cgroup_selected_cpu_matches",
+        "controls_qualified",
+        "delegated_parent_absolute",
+        "delegated_parent_matches",
+        "finish_revalidated",
+        "file_identity_stable",
+        "qualification_identity_stable",
+        "qualified",
+    ];
+    let mut errors = Vec::new();
+    let mut expected_qualification_digest: Option<&str> = None;
+    let mut sample_count = 0_usize;
+    for row in rows {
+        for (arm, samples) in [
+            ("production_tlc", row.tlc.samples.as_slice()),
+            (
+                "warmup_production_tlc",
+                row.tlc.cache_warmup_samples.as_slice(),
+            ),
+            ("count_tlc", row.tlc.count_verification_samples.as_slice()),
+            (
+                "warmup_count_tlc",
+                row.tlc.count_verification_cache_warmup_samples.as_slice(),
+            ),
+            ("count_ty", row.ty.samples.as_slice()),
+            ("warmup_count_ty", row.ty.cache_warmup_samples.as_slice()),
+            ("production_ty", row.ty.production_samples.as_slice()),
+            (
+                "warmup_production_ty",
+                row.ty.production_cache_warmup_samples.as_slice(),
+            ),
+        ] {
+            for sample in samples {
+                sample_count += 1;
+                let label = format!("{}/{arm}/run-{}", row.spec, sample.run_index);
+                let Some(machine) = sample.machine_provenance.as_ref() else {
+                    errors.push(format!("{label} has no runner machine provenance"));
+                    continue;
+                };
+                if machine.get("path").and_then(Value::as_str) != expected_path
+                    || machine.get("provenance_id").and_then(Value::as_str) != Some(expected_id)
+                    || machine
+                        .get("document_provenance_id")
+                        .and_then(Value::as_str)
+                        != Some(expected_id)
+                {
+                    errors.push(format!(
+                        "{label} runner machine path or provenance id differs from report metadata"
+                    ));
+                }
+                if machine
+                    .get("qualification_identity_schema")
+                    .and_then(Value::as_str)
+                    != Some("ty.supremacy.machine-qualification-identity.v1")
+                {
+                    errors.push(format!(
+                        "{label} runner qualification identity schema is invalid"
+                    ));
+                }
+                if required_true
+                    .iter()
+                    .any(|field| machine.get(*field) != Some(&Value::Bool(true)))
+                {
+                    errors.push(format!(
+                        "{label} runner machine qualification is incomplete"
+                    ));
+                }
+                let Some(digest) = machine
+                    .get("qualification_identity_sha256")
+                    .and_then(Value::as_str)
+                    .filter(|digest| valid_sha256(digest))
+                else {
+                    errors.push(format!(
+                        "{label} runner qualification identity digest is invalid"
+                    ));
+                    continue;
+                };
+                if machine
+                    .get("revalidated_qualification_identity_sha256")
+                    .and_then(Value::as_str)
+                    != Some(digest)
+                {
+                    errors.push(format!(
+                        "{label} runner qualification identity digest changed"
+                    ));
+                }
+                match expected_qualification_digest {
+                    Some(expected) if expected != digest => errors.push(format!(
+                        "{label} used a different launcher qualification identity"
+                    )),
+                    None => expected_qualification_digest = Some(digest),
+                    _ => {}
+                }
+                if machine.get("file_device").and_then(Value::as_u64)
+                    != machine
+                        .get("revalidated_file_device")
+                        .and_then(Value::as_u64)
+                    || machine.get("file_inode").and_then(Value::as_u64)
+                        != machine
+                            .get("revalidated_file_inode")
+                            .and_then(Value::as_u64)
+                {
+                    errors.push(format!(
+                        "{label} runner machine provenance file identity changed"
+                    ));
+                }
+                let selected_cpu = machine.get("selected_cpu").and_then(Value::as_u64);
+                let cgroup_cpu = machine.get("cgroup_selected_cpu").and_then(Value::as_u64);
+                let runner_cpu = machine.get("runner_selected_cpu").and_then(Value::as_u64);
+                let resource_cpu = sample
+                    .resource_evidence
+                    .as_ref()
+                    .and_then(|resource| resource.pointer("/cpu/effective_cpu_ids"))
+                    .and_then(Value::as_array)
+                    .filter(|ids| ids.len() == 1)
+                    .and_then(|ids| ids[0].as_u64());
+                if selected_cpu.is_none()
+                    || selected_cpu != cgroup_cpu
+                    || selected_cpu != runner_cpu
+                    || selected_cpu != resource_cpu
+                {
+                    errors.push(format!(
+                        "{label} runner, launcher, cgroup, and resource CPU identities differ"
+                    ));
+                }
+                let controls = machine.get("launcher_controls").and_then(Value::as_object);
+                if controls.is_none_or(|controls| {
+                    controls.is_empty()
+                        || controls.values().any(|value| value != &Value::Bool(true))
+                }) {
+                    errors.push(format!(
+                        "{label} runner launcher controls are missing or not all true"
+                    ));
+                }
+            }
+        }
+    }
+    if sample_count > 0 && expected_qualification_digest.is_none() {
+        errors.push("no runtime sample retained a valid qualification identity".to_string());
+    }
+    errors
+}
+
+fn runtime_input_revalidation_errors(metadata: &RuntimeEvidenceMetadata) -> Vec<String> {
+    fn revalidate_file(label: &str, expected: &RuntimeFileProvenance, errors: &mut Vec<String>) {
+        match RuntimeFileProvenance::new(&expected.path) {
+            Ok(actual) if &actual == expected => {}
+            Ok(actual) => errors.push(format!(
+                "{label} changed during collection: expected {}, found {}",
+                expected.sha256, actual.sha256
+            )),
+            Err(error) => errors.push(format!("{label} could not be revalidated: {error:#}")),
+        }
+    }
+
+    let mut errors = Vec::new();
+    revalidate_file("TY binary", &metadata.ty.binary, &mut errors);
+    revalidate_file("TLC jar", &metadata.tlc.jar, &mut errors);
+    if let Some(community_modules) = &metadata.community_modules {
+        revalidate_file("CommunityModules jar", community_modules, &mut errors);
+    }
+    if let Some(java) = &metadata.java.executable {
+        revalidate_file("Java executable", java, &mut errors);
+    }
+    if let Some(expected) = &metadata.java.java_home {
+        match RuntimeJavaHomeProvenance::new(&expected.path) {
+            Ok(actual) if &actual == expected => {}
+            Ok(actual) => errors.push(format!(
+                "Java home runtime tree changed during collection: expected {}, found {}",
+                expected.tree_sha256, actual.tree_sha256
+            )),
+            Err(error) => errors.push(format!(
+                "Java home runtime tree could not be revalidated: {error:#}"
+            )),
+        }
+        if let Some(executable) = metadata.java.executable.as_ref() {
+            let home_executable = expected
+                .path
+                .join("bin")
+                .join(java_executable_file_name())
+                .canonicalize();
+            if !matches!(home_executable, Ok(path) if path == executable.path) {
+                errors.push(
+                    "Java executable no longer equals canonical java.home/bin/java".to_string(),
+                );
+            }
+        }
+    }
+    revalidate_file("input baseline", &metadata.benchmark.baseline, &mut errors);
+    revalidate_file(
+        "strict-corpus manifest",
+        &metadata.benchmark.strict_corpus_manifest,
+        &mut errors,
+    );
+    if let Some(expected) = &metadata.tla_library {
+        match RuntimeDirectoryProvenance::new(&expected.path) {
+            Ok(actual) if &actual == expected => {}
+            Ok(actual) => errors.push(format!(
+                "TLA library changed during collection: expected {}, found {}",
+                expected.tree_sha256, actual.tree_sha256
+            )),
+            Err(error) => {
+                errors.push(format!("TLA library could not be revalidated: {error:#}"));
+            }
+        }
+    }
+
+    for (label, expected) in [
+        ("TY workspace", &metadata.ty.workspace_checkout),
+        ("Examples checkout", &metadata.examples_checkout),
+    ] {
+        let actual = git_checkout_provenance(&expected.path);
+        if &actual != expected {
+            errors.push(format!("{label} changed during collection"));
+        }
+    }
+
+    if let Some(expected) = &metadata.machine {
+        let delegated_parent = expected
+            .snapshot
+            .pointer("/cgroup/delegated_parent")
+            .and_then(Value::as_str);
+        match runtime_machine_provenance(
+            expected.path.clone(),
+            expected.provenance_id.clone(),
+            delegated_parent,
+        ) {
+            Ok(actual)
+                if actual.qualified
+                    && actual.file_device == expected.file_device
+                    && actual.file_inode == expected.file_inode
+                    && sha256_jcs_value(&actual.snapshot).ok()
+                        == sha256_jcs_value(&expected.snapshot).ok() => {}
+            Ok(_) => errors.push("machine provenance changed during collection".to_string()),
+            Err(error) => errors.push(format!(
+                "machine provenance could not be revalidated: {error:#}"
+            )),
+        }
+    }
+    if let Some(path) = metadata.benchmark.final_receipt_path.as_ref() {
+        if path.exists() || path.is_symlink() {
+            errors.push(format!(
+                "final receipt appeared before the evidence child completed: {}",
+                path.display()
+            ));
+        }
+    }
+    errors
+}
+
 fn canonicalize_lossy(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn supremacy_repo_root(start: &Path) -> PathBuf {
+    let start = canonicalize_lossy(start);
+    start
+        .ancestors()
+        .find(|candidate| {
+            candidate
+                .join("tests/tlc_comparison/strict_corpus_manifest.json")
+                .is_file()
+                && candidate.join("crates/tla-cli/Cargo.toml").is_file()
+        })
+        .map(Path::to_path_buf)
+        .unwrap_or(start)
 }
 
 fn validate_runtime_ty_binary_for_refresh(ty_bin: &Path, allow_debug_runtime: bool) -> Result<()> {
@@ -3867,46 +16475,367 @@ fn is_debug_runtime_binary(path: &Path) -> bool {
         .any(|component| component.as_os_str() == "debug")
 }
 
-fn current_ty_git_commit(repo_root: &Path) -> String {
+fn current_ty_git_commit(_repo_root: &Path) -> String {
     option_env!("TY_GIT_COMMIT")
         .filter(|commit| !commit.trim().is_empty() && *commit != "unknown")
         .map(ToOwned::to_owned)
-        .or_else(|| git_command_text(repo_root, &["rev-parse", "--short", "HEAD"]).ok())
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn java_version_provenance() -> RuntimeCommandVersionProvenance {
-    command_version_provenance(vec!["java".to_string(), "-version".to_string()])
+fn current_ty_build_worktree_dirty() -> Option<bool> {
+    match option_env!("TY_GIT_DIRTY") {
+        Some("false") => Some(false),
+        Some("true") => Some(true),
+        _ => None,
+    }
+}
+
+fn resolve_java_runtime_from_environment() -> Result<ResolvedJavaRuntime> {
+    let path = env::var_os("PATH").context("PATH is not set")?;
+    let home = env::var_os("HOME");
+    let cwd = env::current_dir().context("resolve current working directory for PATH")?;
+    resolve_java_runtime_from_path(&path, home.as_deref(), &cwd)
+}
+
+fn resolved_java_runtime_from_campaign_payload(
+    payload: &RuntimeCampaignPlanPayload,
+) -> Result<ResolvedJavaRuntime> {
+    let provenance: RuntimeCommandVersionProvenance = serde_json::from_value(
+        payload
+            .contract_attestations
+            .pointer("/inputs/java")
+            .cloned()
+            .context("campaign plan has no pinned Java provenance")?,
+    )
+    .context("parse campaign-pinned Java provenance")?;
+    if provenance.executable.as_ref() != Some(&payload.runtime.java_executable)
+        || provenance.java_home.as_ref() != Some(&payload.runtime.java_home)
+        || provenance.status != Some(0)
+        || provenance.settings_status != Some(0)
+        || provenance.version.as_deref().is_none_or(str::is_empty)
+        || provenance.error.is_some()
+        || provenance.argv.first().map(Path::new)
+            != Some(payload.runtime.java_executable.path.as_path())
+        || provenance.settings_argv.first().map(Path::new)
+            != Some(payload.runtime.java_executable.path.as_path())
+    {
+        bail!("campaign-pinned Java provenance is incomplete or diverges from runtime inputs");
+    }
+    let executable = RuntimeFileProvenance::new(&payload.runtime.java_executable.path)
+        .context("revalidate campaign-pinned Java executable")?;
+    let java_home = RuntimeJavaHomeProvenance::new(&payload.runtime.java_home.path)
+        .context("revalidate campaign-pinned Java home")?;
+    if executable != payload.runtime.java_executable || java_home != payload.runtime.java_home {
+        bail!("campaign-pinned Java executable or home changed after plan creation");
+    }
+    Ok(ResolvedJavaRuntime {
+        executable,
+        java_home,
+        provenance,
+    })
+}
+
+fn resolve_java_runtime_from_path(
+    path: &OsStr,
+    home: Option<&OsStr>,
+    cwd: &Path,
+) -> Result<ResolvedJavaRuntime> {
+    let executable_path = resolve_java_path_executable(path, cwd)?;
+    let settings_argv = vec![
+        executable_path.display().to_string(),
+        "-XshowSettings:properties".to_string(),
+        "-version".to_string(),
+    ];
+    let mut settings_command = Command::new(&executable_path);
+    settings_command.args(&settings_argv[1..]);
+    apply_fixed_semantic_provenance_env_from(&mut settings_command, Some(path), home);
+    let settings = settings_command.output().with_context(|| {
+        format!(
+            "run exact Java settings probe {}",
+            executable_path.display()
+        )
+    })?;
+    let settings_output = command_output_lines(&settings.stdout, &settings.stderr);
+    if !settings.status.success() {
+        bail!(
+            "exact Java settings probe {} exited with {}; output: {}",
+            executable_path.display(),
+            settings.status,
+            settings_output.join(" | ")
+        );
+    }
+    let java_homes = settings_output
+        .iter()
+        .filter_map(|line| {
+            line.strip_prefix("java.home = ")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+        .collect::<Vec<_>>();
+    let [reported_java_home] = java_homes.as_slice() else {
+        bail!(
+            "exact Java settings probe {} must report exactly one java.home, found {}",
+            executable_path.display(),
+            java_homes.len()
+        );
+    };
+    if !reported_java_home.is_absolute() {
+        bail!(
+            "exact Java settings probe reported a non-absolute java.home: {}",
+            reported_java_home.display()
+        );
+    }
+    let java_home_path = reported_java_home.canonicalize().with_context(|| {
+        format!(
+            "canonicalize java.home reported by {}: {}",
+            executable_path.display(),
+            reported_java_home.display()
+        )
+    })?;
+    validate_canonical_runtime_directory(&java_home_path, "java.home")?;
+    let home_java_path = java_home_path.join("bin").join(java_executable_file_name());
+    let home_java_path = home_java_path.canonicalize().with_context(|| {
+        format!(
+            "canonicalize java.home executable {}",
+            home_java_path.display()
+        )
+    })?;
+    validate_canonical_java_executable(&home_java_path)?;
+    if home_java_path != executable_path {
+        bail!(
+            "PATH Java resolves to {}, but its fixed-environment java.home resolves bin/java to {}; strict runtime evidence forbids behavior-changing Java wrappers",
+            executable_path.display(),
+            home_java_path.display()
+        );
+    }
+
+    let executable =
+        RuntimeFileProvenance::new(&executable_path).context("hash exact Java executable")?;
+    if executable.path != executable_path {
+        bail!("exact Java executable provenance changed its canonical path");
+    }
+    let java_home = RuntimeJavaHomeProvenance::new(&java_home_path)
+        .context("hash canonical java.home runtime tree")?;
+    let argv = vec![
+        executable_path.display().to_string(),
+        "-version".to_string(),
+    ];
+    let mut provenance =
+        command_version_provenance_with_fixed_semantic_env_from(argv, Some(path), home);
+    if provenance.status != Some(0)
+        || provenance.version.as_deref().is_none_or(str::is_empty)
+        || provenance.error.is_some()
+    {
+        bail!(
+            "exact Java version probe {} did not produce successful version provenance: {:?}",
+            executable_path.display(),
+            provenance.error
+        );
+    }
+    provenance.executable = Some(executable.clone());
+    provenance.java_home = Some(java_home.clone());
+    provenance.settings_argv = settings_argv;
+    provenance.settings_output = settings_output;
+    provenance.settings_status = settings.status.code();
+
+    Ok(ResolvedJavaRuntime {
+        executable,
+        java_home,
+        provenance,
+    })
+}
+
+fn resolve_java_path_executable(path: &OsStr, cwd: &Path) -> Result<PathBuf> {
+    for directory in env::split_paths(path) {
+        let directory = if directory.as_os_str().is_empty() {
+            cwd.to_path_buf()
+        } else if directory.is_absolute() {
+            directory
+        } else {
+            cwd.join(directory)
+        };
+        let candidate = directory.join(java_executable_file_name());
+        let Ok(canonical) = candidate.canonicalize() else {
+            continue;
+        };
+        if validate_canonical_java_executable(&canonical).is_ok() {
+            return Ok(canonical);
+        }
+    }
+    bail!("PATH does not resolve java to a canonical non-symlink regular executable")
+}
+
+#[cfg(windows)]
+fn java_executable_file_name() -> &'static str {
+    "java.exe"
+}
+
+#[cfg(not(windows))]
+fn java_executable_file_name() -> &'static str {
+    "java"
+}
+
+fn validate_canonical_java_executable(path: &Path) -> Result<()> {
+    if !path.is_absolute() || path.canonicalize().ok().as_deref() != Some(path) {
+        bail!(
+            "Java executable must be an absolute canonical path: {}",
+            path.display()
+        );
+    }
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("lstat Java {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!(
+            "Java executable must be a non-symlink regular file: {}",
+            path.display()
+        );
+    }
+    if !metadata_is_executable(&metadata) {
+        bail!("Java executable is not executable: {}", path.display());
+    }
+    Ok(())
+}
+
+fn validate_canonical_runtime_directory(path: &Path, label: &str) -> Result<()> {
+    if !path.is_absolute() || path.canonicalize().ok().as_deref() != Some(path) {
+        bail!(
+            "{label} must be an absolute canonical path: {}",
+            path.display()
+        );
+    }
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("lstat {label} {}", path.display()))?;
+    if !metadata.file_type().is_dir() {
+        bail!(
+            "{label} must be a non-symlink directory: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn metadata_is_executable(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn metadata_is_executable(_metadata: &fs::Metadata) -> bool {
+    true
 }
 
 fn command_version_provenance(argv: Vec<String>) -> RuntimeCommandVersionProvenance {
+    command_version_provenance_with(argv, false)
+}
+
+fn command_version_provenance_with_fixed_semantic_env(
+    argv: Vec<String>,
+) -> RuntimeCommandVersionProvenance {
+    command_version_provenance_with(argv, true)
+}
+
+fn apply_fixed_semantic_provenance_env(command: &mut Command) {
+    let path = env::var_os("PATH");
+    let home = env::var_os("HOME");
+    apply_fixed_semantic_provenance_env_from(command, path.as_deref(), home.as_deref());
+}
+
+fn apply_fixed_semantic_provenance_env_from(
+    command: &mut Command,
+    path: Option<&OsStr>,
+    home: Option<&OsStr>,
+) {
+    command.env_clear();
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+    if let Some(home) = home {
+        command.env("HOME", home);
+    }
+    command.env("LANG", "C");
+    command.env("LC_ALL", "C");
+    command.env("TZ", "UTC");
+}
+
+fn command_version_provenance_with_fixed_semantic_env_from(
+    argv: Vec<String>,
+    path: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> RuntimeCommandVersionProvenance {
     if argv.is_empty() {
-        return RuntimeCommandVersionProvenance {
-            argv,
-            version: None,
-            output: Vec::new(),
-            status: None,
-            error: Some("empty argv".to_string()),
-        };
+        return empty_command_version_provenance(argv);
+    }
+    let mut command = Command::new(&argv[0]);
+    command.args(&argv[1..]);
+    apply_fixed_semantic_provenance_env_from(&mut command, path, home);
+    command_version_provenance_from_output(argv, command.output())
+}
+
+fn command_version_provenance_with(
+    argv: Vec<String>,
+    fixed_semantic_env: bool,
+) -> RuntimeCommandVersionProvenance {
+    if argv.is_empty() {
+        return empty_command_version_provenance(argv);
     }
 
-    match Command::new(&argv[0]).args(&argv[1..]).output() {
+    let mut command = Command::new(&argv[0]);
+    command.args(&argv[1..]);
+    if fixed_semantic_env {
+        apply_fixed_semantic_provenance_env(&mut command);
+    }
+    command_version_provenance_from_output(argv, command.output())
+}
+
+fn empty_command_version_provenance(argv: Vec<String>) -> RuntimeCommandVersionProvenance {
+    RuntimeCommandVersionProvenance {
+        argv,
+        executable: None,
+        java_home: None,
+        version: None,
+        output: Vec::new(),
+        status: None,
+        error: Some("empty argv".to_string()),
+        settings_argv: Vec::new(),
+        settings_output: Vec::new(),
+        settings_status: None,
+    }
+}
+
+fn command_version_provenance_from_output(
+    argv: Vec<String>,
+    output: std::io::Result<std::process::Output>,
+) -> RuntimeCommandVersionProvenance {
+    match output {
         Ok(output) => {
             let output_lines = command_output_lines(&output.stdout, &output.stderr);
             RuntimeCommandVersionProvenance {
                 argv,
+                executable: None,
+                java_home: None,
                 version: output_lines.first().cloned(),
                 output: output_lines,
                 status: output.status.code(),
                 error: None,
+                settings_argv: Vec::new(),
+                settings_output: Vec::new(),
+                settings_status: None,
             }
         }
         Err(err) => RuntimeCommandVersionProvenance {
             argv,
+            executable: None,
+            java_home: None,
             version: None,
             output: Vec::new(),
             status: None,
             error: Some(err.to_string()),
+            settings_argv: Vec::new(),
+            settings_output: Vec::new(),
+            settings_status: None,
         },
     }
 }
@@ -4081,10 +17010,6 @@ fn validate_dir(path: &Path) -> Result<()> {
     }
 }
 
-fn default_examples_dir() -> Option<PathBuf> {
-    env::var_os("HOME").map(|home| PathBuf::from(home).join("tlaplus-examples/specifications"))
-}
-
 fn default_tlc_jar() -> PathBuf {
     env::var_os("TYTOOLS_JAR")
         .or_else(|| env::var_os("TLC_JAR"))
@@ -4129,13 +17054,38 @@ fn resolve_runtime_tla_library_from(
         return Some(path);
     }
 
+    // The installed UPSTREAM proof library outranks the repo's first-party stub
+    // set. 25 of the 141 eligible rows EXTEND TLAPS / FiniteSetTheorems /
+    // NaturalsInduction; whichever library resolves here mediates whether TLC
+    // can parse them at all. Preferring upstream keeps ~18% of the claim corpus
+    // off a TY-authored artifact. `ty install-tlc proof-library` writes here.
+    if let Some(installed) = home
+        .as_ref()
+        .map(|home| {
+            home.join("tlaplus")
+                .join(crate::cmd_tlc::proof_library::PROOF_LIBRARY_DIR)
+        })
+        .filter(|path| path.is_dir())
+    {
+        return Some(installed);
+    }
+
+    // A system TLAPS install (tlapm) is likewise upstream, so it also outranks
+    // the stub.
+    if let Some(tlapm) = home
+        .as_ref()
+        .map(|home| home.join("tlapm/library"))
+        .filter(|path| path.is_dir())
+    {
+        return Some(tlapm);
+    }
+
     let repo_library = repo_root.join(DEFAULT_TLA_LIBRARY);
     if repo_library.is_dir() {
         return Some(repo_library);
     }
 
-    home.map(|home| home.join("tlapm/library"))
-        .filter(|path| path.is_dir())
+    None
 }
 
 fn non_empty_env_path(key: &str) -> Option<PathBuf> {
@@ -4186,6 +17136,7 @@ impl SupremacyMatrixCounts {
         }
     }
 
+    #[cfg(test)]
     fn strict_blocker_count(&self) -> usize {
         self.unsupported
             + self.tlc_error
@@ -4203,6 +17154,7 @@ impl SupremacyMatrixCounts {
         self.runtime_to_error + self.timeout_dominance
     }
 
+    #[cfg(test)]
     fn policy_blocker_count(&self, matrix_policy: &MatrixPolicy) -> usize {
         let allowed_comparable_outcomes = usize::from(matrix_policy.allow_runtime_to_error)
             * self.runtime_to_error
@@ -4211,7 +17163,59 @@ impl SupremacyMatrixCounts {
     }
 }
 
+fn row_has_strict_semantic_result(row: &SupremacyMatrixRow) -> bool {
+    matches!(
+        row.class,
+        SupremacyMatrixClass::Pass
+            | SupremacyMatrixClass::PerfTie
+            | SupremacyMatrixClass::PerfLoser
+            | SupremacyMatrixClass::ExpectedViolationMatch
+    )
+}
+
+fn row_has_policy_semantic_result(row: &SupremacyMatrixRow, matrix_policy: &MatrixPolicy) -> bool {
+    row_has_strict_semantic_result(row)
+        || (row.class == SupremacyMatrixClass::RuntimeToError
+            && matrix_policy.allow_runtime_to_error)
+        || (row.class == SupremacyMatrixClass::TimeoutDominance
+            && matrix_policy.allow_timeout_dominance)
+}
+
+fn row_is_strict_pass(row: &SupremacyMatrixRow) -> bool {
+    row_has_strict_semantic_result(row) && row.claim_class == SupremacyMatrixClaimClass::PassBoth
+}
+
+fn row_is_policy_pass(row: &SupremacyMatrixRow, matrix_policy: &MatrixPolicy) -> bool {
+    row_has_policy_semantic_result(row, matrix_policy)
+        && row.overall == SupremacyMatrixOverallVerdict::PassBoth
+}
+
 impl SupremacyMatrixPolicySummary {
+    fn from_rows(
+        rows: &[SupremacyMatrixRow],
+        counts: &SupremacyMatrixCounts,
+        matrix_policy: &MatrixPolicy,
+    ) -> Self {
+        let blockers = rows
+            .iter()
+            .filter(|row| row.eligible && !row_is_policy_pass(row, matrix_policy))
+            .count();
+        let pass = blockers == 0;
+        Self {
+            allow_runtime_to_error: matrix_policy.allow_runtime_to_error,
+            allow_timeout_dominance: matrix_policy.allow_timeout_dominance,
+            comparable_outcomes: counts.comparable_outcome_count(),
+            pass,
+            blockers,
+            verdict: if pass {
+                SupremacyMatrixVerdict::Pass
+            } else {
+                SupremacyMatrixVerdict::Fail
+            },
+        }
+    }
+
+    #[cfg(test)]
     fn from_counts(counts: &SupremacyMatrixCounts, matrix_policy: &MatrixPolicy) -> Self {
         let blockers = counts.policy_blocker_count(matrix_policy);
         let pass = blockers == 0;
@@ -4511,13 +17515,13 @@ fn expected_violation_match_reason(
             && ty_seconds < tlc_seconds
         {
             return format!(
-                "TY reached the matching expected {} violation faster than TLC",
+                "TY reached the matching expected {} violation faster than TLC in the scalar diagnostic; the exhaustive-holds work_equivalence contract cannot bind an early violation",
                 kind.label()
             );
         }
     }
     format!(
-        "TLC and TY reported matching expected {} violation; expected invalid/error rows are excluded from runtime supremacy comparisons",
+        "TLC and TY reported matching expected {} violation; the exhaustive-holds work_equivalence contract cannot bind an early violation",
         kind.label()
     )
 }
@@ -4536,7 +17540,7 @@ fn classify_bmc_only_matching_error(
     Some((
         SupremacyMatrixClass::ExpectedViolationMatch,
         format!(
-            "BMC-only fixture reported matching checker error `{}` under normal check; expected invalid/error rows are excluded from runtime supremacy comparisons",
+            "BMC-only fixture reported matching checker error `{}` under normal check; the exhaustive-holds work_equivalence contract cannot bind an early error",
             normalized_error_label(tlc_error, ty_error)
         ),
     ))
@@ -4854,6 +17858,911 @@ fn has_finite_positive_runtime(seconds: Option<f64>) -> bool {
     seconds.is_some_and(|seconds| seconds.is_finite() && seconds > 0.0)
 }
 
+fn aggregate_runtime_seconds(
+    aggregate: Option<f64>,
+    samples: &[SupremacyMatrixPerformanceSample],
+) -> Option<f64> {
+    if samples.is_empty() {
+        return aggregate.filter(|seconds| has_finite_positive_runtime(Some(*seconds)));
+    }
+    samples
+        .iter()
+        .map(|sample| {
+            sample
+                .runtime_seconds
+                .filter(|seconds| has_finite_positive_runtime(Some(*seconds)))
+        })
+        .collect::<Option<Vec<_>>>()
+        .and_then(median_f64)
+}
+
+fn aggregate_process_tree_peak_memory(
+    aggregate: Option<u64>,
+    samples: &[SupremacyMatrixPerformanceSample],
+) -> Option<u64> {
+    if samples.is_empty() {
+        return aggregate.filter(|bytes| *bytes > 0);
+    }
+    samples
+        .iter()
+        .map(|sample| {
+            sample
+                .process_tree_peak_memory_bytes
+                .filter(|bytes| *bytes > 0)
+        })
+        .collect::<Option<Vec<_>>>()
+        .and_then(median_u64)
+}
+
+fn complete_paired_samples<'a>(
+    tlc: &'a [SupremacyMatrixPerformanceSample],
+    ty: &'a [SupremacyMatrixPerformanceSample],
+) -> Option<
+    Vec<(
+        &'a SupremacyMatrixPerformanceSample,
+        &'a SupremacyMatrixPerformanceSample,
+    )>,
+> {
+    if tlc.len() < STRICT_MIN_PAIRED_RUNS || tlc.len() != ty.len() {
+        return None;
+    }
+    if tlc.iter().all(|sample| sample.run_index == 0)
+        && ty.iter().all(|sample| sample.run_index == 0)
+    {
+        return Some(tlc.iter().zip(ty).collect());
+    }
+
+    let mut tlc_by_run = BTreeMap::new();
+    let mut ty_by_run = BTreeMap::new();
+    for sample in tlc {
+        if sample.run_index == 0 || tlc_by_run.insert(sample.run_index, sample).is_some() {
+            return None;
+        }
+    }
+    for sample in ty {
+        if sample.run_index == 0 || ty_by_run.insert(sample.run_index, sample).is_some() {
+            return None;
+        }
+    }
+    if tlc_by_run.keys().ne(ty_by_run.keys()) {
+        return None;
+    }
+    Some(
+        tlc_by_run
+            .into_iter()
+            .zip(ty_by_run)
+            .map(|((_, tlc), (_, ty))| (tlc, ty))
+            .collect(),
+    )
+}
+
+fn strict_performance_evidence_qualified(
+    production_tlc: &[SupremacyMatrixPerformanceSample],
+    production_ty: &[SupremacyMatrixPerformanceSample],
+    count_tlc: &[SupremacyMatrixPerformanceSample],
+    count_ty: &[SupremacyMatrixPerformanceSample],
+) -> bool {
+    if !strict_schedule_and_artifacts_qualified(production_tlc, production_ty, count_tlc, count_ty)
+    {
+        return false;
+    }
+    if !strict_engine_tier_provenance_qualified(production_tlc, production_ty, count_tlc, count_ty)
+    {
+        return false;
+    }
+    if !strict_sample_machine_provenance_qualified(
+        production_tlc,
+        production_ty,
+        count_tlc,
+        count_ty,
+    ) {
+        return false;
+    }
+    if !performance_samples_are_deterministic(production_tlc)
+        || !performance_samples_are_deterministic(production_ty)
+        || !performance_samples_are_deterministic(count_tlc)
+        || !performance_samples_are_deterministic(count_ty)
+    {
+        return false;
+    }
+    let Some(production_paired) = complete_paired_samples(production_tlc, production_ty) else {
+        return false;
+    };
+    let Some(count_paired) = complete_paired_samples(count_tlc, count_ty) else {
+        return false;
+    };
+    let count_by_run = count_paired
+        .iter()
+        .map(|(tlc, ty)| (tlc.run_index, (*tlc, *ty)))
+        .collect::<BTreeMap<_, _>>();
+    if count_by_run.len() != count_tlc.len() {
+        return false;
+    }
+
+    let mut expected_cpu_ids: Option<Vec<u64>> = None;
+    let mut expected_memory_method: Option<String> = None;
+    for (production_tlc_sample, production_ty_sample) in production_paired {
+        let Some((count_tlc_sample, count_ty_sample)) =
+            count_by_run.get(&production_tlc_sample.run_index).copied()
+        else {
+            return false;
+        };
+        if !runtime_sample_verdicts_equal(production_ty_sample, count_ty_sample)
+            || !runtime_sample_count_parity(count_tlc_sample, count_ty_sample)
+            || !runtime_sample_count_parity(production_tlc_sample, count_tlc_sample)
+        {
+            return false;
+        }
+        for sample in [
+            production_tlc_sample,
+            production_ty_sample,
+            count_tlc_sample,
+            count_ty_sample,
+        ] {
+            if !sample.strict_qualified
+                || !sample.strict_cpu_qualified
+                || !sample.strict_memory_qualified
+                || !has_finite_positive_runtime(sample.runtime_seconds)
+                || sample.process_tree_peak_memory_bytes.is_none()
+            {
+                return false;
+            }
+            let Some(resources) = sample.resource_evidence.as_ref() else {
+                return false;
+            };
+            if resources.pointer("/cpu/isolation/isolated") != Some(&Value::Bool(true))
+                || resources.pointer("/cpu/confined") != Some(&Value::Bool(true))
+                || resources.pointer("/cpu/process_tree_inherited") != Some(&Value::Bool(true))
+                || resources.pointer("/memory/complete") != Some(&Value::Bool(true))
+                || resources.pointer("/cgroup/parent_verified") != Some(&Value::Bool(true))
+            {
+                return false;
+            }
+            let Some(cpu_ids) = resources
+                .pointer("/cpu/effective_cpu_ids")
+                .and_then(Value::as_array)
+                .map(|ids| ids.iter().filter_map(Value::as_u64).collect::<Vec<_>>())
+                .filter(|ids| ids.len() == 1)
+            else {
+                return false;
+            };
+            if !strict_cgroup_resource_proofs_qualified(resources) {
+                return false;
+            }
+            let Some(memory_method) = resources
+                .pointer("/memory/method")
+                .and_then(Value::as_str)
+                .filter(|method| *method == "linux_cgroup_v2_memory_peak")
+                .map(str::to_string)
+            else {
+                return false;
+            };
+            if resources.pointer("/memory/metric").and_then(Value::as_str)
+                != Some("cgroup_accounted_memory")
+                || resources.pointer("/memory/scope").and_then(Value::as_str)
+                    != Some("process_tree")
+                || resources.pointer("/cpu/method").and_then(Value::as_str)
+                    != Some("linux_sched_setaffinity_inherited")
+            {
+                return false;
+            }
+            match &expected_cpu_ids {
+                Some(expected) if expected != &cpu_ids => return false,
+                None => expected_cpu_ids = Some(cpu_ids),
+                _ => {}
+            }
+            match &expected_memory_method {
+                Some(expected) if expected != &memory_method => return false,
+                None => expected_memory_method = Some(memory_method),
+                _ => {}
+            }
+        }
+    }
+    true
+}
+
+fn strict_single_runtime_observation_qualified(sample: &SupremacyMatrixPerformanceSample) -> bool {
+    sample
+        .status
+        .as_deref()
+        .is_some_and(|status| !status.eq_ignore_ascii_case("timeout"))
+        && !sample
+            .error_type
+            .as_deref()
+            .is_some_and(|error| error.to_ascii_lowercase().contains("timeout"))
+        && sample
+            .artifact_dir
+            .as_deref()
+            .is_some_and(Path::is_absolute)
+        && strict_runtime_observation_resource_identity(sample).is_some()
+        && strict_sample_machine_provenance_qualified(std::slice::from_ref(sample), &[], &[], &[])
+}
+
+fn strict_runtime_observation_resource_identity(
+    sample: &SupremacyMatrixPerformanceSample,
+) -> Option<(Vec<u64>, String)> {
+    if !sample.strict_qualified
+        || !sample.strict_cpu_qualified
+        || !sample.strict_memory_qualified
+        || !has_finite_positive_runtime(sample.runtime_seconds)
+        || sample.process_tree_peak_memory_bytes.is_none()
+    {
+        return None;
+    }
+    let resources = sample.resource_evidence.as_ref()?;
+    if resources.pointer("/cpu/isolation/isolated") != Some(&Value::Bool(true))
+        || resources.pointer("/cpu/confined") != Some(&Value::Bool(true))
+        || resources.pointer("/cpu/process_tree_inherited") != Some(&Value::Bool(true))
+        || resources.pointer("/memory/complete") != Some(&Value::Bool(true))
+        || resources.pointer("/cgroup/parent_verified") != Some(&Value::Bool(true))
+        || resources.pointer("/memory/metric").and_then(Value::as_str)
+            != Some("cgroup_accounted_memory")
+        || resources.pointer("/memory/scope").and_then(Value::as_str) != Some("process_tree")
+        || resources.pointer("/cpu/method").and_then(Value::as_str)
+            != Some("linux_sched_setaffinity_inherited")
+        || !strict_cgroup_resource_proofs_qualified(resources)
+    {
+        return None;
+    }
+    let cpu_ids = resources
+        .pointer("/cpu/effective_cpu_ids")
+        .and_then(Value::as_array)?
+        .iter()
+        .map(Value::as_u64)
+        .collect::<Option<Vec<_>>>()?;
+    if cpu_ids.len() != 1 {
+        return None;
+    }
+    let memory_method = resources
+        .pointer("/memory/method")
+        .and_then(Value::as_str)
+        .filter(|method| *method == "linux_cgroup_v2_memory_peak")?
+        .to_string();
+    Some((cpu_ids, memory_method))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn strict_cache_warmups_qualified(
+    warmup_production_tlc: &[SupremacyMatrixPerformanceSample],
+    warmup_production_ty: &[SupremacyMatrixPerformanceSample],
+    warmup_count_tlc: &[SupremacyMatrixPerformanceSample],
+    warmup_count_ty: &[SupremacyMatrixPerformanceSample],
+    production_tlc: &[SupremacyMatrixPerformanceSample],
+    production_ty: &[SupremacyMatrixPerformanceSample],
+    count_tlc: &[SupremacyMatrixPerformanceSample],
+    count_ty: &[SupremacyMatrixPerformanceSample],
+) -> bool {
+    if !strict_performance_evidence_qualified(production_tlc, production_ty, count_tlc, count_ty)
+        || warmup_production_tlc
+            .iter()
+            .map(|sample| sample.run_index)
+            .ne([1, 8])
+        || warmup_production_ty
+            .iter()
+            .map(|sample| sample.run_index)
+            .ne([2, 7])
+        || warmup_count_ty
+            .iter()
+            .map(|sample| sample.run_index)
+            .ne([3, 6])
+        || warmup_count_tlc
+            .iter()
+            .map(|sample| sample.run_index)
+            .ne([4, 5])
+    {
+        return false;
+    }
+
+    let warmup_for_arm = |arm: &str| -> &[SupremacyMatrixPerformanceSample] {
+        match arm {
+            "production_tlc" => warmup_production_tlc,
+            "production_ty" => warmup_production_ty,
+            "count_tlc" => warmup_count_tlc,
+            "count_ty" => warmup_count_ty,
+            _ => &[],
+        }
+    };
+    for expected in STRICT_CACHE_WARMUP_SCHEDULE {
+        let Some(sample) = warmup_for_arm(expected.arm)
+            .iter()
+            .find(|sample| sample.run_index == expected.sequence_index)
+        else {
+            return false;
+        };
+        if sample.tool_order.as_deref() != Some(expected.tool_order)
+            || sample.pair_block_order.as_deref() != Some(expected.pair_block_order)
+            || !strict_single_runtime_observation_qualified(sample)
+        {
+            return false;
+        }
+    }
+
+    let scored_for_arm = |arm: &str| -> &[SupremacyMatrixPerformanceSample] {
+        match arm {
+            "production_tlc" => production_tlc,
+            "production_ty" => production_ty,
+            "count_tlc" => count_tlc,
+            "count_ty" => count_ty,
+            _ => &[],
+        }
+    };
+    for arm in ["production_tlc", "production_ty", "count_tlc", "count_ty"] {
+        let Some(scored_reference) = scored_for_arm(arm).first() else {
+            return false;
+        };
+        if !performance_samples_are_deterministic(warmup_for_arm(arm))
+            || warmup_for_arm(arm)
+                .iter()
+                .any(|sample| !runtime_sample_semantics_and_tier_equal(sample, scored_reference))
+        {
+            return false;
+        }
+    }
+
+    let expected_artifact_count = warmup_production_tlc.len()
+        + warmup_production_ty.len()
+        + warmup_count_tlc.len()
+        + warmup_count_ty.len()
+        + production_tlc.len()
+        + production_ty.len()
+        + count_tlc.len()
+        + count_ty.len();
+    let production_tlc_all = warmup_production_tlc
+        .iter()
+        .chain(production_tlc)
+        .cloned()
+        .collect::<Vec<_>>();
+    let production_ty_all = warmup_production_ty
+        .iter()
+        .chain(production_ty)
+        .cloned()
+        .collect::<Vec<_>>();
+    let count_tlc_all = warmup_count_tlc
+        .iter()
+        .chain(count_tlc)
+        .cloned()
+        .collect::<Vec<_>>();
+    let count_ty_all = warmup_count_ty
+        .iter()
+        .chain(count_ty)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !strict_engine_tier_provenance_qualified(
+        &production_tlc_all,
+        &production_ty_all,
+        &count_tlc_all,
+        &count_ty_all,
+    ) || !strict_sample_machine_provenance_qualified(
+        &production_tlc_all,
+        &production_ty_all,
+        &count_tlc_all,
+        &count_ty_all,
+    ) {
+        return false;
+    }
+
+    let mut expected_resource_identity: Option<(Vec<u64>, String)> = None;
+    let mut artifact_dirs = BTreeSet::new();
+    for sample in production_tlc_all
+        .iter()
+        .chain(&production_ty_all)
+        .chain(&count_tlc_all)
+        .chain(&count_ty_all)
+    {
+        let Some(identity) = strict_runtime_observation_resource_identity(sample) else {
+            return false;
+        };
+        match expected_resource_identity.as_ref() {
+            Some(expected) if expected != &identity => return false,
+            None => expected_resource_identity = Some(identity),
+            _ => {}
+        }
+        let Some(artifact_dir) = sample
+            .artifact_dir
+            .as_ref()
+            .filter(|path| path.is_absolute())
+        else {
+            return false;
+        };
+        if !artifact_dirs.insert(artifact_dir.clone()) {
+            return false;
+        }
+    }
+    artifact_dirs.len() == expected_artifact_count && expected_resource_identity.is_some()
+}
+
+fn runtime_sample_semantics_and_tier_equal(
+    left: &SupremacyMatrixPerformanceSample,
+    right: &SupremacyMatrixPerformanceSample,
+) -> bool {
+    left.status == right.status
+        && left.error_type == right.error_type
+        && left.violated_obligation == right.violated_obligation
+        && left.states == right.states
+        && left.raw_initial_states_generated == right.raw_initial_states_generated
+        && left.raw_successors_generated == right.raw_successors_generated
+        && left.states_generated == right.states_generated
+        && left.engine_tier == right.engine_tier
+}
+
+fn strict_sample_machine_provenance_qualified(
+    production_tlc: &[SupremacyMatrixPerformanceSample],
+    production_ty: &[SupremacyMatrixPerformanceSample],
+    count_tlc: &[SupremacyMatrixPerformanceSample],
+    count_ty: &[SupremacyMatrixPerformanceSample],
+) -> bool {
+    let mut expected_identity: Option<(String, String, String)> = None;
+    for sample in production_tlc
+        .iter()
+        .chain(production_ty)
+        .chain(count_tlc)
+        .chain(count_ty)
+    {
+        let Some(machine) = sample.machine_provenance.as_ref() else {
+            return false;
+        };
+        let required_true = [
+            "path_is_absolute",
+            "regular_file",
+            "readable_json",
+            "file_identity_verified",
+            "schema_matches",
+            "provenance_id_matches",
+            "machine_present",
+            "status_running",
+            "qualification_state_matches",
+            "qualification_succeeded",
+            "selected_cpu_matches",
+            "cgroup_selected_cpu_matches",
+            "controls_qualified",
+            "delegated_parent_absolute",
+            "delegated_parent_matches",
+            "finish_revalidated",
+            "file_identity_stable",
+            "qualification_identity_stable",
+            "qualified",
+        ];
+        if required_true
+            .iter()
+            .any(|field| machine.get(*field) != Some(&Value::Bool(true)))
+        {
+            return false;
+        }
+        let Some(path) = machine
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|path| Path::new(path).is_absolute())
+        else {
+            return false;
+        };
+        let Some(provenance_id) = machine
+            .get("provenance_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty() && *id == id.trim())
+        else {
+            return false;
+        };
+        if machine
+            .get("document_provenance_id")
+            .and_then(Value::as_str)
+            != Some(provenance_id)
+            || machine
+                .get("qualification_identity_schema")
+                .and_then(Value::as_str)
+                != Some("ty.supremacy.machine-qualification-identity.v1")
+        {
+            return false;
+        }
+        let Some(digest) = machine
+            .get("qualification_identity_sha256")
+            .and_then(Value::as_str)
+            .filter(|digest| valid_sha256(digest))
+        else {
+            return false;
+        };
+        if machine
+            .get("revalidated_qualification_identity_sha256")
+            .and_then(Value::as_str)
+            != Some(digest)
+            || machine.get("file_device").and_then(Value::as_u64).is_none()
+            || machine.get("file_device").and_then(Value::as_u64)
+                != machine
+                    .get("revalidated_file_device")
+                    .and_then(Value::as_u64)
+            || machine.get("file_inode").and_then(Value::as_u64).is_none()
+            || machine.get("file_inode").and_then(Value::as_u64)
+                != machine
+                    .get("revalidated_file_inode")
+                    .and_then(Value::as_u64)
+        {
+            return false;
+        }
+        let selected_cpu = machine.get("selected_cpu").and_then(Value::as_u64);
+        let runner_cpu = machine.get("runner_selected_cpu").and_then(Value::as_u64);
+        let cgroup_cpu = machine.get("cgroup_selected_cpu").and_then(Value::as_u64);
+        let resource_cpu = sample
+            .resource_evidence
+            .as_ref()
+            .and_then(|resources| resources.pointer("/cpu/effective_cpu_ids"))
+            .and_then(Value::as_array)
+            .filter(|ids| ids.len() == 1)
+            .and_then(|ids| ids[0].as_u64());
+        if selected_cpu.is_none()
+            || selected_cpu != runner_cpu
+            || selected_cpu != cgroup_cpu
+            || selected_cpu != resource_cpu
+        {
+            return false;
+        }
+        if machine
+            .get("launcher_controls")
+            .and_then(Value::as_object)
+            .is_none_or(|controls| {
+                controls.is_empty() || controls.values().any(|value| value != &Value::Bool(true))
+            })
+        {
+            return false;
+        }
+        let identity = (
+            path.to_string(),
+            provenance_id.to_string(),
+            digest.to_string(),
+        );
+        match expected_identity.as_ref() {
+            Some(expected) if expected != &identity => return false,
+            None => expected_identity = Some(identity),
+            _ => {}
+        }
+    }
+    expected_identity.is_some()
+}
+
+fn strict_engine_tier_provenance_qualified(
+    production_tlc: &[SupremacyMatrixPerformanceSample],
+    production_ty: &[SupremacyMatrixPerformanceSample],
+    count_tlc: &[SupremacyMatrixPerformanceSample],
+    count_ty: &[SupremacyMatrixPerformanceSample],
+) -> bool {
+    if production_tlc
+        .iter()
+        .chain(count_tlc)
+        .any(|sample| sample.engine_tier.is_some())
+    {
+        return false;
+    }
+
+    [production_ty, count_ty].iter().all(|samples| {
+        let Some(expected) = samples
+            .first()
+            .and_then(|sample| sample.engine_tier.as_deref())
+        else {
+            return false;
+        };
+        if expected.is_empty() || expected != expected.trim() {
+            return false;
+        }
+        samples
+            .iter()
+            .all(|sample| sample.engine_tier.as_deref() == Some(expected))
+    })
+}
+
+fn strict_cgroup_resource_proofs_qualified(resources: &Value) -> bool {
+    let required_true = [
+        "/cgroup/process_tree_naturally_unpopulated",
+        "/cgroup/effective_cpuset/verified",
+        "/cgroup/effective_cpuset/unchanged",
+        "/cgroup/effective_cpuset/selected_cpu_present_before",
+        "/cgroup/effective_cpuset/selected_cpu_present_after",
+        "/cgroup/memory_swap_max/verified",
+        "/cgroup/memory_swap_max/zero_before_command",
+        "/cgroup/memory_swap_max/zero_after_command",
+        "/cgroup/memory_swap_max/unchanged",
+        "/cgroup/cpu_stat/verified",
+        "/cgroup/cpu_stat/nr_throttled_unchanged",
+        "/cgroup/cpu_stat/throttled_usec_unchanged",
+    ];
+    required_true
+        .iter()
+        .all(|path| resources.pointer(path) == Some(&Value::Bool(true)))
+        && resources
+            .pointer("/cgroup/cpu_stat/nr_throttled_delta")
+            .and_then(Value::as_u64)
+            == Some(0)
+        && resources
+            .pointer("/cgroup/cpu_stat/throttled_usec_delta")
+            .and_then(Value::as_u64)
+            == Some(0)
+}
+
+fn strict_schedule_and_artifacts_qualified(
+    production_tlc: &[SupremacyMatrixPerformanceSample],
+    production_ty: &[SupremacyMatrixPerformanceSample],
+    count_tlc: &[SupremacyMatrixPerformanceSample],
+    count_ty: &[SupremacyMatrixPerformanceSample],
+) -> bool {
+    let run_count = production_tlc.len();
+    if run_count < STRICT_MIN_PAIRED_RUNS
+        || run_count % 2 != 0
+        || production_ty.len() != run_count
+        || count_tlc.len() != run_count
+        || count_ty.len() != run_count
+    {
+        return false;
+    }
+
+    let (
+        Some(production_tlc_by_run),
+        Some(production_ty_by_run),
+        Some(count_tlc_by_run),
+        Some(count_ty_by_run),
+    ) = (
+        samples_by_run(production_tlc),
+        samples_by_run(production_ty),
+        samples_by_run(count_tlc),
+        samples_by_run(count_ty),
+    )
+    else {
+        return false;
+    };
+    if [
+        production_tlc_by_run.len(),
+        production_ty_by_run.len(),
+        count_tlc_by_run.len(),
+        count_ty_by_run.len(),
+    ]
+    .iter()
+    .any(|len| *len != run_count)
+    {
+        return false;
+    }
+
+    let mut artifact_dirs = BTreeSet::new();
+    for run_index in 1..=run_count {
+        let Some(production_tlc_sample) = production_tlc_by_run.get(&run_index).copied() else {
+            return false;
+        };
+        let Some(production_ty_sample) = production_ty_by_run.get(&run_index).copied() else {
+            return false;
+        };
+        let Some(count_tlc_sample) = count_tlc_by_run.get(&run_index).copied() else {
+            return false;
+        };
+        let Some(count_ty_sample) = count_ty_by_run.get(&run_index).copied() else {
+            return false;
+        };
+        let schedule = matrix_performance_schedule(run_index);
+        for (sample, expected_order) in [
+            (production_tlc_sample, schedule.production_tool_order),
+            (production_ty_sample, schedule.production_tool_order),
+            (count_tlc_sample, schedule.count_tool_order),
+            (count_ty_sample, schedule.count_tool_order),
+        ] {
+            if sample.tool_order.as_deref() != Some(expected_order)
+                || sample.pair_block_order.as_deref() != Some(schedule.pair_block_order)
+            {
+                return false;
+            }
+            let Some(artifact_dir) = sample
+                .artifact_dir
+                .as_ref()
+                .filter(|path| path.is_absolute())
+            else {
+                return false;
+            };
+            if !artifact_dirs.insert(artifact_dir.clone()) {
+                return false;
+            }
+        }
+    }
+    artifact_dirs.len() == run_count * 4
+}
+
+fn performance_samples_are_deterministic(samples: &[SupremacyMatrixPerformanceSample]) -> bool {
+    let Some(first) = samples.first() else {
+        return false;
+    };
+    samples.iter().all(|sample| {
+        sample.status == first.status
+            && sample.error_type == first.error_type
+            && sample.violated_obligation == first.violated_obligation
+            && sample.states == first.states
+            && sample.raw_initial_states_generated == first.raw_initial_states_generated
+            && sample.raw_successors_generated == first.raw_successors_generated
+            && sample.states_generated == first.states_generated
+    })
+}
+
+fn runtime_sample_verdicts_equal(
+    left: &SupremacyMatrixPerformanceSample,
+    right: &SupremacyMatrixPerformanceSample,
+) -> bool {
+    if left.status != right.status || left.error_type != right.error_type {
+        return false;
+    }
+    match expected_violation_kind(left.error_type.as_deref()) {
+        Some(_) => {
+            left.violated_obligation.is_some()
+                && left.violated_obligation == right.violated_obligation
+        }
+        None => left.violated_obligation.is_none() && right.violated_obligation.is_none(),
+    }
+}
+
+fn runtime_sample_count_parity(
+    tlc: &SupremacyMatrixPerformanceSample,
+    count_ty: &SupremacyMatrixPerformanceSample,
+) -> bool {
+    let semantic_match = match (
+        expected_violation_kind(tlc.error_type.as_deref()),
+        expected_violation_kind(count_ty.error_type.as_deref()),
+    ) {
+        (Some(tlc_kind), Some(ty_kind)) => {
+            tlc_kind == ty_kind
+                && tlc.violated_obligation.is_some()
+                && tlc.violated_obligation == count_ty.violated_obligation
+        }
+        (None, None) => {
+            tlc.status.as_deref() == Some(SUPREMACY_STATUS_PASS)
+                && count_ty.status.as_deref() == Some(SUPREMACY_STATUS_PASS)
+        }
+        _ => false,
+    };
+    semantic_match
+        && tlc.states.is_some()
+        && tlc.states == count_ty.states
+        && tlc.raw_initial_states_generated.is_some()
+        && tlc.raw_initial_states_generated == count_ty.raw_initial_states_generated
+        && tlc.raw_successors_generated.is_some()
+        && tlc.raw_successors_generated == count_ty.raw_successors_generated
+        && tlc.states_generated.is_some()
+        && tlc.states_generated == count_ty.states_generated
+}
+
+fn paired_runtime_speedup(
+    tlc: &[SupremacyMatrixPerformanceSample],
+    ty: &[SupremacyMatrixPerformanceSample],
+) -> Option<f64> {
+    complete_paired_samples(tlc, ty)?
+        .into_iter()
+        .map(|(tlc, ty)| speedup(tlc.runtime_seconds, ty.runtime_seconds))
+        .collect::<Option<Vec<_>>>()
+        .and_then(median_f64)
+}
+
+fn paired_memory_ratio(
+    tlc: &[SupremacyMatrixPerformanceSample],
+    ty: &[SupremacyMatrixPerformanceSample],
+) -> Option<f64> {
+    complete_paired_samples(tlc, ty)?
+        .into_iter()
+        .map(|(tlc, ty)| {
+            memory_ratio(
+                ty.process_tree_peak_memory_bytes,
+                tlc.process_tree_peak_memory_bytes,
+            )
+        })
+        .collect::<Option<Vec<_>>>()
+        .and_then(median_f64)
+}
+
+fn median_f64(mut values: Vec<f64>) -> Option<f64> {
+    if values.is_empty() || values.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    values.sort_by(f64::total_cmp);
+    let midpoint = values.len() / 2;
+    if values.len() % 2 == 1 {
+        Some(values[midpoint])
+    } else {
+        Some((values[midpoint - 1] + values[midpoint]) / 2.0)
+    }
+}
+
+fn median_u64(mut values: Vec<u64>) -> Option<u64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    let midpoint = values.len() / 2;
+    if values.len() % 2 == 1 {
+        Some(values[midpoint])
+    } else {
+        let sum = u128::from(values[midpoint - 1]) + u128::from(values[midpoint]);
+        u64::try_from(sum / 2).ok()
+    }
+}
+
+fn memory_ratio(ty_bytes: Option<u64>, tlc_bytes: Option<u64>) -> Option<f64> {
+    let (Some(ty_bytes), Some(tlc_bytes)) = (ty_bytes, tlc_bytes) else {
+        return None;
+    };
+    if ty_bytes == 0 || tlc_bytes == 0 {
+        return None;
+    }
+    Some(ty_bytes as f64 / tlc_bytes as f64)
+}
+
+fn classify_runtime_axis(speedup: Option<f64>) -> SupremacyMatrixAxisVerdict {
+    match speedup {
+        Some(speedup) if speedup.is_finite() && speedup > STRICT_MIN_RUNTIME_SPEEDUP => {
+            SupremacyMatrixAxisVerdict::Pass
+        }
+        Some(speedup) if speedup.is_finite() && speedup > 0.0 => SupremacyMatrixAxisVerdict::Loss,
+        _ => SupremacyMatrixAxisVerdict::MissingOrStale,
+    }
+}
+
+fn combine_required_runtime_axes(
+    production: SupremacyMatrixAxisVerdict,
+    count_verification: SupremacyMatrixAxisVerdict,
+) -> SupremacyMatrixAxisVerdict {
+    use SupremacyMatrixAxisVerdict::{Loss, MissingOrStale, Pass};
+    match (production, count_verification) {
+        (MissingOrStale, _) | (_, MissingOrStale) => MissingOrStale,
+        (Loss, _) | (_, Loss) => Loss,
+        (Pass, Pass) => Pass,
+    }
+}
+
+fn classify_memory_axis(memory_ratio: Option<f64>) -> SupremacyMatrixAxisVerdict {
+    match memory_ratio {
+        Some(memory_ratio)
+            if memory_ratio.is_finite()
+                && memory_ratio > 0.0
+                && memory_ratio < STRICT_MAX_MEMORY_RATIO =>
+        {
+            SupremacyMatrixAxisVerdict::Pass
+        }
+        Some(memory_ratio) if memory_ratio.is_finite() && memory_ratio > 0.0 => {
+            SupremacyMatrixAxisVerdict::Loss
+        }
+        _ => SupremacyMatrixAxisVerdict::MissingOrStale,
+    }
+}
+
+fn derive_overall_verdict(
+    runtime_axis: SupremacyMatrixAxisVerdict,
+    memory_axis: SupremacyMatrixAxisVerdict,
+) -> SupremacyMatrixOverallVerdict {
+    use SupremacyMatrixAxisVerdict::{Loss, MissingOrStale, Pass};
+    match (runtime_axis, memory_axis) {
+        (MissingOrStale, _) | (_, MissingOrStale) => SupremacyMatrixOverallVerdict::MissingOrStale,
+        (Pass, Pass) => SupremacyMatrixOverallVerdict::PassBoth,
+        (Loss, Pass) => SupremacyMatrixOverallVerdict::RuntimeLoss,
+        (Pass, Loss) => SupremacyMatrixOverallVerdict::MemoryLoss,
+        (Loss, Loss) => SupremacyMatrixOverallVerdict::BothLoss,
+    }
+}
+
+fn derive_claim_class(
+    class: SupremacyMatrixClass,
+    overall: SupremacyMatrixOverallVerdict,
+) -> SupremacyMatrixClaimClass {
+    match class {
+        SupremacyMatrixClass::Unsupported => SupremacyMatrixClaimClass::Unsupported,
+        SupremacyMatrixClass::Pass
+        | SupremacyMatrixClass::PerfTie
+        | SupremacyMatrixClass::PerfLoser
+        | SupremacyMatrixClass::ExpectedViolationMatch => match overall {
+            SupremacyMatrixOverallVerdict::PassBoth => SupremacyMatrixClaimClass::PassBoth,
+            SupremacyMatrixOverallVerdict::RuntimeLoss => SupremacyMatrixClaimClass::RuntimeLoss,
+            SupremacyMatrixOverallVerdict::MemoryLoss => SupremacyMatrixClaimClass::MemoryLoss,
+            SupremacyMatrixOverallVerdict::BothLoss => SupremacyMatrixClaimClass::BothLoss,
+            SupremacyMatrixOverallVerdict::MissingOrStale => {
+                SupremacyMatrixClaimClass::MissingOrStale
+            }
+        },
+        SupremacyMatrixClass::MissingRuntime => SupremacyMatrixClaimClass::MissingOrStale,
+        SupremacyMatrixClass::TlcError
+        | SupremacyMatrixClass::TlcTimeout
+        | SupremacyMatrixClass::RuntimeToError
+        | SupremacyMatrixClass::TimeoutDominance
+        | SupremacyMatrixClass::TyTimeout
+        | SupremacyMatrixClass::ParityFail => SupremacyMatrixClaimClass::ParityBlocker,
+    }
+}
+
 fn speedup(tlc_seconds: Option<f64>, ty_seconds: Option<f64>) -> Option<f64> {
     let (Some(tlc_seconds), Some(ty_seconds)) = (tlc_seconds, ty_seconds) else {
         return None;
@@ -4927,13 +18836,81 @@ pub(super) fn print_summary(
     Ok(())
 }
 
+pub(super) fn print_campaign_segment_summary(
+    collection: &CampaignSegmentCollection,
+    format: crate::cli_schema::SupremacyOutputFormat,
+) -> Result<()> {
+    match format {
+        crate::cli_schema::SupremacyOutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&campaign_segment_summary_value(
+                    &collection.summary,
+                    &collection.binding,
+                ))?
+            );
+        }
+        crate::cli_schema::SupremacyOutputFormat::Markdown => {
+            println!(
+                "# Campaign Segment Diagnostic — Not a Full-Corpus Claim\n\n\
+                 - Segment: `{}`\n\
+                 - Corpus claim complete: `false`\n\
+                 - Corpus claim pass: `false`\n\n{}",
+                collection
+                    .binding
+                    .segment_id
+                    .as_deref()
+                    .unwrap_or("<missing>"),
+                collection.summary.to_markdown()
+            );
+        }
+        crate::cli_schema::SupremacyOutputFormat::Human => {
+            let diagnostic = collection.summary.to_human().replacen(
+                "All-runnable TLC supremacy matrix",
+                "Matrix state after selected campaign segment",
+                1,
+            );
+            println!(
+                "CAMPAIGN SEGMENT DIAGNOSTIC — NOT A FULL-CORPUS CLAIM\n\
+                 segment: {}\n\
+                 corpus_claim_complete: false\n\
+                 corpus_claim_pass: false\n{}",
+                collection
+                    .binding
+                    .segment_id
+                    .as_deref()
+                    .unwrap_or("<missing>"),
+                diagnostic
+            );
+        }
+    }
+    Ok(())
+}
+
+fn campaign_segment_summary_value(
+    summary: &SupremacyMatrixSummary,
+    binding: &RuntimeCampaignReportBinding,
+) -> Value {
+    json!({
+        "schema": RUNTIME_CAMPAIGN_SEGMENT_SUMMARY_SCHEMA,
+        "role": "segment",
+        "campaign": binding,
+        "corpus_claim_complete": false,
+        "corpus_claim_pass": false,
+        "matrix_diagnostic": summary,
+    })
+}
+
 impl SupremacyMatrixSummary {
     pub(super) fn total_rows(&self) -> usize {
         self.rows.len()
     }
 
     pub(super) fn strict_pass_count(&self) -> usize {
-        self.counts.pass
+        self.rows
+            .iter()
+            .filter(|row| row.eligible && row_is_strict_pass(row))
+            .count()
     }
 
     pub(super) fn strict_blocker_count(&self) -> usize {
@@ -4947,12 +18924,17 @@ impl SupremacyMatrixSummary {
             .unwrap_or(self.strict_blockers)
     }
 
-    fn comparable_outcome_count(&self) -> usize {
-        self.counts.comparable_outcome_count()
-    }
-
     fn policy_pass_count(&self) -> usize {
-        self.strict_pass_count() + self.comparable_outcome_count()
+        self.policy
+            .as_ref()
+            .map(|policy| {
+                self.rows
+                    .iter()
+                    .filter(|row| row.eligible)
+                    .count()
+                    .saturating_sub(policy.blockers)
+            })
+            .unwrap_or_else(|| self.strict_pass_count())
     }
 
     fn to_human(&self) -> String {
@@ -5265,6 +19247,198 @@ mod tests {
             .join("tests/tlc_comparison/spec_baseline.json")
     }
 
+    fn authorized_inventory_report_fixture(role: &str) -> Value {
+        let output_directory = "/strict/campaign/segment-0001";
+        json!({
+            "output_dir": output_directory,
+            "artifact_digests": if role == "segment" {
+                json!([{
+                    "artifact_dir": format!(
+                        "{output_directory}/runtime-measured/Spec01/run-0001"
+                    )
+                }])
+            } else {
+                json!([{
+                    "artifact_dir": "/strict/campaign/segment-foreign/runtime-measured/run-0001"
+                }])
+            },
+        })
+    }
+
+    fn refresh_authorized_inventory_test_commitment(inventory: &mut Value) {
+        let entries = inventory["entries"].as_array().unwrap();
+        inventory["entry_count"] = json!(entries.len());
+        let commitment = json!({
+            "schema": inventory["schema"],
+            "path_encoding": inventory["path_encoding"],
+            "entries": inventory["entries"],
+        });
+        inventory["sha256"] = json!(sha256_ty_canonical_json_v1_value(&commitment).unwrap());
+    }
+
+    #[test]
+    fn authorized_storage_inventory_is_exact_hashed_and_role_bound() {
+        let contract = ObservationStorageContract::frozen_v2();
+        let report = authorized_inventory_report_fixture("segment");
+        let inventory =
+            expected_authorized_storage_inventory(&report, "segment", &contract).unwrap();
+        assert_eq!(inventory["entry_count"], json!(31));
+        assert_eq!(
+            inventory["sha256"],
+            json!("f2367488855b59d4786d6718d587a887ef6239d32adf7a3650fcb1d72add9a83")
+        );
+        validate_authorized_storage_inventory(&report, "segment", &contract, &inventory).unwrap();
+
+        let entries = inventory["entries"].as_array().unwrap();
+        assert_eq!(entries.first().unwrap()["relative_path"], json!("."));
+        assert_eq!(
+            entries.last().unwrap()["relative_path"],
+            json!("spec_baseline.refreshed.json")
+        );
+        for required in [
+            "observation-payload/strict-launcher-scratch/home",
+            "observation-storage-capability.json",
+            "observation-storage-release.json",
+            "runtime-ty-trust_cg-preflight/run/payload-manifest.json",
+            "runtime-measured/Spec01/run-0001/stdout.txt",
+        ] {
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry["relative_path"] == required),
+                "missing expected inventory entry {required}"
+            );
+        }
+
+        let aggregate_report = authorized_inventory_report_fixture("merge_superiority");
+        let aggregate = expected_authorized_storage_inventory(
+            &aggregate_report,
+            "merge_superiority",
+            &contract,
+        )
+        .unwrap();
+        assert_eq!(aggregate["entry_count"], json!(13));
+        assert!(aggregate["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| {
+                !entry["relative_path"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("runtime-measured/")
+            }));
+        validate_authorized_storage_inventory(
+            &aggregate_report,
+            "merge_superiority",
+            &contract,
+            &aggregate,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn authorized_storage_inventory_rejects_schedule_and_encoding_tampering() {
+        let contract = ObservationStorageContract::frozen_v2();
+        let report = authorized_inventory_report_fixture("segment");
+        let inventory =
+            expected_authorized_storage_inventory(&report, "segment", &contract).unwrap();
+
+        let mut missing = inventory.clone();
+        missing["entries"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|entry| entry["relative_path"] != "runtime_batch_plan.json");
+        refresh_authorized_inventory_test_commitment(&mut missing);
+        assert!(
+            validate_authorized_storage_inventory(&report, "segment", &contract, &missing)
+                .unwrap_err()
+                .to_string()
+                .contains("exact path/type schedule")
+        );
+
+        let mut extra = inventory.clone();
+        extra["entries"].as_array_mut().unwrap().push(json!({
+            "relative_path": "unauthorized.json",
+            "entry_type": "regular_file",
+        }));
+        extra["entries"]
+            .as_array_mut()
+            .unwrap()
+            .sort_by(|left, right| {
+                left["relative_path"]
+                    .as_str()
+                    .unwrap()
+                    .as_bytes()
+                    .cmp(right["relative_path"].as_str().unwrap().as_bytes())
+            });
+        refresh_authorized_inventory_test_commitment(&mut extra);
+        assert!(
+            validate_authorized_storage_inventory(&report, "segment", &contract, &extra)
+                .unwrap_err()
+                .to_string()
+                .contains("exact path/type schedule")
+        );
+
+        let mut reordered = inventory.clone();
+        reordered["entries"].as_array_mut().unwrap().swap(1, 2);
+        refresh_authorized_inventory_test_commitment(&mut reordered);
+        assert!(
+            validate_authorized_storage_inventory(&report, "segment", &contract, &reordered)
+                .unwrap_err()
+                .to_string()
+                .contains("UTF-8 byte ordered")
+        );
+
+        let mut traversal = inventory.clone();
+        traversal["entries"][1]["relative_path"] = json!("../escape");
+        refresh_authorized_inventory_test_commitment(&mut traversal);
+        assert!(
+            validate_authorized_storage_inventory(&report, "segment", &contract, &traversal)
+                .unwrap_err()
+                .to_string()
+                .contains("strict relative POSIX")
+        );
+
+        let mut wrong_type = inventory.clone();
+        let primary = wrong_type["entries"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry["relative_path"] == "runtime_evidence.json")
+            .unwrap();
+        primary["entry_type"] = json!("directory");
+        refresh_authorized_inventory_test_commitment(&mut wrong_type);
+        assert!(
+            validate_authorized_storage_inventory(&report, "segment", &contract, &wrong_type)
+                .unwrap_err()
+                .to_string()
+                .contains("exact path/type schedule")
+        );
+
+        let mut wrong_digest = inventory.clone();
+        wrong_digest["sha256"] = json!("00".repeat(32));
+        assert!(validate_authorized_storage_inventory(
+            &report,
+            "segment",
+            &contract,
+            &wrong_digest
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("commitment"));
+
+        let mut overlap = report;
+        overlap["artifact_digests"][0]["artifact_dir"] =
+            json!("/strict/campaign/segment-0001/runtime-ty-trust_cg-preflight/run/measured");
+        assert!(
+            expected_authorized_storage_inventory(&overlap, "segment", &contract)
+                .unwrap_err()
+                .to_string()
+                .contains("overlaps")
+        );
+    }
+
     fn class_for(summary: &SupremacyMatrixSummary, spec: &str) -> SupremacyMatrixClass {
         summary
             .rows
@@ -5284,6 +19458,1294 @@ mod tests {
 
     fn reason_for<'a>(summary: &'a SupremacyMatrixSummary, spec: &str) -> &'a str {
         row_for(summary, spec).reason.as_str()
+    }
+
+    fn repeated_performance_samples(
+        arm: &str,
+        runtime_seconds: f64,
+        memory_bytes: u64,
+    ) -> Vec<Value> {
+        (1..=STRICT_MIN_PAIRED_RUNS)
+            .map(|run_index| {
+                let schedule = matrix_performance_schedule(run_index);
+                let mut sample = json!({
+                    "run_index": run_index,
+                    "runtime_seconds": runtime_seconds,
+                    "process_tree_peak_memory_bytes": memory_bytes,
+                    "status": "pass",
+                    "states": 1,
+                    "transitions": 1,
+                    "raw_initial_states_generated": 1,
+                    "raw_successors_generated": 1,
+                    "states_generated": 2,
+                    "tool_order": if arm.starts_with("count-") {
+                        schedule.count_tool_order
+                    } else {
+                        schedule.production_tool_order
+                    },
+                    "pair_block_order": schedule.pair_block_order,
+                    "artifact_dir": format!("/evidence/{arm}/run-{run_index:04}"),
+                    "strict_cpu_qualified": true,
+                    "strict_memory_qualified": true,
+                    "strict_qualified": true,
+                    "requested_execution_envelope": {
+                        "mode": "strict",
+                        "requested_logical_cpus": 1,
+                        "requested_memory_scope": "process_tree"
+                    },
+                    "resource_evidence": {
+                        "cpu": {
+                            "effective_cpu_ids": [7],
+                            "method": "linux_sched_setaffinity_inherited",
+                            "process_tree_inherited": true,
+                            "confined": true,
+                            "isolation": {"isolated": true}
+                        },
+                        "cgroup": {
+                            "parent_verified": true,
+                            "process_tree_naturally_unpopulated": true,
+                            "effective_cpuset": {
+                                "before_command_cpu_ids": [7],
+                                "after_command_cpu_ids": [7],
+                                "selected_cpu_id": 7,
+                                "selected_cpu_present_before": true,
+                                "selected_cpu_present_after": true,
+                                "unchanged": true,
+                                "verified": true
+                            },
+                            "memory_swap_max": {
+                                "before_command": {"kind": "bytes", "bytes": 0},
+                                "after_command": {"kind": "bytes", "bytes": 0},
+                                "zero_before_command": true,
+                                "zero_after_command": true,
+                                "unchanged": true,
+                                "verified": true
+                            },
+                            "cpu_stat": {
+                                "before_command": {
+                                    "nr_throttled": 0,
+                                    "throttled_usec": 0
+                                },
+                                "after_command": {
+                                    "nr_throttled": 0,
+                                    "throttled_usec": 0
+                                },
+                                "nr_throttled_delta": 0,
+                                "throttled_usec_delta": 0,
+                                "nr_throttled_unchanged": true,
+                                "throttled_usec_unchanged": true,
+                                "verified": true
+                            }
+                        },
+                        "memory": {
+                            "peak_bytes": memory_bytes,
+                            "metric": "cgroup_accounted_memory",
+                            "scope": "process_tree",
+                            "method": "linux_cgroup_v2_memory_peak",
+                            "complete": true
+                        },
+                        "strict_qualified": true
+                    }
+                });
+                sample["machine_provenance"] = json!({
+                        "path": "/evidence/machine.json",
+                        "provenance_id": "test-machine",
+                        "document_provenance_id": "test-machine",
+                        "path_is_absolute": true,
+                        "regular_file": true,
+                        "readable_json": true,
+                        "file_device": 10,
+                        "file_inode": 20,
+                        "file_identity_verified": true,
+                        "schema_matches": true,
+                        "provenance_id_matches": true,
+                        "machine_present": true,
+                        "status_running": true,
+                        "qualification_state_matches": true,
+                        "qualification_succeeded": true,
+                        "runner_selected_cpu": 7,
+                        "selected_cpu": 7,
+                        "selected_cpu_matches": true,
+                        "cgroup_selected_cpu": 7,
+                        "cgroup_selected_cpu_matches": true,
+                        "launcher_controls": {
+                            "cpu_isolated": true,
+                            "single_cpu_confined": true
+                        },
+                        "controls_qualified": true,
+                        "delegated_parent_absolute": true,
+                        "delegated_parent_matches": true,
+                        "qualification_identity_schema": "ty.supremacy.machine-qualification-identity.v1",
+                        "qualification_identity_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "finish_revalidated": true,
+                        "revalidated_file_device": 10,
+                        "revalidated_file_inode": 20,
+                        "revalidated_qualification_identity_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "file_identity_stable": true,
+                        "qualification_identity_stable": true,
+                        "qualified": true
+                });
+                if arm.ends_with("-ty") {
+                    sample["engine_tier"] = json!("test-tier");
+                }
+                sample
+            })
+            .collect()
+    }
+
+    fn cache_warmup_samples(
+        arm: &str,
+        runtime_seconds: f64,
+        memory_bytes: u64,
+    ) -> Vec<SupremacyMatrixPerformanceSample> {
+        cache_warmup_samples_from_values(
+            arm,
+            repeated_performance_samples(arm, runtime_seconds, memory_bytes),
+        )
+    }
+
+    fn cache_warmup_samples_from_values(
+        arm: &str,
+        values: Vec<Value>,
+    ) -> Vec<SupremacyMatrixPerformanceSample> {
+        let sequence = match arm {
+            "production-tlc" => [1, 8],
+            "production-ty" => [2, 7],
+            "count-ty" => [3, 6],
+            "count-tlc" => [4, 5],
+            _ => panic!("unsupported warmup test arm {arm}"),
+        };
+        let mut samples =
+            serde_json::from_value::<Vec<SupremacyMatrixPerformanceSample>>(Value::Array(values))
+                .unwrap();
+        samples.truncate(sequence.len());
+        for (sample, sequence_index) in samples.iter_mut().zip(sequence) {
+            let expected = STRICT_CACHE_WARMUP_SCHEDULE[sequence_index - 1];
+            sample.run_index = sequence_index;
+            sample.tool_order = Some(expected.tool_order.to_string());
+            sample.pair_block_order = Some(expected.pair_block_order.to_string());
+            sample.artifact_dir = Some(PathBuf::from(format!(
+                "/evidence/cache-warmup/observation-{sequence_index:04}-{}",
+                arm
+            )));
+        }
+        samples
+    }
+
+    fn repeated_violation_samples(
+        arm: &str,
+        runtime_seconds: f64,
+        memory_bytes: u64,
+        status: &str,
+        error_type: &str,
+        obligation: &str,
+    ) -> Vec<Value> {
+        repeated_performance_samples(arm, runtime_seconds, memory_bytes)
+            .into_iter()
+            .map(|mut sample| {
+                sample["status"] = json!(status);
+                sample["error_type"] = json!(error_type);
+                sample["violated_obligation"] = json!(obligation);
+                sample["states"] = json!(12);
+                sample["transitions"] = json!(20);
+                sample["raw_initial_states_generated"] = json!(1);
+                sample["raw_successors_generated"] = json!(19);
+                sample["states_generated"] = json!(20);
+                sample
+            })
+            .collect()
+    }
+
+    #[test]
+    fn strict_axis_boundaries_are_exclusive_and_wire_values_are_stable() {
+        assert_eq!(
+            classify_runtime_axis(Some(STRICT_MIN_RUNTIME_SPEEDUP)),
+            SupremacyMatrixAxisVerdict::Loss
+        );
+        assert_eq!(
+            classify_runtime_axis(Some(STRICT_MIN_RUNTIME_SPEEDUP + 0.000_001)),
+            SupremacyMatrixAxisVerdict::Pass
+        );
+        assert_eq!(
+            classify_memory_axis(Some(STRICT_MAX_MEMORY_RATIO)),
+            SupremacyMatrixAxisVerdict::Loss
+        );
+        assert_eq!(
+            classify_memory_axis(Some(STRICT_MAX_MEMORY_RATIO - 0.000_001)),
+            SupremacyMatrixAxisVerdict::Pass
+        );
+
+        assert_eq!(
+            serde_json::to_value(SupremacyMatrixOverallVerdict::PassBoth).unwrap(),
+            "pass_both"
+        );
+        assert_eq!(
+            serde_json::to_value(SupremacyMatrixOverallVerdict::MissingOrStale).unwrap(),
+            "missing_or_stale"
+        );
+    }
+
+    #[test]
+    fn matrix_performance_schedule_is_balanced_and_pinned() {
+        assert_eq!(
+            matrix_performance_schedule(1),
+            MatrixPerformanceSchedule {
+                production_tool_order: "tlc_then_ty",
+                count_tool_order: "ty_then_tlc",
+                pair_block_order: "production_then_count",
+            }
+        );
+        assert_eq!(
+            matrix_performance_schedule(2),
+            MatrixPerformanceSchedule {
+                production_tool_order: "ty_then_tlc",
+                count_tool_order: "tlc_then_ty",
+                pair_block_order: "count_then_production",
+            }
+        );
+
+        let schedules = (1..=STRICT_MIN_PAIRED_RUNS)
+            .map(matrix_performance_schedule)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            schedules
+                .iter()
+                .filter(|schedule| schedule.production_tool_order == "tlc_then_ty")
+                .count(),
+            STRICT_MIN_PAIRED_RUNS / 2
+        );
+        assert_eq!(
+            schedules
+                .iter()
+                .filter(|schedule| schedule.count_tool_order == "tlc_then_ty")
+                .count(),
+            STRICT_MIN_PAIRED_RUNS / 2
+        );
+        assert_eq!(
+            schedules
+                .iter()
+                .filter(|schedule| schedule.pair_block_order == "production_then_count")
+                .count(),
+            STRICT_MIN_PAIRED_RUNS / 2
+        );
+    }
+
+    #[test]
+    fn cache_warmup_policy_is_exact_balanced_and_unscored() {
+        assert_eq!(
+            STRICT_CACHE_WARMUP_SCHEDULE
+                .iter()
+                .map(|entry| (entry.sequence_index, entry.arm))
+                .collect::<Vec<_>>(),
+            [
+                (1, "production_tlc"),
+                (2, "production_ty"),
+                (3, "count_ty"),
+                (4, "count_tlc"),
+                (5, "count_tlc"),
+                (6, "count_ty"),
+                (7, "production_ty"),
+                (8, "production_tlc"),
+            ]
+        );
+        let policy = strict_os_cache_policy();
+        assert_eq!(
+            policy.pointer("/schema").and_then(Value::as_str),
+            Some(STRICT_OS_CACHE_POLICY_SCHEMA)
+        );
+        assert_eq!(
+            policy.pointer("/warmups/observations_per_row"),
+            Some(&json!(STRICT_CACHE_WARMUP_OBSERVATIONS_PER_ROW))
+        );
+        assert_eq!(
+            policy.pointer("/warmups/included_in_scoring"),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(
+            policy
+                .pointer("/warmups/schedule")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(STRICT_CACHE_WARMUP_OBSERVATIONS_PER_ROW)
+        );
+    }
+
+    #[test]
+    fn strict_cache_warmups_reject_missing_reordered_failed_drifted_or_reused_evidence() {
+        let scored = |arm, runtime, memory| {
+            serde_json::from_value::<Vec<SupremacyMatrixPerformanceSample>>(Value::Array(
+                repeated_performance_samples(arm, runtime, memory),
+            ))
+            .unwrap()
+        };
+        let production_tlc = scored("production-tlc", 2.0, 2000);
+        let production_ty = scored("production-ty", 1.0, 1000);
+        let count_tlc = scored("count-tlc", 2.0, 2000);
+        let count_ty = scored("count-ty", 1.0, 1000);
+        let warmup_production_tlc = cache_warmup_samples("production-tlc", 20.0, 9000);
+        let warmup_production_ty = cache_warmup_samples("production-ty", 0.1, 100);
+        let warmup_count_tlc = cache_warmup_samples("count-tlc", 30.0, 8000);
+        let warmup_count_ty = cache_warmup_samples("count-ty", 0.2, 200);
+        let qualified =
+            |warmup_production_tlc: &[SupremacyMatrixPerformanceSample],
+             warmup_production_ty: &[SupremacyMatrixPerformanceSample],
+             warmup_count_tlc: &[SupremacyMatrixPerformanceSample],
+             warmup_count_ty: &[SupremacyMatrixPerformanceSample]| {
+                strict_cache_warmups_qualified(
+                    warmup_production_tlc,
+                    warmup_production_ty,
+                    warmup_count_tlc,
+                    warmup_count_ty,
+                    &production_tlc,
+                    &production_ty,
+                    &count_tlc,
+                    &count_ty,
+                )
+            };
+        assert!(qualified(
+            &warmup_production_tlc,
+            &warmup_production_ty,
+            &warmup_count_tlc,
+            &warmup_count_ty,
+        ));
+
+        let mut missing = warmup_production_tlc.clone();
+        missing.pop();
+        assert!(!qualified(
+            &missing,
+            &warmup_production_ty,
+            &warmup_count_tlc,
+            &warmup_count_ty,
+        ));
+
+        let mut reordered = warmup_production_ty.clone();
+        reordered.swap(0, 1);
+        assert!(!qualified(
+            &warmup_production_tlc,
+            &reordered,
+            &warmup_count_tlc,
+            &warmup_count_ty,
+        ));
+
+        let mut failed = warmup_production_ty.clone();
+        failed[0].strict_qualified = false;
+        assert!(!qualified(
+            &warmup_production_tlc,
+            &failed,
+            &warmup_count_tlc,
+            &warmup_count_ty,
+        ));
+
+        let mut timed_out = warmup_count_tlc.clone();
+        timed_out[0].status = Some("timeout".to_string());
+        timed_out[0].error_type = Some("timeout".to_string());
+        assert!(!qualified(
+            &warmup_production_tlc,
+            &warmup_production_ty,
+            &timed_out,
+            &warmup_count_ty,
+        ));
+
+        let mut semantic_drift = warmup_count_ty.clone();
+        semantic_drift[0].states_generated = Some(99);
+        assert!(!qualified(
+            &warmup_production_tlc,
+            &warmup_production_ty,
+            &warmup_count_tlc,
+            &semantic_drift,
+        ));
+
+        let mut tier_drift = warmup_production_ty.clone();
+        tier_drift[0].engine_tier = Some("different-tier".to_string());
+        assert!(!qualified(
+            &warmup_production_tlc,
+            &tier_drift,
+            &warmup_count_tlc,
+            &warmup_count_ty,
+        ));
+
+        let mut reused_artifact = warmup_count_ty.clone();
+        reused_artifact[0].artifact_dir = production_ty[0].artifact_dir.clone();
+        assert!(!qualified(
+            &warmup_production_tlc,
+            &warmup_production_ty,
+            &warmup_count_tlc,
+            &reused_artifact,
+        ));
+    }
+
+    #[test]
+    fn cache_warmups_are_retained_but_do_not_change_scored_medians() {
+        let scored = |arm, runtime, memory| {
+            serde_json::from_value::<Vec<SupremacyMatrixPerformanceSample>>(Value::Array(
+                repeated_performance_samples(arm, runtime, memory),
+            ))
+            .unwrap()
+        };
+        let mut evidence = summarize_performance_samples(scored("production-tlc", 2.0, 2000));
+        evidence.cache_warmup_samples = cache_warmup_samples("production-tlc", 2000.0, 2);
+
+        assert_eq!(evidence.runtime_seconds, Some(2.0));
+        assert_eq!(evidence.process_tree_peak_memory_bytes, Some(2000));
+        assert_eq!(evidence.samples.len(), STRICT_MIN_PAIRED_RUNS);
+        assert_eq!(evidence.cache_warmup_samples.len(), 2);
+    }
+
+    #[test]
+    fn runtime_artifact_digest_inventory_includes_all_warmup_arms() {
+        let mut row = runtime_evidence_row("WarmupArtifacts", 2.0, 1.0, 1);
+        row.tlc.cache_warmup_samples = cache_warmup_samples("production-tlc", 2.0, 2000);
+        row.tlc.count_verification_cache_warmup_samples =
+            cache_warmup_samples("count-tlc", 2.0, 2000);
+        row.ty.cache_warmup_samples = cache_warmup_samples("count-ty", 1.0, 1000);
+        row.ty.production_cache_warmup_samples = cache_warmup_samples("production-ty", 1.0, 1000);
+
+        let (_, errors) = runtime_artifact_digests(&[row]);
+        for arm in [
+            "warmup_production_tlc",
+            "warmup_count_tlc",
+            "warmup_count_ty",
+            "warmup_production_ty",
+        ] {
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.starts_with(&format!("WarmupArtifacts/{arm}/run-"))),
+                "artifact inventory omitted {arm}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_axis_summary_must_match_its_raw_observations() {
+        let samples: Vec<SupremacyMatrixPerformanceSample> = serde_json::from_value(Value::Array(
+            repeated_performance_samples("count-tlc", 2.0, 2000),
+        ))
+        .unwrap();
+        assert!(baseline_axis_summary_matches_samples(
+            Some("pass"),
+            None,
+            Some(1),
+            Some(1),
+            Some(1),
+            Some(2),
+            &samples,
+        ));
+        assert!(!baseline_axis_summary_matches_samples(
+            None,
+            None,
+            Some(1),
+            Some(1),
+            Some(1),
+            Some(2),
+            &samples,
+        ));
+        assert!(!baseline_axis_summary_matches_samples(
+            Some("pass"),
+            None,
+            Some(2),
+            Some(1),
+            Some(1),
+            Some(2),
+            &samples,
+        ));
+        assert!(!baseline_axis_summary_matches_samples(
+            Some("pass"),
+            None,
+            Some(1),
+            Some(1),
+            Some(1),
+            Some(2),
+            &[],
+        ));
+
+        let mut transition_only_difference = samples.clone();
+        transition_only_difference[1].transitions = Some(999);
+        assert!(performance_samples_are_deterministic(
+            &transition_only_difference
+        ));
+
+        let mut raw_work_difference = samples;
+        raw_work_difference[1].raw_successors_generated = Some(2);
+        assert!(!performance_samples_are_deterministic(&raw_work_difference));
+    }
+
+    #[test]
+    fn strict_schedule_matches_two_counterbalanced_pairs_and_block_order() {
+        let production_tlc: Vec<SupremacyMatrixPerformanceSample> = serde_json::from_value(
+            Value::Array(repeated_performance_samples("production-tlc", 2.0, 2000)),
+        )
+        .unwrap();
+        let production: Vec<SupremacyMatrixPerformanceSample> = serde_json::from_value(
+            Value::Array(repeated_performance_samples("production-ty", 1.0, 1000)),
+        )
+        .unwrap();
+        let count_tlc: Vec<SupremacyMatrixPerformanceSample> = serde_json::from_value(
+            Value::Array(repeated_performance_samples("count-tlc", 2.0, 2000)),
+        )
+        .unwrap();
+        let count: Vec<SupremacyMatrixPerformanceSample> = serde_json::from_value(Value::Array(
+            repeated_performance_samples("count-ty", 1.0, 1000),
+        ))
+        .unwrap();
+        assert!(strict_schedule_and_artifacts_qualified(
+            &production_tlc,
+            &production,
+            &count_tlc,
+            &count
+        ));
+
+        let mut wrong_order = production.clone();
+        wrong_order[1].tool_order = Some("tlc_then_ty".to_string());
+        assert!(!strict_schedule_and_artifacts_qualified(
+            &production_tlc,
+            &wrong_order,
+            &count_tlc,
+            &count
+        ));
+
+        let mut malformed_count_order = count.clone();
+        malformed_count_order[0].tool_order = Some("tlc_then_ty".to_string());
+        assert!(!strict_schedule_and_artifacts_qualified(
+            &production_tlc,
+            &production,
+            &count_tlc,
+            &malformed_count_order
+        ));
+
+        let mut duplicate_artifact = count.clone();
+        duplicate_artifact[0].artifact_dir = production[0].artifact_dir.clone();
+        assert!(!strict_schedule_and_artifacts_qualified(
+            &production_tlc,
+            &production,
+            &count_tlc,
+            &duplicate_artifact
+        ));
+
+        let mut wrong_block_order = count_tlc.clone();
+        wrong_block_order[0].pair_block_order = Some("count_then_production".to_string());
+        assert!(!strict_schedule_and_artifacts_qualified(
+            &production_tlc,
+            &production,
+            &wrong_block_order,
+            &count
+        ));
+    }
+
+    #[test]
+    fn runtime_match_requires_all_four_independent_arms() {
+        let samples = |arm: &str, runtime, memory| {
+            serde_json::from_value::<Vec<SupremacyMatrixPerformanceSample>>(Value::Array(
+                repeated_performance_samples(arm, runtime, memory),
+            ))
+            .unwrap()
+        };
+        let production_tlc = summarize_performance_samples(samples("production-tlc", 2.0, 2000));
+        let production_ty = summarize_performance_samples(samples("production-ty", 1.0, 1000));
+        let count_tlc = summarize_performance_samples(samples("count-tlc", 2.0, 2000));
+        let count_ty = summarize_performance_samples(samples("count-ty", 1.0, 1000));
+        let tlc = attach_count_verification_runtime_evidence(production_tlc, count_tlc);
+        let ty = attach_production_runtime_evidence(count_ty, production_ty);
+
+        assert!(runtime_modes_verified_match(&tlc, &ty));
+        assert!(runtime_modes_have_fresh_evidence(&tlc, &ty));
+
+        let mut missing_count_observation = tlc.clone();
+        missing_count_observation.count_verification_samples.pop();
+        assert!(!runtime_modes_verified_match(
+            &missing_count_observation,
+            &ty
+        ));
+        assert!(!runtime_modes_have_fresh_evidence(
+            &missing_count_observation,
+            &ty
+        ));
+
+        let mut divergent_count_tlc = tlc.clone();
+        let mut divergent_count_ty = ty.clone();
+        for sample in &mut divergent_count_tlc.count_verification_samples {
+            sample.states = Some(2);
+        }
+        divergent_count_tlc.count_verification_states = Some(2);
+        for sample in &mut divergent_count_ty.samples {
+            sample.states = Some(2);
+        }
+        divergent_count_ty.states = Some(2);
+        assert!(!runtime_modes_verified_match(
+            &divergent_count_tlc,
+            &divergent_count_ty
+        ));
+
+        let mut admitted_transition_diagnostic = tlc.clone();
+        admitted_transition_diagnostic.count_verification_samples[0].transitions = Some(999);
+        assert!(runtime_modes_verified_match(
+            &admitted_transition_diagnostic,
+            &ty
+        ));
+
+        let mut divergent_raw_count_tlc = tlc.clone();
+        let mut matching_raw_count_ty = ty.clone();
+        for sample in &mut divergent_raw_count_tlc.count_verification_samples {
+            sample.raw_successors_generated = Some(2);
+            sample.states_generated = Some(3);
+        }
+        divergent_raw_count_tlc.count_verification_raw_successors_generated = Some(2);
+        divergent_raw_count_tlc.count_verification_states_generated = Some(3);
+        for sample in &mut matching_raw_count_ty.samples {
+            sample.raw_successors_generated = Some(2);
+            sample.states_generated = Some(3);
+        }
+        matching_raw_count_ty.raw_successors_generated = Some(2);
+        matching_raw_count_ty.states_generated = Some(3);
+        assert!(!runtime_modes_verified_match(
+            &divergent_raw_count_tlc,
+            &matching_raw_count_ty
+        ));
+    }
+
+    #[test]
+    fn engine_tier_parser_uses_final_nonempty_report() {
+        assert_eq!(
+            parse_engine_tier(
+                "noise\n[engine] execution tier: interpreter\n[engine] execution tier: trust-cg native-fused (compiled BFS)\n"
+            ),
+            Some("trust-cg native-fused (compiled BFS)".to_string())
+        );
+        assert_eq!(parse_engine_tier("[engine] execution tier:   \n"), None);
+        assert_eq!(parse_engine_tier("no engine diagnostic\n"), None);
+    }
+
+    #[test]
+    fn strict_engine_tier_provenance_requires_complete_stable_ty_arms() {
+        let samples = |arm, runtime, memory| {
+            serde_json::from_value::<Vec<SupremacyMatrixPerformanceSample>>(Value::Array(
+                repeated_performance_samples(arm, runtime, memory),
+            ))
+            .unwrap()
+        };
+        let production_tlc = samples("production-tlc", 2.0, 2000);
+        let production = samples("production-ty", 1.0, 1000);
+        let count_tlc = samples("count-tlc", 2.0, 2000);
+        let count = samples("count-ty", 1.0, 1000);
+        assert!(strict_performance_evidence_qualified(
+            &production_tlc,
+            &production,
+            &count_tlc,
+            &count
+        ));
+
+        let mut missing_production = production.clone();
+        missing_production[0].engine_tier = None;
+        assert!(!strict_performance_evidence_qualified(
+            &production_tlc,
+            &missing_production,
+            &count_tlc,
+            &count
+        ));
+
+        let mut unstable_count = count.clone();
+        unstable_count[1].engine_tier = Some("different-tier".to_string());
+        assert!(!strict_performance_evidence_qualified(
+            &production_tlc,
+            &production,
+            &count_tlc,
+            &unstable_count
+        ));
+
+        let mut contaminated_tlc = production_tlc.clone();
+        contaminated_tlc[0].engine_tier = Some("not-a-tlc-tier".to_string());
+        assert!(!strict_performance_evidence_qualified(
+            &contaminated_tlc,
+            &production,
+            &count_tlc,
+            &count
+        ));
+    }
+
+    #[test]
+    fn strict_resources_require_explicit_nested_cgroup_proofs() {
+        let samples = |arm, runtime, memory| {
+            serde_json::from_value::<Vec<SupremacyMatrixPerformanceSample>>(Value::Array(
+                repeated_performance_samples(arm, runtime, memory),
+            ))
+            .unwrap()
+        };
+        let production_tlc = samples("production-tlc", 2.0, 2000);
+        let production = samples("production-ty", 1.0, 1000);
+        let count_tlc = samples("count-tlc", 2.0, 2000);
+        let count = samples("count-ty", 1.0, 1000);
+        assert!(strict_performance_evidence_qualified(
+            &production_tlc,
+            &production,
+            &count_tlc,
+            &count
+        ));
+
+        let mut lingering_process_tree = production.clone();
+        lingering_process_tree[0]
+            .resource_evidence
+            .as_mut()
+            .unwrap()["cgroup"]["process_tree_naturally_unpopulated"] = Value::Bool(false);
+        assert!(!strict_performance_evidence_qualified(
+            &production_tlc,
+            &lingering_process_tree,
+            &count_tlc,
+            &count
+        ));
+
+        let mut bad_cpuset = production.clone();
+        bad_cpuset[0].resource_evidence.as_mut().unwrap()["cgroup"]["effective_cpuset"]
+            ["selected_cpu_present_after"] = Value::Bool(false);
+        assert!(!strict_performance_evidence_qualified(
+            &production_tlc,
+            &bad_cpuset,
+            &count_tlc,
+            &count
+        ));
+
+        let mut bad_swap = production.clone();
+        bad_swap[0].resource_evidence.as_mut().unwrap()["cgroup"]["memory_swap_max"]
+            ["zero_after_command"] = Value::Bool(false);
+        assert!(!strict_performance_evidence_qualified(
+            &production_tlc,
+            &bad_swap,
+            &count_tlc,
+            &count
+        ));
+
+        let mut throttled = production.clone();
+        throttled[0].resource_evidence.as_mut().unwrap()["cgroup"]["cpu_stat"]
+            ["nr_throttled_delta"] = json!(1);
+        assert!(!strict_performance_evidence_qualified(
+            &production_tlc,
+            &throttled,
+            &count_tlc,
+            &count
+        ));
+
+        let mut missing_count_metric = count_tlc.clone();
+        missing_count_metric[0].runtime_seconds = None;
+        assert!(!strict_performance_evidence_qualified(
+            &production_tlc,
+            &production,
+            &missing_count_metric,
+            &count
+        ));
+
+        let mut inconsistent_count_runs = count_tlc.clone();
+        inconsistent_count_runs.pop();
+        assert!(!strict_performance_evidence_qualified(
+            &production_tlc,
+            &production,
+            &inconsistent_count_runs,
+            &count
+        ));
+
+        let mut semantically_different_tlc = count_tlc.clone();
+        for sample in &mut semantically_different_tlc {
+            sample.states = Some(2);
+        }
+        let mut semantically_different_count = count.clone();
+        for sample in &mut semantically_different_count {
+            sample.states = Some(2);
+        }
+        assert!(!strict_performance_evidence_qualified(
+            &production_tlc,
+            &production,
+            &semantically_different_tlc,
+            &semantically_different_count
+        ));
+    }
+
+    #[test]
+    fn overall_derivation_reports_both_losses_and_missing_dominates() {
+        use SupremacyMatrixAxisVerdict::{Loss, MissingOrStale, Pass};
+
+        assert_eq!(
+            derive_overall_verdict(Loss, Loss),
+            SupremacyMatrixOverallVerdict::BothLoss
+        );
+        assert_eq!(
+            derive_overall_verdict(Loss, Pass),
+            SupremacyMatrixOverallVerdict::RuntimeLoss
+        );
+        assert_eq!(
+            derive_overall_verdict(Pass, Loss),
+            SupremacyMatrixOverallVerdict::MemoryLoss
+        );
+        assert_eq!(
+            derive_overall_verdict(MissingOrStale, Loss),
+            SupremacyMatrixOverallVerdict::MissingOrStale
+        );
+        assert_eq!(
+            derive_overall_verdict(Pass, MissingOrStale),
+            SupremacyMatrixOverallVerdict::MissingOrStale
+        );
+    }
+
+    #[test]
+    fn repeated_both_axis_boundary_losses_block_strict_matrix() {
+        let summary = classify_baseline_value(json!({
+            "specs": {
+                "boundary_loss": {
+                    "source": {"mode": "check"},
+                    "work_equivalence": WorkEquivalenceEvidence::exhaustive_holds(),
+                    "tlc": {
+                        "status": "pass",
+                        "runtime_seconds": 1.05,
+                        "peak_process_tree_rss_bytes": 1000,
+                        "samples": repeated_performance_samples("production-tlc", 1.05, 1000),
+                        "cache_warmup_samples": cache_warmup_samples("production-tlc", 99.0, 9999),
+                        "states": 1,
+                        "transitions": 1,
+                        "raw_initial_states_generated": 1,
+                        "raw_successors_generated": 1,
+                        "states_generated": 2,
+                        "count_verification_status": "pass",
+                        "count_verification_runtime_seconds": 1.05,
+                        "count_verification_process_tree_peak_memory_bytes": 1000,
+                        "count_verification_samples": repeated_performance_samples("count-tlc", 1.05, 1000),
+                        "count_verification_cache_warmup_samples": cache_warmup_samples("count-tlc", 98.0, 9998),
+                        "count_verification_states": 1,
+                        "count_verification_transitions": 1,
+                        "count_verification_raw_initial_states_generated": 1,
+                        "count_verification_raw_successors_generated": 1,
+                        "count_verification_states_generated": 2,
+                        "error_type": null
+                    },
+                    "ty": {
+                        "status": "pass",
+                        "runtime_seconds": 1.0,
+                        "peak_process_tree_rss_bytes": 950,
+                        "samples": repeated_performance_samples("count-ty", 1.0, 950),
+                        "cache_warmup_samples": cache_warmup_samples("count-ty", 97.0, 9997),
+                        "states": 1,
+                        "transitions": 1,
+                        "raw_initial_states_generated": 1,
+                        "raw_successors_generated": 1,
+                        "states_generated": 2,
+                        "production_status": "pass",
+                        "production_runtime_seconds": 1.0,
+                        "production_samples": repeated_performance_samples("production-ty", 1.0, 950),
+                        "production_cache_warmup_samples": cache_warmup_samples("production-ty", 96.0, 9996),
+                        "production_states": 1,
+                        "production_transitions": 1,
+                        "production_raw_initial_states_generated": 1,
+                        "production_raw_successors_generated": 1,
+                        "production_states_generated": 2,
+                        "error_type": null
+                    },
+                    "verified_match": true
+                }
+            }
+        }))
+        .unwrap();
+
+        let row = row_for(&summary, "boundary_loss");
+        assert_eq!(row.class, SupremacyMatrixClass::Pass);
+        assert_eq!(row.runtime_axis, SupremacyMatrixAxisVerdict::Loss);
+        assert_eq!(row.memory_axis, SupremacyMatrixAxisVerdict::Loss);
+        assert_eq!(row.overall, SupremacyMatrixOverallVerdict::BothLoss);
+        assert!(!summary.strict_pass);
+        assert_eq!(summary.strict_blockers, 1);
+        assert_eq!(serde_json::to_value(row).unwrap()["overall"], "both_loss");
+    }
+
+    #[test]
+    fn count_pair_runtime_loss_blocks_otherwise_passing_production_pair() {
+        let summary = classify_baseline_value(json!({
+            "specs": {
+                "count_runtime_loss": {
+                    "source": {"mode": "check"},
+                    "work_equivalence": WorkEquivalenceEvidence::exhaustive_holds(),
+                    "tlc": {
+                        "status": "pass",
+                        "runtime_seconds": 2.0,
+                        "process_tree_peak_memory_bytes": 2000,
+                        "samples": repeated_performance_samples("production-tlc", 2.0, 2000),
+                        "cache_warmup_samples": cache_warmup_samples("production-tlc", 99.0, 9999),
+                        "states": 1,
+                        "transitions": 1,
+                        "raw_initial_states_generated": 1,
+                        "raw_successors_generated": 1,
+                        "states_generated": 2,
+                        "count_verification_status": "pass",
+                        "count_verification_runtime_seconds": 1.05,
+                        "count_verification_process_tree_peak_memory_bytes": 1000,
+                        "count_verification_samples": repeated_performance_samples("count-tlc", 1.05, 1000),
+                        "count_verification_cache_warmup_samples": cache_warmup_samples("count-tlc", 98.0, 9998),
+                        "count_verification_states": 1,
+                        "count_verification_transitions": 1,
+                        "count_verification_raw_initial_states_generated": 1,
+                        "count_verification_raw_successors_generated": 1,
+                        "count_verification_states_generated": 2,
+                        "error_type": null
+                    },
+                    "ty": {
+                        "status": "pass",
+                        "runtime_seconds": 1.0,
+                        "process_tree_peak_memory_bytes": 100000,
+                        "samples": repeated_performance_samples("count-ty", 1.0, 100000),
+                        "cache_warmup_samples": cache_warmup_samples("count-ty", 97.0, 9997),
+                        "states": 1,
+                        "transitions": 1,
+                        "raw_initial_states_generated": 1,
+                        "raw_successors_generated": 1,
+                        "states_generated": 2,
+                        "production_status": "pass",
+                        "production_runtime_seconds": 1.0,
+                        "production_process_tree_peak_memory_bytes": 1000,
+                        "production_samples": repeated_performance_samples("production-ty", 1.0, 1000),
+                        "production_cache_warmup_samples": cache_warmup_samples("production-ty", 96.0, 9996),
+                        "production_states": 1,
+                        "production_transitions": 1,
+                        "production_raw_initial_states_generated": 1,
+                        "production_raw_successors_generated": 1,
+                        "production_states_generated": 2,
+                        "error_type": null
+                    },
+                    "verified_match": true
+                }
+            }
+        }))
+        .unwrap();
+
+        let row = row_for(&summary, "count_runtime_loss");
+        assert_eq!(row.speedup_tlc_vs_ty, Some(2.0));
+        assert_eq!(row.count_speedup_tlc_vs_ty, Some(1.05));
+        assert_eq!(row.tlc_samples.len(), STRICT_MIN_PAIRED_RUNS);
+        assert_eq!(row.ty_samples.len(), STRICT_MIN_PAIRED_RUNS);
+        assert_eq!(row.count_tlc_samples.len(), STRICT_MIN_PAIRED_RUNS);
+        assert_eq!(row.ty_pinned_samples.len(), STRICT_MIN_PAIRED_RUNS);
+        assert_eq!(row.runtime_axis, SupremacyMatrixAxisVerdict::Loss);
+        // Count-arm memory is retained but is not substituted for the
+        // production-default memory claim.
+        assert_eq!(row.memory_axis, SupremacyMatrixAxisVerdict::Pass);
+        assert_eq!(row.overall, SupremacyMatrixOverallVerdict::RuntimeLoss);
+        assert!(!summary.strict_pass);
+    }
+
+    #[test]
+    fn expected_violation_without_declared_both_axis_evidence_is_strict_blocker() {
+        // This is valid old-schema baseline data: all v2 fields are absent and
+        // must deserialize, but it cannot close a strict performance row.
+        let summary = classify_baseline_str(
+            r#"{
+              "schema_version": 1,
+              "specs": {
+                "expected_violation": {
+                  "source": {"mode": "check"},
+                  "tlc": {"status": "fail", "runtime_seconds": 3.0, "states": 12, "error_type": "invariant"},
+                  "ty": {"status": "pass", "runtime_seconds": 1.0, "states": 12, "error_type": "invariant_violation"},
+                  "verified_match": true
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let row = row_for(&summary, "expected_violation");
+        assert_eq!(row.class, SupremacyMatrixClass::ExpectedViolationMatch);
+        assert_eq!(row.runtime_axis, SupremacyMatrixAxisVerdict::MissingOrStale);
+        assert_eq!(row.memory_axis, SupremacyMatrixAxisVerdict::MissingOrStale);
+        assert_eq!(row.overall, SupremacyMatrixOverallVerdict::MissingOrStale);
+        assert!(!summary.strict_pass);
+        assert_eq!(summary.strict_blockers, 1);
+    }
+
+    #[test]
+    fn legacy_prose_work_equivalence_never_qualifies_or_serializes() {
+        let summary = classify_baseline_str(
+            r#"{
+              "specs": {
+                "legacy": {
+                  "source": {"mode": "check"},
+                  "work_equivalence_rule": "same enough",
+                  "tlc": {
+                    "status": "pass",
+                    "runtime_seconds": 2.0,
+                    "states": 1,
+                    "raw_initial_states_generated": 1,
+                    "raw_successors_generated": 1,
+                    "states_generated": 2,
+                    "error_type": null
+                  },
+                  "ty": {
+                    "status": "pass",
+                    "runtime_seconds": 1.0,
+                    "states": 1,
+                    "raw_initial_states_generated": 1,
+                    "raw_successors_generated": 1,
+                    "states_generated": 2,
+                    "error_type": null
+                  },
+                  "verified_match": true
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let row = row_for(&summary, "legacy");
+        assert_eq!(row.overall, SupremacyMatrixOverallVerdict::MissingOrStale);
+        assert!(row.work_equivalence.is_none());
+        assert!(serde_json::to_value(row)
+            .unwrap()
+            .get("work_equivalence")
+            .is_none());
+    }
+
+    #[test]
+    fn expected_violation_cannot_borrow_exhaustive_holds_work_equivalence() {
+        let tlc_samples =
+            repeated_violation_samples("production-tlc", 2.0, 2000, "fail", "invariant", "TypeOK");
+        let count_tlc_samples =
+            repeated_violation_samples("count-tlc", 2.0, 2000, "fail", "invariant", "TypeOK");
+        let ty_samples = repeated_violation_samples(
+            "count-ty",
+            1.0,
+            1000,
+            "pass",
+            "invariant_violation",
+            "TypeOK",
+        );
+        let production_samples = repeated_violation_samples(
+            "production-ty",
+            1.0,
+            1000,
+            "pass",
+            "invariant_violation",
+            "TypeOK",
+        );
+        let warmup_tlc_samples = cache_warmup_samples_from_values(
+            "production-tlc",
+            repeated_violation_samples("production-tlc", 99.0, 9999, "fail", "invariant", "TypeOK"),
+        );
+        let warmup_count_tlc_samples = cache_warmup_samples_from_values(
+            "count-tlc",
+            repeated_violation_samples("count-tlc", 98.0, 9998, "fail", "invariant", "TypeOK"),
+        );
+        let warmup_ty_samples = cache_warmup_samples_from_values(
+            "count-ty",
+            repeated_violation_samples(
+                "count-ty",
+                97.0,
+                9997,
+                "pass",
+                "invariant_violation",
+                "TypeOK",
+            ),
+        );
+        let warmup_production_samples = cache_warmup_samples_from_values(
+            "production-ty",
+            repeated_violation_samples(
+                "production-ty",
+                96.0,
+                9996,
+                "pass",
+                "invariant_violation",
+                "TypeOK",
+            ),
+        );
+        let summary = classify_baseline_value(json!({
+            "specs": {
+                "equivalent_expected_violation": {
+                    "source": {"mode": "check"},
+                    "work_equivalence": WorkEquivalenceEvidence::exhaustive_holds(),
+                    "tlc": {
+                        "status": "fail",
+                        "runtime_seconds": 2.0,
+                        "peak_process_tree_rss_bytes": 2000,
+                        "samples": tlc_samples,
+                        "cache_warmup_samples": warmup_tlc_samples,
+                        "states": 12,
+                        "transitions": 20,
+                        "raw_initial_states_generated": 1,
+                        "raw_successors_generated": 19,
+                        "states_generated": 20,
+                        "count_verification_status": "fail",
+                        "count_verification_error_type": "invariant",
+                        "count_verification_runtime_seconds": 2.0,
+                        "count_verification_process_tree_peak_memory_bytes": 2000,
+                        "count_verification_samples": count_tlc_samples,
+                        "count_verification_cache_warmup_samples": warmup_count_tlc_samples,
+                        "count_verification_states": 12,
+                        "count_verification_transitions": 20,
+                        "count_verification_raw_initial_states_generated": 1,
+                        "count_verification_raw_successors_generated": 19,
+                        "count_verification_states_generated": 20,
+                        "error_type": "invariant"
+                    },
+                    "ty": {
+                        "status": "pass",
+                        "runtime_seconds": 1.0,
+                        "peak_process_tree_rss_bytes": 1000,
+                        "samples": ty_samples,
+                        "cache_warmup_samples": warmup_ty_samples,
+                        "states": 12,
+                        "transitions": 20,
+                        "raw_initial_states_generated": 1,
+                        "raw_successors_generated": 19,
+                        "states_generated": 20,
+                        "production_status": "pass",
+                        "production_error_type": "invariant_violation",
+                        "production_runtime_seconds": 1.0,
+                        "production_process_tree_peak_memory_bytes": 1000,
+                        "production_samples": production_samples,
+                        "production_cache_warmup_samples": warmup_production_samples,
+                        "production_states": 12,
+                        "production_transitions": 20,
+                        "production_raw_initial_states_generated": 1,
+                        "production_raw_successors_generated": 19,
+                        "production_states_generated": 20,
+                        "error_type": "invariant_violation"
+                    },
+                    "verified_match": true
+                }
+            }
+        }))
+        .unwrap();
+
+        let row = row_for(&summary, "equivalent_expected_violation");
+        assert_eq!(row.runtime_axis, SupremacyMatrixAxisVerdict::Pass);
+        assert_eq!(row.memory_axis, SupremacyMatrixAxisVerdict::Pass);
+        assert_eq!(row.overall, SupremacyMatrixOverallVerdict::MissingOrStale);
+        assert!(!summary.strict_pass);
+        assert_eq!(summary.strict_blockers, 1);
+
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["schema"], "ty.supremacy.matrix_summary.v2");
+        assert_eq!(json["rows"][0]["overall"], "missing_or_stale");
+        assert_eq!(
+            json["rows"][0]["work_equivalence"],
+            json!({
+                "schema_version": 1,
+                "rule_id": "exhaustive_generated_work_parity_v1"
+            })
+        );
+        assert_eq!(
+            json["rows"][0]["tlc_samples"].as_array().unwrap().len(),
+            STRICT_MIN_PAIRED_RUNS
+        );
+        assert_eq!(
+            json["rows"][0]["count_tlc_samples"]
+                .as_array()
+                .unwrap()
+                .len(),
+            STRICT_MIN_PAIRED_RUNS
+        );
+        assert_eq!(
+            json["rows"][0]["ty_pinned_samples"]
+                .as_array()
+                .unwrap()
+                .len(),
+            STRICT_MIN_PAIRED_RUNS
+        );
+        assert_eq!(json["rows"][0]["count_speedup_tlc_vs_ty"], 2.0);
+        assert_eq!(json["min_runtime_speedup"], 1.05);
+        assert_eq!(json["max_memory_ratio"], 0.95);
+        assert_eq!(json["paired_schedule"], STRICT_PAIRED_SCHEDULE);
+    }
+
+    #[test]
+    fn later_repetition_with_different_violated_obligation_blocks_claim() {
+        let tlc_samples =
+            repeated_violation_samples("production-tlc", 2.0, 2000, "fail", "invariant", "TypeOK");
+        let count_tlc_samples =
+            repeated_violation_samples("count-tlc", 2.0, 2000, "fail", "invariant", "TypeOK");
+        let count_samples = repeated_violation_samples(
+            "count-ty",
+            1.0,
+            1000,
+            "pass",
+            "invariant_violation",
+            "TypeOK",
+        );
+        let mut production_samples = repeated_violation_samples(
+            "production-ty",
+            1.0,
+            1000,
+            "pass",
+            "invariant_violation",
+            "TypeOK",
+        );
+        production_samples[3]["violated_obligation"] = json!("OtherInvariant");
+        let summary = classify_baseline_value(json!({
+            "specs": {
+                "changed_obligation": {
+                    "source": {"mode": "check"},
+                    "work_equivalence": WorkEquivalenceEvidence::exhaustive_holds(),
+                    "tlc": {
+                        "status": "fail",
+                        "runtime_seconds": 2.0,
+                        "samples": tlc_samples,
+                        "states": 12,
+                        "transitions": 20,
+                        "raw_initial_states_generated": 1,
+                        "raw_successors_generated": 19,
+                        "states_generated": 20,
+                        "count_verification_status": "fail",
+                        "count_verification_error_type": "invariant",
+                        "count_verification_runtime_seconds": 2.0,
+                        "count_verification_samples": count_tlc_samples,
+                        "count_verification_states": 12,
+                        "count_verification_transitions": 20,
+                        "count_verification_raw_initial_states_generated": 1,
+                        "count_verification_raw_successors_generated": 19,
+                        "count_verification_states_generated": 20,
+                        "error_type": "invariant"
+                    },
+                    "ty": {
+                        "status": "pass",
+                        "runtime_seconds": 1.0,
+                        "samples": count_samples,
+                        "states": 12,
+                        "transitions": 20,
+                        "raw_initial_states_generated": 1,
+                        "raw_successors_generated": 19,
+                        "states_generated": 20,
+                        "error_type": "invariant_violation",
+                        "production_status": "pass",
+                        "production_error_type": "invariant_violation",
+                        "production_runtime_seconds": 1.0,
+                        "production_samples": production_samples,
+                        "production_states": 12,
+                        "production_transitions": 20,
+                        "production_raw_initial_states_generated": 1,
+                        "production_raw_successors_generated": 19,
+                        "production_states_generated": 20
+                    },
+                    "verified_match": true
+                }
+            }
+        }))
+        .unwrap();
+
+        let row = row_for(&summary, "changed_obligation");
+        assert_eq!(row.claim_class, SupremacyMatrixClaimClass::MissingOrStale);
+        assert!(!summary.strict_pass);
+    }
+
+    #[test]
+    fn semantic_blocker_claim_class_takes_precedence_over_passing_axes() {
+        assert_eq!(
+            derive_claim_class(
+                SupremacyMatrixClass::ParityFail,
+                SupremacyMatrixOverallVerdict::PassBoth
+            ),
+            SupremacyMatrixClaimClass::ParityBlocker
+        );
+        assert_eq!(
+            derive_claim_class(
+                SupremacyMatrixClass::Unsupported,
+                SupremacyMatrixOverallVerdict::PassBoth
+            ),
+            SupremacyMatrixClaimClass::Unsupported
+        );
+        assert_eq!(
+            serde_json::to_value(SupremacyMatrixClaimClass::PassBoth).unwrap(),
+            "PASS_BOTH"
+        );
     }
 
     #[test]
@@ -5335,6 +20797,53 @@ mod tests {
         fs::write(path, text).unwrap();
     }
 
+    fn initialize_git_checkout(path: &Path) -> String {
+        let init = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(path)
+            .output()
+            .expect("git init should run");
+        assert!(
+            init.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        commit_git_checkout(path, "initial")
+    }
+
+    fn commit_git_checkout(path: &Path, message: &str) -> String {
+        let add = std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(path)
+            .output()
+            .expect("git add should run");
+        assert!(
+            add.status.success(),
+            "git add failed: {}",
+            String::from_utf8_lossy(&add.stderr)
+        );
+        let commit = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Matrix Test",
+                "-c",
+                "user.email=matrix@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                message,
+            ])
+            .current_dir(path)
+            .output()
+            .expect("git commit should run");
+        assert!(
+            commit.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&commit.stderr)
+        );
+        git_command_text(path, &["rev-parse", "HEAD"]).expect("read test checkout HEAD")
+    }
+
     fn randomized_count_policy_baseline(
         examples_dir: &Path,
         tla_text: &str,
@@ -5342,9 +20851,13 @@ mod tests {
     ) -> String {
         let tla_path = examples_dir.join("RandomizedFixture.tla");
         write_file(&tla_path, tla_text);
+        let examples_head = initialize_git_checkout(examples_dir);
         format!(
             r#"{{
-              "inputs": {{"examples_dir": "{}"}},
+              "inputs": {{
+                "examples_dir": "{}",
+                "examples_git": {{"head": "{examples_head}", "is_dirty": false}}
+              }},
               "specs": {{
                 "randomized_fixture": {{
                   "source": {{"tla_path": "RandomizedFixture.tla"}},
@@ -5373,13 +20886,84 @@ mod tests {
             class_for(&summary, "randomized_fixture"),
             SupremacyMatrixClass::Pass
         );
-        assert_eq!(summary.strict_blockers, 0);
+        assert_eq!(summary.strict_blockers, 1);
+        assert_eq!(
+            row_for(&summary, "randomized_fixture").overall,
+            SupremacyMatrixOverallVerdict::MissingOrStale
+        );
         assert_eq!(summary.counts.pass, 1);
         let reason = reason_for(&summary, "randomized_fixture");
         assert!(reason.contains(RANDOMIZED_COUNT_POLICY_REASON_PREFIX));
         assert!(reason.contains("RandomElement"));
         assert!(reason.contains("TLC states=10"));
         assert!(reason.contains("TY states=8"));
+    }
+
+    #[test]
+    fn randomized_count_policy_ignores_mismatched_examples_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let baseline = randomized_count_policy_baseline(
+            dir.path(),
+            "---- MODULE RandomizedFixture ----\nEXTENDS TLC\nEdges == RandomElement({1, 2})\n====\n",
+            false,
+        );
+        write_file(
+            &dir.path().join("later.txt"),
+            "checkout no longer matches baseline provenance\n",
+        );
+        commit_git_checkout(dir.path(), "later");
+
+        let summary = classify_baseline_str(&baseline).unwrap();
+
+        assert_eq!(
+            class_for(&summary, "randomized_fixture"),
+            SupremacyMatrixClass::ParityFail
+        );
+        assert!(!reason_for(&summary, "randomized_fixture")
+            .contains(RANDOMIZED_COUNT_POLICY_REASON_PREFIX));
+    }
+
+    #[test]
+    fn randomized_count_policy_ignores_dirty_examples_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let baseline = randomized_count_policy_baseline(
+            dir.path(),
+            "---- MODULE RandomizedFixture ----\nEXTENDS TLC\nEdges == RandomElement({1, 2})\n====\n",
+            false,
+        );
+        write_file(
+            &dir.path().join("uncommitted.txt"),
+            "dirty checkout must not affect classification\n",
+        );
+
+        let summary = classify_baseline_str(&baseline).unwrap();
+
+        assert_eq!(
+            class_for(&summary, "randomized_fixture"),
+            SupremacyMatrixClass::ParityFail
+        );
+        assert!(!reason_for(&summary, "randomized_fixture")
+            .contains(RANDOMIZED_COUNT_POLICY_REASON_PREFIX));
+    }
+
+    #[test]
+    fn randomized_count_policy_ignores_recorded_dirty_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let baseline = randomized_count_policy_baseline(
+            dir.path(),
+            "---- MODULE RandomizedFixture ----\nEXTENDS TLC\nEdges == RandomElement({1, 2})\n====\n",
+            false,
+        );
+        let baseline = baseline.replacen(r#""is_dirty": false"#, r#""is_dirty": true"#, 1);
+
+        let summary = classify_baseline_str(&baseline).unwrap();
+
+        assert_eq!(
+            class_for(&summary, "randomized_fixture"),
+            SupremacyMatrixClass::ParityFail
+        );
+        assert!(!reason_for(&summary, "randomized_fixture")
+            .contains(RANDOMIZED_COUNT_POLICY_REASON_PREFIX));
     }
 
     #[test]
@@ -5390,9 +20974,13 @@ mod tests {
             &tla_path,
             "---- MODULE RandomizedFixture ----\nEXTENDS TLC\nPick == RandomElement({1, 2})\n====\n",
         );
+        let examples_head = initialize_git_checkout(dir.path());
         let baseline = format!(
             r#"{{
-              "inputs": {{"examples_dir": "{}"}},
+              "inputs": {{
+                "examples_dir": "{}",
+                "examples_git": {{"head": "{examples_head}", "is_dirty": false}}
+              }},
               "specs": {{
                 "randomized_missing_runtime": {{
                   "source": {{"tla_path": "RandomizedFixture.tla"}},
@@ -5637,11 +21225,36 @@ mod tests {
             status: status.to_string(),
             error_type: error_type.map(str::to_string),
             runtime_seconds: Some(1.0),
+            process_tree_peak_memory_bytes: None,
+            samples: Vec::new(),
+            cache_warmup_samples: Vec::new(),
             states: Some(10),
+            transitions: Some(20),
+            raw_initial_states_generated: Some(1),
+            raw_successors_generated: Some(19),
+            states_generated: Some(20),
+            count_verification_status: None,
+            count_verification_error_type: None,
+            count_verification_runtime_seconds: None,
+            count_verification_process_tree_peak_memory_bytes: None,
+            count_verification_samples: Vec::new(),
+            count_verification_cache_warmup_samples: Vec::new(),
+            count_verification_states: None,
+            count_verification_transitions: None,
+            count_verification_raw_initial_states_generated: None,
+            count_verification_raw_successors_generated: None,
+            count_verification_states_generated: None,
             production_status: production_status.map(str::to_string),
             production_error_type: production_error_type.map(str::to_string),
             production_runtime_seconds: Some(0.5),
+            production_process_tree_peak_memory_bytes: None,
+            production_samples: Vec::new(),
+            production_cache_warmup_samples: Vec::new(),
             production_states: Some(5),
+            production_transitions: Some(10),
+            production_raw_initial_states_generated: Some(1),
+            production_raw_successors_generated: Some(9),
+            production_states_generated: Some(10),
             metadata: BTreeMap::new(),
         };
 
@@ -5691,54 +21304,59 @@ mod tests {
     }
 
     #[test]
-    fn runtime_env_is_reducer_pin_free_and_count_verify_uses_the_flag() {
-        // The retired design pinned TY_AUTO_POR/TY_AUTO_SYMMETRY=0 in the env;
-        // semantic levers are now CLI-flag-only (the child `ty check` ignores
-        // ambient env), so the runtime env must carry NO reducer pins and the
-        // count-verify axis must get its lever via `--no-reduction` in argv.
+    fn runtime_ty_arms_retain_auto_routing_and_count_adds_exact_controls() {
         let base = matrix_runtime_refresh_base_env();
-        let spec_dir = Path::new("/tmp/production-env-spec");
-        let env = ty_matrix_runtime_refresh_env(spec_dir, &base);
-        for key in ["TY_AUTO_POR", "TY_AUTO_SYMMETRY"] {
+        for key in [
+            "TY_AUTO_POR",
+            "TY_AUTO_SYMMETRY",
+            "TY_trust_cg",
+            "TY_TRUST_CG_BFS",
+            "TY_TRUST_CG_EXISTS",
+            "TY_BYTECODE_VM",
+        ] {
             assert!(
-                !env.contains_key(key),
-                "runtime env must not pin {key} (semantic levers are CLI flags now)"
+                !base.contains_key(key),
+                "runtime env must not select routing or reductions through {key}"
             );
         }
 
-        // Count-verify inserts the flag before the trailing `--backend` pair.
-        let argv = vec![
-            "ty".to_string(),
-            "check".to_string(),
-            "Spec.tla".to_string(),
-            "--backend".to_string(),
-            "trust-cg".to_string(),
-        ];
-        let with_flag = with_count_verify_flag(argv);
-        assert_eq!(
-            with_flag,
-            vec![
-                "ty".to_string(),
-                "check".to_string(),
-                "Spec.tla".to_string(),
-                COUNT_VERIFY_FLAG.to_string(),
-                "--backend".to_string(),
-                "trust-cg".to_string(),
-            ],
-            "count-verify lever must be the {COUNT_VERIFY_FLAG} CLI flag, inserted before --backend"
+        let production = ty_check_command_spec(
+            Path::new("ty"),
+            Path::new("Spec.tla"),
+            Path::new("Spec.cfg"),
+            None,
+            false,
+            Path::new("/repo"),
+            Path::new("production"),
+            30,
+            &base,
         );
-
-        // Without a --backend pair the flag is appended.
-        let with_flag_no_backend =
-            with_count_verify_flag(vec!["ty".to_string(), "check".to_string()]);
+        let count = ty_check_command_spec(
+            Path::new("ty"),
+            Path::new("Spec.tla"),
+            Path::new("Spec.cfg"),
+            None,
+            true,
+            Path::new("/repo"),
+            Path::new("count"),
+            30,
+            &base,
+        );
+        for argv in [&production.argv, &count.argv] {
+            assert!(argv.iter().all(|arg| arg != "--backend"));
+        }
+        assert!(production
+            .argv
+            .iter()
+            .all(|arg| !matches!(arg.as_str(), "--bfs-only" | "--no-reduction" | "--workers")));
         assert_eq!(
-            with_flag_no_backend.last().map(String::as_str),
-            Some(COUNT_VERIFY_FLAG)
+            &count.argv[production.argv.len()..],
+            ["--bfs-only", "--no-reduction", "--workers", "1"]
         );
     }
 
     #[test]
-    fn apply_runtime_row_records_and_clears_production_axis_fields() {
+    fn apply_runtime_row_records_and_clears_independent_axis_fields() {
         let mut baseline = json!({
             "specs": {
                 "Row": {
@@ -5751,40 +21369,123 @@ mod tests {
         });
         let provenance = runtime_baseline_provenance();
         let mut row = runtime_evidence_row("Row", 2.0, 1.0, 10);
+        row.tlc = attach_count_verification_runtime_evidence(
+            row.tlc,
+            RuntimeModeEvidence {
+                status: "pass".to_string(),
+                runtime_seconds: Some(1.75),
+                states: Some(10),
+                transitions: Some(42),
+                raw_initial_states_generated: Some(1),
+                raw_successors_generated: Some(41),
+                states_generated: Some(42),
+                error_type: None,
+                artifact_dir: PathBuf::from("Row/count-tlc-run1"),
+                ..RuntimeModeEvidence::default()
+            },
+        );
         row.ty = attach_production_runtime_evidence(
             row.ty,
             RuntimeModeEvidence {
                 status: "pass".to_string(),
                 runtime_seconds: Some(0.5),
                 states: Some(4),
+                transitions: Some(8),
+                raw_initial_states_generated: Some(1),
+                raw_successors_generated: Some(7),
+                states_generated: Some(8),
                 error_type: None,
                 artifact_dir: PathBuf::from("Row/ty-trust_cg-production-run1"),
                 ..RuntimeModeEvidence::default()
             },
         );
+        row.tlc.cache_warmup_samples = cache_warmup_samples("production-tlc", 9.0, 9000);
+        row.tlc.count_verification_cache_warmup_samples =
+            cache_warmup_samples("count-tlc", 8.0, 8000);
+        row.ty.cache_warmup_samples = cache_warmup_samples("count-ty", 7.0, 7000);
+        row.ty.production_cache_warmup_samples = cache_warmup_samples("production-ty", 6.0, 6000);
 
         apply_runtime_row(&mut baseline, &row, &provenance);
+        let tlc = &baseline["specs"]["Row"]["tlc"];
+        assert_eq!(tlc["runtime_seconds"], json!(2.0));
+        assert_eq!(tlc["raw_initial_states_generated"], json!(1));
+        assert_eq!(tlc["raw_successors_generated"], json!(41));
+        assert_eq!(tlc["states_generated"], json!(42));
+        assert_eq!(tlc["count_verification_status"], json!("pass"));
+        assert_eq!(tlc["count_verification_runtime_seconds"], json!(1.75));
+        assert_eq!(tlc["count_verification_states"], json!(10));
+        assert_eq!(
+            tlc["count_verification_raw_initial_states_generated"],
+            json!(1)
+        );
+        assert_eq!(
+            tlc["count_verification_raw_successors_generated"],
+            json!(41)
+        );
+        assert_eq!(tlc["count_verification_states_generated"], json!(42));
+        assert_eq!(tlc["count_verification_error_type"], json!(null));
+        assert_eq!(tlc["cache_warmup_samples"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            tlc["count_verification_cache_warmup_samples"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
         let ty = &baseline["specs"]["Row"]["ty"];
         assert_eq!(ty["runtime_seconds"], json!(1.0));
+        assert_eq!(ty["raw_initial_states_generated"], json!(1));
+        assert_eq!(ty["raw_successors_generated"], json!(41));
+        assert_eq!(ty["states_generated"], json!(42));
         assert_eq!(ty["production_status"], json!("pass"));
         assert_eq!(ty["production_runtime_seconds"], json!(0.5));
         assert_eq!(ty["production_states"], json!(4));
+        assert_eq!(ty["production_raw_initial_states_generated"], json!(1));
+        assert_eq!(ty["production_raw_successors_generated"], json!(7));
+        assert_eq!(ty["production_states_generated"], json!(8));
         assert_eq!(ty["production_error_type"], json!(null));
+        assert_eq!(ty["cache_warmup_samples"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            ty["production_cache_warmup_samples"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
         assert!(baseline["specs"]["Row"]["tlc"]
             .get("production_status")
             .is_none());
 
-        // A later refresh WITHOUT a production run must clear the stale
-        // production axis so old production numbers never overlay fresh
-        // pinned evidence.
+        // A later refresh without either independent axis must clear both
+        // stale axes so old numbers never overlay fresh evidence.
         let row = runtime_evidence_row("Row", 2.0, 1.5, 10);
         apply_runtime_row(&mut baseline, &row, &provenance);
+        let tlc = &baseline["specs"]["Row"]["tlc"];
+        assert_eq!(tlc["runtime_seconds"], json!(2.0));
+        assert!(tlc.get("count_verification_status").is_none());
+        assert!(tlc.get("count_verification_runtime_seconds").is_none());
+        assert!(tlc.get("count_verification_states").is_none());
+        assert!(tlc
+            .get("count_verification_raw_initial_states_generated")
+            .is_none());
+        assert!(tlc
+            .get("count_verification_raw_successors_generated")
+            .is_none());
+        assert!(tlc.get("count_verification_states_generated").is_none());
+        assert!(tlc.get("count_verification_error_type").is_none());
+        assert!(tlc.get("cache_warmup_samples").is_none());
+        assert!(tlc.get("count_verification_cache_warmup_samples").is_none());
         let ty = &baseline["specs"]["Row"]["ty"];
         assert_eq!(ty["runtime_seconds"], json!(1.5));
         assert!(ty.get("production_status").is_none());
         assert!(ty.get("production_runtime_seconds").is_none());
         assert!(ty.get("production_states").is_none());
+        assert!(ty.get("production_raw_initial_states_generated").is_none());
+        assert!(ty.get("production_raw_successors_generated").is_none());
+        assert!(ty.get("production_states_generated").is_none());
         assert!(ty.get("production_error_type").is_none());
+        assert!(ty.get("cache_warmup_samples").is_none());
+        assert!(ty.get("production_cache_warmup_samples").is_none());
     }
 
     #[test]
@@ -5826,7 +21527,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_evidence_match_allows_randomized_source_state_mismatch() {
+    fn runtime_evidence_match_rejects_randomized_source_state_mismatch() {
         let dir = tempfile::tempdir().unwrap();
         let source_path = dir.path().join("RandomizedFixture.tla");
         write_file(
@@ -5842,7 +21543,7 @@ mod tests {
         let mut ty = runtime_mode_evidence("pass", Some(1.0), Some(8), None, "Row", "ty");
         ty.artifact_dir = ty_dir;
 
-        assert!(runtime_modes_verified_match(&tlc, &ty));
+        assert!(!runtime_modes_verified_match(&tlc, &ty));
     }
 
     #[test]
@@ -5941,7 +21642,32 @@ TypeOK == counter \in {{0, 1, 2}}
             refreshed: true,
             note: None,
             required_flags: Vec::new(),
+            collection_outcome: default_runtime_collection_outcome(),
+            resource_limit_event: None,
         }
+    }
+
+    fn resource_limited_runtime_evidence_row(spec: &str) -> RuntimeEvidenceRow {
+        runtime_resource_limit_row(
+            spec,
+            Path::new("/campaign/segments/segment-0001"),
+            &ObservationStorageLimitError {
+                arm: RuntimeOutputKind::Tlc,
+                run_index: 3,
+                trigger: StorageLimitTrigger {
+                    kind: StorageLimitTriggerKind::KernelQuota,
+                    observed: 4_000_000_000,
+                    limit: ObservationStorageContract::frozen_v2().max_observation_allocated_bytes,
+                    elapsed_milliseconds: 50,
+                    process_group_killed: true,
+                    child_reaped: true,
+                },
+                artifact_dir: PathBuf::from(
+                    "/campaign/segments/segment-0001/Spec01/scored/tlc-run3",
+                ),
+            },
+        )
+        .unwrap()
     }
 
     fn runtime_mode_evidence(
@@ -5956,10 +21682,318 @@ TypeOK == counter \in {{0, 1, 2}}
             status: status.to_string(),
             runtime_seconds,
             states,
+            transitions: states.map(|_| 42),
+            raw_initial_states_generated: states.map(|_| 1),
+            raw_successors_generated: states.map(|_| 41),
+            states_generated: states.map(|_| 42),
             error_type: error_type.map(str::to_string),
             artifact_dir: PathBuf::from(format!("{spec}/{mode}")),
             ..RuntimeModeEvidence::default()
         }
+    }
+
+    #[test]
+    fn runtime_evidence_row_round_trips_when_empty_vectors_are_omitted() {
+        let row = runtime_evidence_row("NormalCheckRow", 2.0, 1.0, 3);
+        let serialized = serde_json::to_value(&row).unwrap();
+
+        assert!(serialized.get("required_flags").is_none());
+        for mode in ["tlc", "ty"] {
+            let serialized_mode = serialized.get(mode).unwrap();
+            assert!(serialized_mode.get("samples").is_none());
+            assert!(serialized_mode.get("cache_warmup_samples").is_none());
+            assert!(serialized_mode.get("count_verification_samples").is_none());
+            assert!(serialized_mode
+                .get("count_verification_cache_warmup_samples")
+                .is_none());
+            assert!(serialized_mode.get("production_samples").is_none());
+            assert!(serialized_mode
+                .get("production_cache_warmup_samples")
+                .is_none());
+        }
+
+        let deserialized: RuntimeEvidenceRow = serde_json::from_value(serialized).unwrap();
+        assert_eq!(deserialized.spec, row.spec);
+        assert!(deserialized.required_flags.is_empty());
+        for mode in [&deserialized.tlc, &deserialized.ty] {
+            assert!(mode.samples.is_empty());
+            assert!(mode.cache_warmup_samples.is_empty());
+            assert!(mode.count_verification_samples.is_empty());
+            assert!(mode.count_verification_cache_warmup_samples.is_empty());
+            assert!(mode.production_samples.is_empty());
+            assert!(mode.production_cache_warmup_samples.is_empty());
+        }
+
+        let mut unknown = serde_json::to_value(vec![row]).unwrap();
+        unknown[0]["ty"]["unrecognized_measurement"] = json!(1);
+        assert!(deserialize_exact_campaign_rows(&unknown, "segment-0001")
+            .unwrap_err()
+            .to_string()
+            .contains("unrecognized or noncanonical"));
+    }
+
+    #[test]
+    fn campaign_aggregate_rejects_same_name_measurement_substitution() {
+        let merged_rows = vec![runtime_evidence_row("Spec01", 2.0, 1.0, 3)];
+        let mut report = json!({"rows": merged_rows});
+        assert_eq!(
+            validate_campaign_aggregate_row_union(&report, &merged_rows).unwrap(),
+            vec!["Spec01".to_string()]
+        );
+
+        report["rows"][0]["ty"]["runtime_seconds"] = json!(9.0);
+        assert!(validate_campaign_aggregate_row_union(&report, &merged_rows)
+            .unwrap_err()
+            .to_string()
+            .contains("exact sealed segment row union"));
+    }
+
+    #[test]
+    fn campaign_aggregate_rejects_refreshed_baseline_row_divergence() {
+        let original = promotion_ready_baseline();
+        let rows = vec![runtime_evidence_row("RuntimeSpec", 4.0, 1.0, 10)];
+        let mut provenance = runtime_baseline_provenance();
+        let mut applied = original.clone();
+        for row in &rows {
+            apply_runtime_row(&mut applied, row, &provenance);
+        }
+        provenance.refreshed_specs_jcs_sha256 = sha256_jcs_value(&applied["specs"]).unwrap();
+        let reconstructed = reconstruct_campaign_baseline(original, &rows, &provenance).unwrap();
+        validate_exact_campaign_baseline(&reconstructed, &reconstructed, "aggregate").unwrap();
+
+        let mut divergent = reconstructed.clone();
+        divergent["specs"]["RuntimeSpec"]["ty"]["runtime_seconds"] = json!(99.0);
+        assert!(
+            validate_exact_campaign_baseline(&divergent, &reconstructed, "aggregate")
+                .unwrap_err()
+                .to_string()
+                .contains("exact plan-plus-sealed-rows reconstruction")
+        );
+    }
+
+    #[test]
+    fn receipt_sealed_resource_segment_is_inventory_only_and_never_promoted() {
+        let row = resource_limited_runtime_evidence_row("RuntimeSpec");
+        validate_campaign_runtime_row_outcome(&row).unwrap();
+        validate_strict_runtime_collection_outcomes(std::slice::from_ref(&row), false)
+            .expect("typed resource exhaustion must let a strict segment exit for receipt sealing");
+        validate_campaign_rows_for_merge(
+            std::slice::from_ref(&row),
+            RuntimeCampaignMergePurpose::Inventory,
+        )
+        .expect("a receipt-validated typed resource segment must remain mergeable as inventory");
+        let error = validate_campaign_rows_for_merge(
+            std::slice::from_ref(&row),
+            RuntimeCampaignMergePurpose::Superiority,
+        )
+        .expect_err("typed resource exhaustion can never be promoted as superiority");
+        assert!(error.to_string().contains("resource-limited"));
+
+        let original = promotion_ready_baseline();
+        let original_spec = original["specs"]["RuntimeSpec"].clone();
+        let mut provenance = runtime_baseline_provenance();
+        provenance.refreshed_specs_jcs_sha256 =
+            sha256_jcs_value(&original["specs"]).expect("digest baseline specs");
+        let reconstructed = reconstruct_campaign_baseline(original, &[row], &provenance).unwrap();
+        assert_eq!(reconstructed["specs"]["RuntimeSpec"], original_spec);
+        assert_eq!(reconstructed["ty_refresh"]["specs_updated"], json!(0));
+
+        let mut invalid_complete = runtime_evidence_row("OtherSpec", 2.0, 1.0, 3);
+        invalid_complete.ty.runtime_seconds = None;
+        assert!(validate_campaign_rows_for_merge(
+            &[
+                resource_limited_runtime_evidence_row("RuntimeSpec"),
+                invalid_complete
+            ],
+            RuntimeCampaignMergePurpose::Inventory,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("without promotable fresh evidence"));
+    }
+
+    #[test]
+    fn finalized_superiority_cannot_overclaim_resource_limited_rows() {
+        let forged_complete = json!({
+            "measurement_complete": true,
+            "incomplete_runtime_specs": []
+        });
+        let resource = resource_limited_runtime_evidence_row("RuntimeSpec");
+        let error = validate_finalized_superiority_measurements(
+            &forged_complete,
+            std::slice::from_ref(&resource),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("resource-limited"));
+
+        let complete = runtime_evidence_row("RuntimeSpec", 2.0, 1.0, 3);
+        validate_finalized_superiority_measurements(
+            &forged_complete,
+            std::slice::from_ref(&complete),
+        )
+        .unwrap();
+        let forged_incomplete = json!({
+            "measurement_complete": false,
+            "incomplete_runtime_specs": []
+        });
+        assert!(
+            validate_finalized_superiority_measurements(&forged_incomplete, &[complete],).is_err()
+        );
+    }
+
+    #[test]
+    fn observation_storage_contract_is_exactly_frozen_to_launcher_v2() {
+        let contract = ObservationStorageContract::frozen_v2();
+        contract.validate().unwrap();
+        assert_eq!(contract.payload_hard_byte_headroom(), 2_147_483_648);
+        assert_eq!(contract.payload_hard_inode_headroom(), 10_000);
+
+        let mut drifted = contract;
+        drifted.stdout_max_bytes += 1;
+        assert!(drifted
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("frozen launcher-supported"));
+    }
+
+    #[test]
+    fn campaign_batch_plan_rejects_selection_mismatch() {
+        let campaign = json!({
+            "planned_runtime_specs": ["Spec01", "Spec02"]
+        });
+        let report = json!({
+            "campaign": campaign,
+            "baseline": "/campaign/baseline.json",
+            "output_dir": "/campaign/segment-0001",
+            "limit": null,
+            "selected_runtime_specs": ["Spec01", "Spec02"]
+        });
+        let mut batch_plan = json!({
+            "baseline": "/campaign/baseline.json",
+            "output_dir": "/campaign/segment-0001",
+            "runtime_limit": null,
+            "explicit_runtime_specs": ["Spec01", "Spec02"],
+            "selected_runtime_specs": ["Spec01", "Spec02"],
+            "skipped_batchable_runtime_specs_by_limit": []
+        });
+        validate_campaign_runtime_batch_plan_linkage(&report, &batch_plan).unwrap();
+
+        batch_plan["explicit_runtime_specs"] = json!(["Spec01"]);
+        assert!(
+            validate_campaign_runtime_batch_plan_linkage(&report, &batch_plan)
+                .unwrap_err()
+                .to_string()
+                .contains("selection or path contract")
+        );
+    }
+
+    #[test]
+    fn campaign_receipt_argv_is_bound_to_plan_segment_and_merge_manifests() {
+        let plan_file = RuntimeFileProvenance {
+            path: PathBuf::from("/campaign/plan.json"),
+            sha256: "ab".repeat(32),
+            size_bytes: 1,
+        };
+        let segment_binding = RuntimeCampaignReportBinding {
+            role: "segment".to_string(),
+            campaign_id: "cd".repeat(32),
+            campaign_plan: plan_file.clone(),
+            contract_attestations_sha256: "ef".repeat(32),
+            segment_id: Some("segment-0001".to_string()),
+            merge_purpose: None,
+            planned_runtime_specs: vec!["Spec01".to_string()],
+            segments: Vec::new(),
+            machine_compatibility_sha256: None,
+            corpus_claim_complete: false,
+            corpus_claim_pass: false,
+        };
+        let segment_report = json!({
+            "campaign": segment_binding,
+            "output_dir": "/campaign/segment-output"
+        });
+        let segment_argv = json!([
+            "/campaign/ty",
+            "supremacy",
+            "matrix-segment",
+            "--mode",
+            "enforce",
+            "--campaign-plan",
+            "/campaign/plan.json",
+            "--segment-id",
+            "segment-0001",
+            "--runtime-output-dir",
+            "/campaign/segment-output"
+        ]);
+        validate_campaign_receipt_argv(&segment_report, segment_argv.as_array().unwrap()).unwrap();
+
+        let mut markdown_argv = segment_argv.as_array().unwrap().clone();
+        markdown_argv.extend([json!("--format"), json!("markdown")]);
+        validate_campaign_receipt_argv(&segment_report, &markdown_argv).unwrap();
+
+        let mut wrong_segment = segment_argv;
+        wrong_segment[8] = json!("segment-0002");
+        assert!(
+            validate_campaign_receipt_argv(&segment_report, wrong_segment.as_array().unwrap())
+                .unwrap_err()
+                .to_string()
+                .contains("different segment id")
+        );
+
+        let payload = campaign_test_payload(6, 1);
+        let manifests = payload
+            .segments
+            .iter()
+            .map(campaign_test_manifest)
+            .collect::<Vec<_>>();
+        let merge_binding = RuntimeCampaignReportBinding {
+            role: "aggregate".to_string(),
+            campaign_id: "cd".repeat(32),
+            campaign_plan: plan_file,
+            contract_attestations_sha256: "ef".repeat(32),
+            segment_id: None,
+            merge_purpose: Some("superiority".to_string()),
+            planned_runtime_specs: payload.runtime_specs,
+            segments: manifests.clone(),
+            machine_compatibility_sha256: Some("12".repeat(32)),
+            corpus_claim_complete: true,
+            corpus_claim_pass: true,
+        };
+        let merge_report = json!({
+            "campaign": merge_binding,
+            "output_dir": "/campaign/merge-output"
+        });
+        let mut merge_argv = vec![
+            "/campaign/ty".to_string(),
+            "supremacy".to_string(),
+            "matrix-merge".to_string(),
+            "--mode".to_string(),
+            "enforce".to_string(),
+            "--campaign-plan".to_string(),
+            "/campaign/plan.json".to_string(),
+            "--segment-report".to_string(),
+        ];
+        merge_argv.extend(
+            manifests
+                .iter()
+                .rev()
+                .map(|manifest| manifest.report.path.display().to_string()),
+        );
+        merge_argv.extend([
+            "--runtime-output-dir".to_string(),
+            "/campaign/merge-output".to_string(),
+        ]);
+        let merge_argv = serde_json::to_value(merge_argv).unwrap();
+        validate_campaign_receipt_argv(&merge_report, merge_argv.as_array().unwrap()).unwrap();
+
+        let mut wrong_reports = merge_argv;
+        wrong_reports[8] = json!("/campaign/foreign/runtime_evidence.json");
+        assert!(
+            validate_campaign_receipt_argv(&merge_report, wrong_reports.as_array().unwrap())
+                .unwrap_err()
+                .to_string()
+                .contains("differs from the aggregate manifest")
+        );
     }
 
     #[test]
@@ -5983,8 +22017,16 @@ TypeOK == counter \in {{0, 1, 2}}
             ty_binary: RuntimeFileProvenance {
                 path: PathBuf::from("/tmp/ty"),
                 sha256: "0123456789abcdef".to_string(),
+                size_bytes: 1,
             },
             allow_debug_runtime: false,
+            evidence_set_id: "evidence-set-1".to_string(),
+            runtime_evidence_path: PathBuf::from("/tmp/runtime_evidence.json"),
+            refreshed_specs_jcs_sha256: "refreshed-specs".to_string(),
+            machine_provenance_path: Some(PathBuf::from("/tmp/machine.json")),
+            machine_provenance_id: Some("machine-1".to_string()),
+            final_receipt_path: Some(PathBuf::from("/tmp/strict-evidence-receipt.json")),
+            campaign: None,
         }
     }
 
@@ -6066,6 +22108,7 @@ TypeOK == counter \in {{0, 1, 2}}
             runtime_limit: None,
             runtime_specs: Vec::new(),
             runtime_timeout: 300,
+            runtime_runs: 5,
             production_runtime: true,
             runtime_ty_bin: None,
             allow_debug_runtime: false,
@@ -6124,10 +22167,12 @@ TypeOK == counter \in {{0, 1, 2}}
         .unwrap();
 
         assert_eq!(summary.schema, MATRIX_SUMMARY_SCHEMA);
+        assert_eq!(summary.paired_statistic, STRICT_PAIRED_STATISTIC);
+        assert_eq!(summary.paired_schedule, STRICT_PAIRED_SCHEDULE);
         assert_eq!(summary.verdict, SupremacyMatrixVerdict::Fail);
         assert!(!summary.strict_pass);
-        assert_eq!(summary.strict_blockers, 5);
-        assert_eq!(summary.strict_blocker_count(), 5);
+        assert_eq!(summary.strict_blockers, 6);
+        assert_eq!(summary.strict_blocker_count(), 6);
         assert_eq!(class_for(&summary, "pass_spec"), SupremacyMatrixClass::Pass);
         assert_eq!(
             class_for(&summary, "perf_loser_spec"),
@@ -6154,7 +22199,7 @@ TypeOK == counter \in {{0, 1, 2}}
         assert_eq!(json["schema"], MATRIX_SUMMARY_SCHEMA);
         assert_eq!(json["verdict"], "fail");
         assert_eq!(json["strict_pass"], false);
-        assert_eq!(json["strict_blockers"], 5);
+        assert_eq!(json["strict_blockers"], 6);
         assert_eq!(json["counts"]["perf_loser"], 1);
     }
 
@@ -6283,8 +22328,8 @@ TypeOK == counter \in {{0, 1, 2}}
             SupremacyMatrixClass::TlcTimeout
         );
         assert_eq!(summary.verdict, SupremacyMatrixVerdict::Fail);
-        assert_eq!(summary.strict_blockers, 1);
-        assert_eq!(summary.enforce_blocker_count(), 1);
+        assert_eq!(summary.strict_blockers, 2);
+        assert_eq!(summary.enforce_blocker_count(), 2);
         assert!(summary.policy.is_none());
     }
 
@@ -6373,12 +22418,12 @@ TypeOK == counter \in {{0, 1, 2}}
         );
         assert_eq!(summary.counts.runtime_to_error, 0);
         assert_eq!(summary.counts.timeout_dominance, 1);
-        assert_eq!(summary.strict_blockers, 2);
+        assert_eq!(summary.strict_blockers, 3);
         assert!(!summary.strict_pass);
         let policy_summary = summary.policy.as_ref().expect("policy summary");
         assert_eq!(policy_summary.comparable_outcomes, 1);
-        assert_eq!(policy_summary.blockers, 1);
-        assert_eq!(summary.enforce_blocker_count(), 1);
+        assert_eq!(policy_summary.blockers, 3);
+        assert_eq!(summary.enforce_blocker_count(), 3);
         assert_eq!(summary.verdict, SupremacyMatrixVerdict::Fail);
     }
 
@@ -6435,11 +22480,11 @@ TypeOK == counter \in {{0, 1, 2}}
             summary.next_action_counts.get("triage_unsupported"),
             Some(&1)
         );
-        assert_eq!(summary.strict_blockers, 4);
-        assert_eq!(summary.enforce_blocker_count(), 4);
+        assert_eq!(summary.strict_blockers, 5);
+        assert_eq!(summary.enforce_blocker_count(), 5);
         assert_eq!(summary.verdict, SupremacyMatrixVerdict::Fail);
         assert_eq!(summary.policy.as_ref().unwrap().comparable_outcomes, 0);
-        assert_eq!(summary.policy.as_ref().unwrap().blockers, 4);
+        assert_eq!(summary.policy.as_ref().unwrap().blockers, 5);
         assert!(row_for(&summary, "missing_both")
             .reason
             .contains("TLC and TY runtime_seconds"));
@@ -6619,7 +22664,7 @@ TypeOK == counter \in {{0, 1, 2}}
     }
 
     #[test]
-    fn matrix_policy_can_pass_on_comparable_rows_without_strict_win() {
+    fn matrix_policy_cannot_promote_missing_both_axis_evidence() {
         let policy = MatrixPolicy {
             allow_runtime_to_error: true,
             allow_timeout_dominance: true,
@@ -6645,13 +22690,13 @@ TypeOK == counter \in {{0, 1, 2}}
         )
         .unwrap();
 
-        assert_eq!(summary.strict_blockers, 1);
+        assert_eq!(summary.strict_blockers, 2);
         assert!(!summary.strict_pass);
-        assert_eq!(summary.enforce_blocker_count(), 0);
-        assert_eq!(summary.verdict, SupremacyMatrixVerdict::Pass);
+        assert_eq!(summary.enforce_blocker_count(), 2);
+        assert_eq!(summary.verdict, SupremacyMatrixVerdict::Fail);
         assert_eq!(
             summary.policy.as_ref().unwrap().verdict,
-            SupremacyMatrixVerdict::Pass
+            SupremacyMatrixVerdict::Fail
         );
     }
 
@@ -6702,7 +22747,7 @@ TypeOK == counter \in {{0, 1, 2}}
         );
         assert_eq!(summary.counts.runtime_to_error, 0);
         assert_eq!(summary.counts.timeout_dominance, 0);
-        assert_eq!(summary.enforce_blocker_count(), 2);
+        assert_eq!(summary.enforce_blocker_count(), 3);
         assert_eq!(summary.verdict, SupremacyMatrixVerdict::Fail);
     }
 
@@ -6814,12 +22859,75 @@ TypeOK == counter \in {{0, 1, 2}}
 
     #[test]
     fn matrix_enforce_rejects_allow_debug_runtime() {
-        let err = validate_matrix_runtime_refresh_policy(SupremacyMode::Enforce, true)
+        let err = validate_matrix_runtime_refresh_policy(SupremacyMode::Enforce, true, true)
             .expect_err("enforce mode must reject debug runtime refresh evidence");
 
         assert!(err.to_string().contains("--allow-debug-runtime"));
-        validate_matrix_runtime_refresh_policy(SupremacyMode::Warn, true)
+        validate_matrix_runtime_refresh_policy(SupremacyMode::Warn, true, true)
             .expect("warn mode may use debug runtime smoke evidence");
+    }
+
+    #[test]
+    fn matrix_enforce_runtime_refresh_rejects_parallel_compile_override() {
+        let err = validate_matrix_runtime_refresh_policy_with_compile_jobs(
+            SupremacyMode::Enforce,
+            false,
+            true,
+            "4",
+        )
+        .expect_err("enforce mode must reject parallel native compilation");
+
+        assert!(err
+            .to_string()
+            .contains("requires TY_TRUST_CG_NATIVE_CALLOUT_COMPILE_JOBS=1"));
+        validate_matrix_runtime_refresh_policy_with_compile_jobs(
+            SupremacyMode::Warn,
+            false,
+            true,
+            "4",
+        )
+        .expect("warn mode may retain a diagnostic compile-job override");
+        validate_matrix_runtime_refresh_policy_with_compile_jobs(
+            SupremacyMode::Enforce,
+            false,
+            false,
+            "4",
+        )
+        .expect("an unused runtime override must not block matrix-only enforcement");
+    }
+
+    #[test]
+    fn enforced_refresh_checkout_state_requires_exact_clean_manifest_pin() {
+        validate_checkout_state_matches_pin(
+            "0123456789abcdef",
+            Some("0123456789abcdef"),
+            Some(false),
+            None,
+        )
+        .expect("an exact clean checkout should qualify");
+
+        let mismatch = validate_checkout_state_matches_pin(
+            "0123456789abcdef",
+            Some("fedcba9876543210"),
+            Some(false),
+            None,
+        )
+        .expect_err("a mismatched checkout must not qualify");
+        assert!(mismatch.to_string().contains("HEAD mismatch"));
+
+        let dirty = validate_checkout_state_matches_pin(
+            "0123456789abcdef",
+            Some("0123456789abcdef"),
+            Some(true),
+            None,
+        )
+        .expect_err("a dirty checkout must not qualify");
+        assert!(dirty.to_string().contains("dirty"));
+
+        let unavailable =
+            validate_checkout_state_matches_pin("0123456789abcdef", None, None, Some("not a repo"))
+                .expect_err("an uninspectable checkout must not qualify");
+        assert!(unavailable.to_string().contains("could not inspect"));
     }
 
     #[test]
@@ -6857,6 +22965,232 @@ TypeOK == counter \in {{0, 1, 2}}
     fn matrix_enforce_accepts_fresh_promotion_metadata() {
         validate_enforceable_baseline_value(&promotion_ready_baseline())
             .expect("fresh baseline promotion metadata should be enforceable");
+    }
+
+    #[test]
+    fn matrix_enforce_accepts_fresh_v4_collection_status_metadata() {
+        let mut baseline = promotion_ready_baseline();
+        baseline["schema_version"] = json!(4);
+        baseline["specs"]["RuntimeSpec"]["tlc"]["status"] = json!("uncollected");
+        baseline["specs"]["TimeoutSpec"]["tlc"]["status"] = json!("unsupported");
+        baseline["stats"] = json!({
+            "ty_fail": 0,
+            "ty_match": 1,
+            "ty_mismatch": 0,
+            "ty_untested": 1,
+            "tlc_error": 0,
+            "tlc_pass": 0,
+            "tlc_timeout": 0,
+            "tlc_uncollected": 1,
+            "tlc_unsupported": 1
+        });
+        baseline["specs_jcs_sha256"] =
+            json!(sha256_jcs_value(&baseline["specs"]).expect("digest should compute"));
+
+        validate_enforceable_baseline_value(&baseline)
+            .expect("fresh schema-v4 collection-status metadata should be enforceable");
+
+        baseline["stats"]["tlc_error"] = json!(2);
+        let error = validate_enforceable_baseline_value(&baseline)
+            .expect_err("schema-v4 collection statuses must not collapse into tlc_error");
+        assert!(
+            error
+                .to_string()
+                .contains("matrix baseline promotion metadata is stale"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn strict_corpus_requires_v4_generated_work_schema() {
+        let error = validate_strict_baseline_schema_version(&json!({"schema_version": 3}))
+            .expect_err("v3 predates canonical raw generated-work evidence");
+        assert!(error.to_string().contains("must be >= 4"));
+        validate_strict_baseline_schema_version(&json!({"schema_version": 4})).unwrap();
+        validate_strict_baseline_schema_version(&json!({"schema_version": 5})).unwrap();
+    }
+
+    #[test]
+    fn matrix_enforce_rejects_legacy_or_free_form_work_equivalence() {
+        for (field, value, expected) in [
+            (
+                "work_equivalence_rule",
+                json!("same work, approximately"),
+                "legacy work-equivalence field",
+            ),
+            (
+                "equivalent_work_rule",
+                json!("same work, approximately"),
+                "legacy work-equivalence field",
+            ),
+            (
+                "performance_work_equivalence_rule",
+                json!("same work, approximately"),
+                "legacy work-equivalence field",
+            ),
+            (
+                "work_equivalence",
+                json!("same work, approximately"),
+                "parse typed work-equivalence evidence",
+            ),
+            (
+                "work_equivalence",
+                json!({
+                    "schema_version": 1,
+                    "rule_id": "exhaustive_generated_work_parity_v1",
+                    "free_form_exception": "close enough"
+                }),
+                "unknown field",
+            ),
+        ] {
+            let mut baseline = promotion_ready_baseline();
+            baseline["specs"]["A"][field] = value;
+            let error = validate_enforceable_baseline_value(&baseline)
+                .expect_err("untyped or extensible work-equivalence evidence must fail enforce");
+            let message = error
+                .chain()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(message.contains(expected), "{field}: {message}");
+        }
+    }
+
+    #[test]
+    fn strict_rows_require_exact_typed_holds_evidence_and_exclusions_omit_it() {
+        let mut entry = json!({
+            "source": {"mode": "check"},
+            "work_equivalence": WorkEquivalenceEvidence::exhaustive_holds(),
+            "tlc": {
+                "status": "pass",
+                "error_type": null,
+                "states": 7,
+                "raw_initial_states_generated": 1,
+                "raw_successors_generated": 9,
+                "states_generated": 10
+            },
+            "ty": {
+                "status": "pass",
+                "error_type": null,
+                "states": 7,
+                "raw_initial_states_generated": 1,
+                "raw_successors_generated": 9,
+                "states_generated": 10
+            },
+            "verified_match": true,
+            "eligibility": "eligible"
+        });
+        validate_strict_row_work_equivalence("Holds", &entry, true).unwrap();
+
+        let mut missing = entry.clone();
+        missing.as_object_mut().unwrap().remove("work_equivalence");
+        assert!(
+            validate_strict_row_work_equivalence("Missing", &missing, true)
+                .unwrap_err()
+                .to_string()
+                .contains("missing typed work_equivalence")
+        );
+
+        assert!(
+            validate_strict_row_work_equivalence("Excluded", &entry, false)
+                .unwrap_err()
+                .to_string()
+                .contains("must omit work_equivalence")
+        );
+        entry.as_object_mut().unwrap().remove("work_equivalence");
+        validate_strict_row_work_equivalence("Excluded", &entry, false).unwrap();
+        entry["work_equivalence"] = Value::Null;
+        assert!(
+            validate_strict_row_work_equivalence("ExcludedNull", &entry, false)
+                .unwrap_err()
+                .to_string()
+                .contains("must omit work_equivalence")
+        );
+
+        let skeleton = json!({
+            "work_equivalence": WorkEquivalenceEvidence::exhaustive_holds(),
+            "tlc": {"status": "untested", "error_type": null},
+            "ty": {"status": "untested", "error_type": null},
+            "verified_match": false,
+            "eligibility": "eligible"
+        });
+        validate_strict_row_work_equivalence("Uncollected", &skeleton, true)
+            .expect("typed input binding must allow refreshable, uncollected evidence");
+    }
+
+    #[test]
+    fn final_classification_rejects_exhaustive_binding_for_non_holds_outcomes() {
+        let entry = || {
+            json!({
+                "source": {"mode": "check"},
+                "work_equivalence": WorkEquivalenceEvidence::exhaustive_holds(),
+                "tlc": {
+                    "status": "pass",
+                    "error_type": null,
+                    "states": 7,
+                    "raw_initial_states_generated": 1,
+                    "raw_successors_generated": 9,
+                    "states_generated": 10
+                },
+                "ty": {
+                    "status": "pass",
+                    "error_type": null,
+                    "states": 7,
+                    "raw_initial_states_generated": 1,
+                    "raw_successors_generated": 9,
+                    "states_generated": 10
+                },
+                "verified_match": true,
+                "eligibility": "eligible"
+            })
+        };
+        for (label, candidate, expected) in [
+            (
+                "Violation",
+                {
+                    let mut value = entry();
+                    value["tlc"]["status"] = json!("fail");
+                    value["tlc"]["error_type"] = json!("invariant");
+                    value["ty"]["error_type"] = json!("invariant_violation");
+                    value
+                },
+                WorkEquivalenceVerdict::ExpectedViolation,
+            ),
+            (
+                "Deadlock",
+                {
+                    let mut value = entry();
+                    value["tlc"]["status"] = json!("error");
+                    value["tlc"]["error_type"] = json!("deadlock");
+                    value["ty"]["status"] = json!("error");
+                    value["ty"]["error_type"] = json!("deadlock");
+                    value
+                },
+                WorkEquivalenceVerdict::Deadlock,
+            ),
+            (
+                "RawMismatch",
+                {
+                    let mut value = entry();
+                    value["ty"]["raw_successors_generated"] = json!(8);
+                    value
+                },
+                WorkEquivalenceVerdict::Other,
+            ),
+        ] {
+            validate_strict_row_work_equivalence(label, &candidate, true).expect(
+                "input validation is shape-only so incomplete evidence remains refreshable",
+            );
+            let parsed: BaselineSpec = serde_json::from_value(candidate.clone()).unwrap();
+            assert_eq!(baseline_work_equivalence_verdict(&parsed, None), expected);
+
+            let mut specs = Map::new();
+            specs.insert(label.to_string(), candidate);
+            let summary = classify_baseline_value(json!({"specs": Value::Object(specs)})).unwrap();
+            let row = row_for(&summary, label);
+            assert_eq!(row.overall, SupremacyMatrixOverallVerdict::MissingOrStale);
+            assert!(!summary.strict_pass);
+        }
     }
 
     #[test]
@@ -6940,6 +23274,204 @@ TypeOK == counter \in {{0, 1, 2}}
     }
 
     #[test]
+    fn runtime_directory_provenance_hashes_paths_types_and_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("nested")).unwrap();
+        fs::write(dir.path().join("A.tla"), b"---- MODULE A ----\n====\n").unwrap();
+        fs::write(
+            dir.path().join("nested/B.tla"),
+            b"---- MODULE B ----\n====\n",
+        )
+        .unwrap();
+
+        let first = RuntimeDirectoryProvenance::new(dir.path()).unwrap();
+        let repeated = RuntimeDirectoryProvenance::new(dir.path()).unwrap();
+        assert_eq!(first.tree_sha256, repeated.tree_sha256);
+        assert_eq!(first.file_count, 2);
+        assert_eq!(
+            first.total_bytes,
+            b"---- MODULE A ----\n====\n".len() as u64 + b"---- MODULE B ----\n====\n".len() as u64
+        );
+
+        fs::write(dir.path().join("nested/B.tla"), b"changed\n").unwrap();
+        let changed = RuntimeDirectoryProvenance::new(dir.path()).unwrap();
+        assert_ne!(first.tree_sha256, changed.tree_sha256);
+        assert!(valid_sha256(&changed.tree_sha256));
+    }
+
+    #[test]
+    fn runtime_machine_provenance_requires_exact_launcher_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("machine.json");
+        let provenance_id = "opaque-id";
+        let parent = "/sys/fs/cgroup/strict.service";
+        let controls = REQUIRED_MACHINE_QUALIFICATION_CONTROLS
+            .iter()
+            .copied()
+            .map(|name| (name, true))
+            .collect::<BTreeMap<_, _>>();
+        let document = json!({
+            "schema": MACHINE_PROVENANCE_SCHEMA,
+            "provenance_id": provenance_id,
+            "status": "running",
+            "qualification": {
+                "state": "qualified",
+                "succeeded": true,
+                "selected_cpu": 7,
+                "controls": controls,
+            },
+            "machine": {
+                "os": "Linux",
+                "architecture": "x86_64",
+            },
+            "cgroup": {
+                "delegated_parent": parent,
+                "cpu": {
+                    "selected_logical_cpu": 7,
+                },
+            },
+        });
+        fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+
+        let qualified =
+            runtime_machine_provenance(path.clone(), provenance_id.to_string(), Some(parent))
+                .unwrap();
+        assert!(qualified.qualified);
+        assert_eq!(qualified.provenance_id, provenance_id);
+
+        for control in [
+            "systemd_runtime_max_bound",
+            "guest_identity_stable",
+            "output_storage_contract_stable",
+            "semantic_environment_stable",
+            "child_environment_allowlisted",
+        ] {
+            let mut missing = document.clone();
+            missing["qualification"]["controls"]
+                .as_object_mut()
+                .unwrap()
+                .remove(control);
+            fs::write(&path, serde_json::to_vec(&missing).unwrap()).unwrap();
+            assert!(
+                !runtime_machine_provenance(path.clone(), provenance_id.to_string(), Some(parent))
+                    .unwrap()
+                    .qualified,
+                "missing required control {control} was admitted"
+            );
+
+            let mut failed = document.clone();
+            failed["qualification"]["controls"][control] = Value::Bool(false);
+            fs::write(&path, serde_json::to_vec(&failed).unwrap()).unwrap();
+            assert!(
+                !runtime_machine_provenance(path.clone(), provenance_id.to_string(), Some(parent))
+                    .unwrap()
+                    .qualified,
+                "false required control {control} was admitted"
+            );
+        }
+        fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let wrong_id =
+            runtime_machine_provenance(path.clone(), "wrong".to_string(), Some(parent)).unwrap();
+        assert!(!wrong_id.qualified);
+        let wrong_parent = runtime_machine_provenance(
+            path,
+            provenance_id.to_string(),
+            Some("/sys/fs/cgroup/other.service"),
+        )
+        .unwrap();
+        assert!(!wrong_parent.qualified);
+    }
+
+    #[test]
+    fn machine_admission_requires_exact_controls_and_completed_finalization() {
+        let controls = REQUIRED_MACHINE_QUALIFICATION_CONTROLS
+            .iter()
+            .map(|name| ((*name).to_string(), Value::Bool(true)))
+            .collect::<Map<_, _>>();
+        validate_required_machine_qualification_controls(&controls).unwrap();
+        for control in [
+            "systemd_runtime_max_bound",
+            "guest_identity_stable",
+            "output_storage_contract_stable",
+            "semantic_environment_stable",
+            "child_environment_allowlisted",
+        ] {
+            let mut missing = controls.clone();
+            missing.remove(control);
+            assert!(validate_required_machine_qualification_controls(&missing)
+                .unwrap_err()
+                .to_string()
+                .contains("not exact"));
+            let mut failed = controls.clone();
+            failed.insert(control.to_string(), Value::Bool(false));
+            assert!(validate_required_machine_qualification_controls(&failed)
+                .unwrap_err()
+                .to_string()
+                .contains("not all true"));
+        }
+
+        let complete = json!({
+            "repository_finalization": {
+                "matches_qualified_snapshot": true,
+                "pre_receipt_checked_at_utc": "2026-07-23T12:00:00Z",
+                "post_receipt_checked_at_utc": "2026-07-23T12:00:01Z",
+                "snapshot": {"head": "12".repeat(20)}
+            }
+        });
+        completed_machine_finalization(
+            &complete,
+            "/repository_finalization",
+            "matches_qualified_snapshot",
+            "repository",
+        )
+        .unwrap();
+        for pointer in [
+            "/repository_finalization/matches_qualified_snapshot",
+            "/repository_finalization/pre_receipt_checked_at_utc",
+            "/repository_finalization/post_receipt_checked_at_utc",
+            "/repository_finalization/snapshot",
+        ] {
+            let mut incomplete = complete.clone();
+            *incomplete.pointer_mut(pointer).unwrap() = Value::Null;
+            assert!(
+                completed_machine_finalization(
+                    &incomplete,
+                    "/repository_finalization",
+                    "matches_qualified_snapshot",
+                    "repository",
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("incomplete"),
+                "finalization field {pointer} was admitted"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_refresh_metadata_binds_report_and_machine_identity() {
+        let provenance = runtime_baseline_provenance();
+        let refresh = runtime_ty_refresh(&provenance, &[]);
+
+        assert_eq!(
+            refresh.get("evidence_set_id"),
+            Some(&json!("evidence-set-1"))
+        );
+        assert_eq!(
+            refresh.get("runtime_evidence_path"),
+            Some(&json!("/tmp/runtime_evidence.json"))
+        );
+        assert_eq!(
+            refresh.get("machine_provenance_path"),
+            Some(&json!("/tmp/machine.json"))
+        );
+        assert_eq!(
+            refresh.get("machine_provenance_id"),
+            Some(&json!("machine-1"))
+        );
+    }
+
+    #[test]
     fn refresh_runtime_rejects_debug_ty_binary_unless_allowed() {
         let debug_bin = Path::new("target/user/debug/ty");
         let release_bin = Path::new("target/user/release/ty");
@@ -6955,7 +23487,7 @@ TypeOK == counter \in {{0, 1, 2}}
     }
 
     #[test]
-    fn refresh_runtime_preflight_command_forces_json_trust_cg_backend() {
+    fn refresh_runtime_preflight_uses_auto_count_equivalence_argv() {
         let argv = ty_no_config_preflight_argv(
             Path::new("target/user/release/ty"),
             Path::new("/tmp/SupremacyMatrixRuntimePreflight.tla"),
@@ -6974,13 +23506,13 @@ TypeOK == counter \in {{0, 1, 2}}
                 "MyNext",
                 "--inv",
                 "TypeOK",
+                "--bfs-only",
+                "--no-reduction",
                 "--workers",
                 "1",
                 "--force",
                 "--output",
-                "json",
-                "--backend",
-                "trust-cg"
+                "json"
             ]
             .iter()
             .map(|value| (*value).to_string())
@@ -7020,14 +23552,40 @@ TypeOK == counter \in {{0, 1, 2}}
         permissions.set_mode(0o755);
         fs::set_permissions(&bin, permissions).unwrap();
 
-        let err = preflight_runtime_ty_trust_cg_for_refresh(
-            &bin,
-            dir.path(),
-            dir.path(),
-            5,
-            &BTreeMap::new(),
-        )
-        .expect_err("backend_unavailable preflight must fail closed");
+        let config = RuntimeCollectionConfig {
+            output_dir: dir.path().to_path_buf(),
+            timeout_seconds: 5,
+            runs: 1,
+            mode: SupremacyMode::Warn,
+            limit: None,
+            ty_bin: bin.clone(),
+            ty_base_env: BTreeMap::new(),
+            allow_debug_runtime: true,
+            production_runtime: false,
+            java: ResolvedJavaRuntime {
+                executable: RuntimeFileProvenance {
+                    path: bin.clone(),
+                    sha256: "00".repeat(32),
+                    size_bytes: 1,
+                },
+                java_home: RuntimeJavaHomeProvenance {
+                    path: dir.path().to_path_buf(),
+                    tree_sha256: "11".repeat(32),
+                    file_count: 0,
+                    total_bytes: 0,
+                    symlink_count: 0,
+                    external_target_count: 0,
+                },
+                provenance: empty_command_version_provenance(Vec::new()),
+            },
+            tlc_jar: bin.clone(),
+            community_modules: None,
+            tla_library: None,
+            observation_storage_contract: None,
+            observation_storage_binding: None,
+        };
+        let err = preflight_runtime_ty_trust_cg_for_refresh(&bin, dir.path(), dir.path(), &config)
+            .expect_err("backend_unavailable preflight must fail closed");
         let message = err.to_string();
 
         assert!(message.contains("backend_unavailable"), "{message}");
@@ -7132,6 +23690,75 @@ TypeOK == counter \in {{0, 1, 2}}
         assert!(provenance.error.is_none());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn strict_java_resolution_rejects_a_path_wrapper_and_uses_exact_home_java() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let java_home = dir.path().join("jdk");
+        let java_bin_dir = java_home.join("bin");
+        let wrapper_dir = dir.path().join("wrapper");
+        fs::create_dir_all(&java_bin_dir).unwrap();
+        fs::create_dir_all(&wrapper_dir).unwrap();
+        let java = java_bin_dir.join("java");
+        let wrapper = wrapper_dir.join("java");
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"-XshowSettings:properties\" ]; then\n  printf '%s\\n' '    java.home = {}' >&2\nelse\n  printf '%s\\n' 'openjdk version \"21-test\"' >&2\nfi\n",
+            java_home.display()
+        );
+        fs::write(&java, &script).unwrap();
+        fs::write(&wrapper, &script).unwrap();
+        for path in [&java, &wrapper] {
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).unwrap();
+        }
+
+        let resolved =
+            resolve_java_runtime_from_path(java_bin_dir.as_os_str(), None, dir.path()).unwrap();
+        assert_eq!(resolved.executable.path, java.canonicalize().unwrap());
+        assert_eq!(
+            resolved.provenance.argv[0],
+            java.canonicalize().unwrap().display().to_string()
+        );
+        assert_eq!(
+            tlc_matrix_runtime_base_argv(&resolved.executable.path, "tlc.jar", None)[0],
+            java.canonicalize().unwrap().display().to_string()
+        );
+
+        let error = resolve_java_runtime_from_path(wrapper_dir.as_os_str(), None, dir.path())
+            .expect_err("PATH wrapper must not be accepted as measured Java");
+        assert!(
+            error
+                .to_string()
+                .contains("behavior-changing Java wrappers"),
+            "{error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn java_home_provenance_binds_resolved_external_symlink_content() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let java_home = dir.path().join("jdk");
+        fs::create_dir_all(java_home.join("lib")).unwrap();
+        fs::write(java_home.join("release"), "JAVA_VERSION=\"21-test\"\n").unwrap();
+        let external = dir.path().join("external-security.conf");
+        fs::write(&external, "policy=first\n").unwrap();
+        symlink(&external, java_home.join("lib/security.conf")).unwrap();
+
+        let first = RuntimeJavaHomeProvenance::new(&java_home.canonicalize().unwrap()).unwrap();
+        assert_eq!(first.symlink_count, 1);
+        assert_eq!(first.external_target_count, 1);
+
+        fs::write(&external, "policy=second\n").unwrap();
+        let second = RuntimeJavaHomeProvenance::new(&java_home.canonicalize().unwrap()).unwrap();
+        assert_ne!(first.tree_sha256, second.tree_sha256);
+    }
+
     #[test]
     fn examples_checkout_provenance_records_commit_and_dirty_state() {
         let dir = tempfile::tempdir().unwrap();
@@ -7220,11 +23847,7 @@ TypeOK == counter \in {{0, 1, 2}}
                 "MyNext",
                 "--inv",
                 "TypeOK",
-                "--workers",
-                "1",
-                "--force",
-                "--backend",
-                "trust-cg"
+                "--force"
             ]
             .iter()
             .map(|value| (*value).to_string())
@@ -7307,7 +23930,7 @@ AltOK == counter = 0
     }
 
     #[test]
-    fn refresh_runtime_ty_env_uses_non_strict_trust_cg_overrides() {
+    fn refresh_runtime_ty_env_is_observation_local_without_routing_overrides() {
         let base_env =
             matrix_runtime_refresh_base_env_with_compile_jobs(DEFAULT_RUNTIME_REFRESH_COMPILE_JOBS);
         let spec_dir = Path::new("reports/perf/runtime/SpecA");
@@ -7318,19 +23941,24 @@ AltOK == counter = 0
             .to_string();
 
         for (key, value) in [
-            ("TY_trust_cg", "1"),
-            ("TY_TRUST_CG_BFS", "1"),
-            ("TY_TRUST_CG_EXISTS", "1"),
-            ("TY_BYTECODE_VM", "1"),
-            ("TY_BYTECODE_VM_STATS", "1"),
             (
                 RUNTIME_REFRESH_COMPILE_JOBS_ENV,
                 DEFAULT_RUNTIME_REFRESH_COMPILE_JOBS,
             ),
-            ("TY_TRUST_CG_NATIVE_FUSED_ENABLE_LOCAL_DEDUP", "1"),
             ("TY_DISABLE_ARTIFACT_CACHE", "1"),
+            ("TY_ENGINE_TIER", "1"),
         ] {
             assert_eq!(env.get(key).map(String::as_str), Some(value), "{key}");
+        }
+        for key in [
+            "TY_trust_cg",
+            "TY_TRUST_CG_BFS",
+            "TY_TRUST_CG_EXISTS",
+            "TY_BYTECODE_VM",
+            "TY_BYTECODE_VM_STATS",
+            "TY_TRUST_CG_NATIVE_FUSED_ENABLE_LOCAL_DEDUP",
+        ] {
+            assert!(!env.contains_key(key), "{key}");
         }
         assert_eq!(
             env.get("TY_CACHE_DIR").map(String::as_str),
@@ -7376,7 +24004,7 @@ AltOK == counter = 0
     }
 
     #[test]
-    fn runtime_collection_config_uses_non_strict_matrix_refresh_env() {
+    fn runtime_collection_config_uses_auto_matrix_refresh_env() {
         let dir = tempfile::tempdir().unwrap();
         let args = SupremacyMatrixArgs {
             baseline: PathBuf::from("tests/tlc_comparison/spec_baseline.json"),
@@ -7389,6 +24017,7 @@ AltOK == counter = 0
             runtime_limit: Some(1),
             runtime_specs: Vec::new(),
             runtime_timeout: 30,
+            runtime_runs: 5,
             production_runtime: true,
             runtime_ty_bin: Some(PathBuf::from("target/user/release/ty")),
             allow_debug_runtime: false,
@@ -7397,11 +24026,33 @@ AltOK == counter = 0
             runtime_tla_library: None,
         };
 
-        let config = RuntimeCollectionConfig::from_args(&args, dir.path()).unwrap();
+        let pinned_java = ResolvedJavaRuntime {
+            executable: RuntimeFileProvenance {
+                path: dir.path().join("jdk/bin/java"),
+                sha256: "00".repeat(32),
+                size_bytes: 1,
+            },
+            java_home: RuntimeJavaHomeProvenance {
+                path: dir.path().join("jdk"),
+                tree_sha256: "11".repeat(32),
+                file_count: 1,
+                total_bytes: 1,
+                symlink_count: 0,
+                external_target_count: 0,
+            },
+            provenance: empty_command_version_provenance(Vec::new()),
+        };
+        let config =
+            RuntimeCollectionConfig::from_args_with_java(&args, dir.path(), Some(pinned_java))
+                .unwrap();
 
+        assert!(!config.ty_base_env.contains_key("TY_trust_cg"));
         assert_eq!(
-            config.ty_base_env.get("TY_trust_cg").map(String::as_str),
-            Some("1")
+            config
+                .ty_base_env
+                .get(RUNTIME_REFRESH_COMPILE_JOBS_ENV)
+                .map(String::as_str),
+            Some(DEFAULT_RUNTIME_REFRESH_COMPILE_JOBS)
         );
         assert!(!config
             .ty_base_env
@@ -7409,6 +24060,23 @@ AltOK == counter = 0
         assert!(!config
             .ty_base_env
             .contains_key("TY_TRUST_CG_NATIVE_FUSED_STRICT"));
+
+        let mut zero_runs = args.clone();
+        zero_runs.runtime_runs = 0;
+        assert!(RuntimeCollectionConfig::from_args(&zero_runs, dir.path())
+            .unwrap_err()
+            .to_string()
+            .contains("--runtime-runs must be >= 1"));
+
+        let mut undersized_enforce = args.clone();
+        undersized_enforce.mode = SupremacyMode::Enforce;
+        undersized_enforce.runtime_runs = STRICT_MIN_PAIRED_RUNS - 1;
+        assert!(
+            RuntimeCollectionConfig::from_args(&undersized_enforce, dir.path())
+                .unwrap_err()
+                .to_string()
+                .contains("--mode enforce")
+        );
     }
 
     #[test]
@@ -7468,7 +24136,7 @@ AltOK == counter = 0
     }
 
     #[test]
-    fn refresh_runtime_preflight_uses_non_strict_env() {
+    fn refresh_runtime_preflight_uses_auto_env() {
         let base_env =
             matrix_runtime_refresh_base_env_with_compile_jobs(DEFAULT_RUNTIME_REFRESH_COMPILE_JOBS);
         let dir = tempfile::tempdir().unwrap();
@@ -7502,10 +24170,9 @@ AltOK == counter = 0
         assert!(!command
             .env_overrides
             .contains_key("TY_TRUST_CG_NATIVE_FUSED_STRICT"));
-        assert!(command
-            .argv
-            .windows(2)
-            .any(|window| window == ["--backend", "trust-cg"]));
+        assert!(command.argv.iter().all(|arg| arg != "--backend"));
+        assert!(command.argv.iter().any(|arg| arg == "--bfs-only"));
+        assert!(command.argv.iter().any(|arg| arg == "--no-reduction"));
     }
 
     #[test]
@@ -7668,6 +24335,7 @@ AltOK == counter = 0
             &[],
             &limited,
             &plan,
+            None,
         )
         .unwrap();
         let batch_plan_json: Value =
@@ -8276,7 +24944,7 @@ AltOK == counter = 0
         );
         assert_eq!(summary.counts.expected_violation_match, 5);
         assert_eq!(summary.counts.tlc_error, 1);
-        assert_eq!(summary.strict_blockers, 1);
+        assert_eq!(summary.strict_blockers, 6);
     }
 
     #[test]
@@ -8344,7 +25012,7 @@ AltOK == counter = 0
     }
 
     #[test]
-    fn expected_violation_matches_are_non_blocking_without_runtime_evidence() {
+    fn expected_violation_matches_block_without_performance_evidence() {
         let summary = classify_baseline_str(
             r#"{
               "specs": {
@@ -8387,14 +25055,18 @@ AltOK == counter = 0
         assert_eq!(summary.counts.missing_runtime, 0);
         assert_eq!(summary.counts.perf_loser, 0);
         assert_eq!(summary.counts.perf_tie, 0);
-        assert_eq!(summary.strict_blockers, 0);
+        assert_eq!(summary.strict_blockers, 3);
+        assert!(summary
+            .rows
+            .iter()
+            .all(|row| { row.overall == SupremacyMatrixOverallVerdict::MissingOrStale }));
         assert!(row_for(&summary, "missing_ty_runtime")
             .reason
-            .contains("excluded from runtime supremacy"));
+            .contains("work_equivalence"));
     }
 
     #[test]
-    fn bmc_only_matching_checker_errors_are_non_blocking() {
+    fn bmc_only_matching_checker_errors_are_correctness_only_without_perf_evidence() {
         let summary = classify_baseline_str(
             r#"{
               "specs": {
@@ -8425,7 +25097,7 @@ AltOK == counter = 0
         );
         assert_eq!(summary.counts.expected_violation_match, 1);
         assert_eq!(summary.counts.tlc_error, 1);
-        assert_eq!(summary.strict_blockers, 1);
+        assert_eq!(summary.strict_blockers, 2);
         assert!(row_for(&summary, "bmc_only_fixture")
             .reason
             .contains("BMC-only fixture"));
@@ -8608,9 +25280,13 @@ AltOK == counter = 0
 
     #[test]
     fn matrix_tlc_runtime_base_argv_uses_shared_single_thread_jvm_profile() {
-        let argv = super::tlc_matrix_runtime_base_argv("tytools.jar", Some(Path::new("lib")));
+        let argv = super::tlc_matrix_runtime_base_argv(
+            Path::new("/jdk/bin/java"),
+            "tytools.jar",
+            Some(Path::new("lib")),
+        );
 
-        assert_eq!(argv[0], "java");
+        assert_eq!(argv[0], "/jdk/bin/java");
         for arg in super::tlc_java_single_thread_args() {
             assert!(argv.contains(&(*arg).to_string()), "{arg}");
         }
@@ -9288,6 +25964,8 @@ CHECK_DEADLOCK FALSE
             ty,
             note: None,
             required_flags: Vec::new(),
+            collection_outcome: default_runtime_collection_outcome(),
+            resource_limit_event: None,
         };
         let provenance = runtime_baseline_provenance();
 
@@ -9318,7 +25996,11 @@ CHECK_DEADLOCK FALSE
         );
         assert_eq!(summary.counts.timeout_dominance, 1);
         assert_eq!(summary.counts.missing_runtime, 0);
-        assert_eq!(summary.enforce_blocker_count(), 0);
+        assert_eq!(summary.enforce_blocker_count(), 1);
+        assert_eq!(
+            row_for(&summary, "TimeoutRow").overall,
+            SupremacyMatrixOverallVerdict::MissingOrStale
+        );
     }
 
     #[test]
@@ -9367,6 +26049,8 @@ CHECK_DEADLOCK FALSE
             ty,
             note: None,
             required_flags: Vec::new(),
+            collection_outcome: default_runtime_collection_outcome(),
+            resource_limit_event: None,
         };
         let provenance = runtime_baseline_provenance();
 
@@ -9463,6 +26147,8 @@ CHECK_DEADLOCK FALSE
                 ty,
                 note: None,
                 required_flags: Vec::new(),
+                collection_outcome: default_runtime_collection_outcome(),
+                resource_limit_event: None,
             };
             assert!(!row.refreshed, "{error_type}");
             let provenance = runtime_baseline_provenance();
@@ -9539,6 +26225,8 @@ CHECK_DEADLOCK FALSE
             ty,
             note: None,
             required_flags: Vec::new(),
+            collection_outcome: default_runtime_collection_outcome(),
+            resource_limit_event: None,
         };
         let provenance = runtime_baseline_provenance();
 
@@ -9584,7 +26272,8 @@ CHECK_DEADLOCK FALSE
         });
         let original_spec = baseline["specs"]["CollectionError"].clone();
         let error = anyhow::anyhow!("run TLC failed");
-        let row = runtime_collection_error_row("CollectionError", Path::new("out"), &error);
+        let row =
+            runtime_collection_error_row("CollectionError", Path::new("out"), &error).unwrap();
 
         assert_eq!(row.spec, "CollectionError");
         assert_eq!(
@@ -9622,7 +26311,8 @@ CHECK_DEADLOCK FALSE
             "CollectionError",
             Path::new("out"),
             &anyhow::anyhow!("TLC failed"),
-        );
+        )
+        .unwrap();
         let err = validate_runtime_refresh_rows_promoted(std::slice::from_ref(&collection_error))
             .expect_err("collection errors must fail enforce-mode refresh");
         assert!(err.to_string().contains("CollectionError"));
@@ -9648,6 +26338,8 @@ CHECK_DEADLOCK FALSE
             ty,
             note: None,
             required_flags: Vec::new(),
+            collection_outcome: default_runtime_collection_outcome(),
+            resource_limit_event: None,
         };
 
         let err = validate_runtime_refresh_rows_promoted(&[passing, debug_row])
@@ -9711,6 +26403,2082 @@ CHECK_DEADLOCK FALSE
         let expected_digest = format!("{:x}", Sha256::digest(expected.as_bytes()));
 
         assert_eq!(digest, expected_digest);
+    }
+
+    fn campaign_test_payload(spec_count: usize, segment_size: usize) -> RuntimeCampaignPlanPayload {
+        let runtime_specs = (1..=spec_count)
+            .map(|index| format!("Spec{index:02}"))
+            .collect::<Vec<_>>();
+        let segments = runtime_specs
+            .chunks(segment_size)
+            .enumerate()
+            .map(|(index, specs)| RuntimeCampaignPlanSegment {
+                segment_id: format!("segment-{:04}", index + 1),
+                runtime_specs: specs.to_vec(),
+                output_dir: PathBuf::from(format!("/campaign/segments/segment-{:04}", index + 1)),
+                report_path: PathBuf::from(format!(
+                    "/campaign/segments/segment-{:04}/runtime_evidence.json",
+                    index + 1
+                )),
+                attempt_marker: PathBuf::from(format!(
+                    "/campaign/attempts/segment-{:04}.json",
+                    index + 1
+                )),
+            })
+            .collect();
+        let cache_attestation = strict_os_cache_policy();
+        let cache_digest = sha256_ty_canonical_json_v1_value(&cache_attestation).unwrap();
+        let file = |name: &str| RuntimeFileProvenance {
+            path: PathBuf::from(format!("/campaign/{name}")),
+            sha256: "ab".repeat(32),
+            size_bytes: 1,
+        };
+        let baseline = file("baseline.json");
+        let ty_binary = file("ty");
+        let java_executable = file("jdk/bin/java");
+        let java_home = RuntimeJavaHomeProvenance {
+            path: PathBuf::from("/campaign/jdk"),
+            tree_sha256: "bc".repeat(32),
+            file_count: 1,
+            total_bytes: 1,
+            symlink_count: 0,
+            external_target_count: 0,
+        };
+        let tlc_jar = file("tlc.jar");
+        let community_modules = file("CommunityModules.jar");
+        RuntimeCampaignPlanPayload {
+            artifacts: RuntimeCampaignArtifactLayout {
+                root: PathBuf::from("/campaign"),
+                campaign_plan: PathBuf::from("/campaign/campaign-plan.json"),
+                attempts_dir: PathBuf::from("/campaign/attempts"),
+                inventory_output_dir: PathBuf::from("/campaign/merge-inventory"),
+                inventory_report_path: PathBuf::from(
+                    "/campaign/merge-inventory/runtime_evidence.json",
+                ),
+                inventory_attempt_marker: PathBuf::from("/campaign/attempts/merge-inventory.json"),
+                superiority_output_dir: PathBuf::from("/campaign/merge-superiority"),
+                superiority_report_path: PathBuf::from(
+                    "/campaign/merge-superiority/runtime_evidence.json",
+                ),
+                superiority_attempt_marker: PathBuf::from(
+                    "/campaign/attempts/merge-superiority.json",
+                ),
+            },
+            baseline: baseline.clone(),
+            policy: None,
+            runtime: RuntimeCampaignRuntimeConfig {
+                timeout_seconds: 300,
+                runs: 6,
+                production_runtime: true,
+                allow_debug_runtime: false,
+                ty_binary: ty_binary.clone(),
+                java_executable: java_executable.clone(),
+                java_home: java_home.clone(),
+                tlc_jar: tlc_jar.clone(),
+                community_modules: Some(community_modules.clone()),
+                tla_library: None,
+            },
+            observation_storage_contract: ObservationStorageContract::frozen_v2(),
+            contract_attestations: json!({
+                "runtime_contract": {
+                    "mode": "enforce",
+                    "timeout_seconds": 300,
+                    "runs": 6,
+                    "production_runtime": true
+                },
+                "independent_attestations": {
+                    "os_cache_policy": {
+                        "attestation": cache_attestation,
+                        "ty_canonical_json_v1_sha256": cache_digest
+                    },
+                    "source_revision": {},
+                    "ty_binary": ty_binary,
+                    "binary_source_build_linkage": {
+                        "asserted": false
+                    }
+                },
+                "inputs": {
+                    "baseline": baseline,
+                    "tlc": {
+                        "jar": tlc_jar
+                    },
+                    "java": {
+                        "executable": java_executable,
+                        "java_home": java_home
+                    },
+                    "community_modules": community_modules,
+                    "tla_library": null
+                }
+            }),
+            segment_size,
+            runtime_specs,
+            blocked_runtime_specs: Vec::new(),
+            segments,
+        }
+    }
+
+    #[test]
+    fn campaign_frozen_one_row_partition_is_deterministic() {
+        let payload = campaign_test_payload(12, 1);
+        validate_campaign_plan_payload(&payload).unwrap();
+        assert_eq!(payload.segments.len(), 12);
+        assert!(payload
+            .segments
+            .iter()
+            .all(|segment| segment.runtime_specs.len() == 1));
+        assert_eq!(payload.segments[0].segment_id, "segment-0001");
+        assert_eq!(payload.segments[11].segment_id, "segment-0012");
+        assert_eq!(
+            payload
+                .segments
+                .iter()
+                .flat_map(|segment| segment.runtime_specs.iter().cloned())
+                .collect::<Vec<_>>(),
+            payload.runtime_specs
+        );
+    }
+
+    #[test]
+    fn campaign_spec_names_are_single_confined_filesystem_components() {
+        for unsafe_name in [
+            "../outside",
+            "/outside",
+            ".",
+            "..",
+            "nested/name",
+            "nested\\name",
+            "name/",
+            " leading-space",
+            "trailing-space ",
+            "line\nbreak",
+        ] {
+            let mut payload = campaign_test_payload(1, 1);
+            payload.runtime_specs[0] = unsafe_name.to_string();
+            payload.segments[0].runtime_specs[0] = unsafe_name.to_string();
+            let error = validate_campaign_plan_payload(&payload)
+                .expect_err("unsafe runtime spec component must fail closed");
+            assert!(
+                format!("{error:#}").contains("safe normal UTF-8 filesystem component"),
+                "{unsafe_name:?}: {error:#}"
+            );
+            assert!(
+                runtime_spec_artifact_dir(Path::new("/campaign/segment"), unsafe_name).is_err()
+            );
+        }
+
+        let confined =
+            runtime_spec_artifact_dir(Path::new("/campaign/segment"), "Safe_Name-01").unwrap();
+        assert_eq!(confined, Path::new("/campaign/segment/Safe_Name-01"));
+
+        let mut blocked = campaign_test_payload(1, 1);
+        blocked.blocked_runtime_specs = vec!["../blocked-outside".to_string()];
+        let error = validate_campaign_plan_payload(&blocked).unwrap_err();
+        assert!(format!("{error:#}").contains("safe normal UTF-8 filesystem component"));
+    }
+
+    #[test]
+    fn campaign_project_id_range_fails_closed_on_u32_overflow() {
+        validate_campaign_project_id_range(50_000, 12).unwrap();
+        assert!(validate_campaign_project_id_range(u32::MAX - 1, 2)
+            .unwrap_err()
+            .to_string()
+            .contains("overflows u32"));
+        assert!(validate_campaign_project_id_range(50_000, 0)
+            .unwrap_err()
+            .to_string()
+            .contains("at least one segment"));
+    }
+
+    #[test]
+    fn campaign_plan_rejects_overlap_and_digest_changes_with_membership() {
+        let mut payload = campaign_test_payload(7, 1);
+        let original_digest =
+            sha256_ty_canonical_json_v1_value(&serde_json::to_value(&payload).unwrap()).unwrap();
+        payload.segments[1].runtime_specs[0] = payload.segments[0].runtime_specs[0].clone();
+        assert!(validate_campaign_plan_payload(&payload)
+            .unwrap_err()
+            .to_string()
+            .contains("exact ordered partition"));
+        let changed_digest =
+            sha256_ty_canonical_json_v1_value(&serde_json::to_value(&payload).unwrap()).unwrap();
+        assert_ne!(original_digest, changed_digest);
+    }
+
+    #[test]
+    fn campaign_plan_rejects_output_path_substitution() {
+        let mut payload = campaign_test_payload(2, 1);
+        payload.segments[0].report_path = PathBuf::from("/campaign/retry/runtime_evidence.json");
+        assert!(validate_campaign_plan_payload(&payload)
+            .unwrap_err()
+            .to_string()
+            .contains("one-attempt artifact path"));
+    }
+
+    #[test]
+    fn campaign_plan_rejects_unknown_nested_provenance_fields() {
+        let payload = campaign_test_payload(2, 1);
+        let mut value = serde_json::to_value(payload).unwrap();
+        value["runtime"]["java_home"]["unrecognized"] = json!(true);
+        assert!(serde_json::from_value::<RuntimeCampaignPlanPayload>(value).is_err());
+    }
+
+    #[test]
+    fn campaign_plan_rejects_blocked_rows_before_collection() {
+        let mut payload = campaign_test_payload(2, 1);
+        payload
+            .blocked_runtime_specs
+            .push("UnbatchableSpec".to_string());
+        assert!(validate_campaign_plan_payload(&payload)
+            .unwrap_err()
+            .to_string()
+            .contains("may not contain blocked"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn campaign_private_evidence_files_require_exact_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("attempt.json");
+        fs::write(&marker, b"attempt").unwrap();
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
+        validate_private_evidence_file_mode(&marker, "campaign attempt marker").unwrap();
+
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(
+            validate_private_evidence_file_mode(&marker, "campaign attempt marker")
+                .unwrap_err()
+                .to_string()
+                .contains("mode 0600")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn campaign_plan_is_created_as_a_single_link_mode_0600_file() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let plan = directory.path().join("campaign-plan.json");
+        let file = create_private_campaign_plan_file(&plan).unwrap();
+        let metadata = file.metadata().unwrap();
+
+        assert!(metadata.file_type().is_file());
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+
+        fs::set_permissions(&plan, fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(validate_private_campaign_plan_file(&file, &plan)
+            .unwrap_err()
+            .to_string()
+            .contains("mode 0600"));
+
+        fs::set_permissions(&plan, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::hard_link(&plan, directory.path().join("campaign-plan-alias.json")).unwrap();
+        assert!(validate_private_campaign_plan_file(&file, &plan)
+            .unwrap_err()
+            .to_string()
+            .contains("one link"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn campaign_directories_require_exact_mode_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("campaign");
+        create_private_campaign_directory(&root, "campaign artifact root").unwrap();
+        validate_private_campaign_directory(&root, "campaign artifact root").unwrap();
+
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(
+            validate_private_campaign_directory(&root, "campaign artifact root")
+                .unwrap_err()
+                .to_string()
+                .contains("mode 0700")
+        );
+    }
+
+    #[test]
+    fn campaign_segment_can_never_set_corpus_claims() {
+        let binding = RuntimeCampaignReportBinding {
+            role: "segment".to_string(),
+            campaign_id: "ab".repeat(32),
+            campaign_plan: RuntimeFileProvenance {
+                path: PathBuf::from("/campaign/plan.json"),
+                sha256: "cd".repeat(32),
+                size_bytes: 1,
+            },
+            contract_attestations_sha256: "ef".repeat(32),
+            segment_id: Some("segment-0001".to_string()),
+            merge_purpose: None,
+            planned_runtime_specs: vec!["Spec01".to_string()],
+            segments: Vec::new(),
+            machine_compatibility_sha256: None,
+            corpus_claim_complete: true,
+            corpus_claim_pass: true,
+        };
+        assert!(binding
+            .validate_claim_role()
+            .unwrap_err()
+            .to_string()
+            .contains("may not claim"));
+    }
+
+    fn release_test_executable(path: &str, digest_byte: &str, mode: &str) -> Value {
+        json!({
+            "path": path,
+            "sha256": digest_byte.repeat(64),
+            "size_bytes": 100,
+            "device": 1,
+            "inode": 2,
+            "uid": 0,
+            "gid": 0,
+            "mode": mode,
+            "parent_chain": [{
+                "path": "/",
+                "device": 1,
+                "inode": 1,
+                "uid": 0,
+                "gid": 0,
+                "mode": "0755"
+            }]
+        })
+    }
+
+    fn release_test_inventory(digest_byte: &str) -> Value {
+        json!({
+            "schema": EXACT_STORAGE_INVENTORY_SCHEMA,
+            "entry_count": 13,
+            "leaf": "ty-canonical-json-v1(strict-utf8 relative path without normalization,type,identity,metadata,regular-content-sha256-except-release-slot)",
+            "aggregation": "sha256-domain-count-sorted-leaf-sha256",
+            "sha256": digest_byte.repeat(64)
+        })
+    }
+
+    fn release_bridge_test_fixture() -> (Value, Value, Value, Value, Value, Value) {
+        let output_dir = "/campaign/segment-0001";
+        let machine_path = "/run/user/1000/ty-machine.json";
+        let campaign_plan_path = "/campaign/campaign-plan.json";
+        let receipt_path = format!("{output_dir}/strict-evidence-receipt.json");
+        let campaign_plan_sha256 = "a".repeat(64);
+        let campaign_id = "6".repeat(64);
+        let contract = ObservationStorageContract::frozen_v2();
+        let contract_value = serde_json::to_value(&contract).unwrap();
+        let contract_sha256 = sha256_ty_canonical_json_v1_value(&contract_value).unwrap();
+        let authorized_entries = (0..13)
+            .map(|index| {
+                json!({
+                    "relative_path": if index == 0 {
+                        ".".to_string()
+                    } else {
+                        format!("entry-{index:02}")
+                    },
+                    "entry_type": if index < 5 {
+                        "directory"
+                    } else {
+                        "regular_file"
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let authorized_inventory = json!({
+            "schema": AUTHORIZED_STORAGE_INVENTORY_SCHEMA,
+            "path_encoding": AUTHORIZED_STORAGE_PATH_ENCODING,
+            "entries": authorized_entries,
+            "entry_count": 13,
+            "sha256": "b".repeat(64)
+        });
+        let semantic = json!({
+            "artifact_admission": {
+                "authorized_storage_inventory": authorized_inventory
+            }
+        });
+        let semantic_sha256 = sha256_ty_canonical_json_v1_value(&semantic).unwrap();
+        let receipt_file = json!({
+            "path": receipt_path,
+            "sha256": "c".repeat(64),
+            "size_bytes": 200,
+            "device": 10,
+            "inode": 11
+        });
+        let final_receipt = json!({
+            "schema": FINAL_RECEIPT_SCHEMA,
+            "path": receipt_file["path"],
+            "sha256": receipt_file["sha256"],
+            "size_bytes": receipt_file["size_bytes"],
+            "device": receipt_file["device"],
+            "inode": receipt_file["inode"],
+            "status": "created"
+        });
+        let mut machine = json!({
+            "provenance_id": "provenance-1",
+            "command": {
+                "evidence_project_id": 50_000,
+                "payload_project_id": 50_001
+            },
+            "final_receipt": final_receipt,
+            "observation_storage_release": {
+                "schema": OBSERVATION_STORAGE_RELEASE_SCHEMA,
+                "status": "pending",
+                "released": false
+            }
+        });
+        let pending_machine_sha256 = reconstructed_pending_machine_sha256(&machine).unwrap();
+        let pending_machine_file = reconstructed_pending_machine_file(&machine).unwrap();
+        let pending_machine_file_sha256 = sha256_bytes(&pending_machine_file);
+        let attestor =
+            release_test_executable("/usr/local/libexec/ty-strict-storage-attestor", "d", "0755");
+        let sudo = release_test_executable("/usr/bin/sudo", "e", "4755");
+        let sudo_authorization = json!({
+            "schema": SUDO_ATTESTOR_AUTHORIZATION_SCHEMA,
+            "status": "verified",
+            "exclusive": true,
+            "caller_uid": 1000,
+            "caller_user": "tybench",
+            "sudo_executable":
+                release_executable_authorization_identity(&sudo, "test sudo").unwrap(),
+            "attestor_executable":
+                release_executable_authorization_identity(&attestor, "test attestor").unwrap(),
+            "policy_query": ["/usr/bin/sudo", "-n", "-U", "tybench", "-l"],
+            "authorized_command": format!(
+                "(root) NOPASSWD: sha256:{} /usr/local/libexec/ty-strict-storage-attestor attest-observation-storage *",
+                "d".repeat(64)
+            ),
+            "effective_command_count": 1,
+            "policy_stdout_sha256": "7".repeat(64),
+            "policy_stdout_size_bytes": 256
+        });
+        let capability_file = json!({
+            "path": format!("{output_dir}/{OBSERVATION_STORAGE_CAPABILITY_NAME}"),
+            "sha256": "f".repeat(64),
+            "size_bytes": 300,
+            "device": 10,
+            "inode": 12,
+            "uid": 0,
+            "gid": 0,
+            "mode": "0444",
+            "filesystem_flags": 16,
+            "immutable": true
+        });
+        let mut root_release_file = json!({
+            "path": format!("{output_dir}/{OBSERVATION_STORAGE_RELEASE_NAME}"),
+            "sha256": "1".repeat(64),
+            "size_bytes": OBSERVATION_STORAGE_RELEASE_SLOT_BYTES,
+            "device": 10,
+            "inode": 13,
+            "uid": 0,
+            "gid": 0,
+            "mode": "0444",
+            "nlink": 1,
+            "allocated_bytes": OBSERVATION_STORAGE_RELEASE_SLOT_BYTES,
+            "filesystem_flags": 16,
+            "immutable": true
+        });
+        let live_inventory = release_test_inventory("2");
+        let cgroup_binding = json!({
+            "schema": OBSERVATION_STORAGE_CGROUP_BINDING_SCHEMA,
+            "unit_name": "ty-supremacy-segment.service",
+            "mount_root": "/",
+            "mount_point": "/sys/fs/cgroup",
+            "mount_device": 20,
+            "mount_inode": 21,
+            "delegated_parent": "/sys/fs/cgroup/ty-supremacy-segment.service",
+            "delegated_parent_device": 20,
+            "delegated_parent_inode": 22,
+            "supervisor": "/sys/fs/cgroup/ty-supremacy-segment.service/supervisor",
+            "supervisor_device": 20,
+            "supervisor_inode": 23
+        });
+        let released_at = "2026-07-23T00:00:00Z";
+        let cgroup_proof = json!({
+            "schema": OBSERVATION_STORAGE_CGROUP_REMOVAL_PROOF_SCHEMA,
+            "binding": cgroup_binding,
+            "delegated_parent_absent": true,
+            "supervisor_absent": true,
+            "kernel_semantics": "cgroup_v2_rmdir_requires_unpopulated_subtree",
+            "checked_at_utc": released_at
+        });
+        let quota = |project_id| {
+            json!({
+                "queried_project_id": project_id,
+                "hard_bytes": 1024,
+                "soft_bytes": 1024,
+                "current_bytes": 1024,
+                "hard_inodes": 1,
+                "soft_inodes": 1,
+                "current_inodes": 1,
+                "valid_fields": 15
+            })
+        };
+        let ledger_path = "/mnt/evidence/.ty-supremacy-project-quota-state/lease-ledger.json";
+        let root_release = json!({
+            "schema": OBSERVATION_STORAGE_RELEASE_SCHEMA,
+            "status": "released",
+            "released": true,
+            "proof_phase": "committed",
+            "released_at_utc": released_at,
+            "filesystem_uuid": "5".repeat(32),
+            "provenance_id": "provenance-1",
+            "campaign_id": campaign_id,
+            "campaign_plan_sha256": campaign_plan_sha256,
+            "segment_id": "segment-0001",
+            "output_directory": output_dir,
+            "evidence_project_id": 50_000,
+            "payload_project_id": 50_001,
+            "contract_sha256": contract_sha256,
+            "receipt_file": receipt_file,
+            "machine_pre_release_file": {
+                "path": machine_path,
+                "sha256": pending_machine_file_sha256,
+                "size_bytes": pending_machine_file.len(),
+                "device": 30,
+                "inode": 31
+            },
+            "machine_pre_release_ty_canonical_json_v1_sha256": pending_machine_sha256,
+            "capability_file": capability_file,
+            "attestor": attestor,
+            "sudo_authorization": sudo_authorization,
+            "semantic_validation_ty_canonical_json_v1_sha256": semantic_sha256,
+            "cgroup_removal_proof": cgroup_proof,
+            "immutable_seal": {
+                "schema": "ty.supremacy.observation-storage-immutable-seal.v1",
+                "scope_root": output_dir,
+                "scope_device": 10,
+                "scope_inode": 9,
+                "root_deferred": false,
+                "counts": {
+                    "directories": 5,
+                    "regular_files": 8,
+                    "entries": 13
+                },
+                "regular_hard_link_policy": "reject_nlink_not_one",
+                "special_entry_policy": "reject",
+                "seal": "FS_IMMUTABLE_FL"
+            },
+            "sealed_inventory_commitment": live_inventory,
+            "payload_post_prune": {
+                "current_bytes": 1024,
+                "current_inodes": 1,
+                "maximum_residual_bytes": contract.maximum_payload_post_prune_bytes,
+                "maximum_residual_inodes": contract.maximum_payload_post_prune_inodes
+            },
+            "ledger_transition": {
+                "persistent_ledger_path": ledger_path,
+                "release_history_index": 0,
+                "active_lease_ty_canonical_json_v1_sha256": "4".repeat(64),
+                "required_transition": "same_atomic_rename_clears_active_and_appends_history"
+            },
+            "retired_project_quotas": {
+                "evidence": quota(50_000),
+                "payload": quota(50_001)
+            },
+            "prepared_inventory_commitment": live_inventory,
+            "final_cgroup_removal_proof": cgroup_proof,
+            "durable_ledger_commit": {
+                "persistent_ledger_path": ledger_path,
+                "filesystem_uuid": "5".repeat(32),
+                "release_history_index": 0,
+                "required_phase": "committed"
+            }
+        });
+        let mut release_slot = python_sorted_pretty_json_file(&root_release).unwrap();
+        release_slot.resize(
+            usize::try_from(OBSERVATION_STORAGE_RELEASE_SLOT_BYTES).unwrap(),
+            b' ',
+        );
+        root_release_file["sha256"] = json!(sha256_bytes(&release_slot));
+        let history = reconstructed_committed_release_history_entry(
+            &root_release,
+            &root_release_file,
+            &live_inventory,
+        )
+        .unwrap();
+        let history_sha256 = sha256_ty_canonical_json_v1_value(&history).unwrap();
+        let mut machine_release = root_release.clone();
+        machine_release["release_file"] = root_release_file.clone();
+        machine_release["final_inventory_commitment"] = live_inventory.clone();
+        machine_release["durable_ledger_commit"]["proof_phase"] = json!("committed");
+        machine_release["durable_ledger_commit"]["finalized_entry_ty_canonical_json_v1_sha256"] =
+            json!(history_sha256);
+        machine_release["privileged_execution"] = json!({
+            "attestor_executable": machine_release["attestor"],
+            "sudo_executable": sudo,
+            "command": [
+                "/usr/bin/sudo",
+                "-n",
+                "--",
+                "/usr/local/libexec/ty-strict-storage-attestor",
+                "attest-observation-storage",
+                "--operation",
+                "release",
+                "--sudo-executable",
+                "/usr/bin/sudo",
+                "--output-directory",
+                output_dir,
+                "--evidence-project-id",
+                "50000",
+                "--payload-project-id",
+                "50001",
+                "--capability-output",
+                format!("{output_dir}/{OBSERVATION_STORAGE_CAPABILITY_NAME}"),
+                "--provenance-id",
+                "provenance-1",
+                "--campaign-id",
+                campaign_id,
+                "--campaign-plan",
+                campaign_plan_path,
+                "--campaign-plan-sha256",
+                campaign_plan_sha256,
+                "--segment-id",
+                "segment-0001",
+                "--receipt",
+                receipt_path,
+                "--machine-provenance",
+                machine_path
+            ]
+        });
+        machine["observation_storage_release"] = machine_release;
+        let report = json!({
+            "campaign": {
+                "role": "segment",
+                "campaign_id": campaign_id,
+                "campaign_plan": {
+                    "path": campaign_plan_path,
+                    "sha256": campaign_plan_sha256
+                },
+                "segment_id": "segment-0001"
+            },
+            "observation_storage_contract": contract_value
+        });
+        let receipt = json!({
+            "machine_provenance": {
+                "path": machine_path,
+                "provenance_id": "provenance-1"
+            },
+            "semantic_validation": semantic
+        });
+        (
+            report,
+            receipt,
+            machine,
+            root_release,
+            root_release_file,
+            live_inventory,
+        )
+    }
+
+    fn capability_security_test_fixture() -> (
+        Map<String, Value>,
+        Map<String, Value>,
+        ObservationStorageContract,
+        PathBuf,
+    ) {
+        let contract = ObservationStorageContract::frozen_v2();
+        let output_dir = PathBuf::from("/mnt/evidence/campaign/segment-0001");
+        let payload_dir = output_dir.join(OBSERVATION_PAYLOAD_DIRECTORY_NAME);
+        let contract_value = serde_json::to_value(&contract).unwrap();
+        let contract_sha256 = sha256_ty_canonical_json_v1_value(&contract_value).unwrap();
+        let cgroup_binding = json!({
+            "schema": OBSERVATION_STORAGE_CGROUP_BINDING_SCHEMA,
+            "unit_name": "ty-supremacy-test.service",
+            "mount_root": "/",
+            "mount_point": "/sys/fs/cgroup",
+            "mount_device": 20,
+            "mount_inode": 21,
+            "delegated_parent": "/sys/fs/cgroup/ty-supremacy-test.service",
+            "delegated_parent_device": 20,
+            "delegated_parent_inode": 22,
+            "supervisor": "/sys/fs/cgroup/ty-supremacy-test.service/supervisor",
+            "supervisor_device": 20,
+            "supervisor_inode": 23
+        });
+        let quota_enforcement = json!({
+            "operation": "Q_GETINFO",
+            "quota_type": "project",
+            "status": "already_enabled_verified",
+            "errno": 0
+        });
+        let sudo_authorization = json!({"test": "bound-elsewhere"});
+        let output_identity =
+            json!({"device": 10, "inode": 11, "uid": 1000, "gid": 1000, "mode": "0700"});
+        let payload_identity =
+            json!({"device": 10, "inode": 12, "uid": 1000, "gid": 1000, "mode": "0700"});
+        let filesystem_total_bytes = 512_u64 * 1024 * 1024 * 1024;
+        let filesystem_total_inodes = 33_554_432_u64;
+        let active_lease = json!({
+            "provenance_id": "provenance-1",
+            "campaign_id": "6".repeat(64),
+            "campaign_plan_sha256": "a".repeat(64),
+            "segment_id": "segment-0001",
+            "output_directory": output_dir,
+            "evidence_project_id": 50_000,
+            "payload_project_id": 50_001,
+            "contract_sha256": contract_sha256,
+            "cgroup_binding": cgroup_binding
+        });
+        let active_lease_ledger = json!({
+            "schema": OBSERVATION_STORAGE_LEASE_LEDGER_SCHEMA,
+            "filesystem_uuid": "5".repeat(32),
+            "leases": [active_lease],
+            "releases": []
+        });
+        let evidence_statvfs = json!({
+            "total_bytes": filesystem_total_bytes,
+            "available_bytes": contract.minimum_prelaunch_available_bytes,
+            "total_inodes": filesystem_total_inodes,
+            "available_inodes": contract.minimum_prelaunch_available_inodes
+        });
+        let payload_statvfs = json!({
+            "total_bytes": filesystem_total_bytes,
+            "available_bytes": contract.minimum_prelaunch_available_bytes,
+            "total_inodes": filesystem_total_inodes,
+            "available_inodes": contract.minimum_prelaunch_available_inodes
+        });
+        let mut capability = json!({
+            "role": "segment",
+            "provenance_id": "provenance-1",
+            "campaign_id": "6".repeat(64),
+            "campaign_plan_sha256": "a".repeat(64),
+            "segment_id": "segment-0001",
+            "segment_ordinal": 1,
+            "contract": contract_value,
+            "contract_sha256": contract_sha256,
+            "payload_quota_applicable": true,
+            "project_quota_scope": "split_segment_evidence_and_payload_trees",
+            "filesystem_reserve_scope": "global_mount",
+            "quota_backend": "ext4_dual_project_quota",
+            "privileged_quota_enforcement_preexisting": true,
+            "quota_enforcement_verified": true,
+            "evidence_project_id": 50_000,
+            "payload_project_id": 50_001,
+            "capability_file_contract": {
+                "uid": 0,
+                "mode": "0444",
+                "immutable_flag": "FS_IMMUTABLE_FL",
+                "exclusive_creation": true
+            }
+        });
+        let remaining_capability = json!({
+            "evidence_quota_soft_bytes": contract.evidence_soft_allocated_bytes,
+            "evidence_quota_hard_bytes": contract.evidence_hard_allocated_bytes,
+            "evidence_quota_soft_inodes": contract.evidence_soft_inodes,
+            "evidence_quota_hard_inodes": contract.evidence_hard_inodes,
+            "payload_quota_soft_bytes": contract.max_observation_allocated_bytes,
+            "payload_quota_hard_bytes": contract.hard_observation_allocated_bytes,
+            "payload_quota_soft_inodes": contract.max_observation_entries,
+            "payload_quota_hard_inodes": contract.hard_observation_inodes,
+            "evidence_quota_current_bytes": 0,
+            "evidence_quota_current_inodes": 0,
+            "payload_quota_current_bytes": 0,
+            "payload_quota_current_inodes": 0,
+            "evidence_finalization_reserve_bytes": contract.evidence_finalization_reserve_bytes,
+            "evidence_project_byte_reserve_bytes":
+                contract.evidence_hard_allocated_bytes - contract.evidence_soft_allocated_bytes,
+            "evidence_project_inode_reserve":
+                contract.evidence_hard_inodes - contract.evidence_soft_inodes,
+            "payload_project_byte_reserve_bytes": contract.payload_hard_byte_headroom(),
+            "payload_project_inode_reserve": contract.payload_hard_inode_headroom(),
+            "evidence_project_statvfs": evidence_statvfs,
+            "payload_project_statvfs": payload_statvfs,
+            "filesystem_available_bytes": contract.minimum_prelaunch_available_bytes,
+            "filesystem_available_inodes": contract.minimum_prelaunch_available_inodes,
+            "filesystem_total_bytes": filesystem_total_bytes,
+            "filesystem_mount": "/mnt/evidence",
+            "filesystem_type": "ext4",
+            "filesystem_mount_source": "/dev/vdb1",
+            "filesystem_device": {
+                "st_dev": 10,
+                "major": 0,
+                "minor": 10,
+                "major_minor": "0:10"
+            },
+            "output_directory_identity": output_identity,
+            "payload_directory_identity": payload_identity,
+            "quota_enforcement": quota_enforcement,
+            "quota_enforcement_status":
+                "q_getinfo_and_dual_q_getquota_then_lease_persisted_before_assignment",
+            "active_lease": active_lease,
+            "active_lease_ledger": active_lease_ledger,
+            "cgroup_binding": cgroup_binding,
+            "sudo_authorization": sudo_authorization
+        });
+        capability
+            .as_object_mut()
+            .unwrap()
+            .extend(remaining_capability.as_object().unwrap().clone());
+        let capability_object = capability.as_object_mut().unwrap();
+        let configuration_binding = json!({
+            "provenance_id": capability_object["provenance_id"],
+            "campaign_id": capability_object["campaign_id"],
+            "campaign_plan_sha256": capability_object["campaign_plan_sha256"],
+            "segment_id": capability_object["segment_id"],
+            "output_directory": output_dir,
+            "contract": capability_object["contract"],
+            "contract_sha256": capability_object["contract_sha256"],
+            "evidence_project_id": 50_000,
+            "payload_project_id": 50_001,
+            "cgroup_binding": capability_object["cgroup_binding"]
+        });
+        let mut raw = json!({
+            "schema": OBSERVATION_STORAGE_RAW_ATTESTATION_SCHEMA,
+            "attestor_euid": 0,
+            "configuration_performed": true,
+            "output_directory": output_dir,
+            "payload_directory": payload_dir,
+            "allocation_ledger": "durable_nonzero_project_quota_limits_never_cleared",
+            "configuration_binding": configuration_binding
+        });
+        for field in [
+            "output_directory_identity",
+            "payload_directory_identity",
+            "filesystem_mount",
+            "filesystem_type",
+            "filesystem_mount_source",
+            "filesystem_device",
+            "filesystem_total_bytes",
+            "filesystem_available_bytes",
+            "filesystem_available_inodes",
+            "evidence_project_statvfs",
+            "payload_project_statvfs",
+            "quota_enforcement",
+            "quota_enforcement_status",
+            "active_lease",
+            "active_lease_ledger",
+            "cgroup_binding",
+            "sudo_authorization",
+        ] {
+            raw[field] = capability_object[field].clone();
+        }
+        (
+            capability.as_object().unwrap().clone(),
+            raw.as_object().unwrap().clone(),
+            contract,
+            output_dir,
+        )
+    }
+
+    #[test]
+    fn final_capability_security_semantics_fail_closed() {
+        let (capability, raw, contract, output_dir) = capability_security_test_fixture();
+        validate_capability_security_semantics(
+            &capability,
+            &raw,
+            &contract,
+            "segment-0001",
+            &output_dir,
+        )
+        .unwrap();
+
+        for (field, tampered) in [
+            ("role", json!("merge")),
+            ("segment_ordinal", json!(2)),
+            ("payload_quota_applicable", json!(false)),
+            ("quota_enforcement_verified", json!(false)),
+            (
+                "evidence_quota_hard_bytes",
+                json!(contract.evidence_hard_allocated_bytes + 1),
+            ),
+            (
+                "payload_quota_current_bytes",
+                json!(contract.max_observation_allocated_bytes),
+            ),
+            ("payload_project_inode_reserve", json!(0)),
+        ] {
+            let mut changed = capability.clone();
+            changed.insert(field.to_string(), tampered);
+            assert!(
+                validate_capability_security_semantics(
+                    &changed,
+                    &raw,
+                    &contract,
+                    "segment-0001",
+                    &output_dir,
+                )
+                .is_err(),
+                "tampered capability field {field} was accepted"
+            );
+        }
+
+        let mut changed = capability.clone();
+        changed["capability_file_contract"]["immutable_flag"] = json!("none");
+        assert!(validate_capability_security_semantics(
+            &changed,
+            &raw,
+            &contract,
+            "segment-0001",
+            &output_dir,
+        )
+        .is_err());
+
+        let mut changed_raw = raw.clone();
+        changed_raw["configuration_performed"] = json!(false);
+        assert!(validate_capability_security_semantics(
+            &capability,
+            &changed_raw,
+            &contract,
+            "segment-0001",
+            &output_dir,
+        )
+        .is_err());
+
+        for pointer in [
+            "/evidence_project_statvfs/total_bytes",
+            "/payload_project_statvfs/available_inodes",
+            "/filesystem_available_bytes",
+            "/filesystem_available_inodes",
+        ] {
+            let mut changed = Value::Object(capability.clone());
+            let mut changed_raw = Value::Object(raw.clone());
+            let tampered = match pointer {
+                "/evidence_project_statvfs/total_bytes" => {
+                    json!(contract.evidence_soft_allocated_bytes)
+                }
+                "/payload_project_statvfs/available_inodes" => {
+                    json!(contract.minimum_prelaunch_available_inodes - 1)
+                }
+                "/filesystem_available_bytes" => {
+                    json!(capability["filesystem_total_bytes"].as_u64().unwrap() + 1)
+                }
+                "/filesystem_available_inodes" => {
+                    json!(
+                        capability["evidence_project_statvfs"]["total_inodes"]
+                            .as_u64()
+                            .unwrap()
+                            + 1
+                    )
+                }
+                _ => unreachable!(),
+            };
+            *changed.pointer_mut(pointer).unwrap() = tampered.clone();
+            *changed_raw.pointer_mut(pointer).unwrap() = tampered;
+            assert!(
+                validate_capability_security_semantics(
+                    changed.as_object().unwrap(),
+                    changed_raw.as_object().unwrap(),
+                    &contract,
+                    "segment-0001",
+                    &output_dir,
+                )
+                .is_err(),
+                "invalid global statvfs field {pointer} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn cgroup_release_binding_requires_safe_normalized_descendants() {
+        let (_, _, _, root_release, _, _) = release_bridge_test_fixture();
+        let binding = root_release
+            .pointer("/cgroup_removal_proof/binding")
+            .unwrap();
+        validate_release_cgroup_binding(binding, "test binding").unwrap();
+
+        for pointer in [
+            "/unit_name",
+            "/mount_point",
+            "/delegated_parent",
+            "/mount_inode",
+        ] {
+            let mut changed = binding.clone();
+            *changed.pointer_mut(pointer).unwrap() = match pointer {
+                "/unit_name" => json!("other.service"),
+                "/mount_point" => json!("/sys/fs/cgroup/../cgroup"),
+                "/delegated_parent" => json!("/outside/ty-supremacy-segment.service"),
+                "/mount_inode" => json!(0),
+                _ => unreachable!(),
+            };
+            assert!(
+                validate_release_cgroup_binding(&changed, "test binding").is_err(),
+                "tampered cgroup field {pointer} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn retired_project_quota_requires_all_kernel_validity_bits() {
+        let mut quota = json!({
+            "queried_project_id": 50_000,
+            "hard_bytes": 1024,
+            "soft_bytes": 1024,
+            "current_bytes": 1,
+            "hard_inodes": 1,
+            "soft_inodes": 1,
+            "current_inodes": 1,
+            "valid_fields": 15
+        });
+        validate_retired_project_quota(&quota, "test quota").unwrap();
+        quota["valid_fields"] = json!(1);
+        assert!(validate_retired_project_quota(&quota, "test quota").is_err());
+    }
+
+    #[test]
+    fn effective_sudo_policy_requires_one_exact_digest_bound_command() {
+        let command =
+            "(root) NOPASSWD: sha256:abcd /usr/local/libexec/attestor attest-observation-storage *";
+        let exact = format!(
+            "Matching Defaults entries for tybench on guest:\n    env_reset\n\nUser tybench may run the following commands on guest:\n    {command}\n"
+        );
+        validate_exact_sudo_policy_text(&exact, "tybench", command).unwrap();
+
+        for rejected in [
+            exact.replace(command, "(ALL) NOPASSWD: ALL"),
+            format!("{exact}    (root) NOPASSWD: /usr/bin/id\n"),
+            format!(
+                "{exact}User tybench may run the following commands on other:\n    {command}\n"
+            ),
+            format!("User other may run the following commands on guest:\n    {command}\n"),
+        ] {
+            assert!(validate_exact_sudo_policy_text(&rejected, "tybench", command).is_err());
+        }
+    }
+
+    #[test]
+    fn final_machine_storage_release_role_fails_closed() {
+        let segment_report = json!({"campaign": {"role": "segment"}});
+        let (_, _, released_machine, _, _, _) = release_bridge_test_fixture();
+        validate_machine_observation_storage_release_role(&segment_report, &released_machine)
+            .unwrap();
+
+        for invalid in [
+            json!({}),
+            json!({
+                "observation_storage_release": {
+                    "schema": OBSERVATION_STORAGE_RELEASE_SCHEMA,
+                    "status": "released",
+                    "released": true
+                }
+            }),
+            json!({
+                "observation_storage_release": {
+                    "schema": OBSERVATION_STORAGE_RELEASE_SCHEMA,
+                    "status": "pending",
+                    "released": false
+                }
+            }),
+            json!({
+                "observation_storage_release": {
+                    "schema": "ty.supremacy.observation-storage-lease-release.v1",
+                    "status": "released",
+                    "released": true
+                }
+            }),
+        ] {
+            assert!(
+                validate_machine_observation_storage_release_role(&segment_report, &invalid)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("release")
+            );
+        }
+
+        let aggregate_report = json!({"campaign": {"role": "aggregate"}});
+        validate_machine_observation_storage_release_role(&aggregate_report, &json!({})).unwrap();
+        assert!(validate_machine_observation_storage_release_role(
+            &aggregate_report,
+            &released_machine,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("non-segment"));
+    }
+
+    #[test]
+    fn release_bridge_binds_root_slot_machine_preimage_inventory_and_history() {
+        let (report, receipt, machine, root_release, root_file, inventory) =
+            release_bridge_test_fixture();
+        validate_observation_storage_release_bridge_values(
+            &report,
+            &receipt,
+            &machine,
+            "provenance-1",
+            Path::new("/campaign/segment-0001"),
+            &root_release,
+            &root_file,
+            &inventory,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn release_bridge_rejects_minimal_extra_and_forged_documents() {
+        let (report, receipt, machine, root_release, root_file, inventory) =
+            release_bridge_test_fixture();
+        let validate =
+            |machine: &Value, root_release: &Value, root_file: &Value, inventory: &Value| {
+                validate_observation_storage_release_bridge_values(
+                    &report,
+                    &receipt,
+                    machine,
+                    "provenance-1",
+                    Path::new("/campaign/segment-0001"),
+                    root_release,
+                    root_file,
+                    inventory,
+                )
+            };
+
+        let mut extra = machine.clone();
+        extra["observation_storage_release"]["unrecognized"] = json!(true);
+        assert!(validate(&extra, &root_release, &root_file, &inventory).is_err());
+
+        let mut forged_projection = machine.clone();
+        forged_projection["observation_storage_release"]["released_at_utc"] =
+            json!("2026-07-24T00:00:00Z");
+        assert!(validate(&forged_projection, &root_release, &root_file, &inventory).is_err());
+
+        let mut forged_preimage = machine.clone();
+        forged_preimage["observation_storage_release"]
+            ["machine_pre_release_ty_canonical_json_v1_sha256"] = json!("9".repeat(64));
+        assert!(validate(&forged_preimage, &root_release, &root_file, &inventory).is_err());
+
+        let mut forged_file = root_file.clone();
+        forged_file["inode"] = json!(999);
+        assert!(validate(&machine, &root_release, &forged_file, &inventory).is_err());
+
+        let forged_inventory = release_test_inventory("8");
+        assert!(validate(&machine, &root_release, &root_file, &forged_inventory).is_err());
+
+        let mut forged_history = machine.clone();
+        forged_history["observation_storage_release"]["durable_ledger_commit"]
+            ["finalized_entry_ty_canonical_json_v1_sha256"] = json!("7".repeat(64));
+        assert!(validate(&forged_history, &root_release, &root_file, &inventory).is_err());
+    }
+
+    #[test]
+    fn final_machine_top_level_schema_is_exact_and_role_bound() {
+        let mut machine = Map::new();
+        for name in [
+            "schema",
+            "provenance_id",
+            "created_at_utc",
+            "status",
+            "qualification",
+            "final_receipt",
+            "storage_confinement",
+            "observation_storage",
+            "systemd",
+            "identity",
+            "working_directory",
+            "machine",
+            "environment",
+            "repository",
+            "command",
+            "cgroup",
+            "qualified_at_utc",
+            "systemd_runtime_max_finalization",
+            "machine_contract_finalization",
+            "observation_storage_finalization",
+            "repository_finalization",
+        ] {
+            machine.insert(name.to_string(), Value::Null);
+        }
+        let aggregate_report = json!({"campaign": {"role": "aggregate"}});
+        validate_final_machine_top_level_fields(&aggregate_report, &Value::Object(machine.clone()))
+            .unwrap();
+
+        let segment_report = json!({"campaign": {"role": "segment"}});
+        assert!(validate_final_machine_top_level_fields(
+            &segment_report,
+            &Value::Object(machine.clone())
+        )
+        .is_err());
+        machine.insert("observation_storage_release".to_string(), Value::Null);
+        validate_final_machine_top_level_fields(&segment_report, &Value::Object(machine.clone()))
+            .unwrap();
+        assert!(validate_final_machine_top_level_fields(
+            &aggregate_report,
+            &Value::Object(machine.clone())
+        )
+        .is_err());
+        machine.insert("unrecognized".to_string(), Value::Null);
+        assert!(
+            validate_final_machine_top_level_fields(&segment_report, &Value::Object(machine))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn release_machine_preimage_digest_is_cross_language_and_integer_only() {
+        let final_machine = json!({
+            "z": 7,
+            "nested": {"s": "μ", "b": true, "n": null},
+            "observation_storage_release": {
+                "schema": OBSERVATION_STORAGE_RELEASE_SCHEMA,
+                "status": "released",
+                "released": true,
+                "root_release_file": {"sha256": "ab".repeat(32)}
+            }
+        });
+        assert_eq!(
+            reconstructed_pending_machine_sha256(&final_machine).unwrap(),
+            "7d0fcccbb1d9732c7de53e8f2fbb20f4ba7d1251be16e5e4d072003d1cd04d48"
+        );
+
+        let mut changed = final_machine.clone();
+        changed["z"] = json!(8);
+        assert_ne!(
+            reconstructed_pending_machine_sha256(&changed).unwrap(),
+            reconstructed_pending_machine_sha256(&final_machine).unwrap()
+        );
+
+        let mut float_machine = final_machine;
+        float_machine["nested"]["float"] = json!(1.5);
+        assert!(reconstructed_pending_machine_sha256(&float_machine)
+            .unwrap_err()
+            .to_string()
+            .contains("forbids floats"));
+    }
+
+    #[test]
+    fn pending_machine_file_encoding_matches_python_sorted_ascii_pretty_json() {
+        let value = json!({
+            "z": "μ😀\n",
+            "a": [1, true, null],
+            "observation_storage_release": {
+                "schema": OBSERVATION_STORAGE_RELEASE_SCHEMA,
+                "status": "released",
+                "released": true
+            }
+        });
+        let expected = concat!(
+            "{\n",
+            "  \"a\": [\n",
+            "    1,\n",
+            "    true,\n",
+            "    null\n",
+            "  ],\n",
+            "  \"observation_storage_release\": {\n",
+            "    \"released\": false,\n",
+            "    \"schema\": \"ty.supremacy.observation-storage-lease-release.v2\",\n",
+            "    \"status\": \"pending\"\n",
+            "  },\n",
+            "  \"z\": \"\\u03bc\\ud83d\\ude00\\n\"\n",
+            "}\n"
+        );
+        assert_eq!(
+            reconstructed_pending_machine_file(&value).unwrap(),
+            expected.as_bytes()
+        );
+
+        let mut boundary_encoding = String::new();
+        write_python_ascii_json_string(
+            "\u{0000}\u{001f} ~\u{007f}\u{0080}μ😀",
+            &mut boundary_encoding,
+        )
+        .unwrap();
+        assert_eq!(
+            boundary_encoding,
+            "\"\\u0000\\u001f ~\\u007f\\u0080\\u03bc\\ud83d\\ude00\""
+        );
+    }
+
+    #[test]
+    fn strict_json_parser_rejects_duplicate_keys_and_accepts_padding() {
+        assert_eq!(
+            parse_unique_json(b"{\"a\":[1,true,null]}   \n").unwrap(),
+            json!({"a": [1, true, null]})
+        );
+        for invalid in [
+            br#"{"a":1,"a":2}"#.as_slice(),
+            br#"{"outer":{"a":1,"a":2}}"#.as_slice(),
+        ] {
+            assert!(parse_unique_json(invalid)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate"));
+        }
+    }
+
+    #[test]
+    fn finalized_campaign_scope_admits_segments_only_for_internal_merge() {
+        let mut binding = RuntimeCampaignReportBinding {
+            role: "segment".to_string(),
+            campaign_id: "ab".repeat(32),
+            campaign_plan: RuntimeFileProvenance {
+                path: PathBuf::from("/campaign/plan.json"),
+                sha256: "cd".repeat(32),
+                size_bytes: 1,
+            },
+            contract_attestations_sha256: "ef".repeat(32),
+            segment_id: Some("segment-0001".to_string()),
+            merge_purpose: None,
+            planned_runtime_specs: vec!["Spec01".to_string()],
+            segments: Vec::new(),
+            machine_compatibility_sha256: None,
+            corpus_claim_complete: false,
+            corpus_claim_pass: false,
+        };
+        binding.validate_claim_role().unwrap();
+        let diagnostic_summary = classify_baseline_str(
+            r#"{
+                "specs": {
+                    "Spec01": {
+                        "source": {},
+                        "tlc": {"status": "pass", "runtime_seconds": 2.0, "states": 3},
+                        "ty": {"status": "pass", "runtime_seconds": 1.0, "states": 3},
+                        "verified_match": true
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let segment_summary = campaign_segment_summary_value(&diagnostic_summary, &binding);
+        assert_eq!(
+            segment_summary["schema"],
+            json!(RUNTIME_CAMPAIGN_SEGMENT_SUMMARY_SCHEMA)
+        );
+        assert_eq!(segment_summary["role"], json!("segment"));
+        assert_eq!(segment_summary["corpus_claim_complete"], json!(false));
+        assert_eq!(segment_summary["corpus_claim_pass"], json!(false));
+        assert!(segment_summary.get("strict_pass").is_none());
+        assert!(segment_summary.get("matrix_diagnostic").is_some());
+
+        let mut policy_promoted = diagnostic_summary.clone();
+        policy_promoted.strict_pass = false;
+        policy_promoted.strict_blockers = 1;
+        policy_promoted.policy = Some(SupremacyMatrixPolicySummary {
+            allow_runtime_to_error: true,
+            allow_timeout_dominance: false,
+            comparable_outcomes: 1,
+            pass: true,
+            blockers: 0,
+            verdict: SupremacyMatrixVerdict::Pass,
+        });
+        assert_eq!(policy_promoted.enforce_blocker_count(), 0);
+        assert!(!campaign_summary_supports_strict_claim(&policy_promoted));
+
+        validate_finalized_campaign_scope(&binding, FinalizedRuntimeEvidenceScope::CampaignSegment)
+            .unwrap();
+        assert!(validate_finalized_campaign_scope(
+            &binding,
+            FinalizedRuntimeEvidenceScope::PublicClaim
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("cannot be admitted"));
+
+        binding.role = "aggregate".to_string();
+        binding.segment_id = None;
+        binding.merge_purpose = Some("superiority".to_string());
+        binding.machine_compatibility_sha256 = Some("12".repeat(32));
+        binding.corpus_claim_complete = true;
+        binding.corpus_claim_pass = true;
+        binding.validate_claim_role().unwrap();
+        validate_finalized_campaign_scope(&binding, FinalizedRuntimeEvidenceScope::PublicClaim)
+            .unwrap();
+        assert!(validate_finalized_campaign_scope(
+            &binding,
+            FinalizedRuntimeEvidenceScope::CampaignSegment
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("cannot be an aggregate"));
+    }
+
+    #[test]
+    fn campaign_commands_inherit_the_plan_bound_ty_binary_without_override() {
+        let payload = campaign_test_payload(1, 1);
+        let args = matrix_args_from_campaign_plan(
+            &payload,
+            PathBuf::from("/campaign/output"),
+            payload.runtime_specs.clone(),
+        );
+        assert_eq!(
+            args.runtime_ty_bin.as_deref(),
+            Some(payload.runtime.ty_binary.path.as_path())
+        );
+        assert!(args.runtime_specs == payload.runtime_specs);
+        assert_eq!(args.mode, SupremacyMode::Enforce);
+    }
+
+    fn campaign_test_manifest(
+        segment: &RuntimeCampaignPlanSegment,
+    ) -> RuntimeCampaignSegmentManifest {
+        let file = |name: &str| RuntimeFileProvenance {
+            path: PathBuf::from(format!("/campaign/{}/{}", segment.segment_id, name)),
+            sha256: "12".repeat(32),
+            size_bytes: 1,
+        };
+        RuntimeCampaignSegmentManifest {
+            segment_id: segment.segment_id.clone(),
+            runtime_specs: segment.runtime_specs.clone(),
+            evidence_set_id: "34".repeat(32),
+            report: RuntimeFileProvenance {
+                path: segment.report_path.clone(),
+                sha256: "12".repeat(32),
+                size_bytes: 1,
+            },
+            refreshed_baseline: file("spec_baseline.refreshed.json"),
+            final_receipt: file("strict-evidence-receipt.json"),
+            machine_provenance: file("machine.json"),
+            machine_provenance_id: format!("machine-{}", segment.segment_id),
+            machine_compatibility_sha256: "56".repeat(32),
+        }
+    }
+
+    #[test]
+    fn campaign_aggregate_claim_role_is_strict() {
+        let payload = campaign_test_payload(2, 1);
+        let manifests = payload
+            .segments
+            .iter()
+            .map(campaign_test_manifest)
+            .collect::<Vec<_>>();
+        let mut binding = RuntimeCampaignReportBinding {
+            role: "aggregate".to_string(),
+            campaign_id: "ab".repeat(32),
+            campaign_plan: RuntimeFileProvenance {
+                path: PathBuf::from("/campaign/plan.json"),
+                sha256: "cd".repeat(32),
+                size_bytes: 1,
+            },
+            contract_attestations_sha256: "ef".repeat(32),
+            segment_id: None,
+            merge_purpose: Some("superiority".to_string()),
+            planned_runtime_specs: payload.runtime_specs.clone(),
+            segments: manifests,
+            machine_compatibility_sha256: Some("56".repeat(32)),
+            corpus_claim_complete: true,
+            corpus_claim_pass: true,
+        };
+        binding.validate_claim_role().unwrap();
+
+        binding.corpus_claim_complete = false;
+        assert!(binding
+            .validate_claim_role()
+            .unwrap_err()
+            .to_string()
+            .contains("pass requires"));
+        binding.corpus_claim_complete = true;
+        binding.segment_id = Some("segment-0001".to_string());
+        assert!(binding
+            .validate_claim_role()
+            .unwrap_err()
+            .to_string()
+            .contains("may not identify"));
+
+        binding.segment_id = None;
+        binding.merge_purpose = Some("inventory".to_string());
+        binding.corpus_claim_pass = false;
+        binding.corpus_claim_complete = true;
+        binding.validate_claim_role().unwrap();
+        assert!(validate_finalized_campaign_scope(
+            &binding,
+            FinalizedRuntimeEvidenceScope::PublicClaim
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("loser inventories"));
+    }
+
+    #[test]
+    fn campaign_manifest_cover_rejects_missing_duplicate_and_foreign_segments() {
+        let payload = campaign_test_payload(12, 1);
+        let manifests = payload
+            .segments
+            .iter()
+            .map(campaign_test_manifest)
+            .collect::<Vec<_>>();
+        validate_campaign_manifest_cover(&payload, &manifests).unwrap();
+
+        let mut missing = manifests.clone();
+        missing.pop();
+        assert!(validate_campaign_manifest_cover(&payload, &missing)
+            .unwrap_err()
+            .to_string()
+            .contains("requires 12"));
+
+        let mut duplicate = manifests.clone();
+        duplicate[1] = duplicate[0].clone();
+        assert!(validate_campaign_manifest_cover(&payload, &duplicate)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate"));
+
+        let mut foreign = manifests.clone();
+        foreign[1].segment_id = "segment-9999".to_string();
+        assert!(validate_campaign_manifest_cover(&payload, &foreign)
+            .unwrap_err()
+            .to_string()
+            .contains("foreign"));
+
+        let mut overlap = manifests;
+        overlap[1].runtime_specs[0] = overlap[0].runtime_specs[0].clone();
+        assert!(validate_campaign_manifest_cover(&payload, &overlap)
+            .unwrap_err()
+            .to_string()
+            .contains("membership"));
+    }
+
+    #[test]
+    fn campaign_contract_rejects_cache_policy_digest_mismatch() {
+        let mut payload = campaign_test_payload(2, 1);
+        *payload
+            .contract_attestations
+            .pointer_mut("/independent_attestations/os_cache_policy/ty_canonical_json_v1_sha256")
+            .unwrap() = Value::String("00".repeat(32));
+        assert!(validate_campaign_plan_payload(&payload)
+            .unwrap_err()
+            .to_string()
+            .contains("exact balanced steady-cache policy"));
+
+        let mut substituted_policy = campaign_test_payload(2, 1);
+        let substituted_attestation = json!({
+            "schema": STRICT_OS_CACHE_POLICY_SCHEMA,
+            "warmups": {"observations_per_row": 0}
+        });
+        let substituted_digest =
+            sha256_ty_canonical_json_v1_value(&substituted_attestation).unwrap();
+        substituted_policy
+            .contract_attestations
+            .pointer_mut("/independent_attestations/os_cache_policy/attestation")
+            .map(|value| *value = substituted_attestation)
+            .unwrap();
+        substituted_policy
+            .contract_attestations
+            .pointer_mut("/independent_attestations/os_cache_policy/ty_canonical_json_v1_sha256")
+            .map(|value| *value = Value::String(substituted_digest))
+            .unwrap();
+        assert!(validate_campaign_plan_payload(&substituted_policy)
+            .unwrap_err()
+            .to_string()
+            .contains("exact balanced steady-cache policy"));
+
+        let original_digest = sha256_ty_canonical_json_v1_value(
+            &serde_json::to_value(&campaign_test_payload(2, 1)).unwrap(),
+        )
+        .unwrap();
+        let mut changed = campaign_test_payload(2, 1);
+        changed.contract_attestations["runtime_contract"]["runs"] = json!(8);
+        let changed_digest =
+            sha256_ty_canonical_json_v1_value(&serde_json::to_value(&changed).unwrap()).unwrap();
+        assert_ne!(original_digest, changed_digest);
+    }
+
+    fn campaign_queue_configuration(file_sha256: &str) -> Value {
+        let path = "logical_block_size";
+        let size_bytes = 4_u64;
+        let mut hasher = Sha256::new();
+        hasher.update(path.as_bytes());
+        hasher.update([0]);
+        hasher.update(size_bytes.to_string().as_bytes());
+        hasher.update([0]);
+        for pair in file_sha256.as_bytes().chunks_exact(2) {
+            hasher.update([u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()]);
+        }
+        hasher.update([0]);
+        json!({
+            "schema": "ty.supremacy.block-device-queue-configuration.v1",
+            "digest_algorithm": "sha256_path_nul_size_nul_digest_nul.v1",
+            "file_count": 1,
+            "files": [{
+                "path": path,
+                "size_bytes": size_bytes,
+                "sha256": file_sha256,
+            }],
+            "tree_sha256": format!("{:x}", hasher.finalize()),
+        })
+    }
+
+    fn campaign_machine_snapshot(model: &str, boot_id: &str) -> Value {
+        json!({
+            "provenance_id": format!("ephemeral-{boot_id}"),
+            "machine": {
+                "guest_identity": {
+                    "schema": "ty.supremacy.guest-identity.v1",
+                    "machine_id_sha256": "11".repeat(32),
+                    "dmi_product_uuid_sha256": "22".repeat(32)
+                },
+                "semantic_environment": {
+                    "schema": "ty.supremacy.semantic-environment.v1",
+                    "allowlist_schema": "ty.supremacy.strict-child-environment-allowlist.v1",
+                    "variables": {
+                        "LANG": "C",
+                        "LC_ALL": "C",
+                        "TZ": "UTC",
+                        "HOME": "/home/campaign",
+                        "PATH": "/usr/bin:/bin"
+                    }
+                },
+                "output_storage": {
+                    "schema": "ty.supremacy.output-storage-mount.v2",
+                    "selection": "deepest_enclosing_mount_of_canonical_existing_output_ancestor",
+                    "device": {
+                        "st_dev": 2049,
+                        "major": 8,
+                        "minor": 1,
+                        "major_minor": "8:1"
+                    },
+                    "filesystem_type": "ext4",
+                    "mount_source": "/dev/vda1",
+                    "mount_root": "/",
+                    "mount_options": ["relatime", "rw"],
+                    "super_options": ["errors=remount-ro", "rw"],
+                    "filesystem_traits": {
+                        "block_size": 4096,
+                        "fragment_size": 4096,
+                        "flags": 4096,
+                        "name_max": 255
+                    },
+                    "block_device_identity": {
+                        "kind": "partition",
+                        "kernel_name": "vda1",
+                        "major": 8,
+                        "minor": 1,
+                        "major_minor": "8:1",
+                        "sysfs_path_sha256": "33".repeat(32),
+                        "partition": {
+                            "number": 1,
+                            "start_512_byte_sectors": 2048,
+                            "size_512_byte_sectors": 2097152
+                        }
+                    },
+                    "block_device_queue_source": {
+                        "kernel_name": "vda",
+                        "major": 8,
+                        "minor": 0,
+                        "major_minor": "8:0",
+                        "sysfs_path_sha256": "44".repeat(32),
+                        "relationship": "partition_parent",
+                        "device_mapper": null,
+                        "size_512_byte_sectors": 4194304,
+                        "stable_identity": {
+                            "model": [{
+                                "path": "device/model",
+                                "size_bytes": 8,
+                                "sha256": "55".repeat(32)
+                            }],
+                            "vendor": [],
+                            "revision": [],
+                            "serial": [],
+                            "wwid": []
+                        }
+                    },
+                    "block_device_traits": {
+                        "logical_block_size": 512,
+                        "physical_block_size": 4096,
+                        "minimum_io_size": 4096,
+                        "optimal_io_size": 0,
+                        "discard_granularity": 4096,
+                        "rotational": 0
+                    },
+                    "block_device_queue_configuration":
+                        campaign_queue_configuration(&"66".repeat(32))
+                },
+                "uname": {
+                    "system": "Linux",
+                    "node": "campaign-host",
+                    "release": "6.12.0",
+                    "version": "fixture",
+                    "machine": "x86_64"
+                },
+                "os_release": {"ID": "fixture", "VERSION_ID": "1"},
+                "boot_id": boot_id,
+                "kernel_command_line": "quiet isolcpus=2",
+                "clocksource": "tsc",
+                "cpu": {
+                    "logical_count": 8,
+                    "first_processor": {
+                        "processor": "0",
+                        "vendor_id": "GenuineIntel",
+                        "model name": model,
+                        "cpu MHz": if boot_id == "boot-a" { "1200" } else { "4100" }
+                    },
+                    "selected_processor": {
+                        "processor": "2",
+                        "vendor_id": "GenuineIntel",
+                        "model name": model,
+                        "cpu MHz": if boot_id == "boot-a" { "1200" } else { "4100" }
+                    },
+                    "online": "0-7",
+                    "offline": "",
+                    "isolated": "2",
+                    "nohz_full": "2",
+                    "selected": 2,
+                    "selected_topology": {
+                        "core_id": "2",
+                        "physical_package_id": "0",
+                        "thread_siblings_list": "2,6",
+                        "scaling_governor": "performance",
+                        "scaling_driver": "intel_pstate",
+                        "energy_performance_preference": "performance"
+                    },
+                    "intel_pstate_no_turbo": "1",
+                    "cpufreq_boost": null
+                },
+                "memory": {
+                    "MemTotal": "32768000 kB",
+                    "MemFree": if boot_id == "boot-a" { "10 kB" } else { "20 kB" },
+                    "SwapTotal": "0 kB",
+                    "Hugepagesize": "2048 kB"
+                },
+                "active_swap": []
+            }
+        })
+    }
+
+    #[test]
+    fn campaign_machine_projection_ignores_ephemeral_reboot_state_but_not_static_model() {
+        let first = runtime_machine_compatibility_from_snapshot(&campaign_machine_snapshot(
+            "Model A", "boot-a",
+        ))
+        .unwrap();
+        let rebooted = runtime_machine_compatibility_from_snapshot(&campaign_machine_snapshot(
+            "Model A", "boot-b",
+        ))
+        .unwrap();
+        let foreign = runtime_machine_compatibility_from_snapshot(&campaign_machine_snapshot(
+            "Model B", "boot-c",
+        ))
+        .unwrap();
+        assert_eq!(first, rebooted);
+        assert_ne!(first, foreign);
+
+        let mut different_guest = campaign_machine_snapshot("Model A", "boot-c");
+        different_guest["machine"]["guest_identity"]["machine_id_sha256"] = json!("33".repeat(32));
+        assert_ne!(
+            first,
+            runtime_machine_compatibility_from_snapshot(&different_guest).unwrap()
+        );
+
+        let mut different_selected_core = campaign_machine_snapshot("Model A", "boot-c");
+        different_selected_core["machine"]["cpu"]["selected_processor"]["model name"] =
+            json!("Model E");
+        assert_ne!(
+            first,
+            runtime_machine_compatibility_from_snapshot(&different_selected_core).unwrap()
+        );
+        let mut mislabeled_selected_core = campaign_machine_snapshot("Model A", "boot-c");
+        mislabeled_selected_core["machine"]["cpu"]["selected_processor"]["processor"] = json!("7");
+        assert!(
+            runtime_machine_compatibility_from_snapshot(&mislabeled_selected_core)
+                .unwrap_err()
+                .to_string()
+                .contains("differs from selected CPU")
+        );
+
+        let mut different_storage = campaign_machine_snapshot("Model A", "boot-d");
+        different_storage["machine"]["output_storage"]["filesystem_type"] = json!("xfs");
+        assert_ne!(
+            first,
+            runtime_machine_compatibility_from_snapshot(&different_storage).unwrap()
+        );
+        let mut different_partition = campaign_machine_snapshot("Model A", "boot-d");
+        different_partition["machine"]["output_storage"]["block_device_identity"]["partition"]
+            ["start_512_byte_sectors"] = json!(4096);
+        assert_ne!(
+            first,
+            runtime_machine_compatibility_from_snapshot(&different_partition).unwrap()
+        );
+        let mut different_queue = campaign_machine_snapshot("Model A", "boot-d");
+        different_queue["machine"]["output_storage"]["block_device_queue_source"]
+            ["sysfs_path_sha256"] = json!("55".repeat(32));
+        assert_ne!(
+            first,
+            runtime_machine_compatibility_from_snapshot(&different_queue).unwrap()
+        );
+        let mut different_queue_configuration = campaign_machine_snapshot("Model A", "boot-d");
+        different_queue_configuration["machine"]["output_storage"]
+            ["block_device_queue_configuration"] = campaign_queue_configuration(&"77".repeat(32));
+        assert_ne!(
+            first,
+            runtime_machine_compatibility_from_snapshot(&different_queue_configuration).unwrap()
+        );
+        let mut different_device_identity = campaign_machine_snapshot("Model A", "boot-d");
+        different_device_identity["machine"]["output_storage"]["block_device_queue_source"]
+            ["stable_identity"]["model"][0]["sha256"] = json!("88".repeat(32));
+        assert_ne!(
+            first,
+            runtime_machine_compatibility_from_snapshot(&different_device_identity).unwrap()
+        );
+        let mut tampered_queue_configuration = campaign_machine_snapshot("Model A", "boot-d");
+        tampered_queue_configuration["machine"]["output_storage"]
+            ["block_device_queue_configuration"]["files"][0]["sha256"] = json!("99".repeat(32));
+        assert!(
+            runtime_machine_compatibility_from_snapshot(&tampered_queue_configuration)
+                .unwrap_err()
+                .to_string()
+                .contains("tree digest")
+        );
+        let mut unknown_storage_field = campaign_machine_snapshot("Model A", "boot-d");
+        unknown_storage_field["machine"]["output_storage"]["unprojected"] = json!(true);
+        assert!(
+            runtime_machine_compatibility_from_snapshot(&unknown_storage_field)
+                .unwrap_err()
+                .to_string()
+                .contains("fields are not exact")
+        );
+
+        let mut hostile_environment = campaign_machine_snapshot("Model A", "boot-e");
+        hostile_environment["machine"]["semantic_environment"]["variables"]["LD_PRELOAD"] =
+            json!("/tmp/inject.so");
+        assert!(
+            runtime_machine_compatibility_from_snapshot(&hostile_environment)
+                .unwrap_err()
+                .to_string()
+                .contains("strict allowlist")
+        );
+
+        let mut missing_model = campaign_machine_snapshot("Model A", "boot-a");
+        missing_model
+            .pointer_mut("/machine/cpu/first_processor")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("model name");
+        assert!(runtime_machine_compatibility_from_snapshot(&missing_model)
+            .unwrap_err()
+            .to_string()
+            .contains("neither an x86"));
+
+        let mut missing_topology = campaign_machine_snapshot("Model A", "boot-a");
+        missing_topology
+            .pointer_mut("/machine/cpu/selected_topology")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("scaling_driver");
+        assert!(
+            runtime_machine_compatibility_from_snapshot(&missing_topology)
+                .unwrap_err()
+                .to_string()
+                .contains("scaling_driver")
+        );
+
+        let sparse = json!({
+            "machine": {
+                "uname": {},
+                "os_release": {},
+                "cpu": {"first_processor": {}},
+                "memory": {},
+                "active_swap": []
+            }
+        });
+        assert!(runtime_machine_compatibility_from_snapshot(&sparse).is_err());
+
+        let mut arm = campaign_machine_snapshot("unused", "boot-arm");
+        arm["machine"]["uname"]["machine"] = json!("aarch64");
+        arm["machine"]["cpu"]["first_processor"] = json!({
+            "processor": "0",
+            "CPU implementer": "0x41",
+            "CPU architecture": "8",
+            "CPU variant": "0x0",
+            "CPU part": "0xd0c",
+            "CPU revision": "1"
+        });
+        arm["machine"]["cpu"]["selected_processor"] = json!({
+            "processor": "2",
+            "CPU implementer": "0x41",
+            "CPU architecture": "8",
+            "CPU variant": "0x0",
+            "CPU part": "0xd0c",
+            "CPU revision": "1"
+        });
+        arm["machine"]["cpu"]["selected_topology"]["scaling_governor"] = Value::Null;
+        arm["machine"]["cpu"]["selected_topology"]["scaling_driver"] = Value::Null;
+        runtime_machine_compatibility_from_snapshot(&arm).unwrap();
+
+        let mut swap_first = campaign_machine_snapshot("Model A", "boot-a");
+        let mut swap_later = campaign_machine_snapshot("Model A", "boot-b");
+        for (snapshot, used_kib) in [(&mut swap_first, "10"), (&mut swap_later, "999")] {
+            snapshot["machine"]["active_swap"] = json!([{
+                "filename": "/swapfile",
+                "type": "file",
+                "size_kib": "1048576",
+                "used_kib": used_kib,
+                "priority": "-2"
+            }]);
+        }
+        assert_eq!(
+            runtime_machine_compatibility_from_snapshot(&swap_first).unwrap(),
+            runtime_machine_compatibility_from_snapshot(&swap_later).unwrap()
+        );
+    }
+
+    fn campaign_unfinalized_report_fixture(
+        report_path: &Path,
+        refreshed_baseline: &Path,
+    ) -> (RuntimeCampaignPlan, RuntimeFileProvenance, Value) {
+        let mut payload = campaign_test_payload(1, 1);
+        payload.segments[0].output_dir = report_path
+            .parent()
+            .expect("test report has parent")
+            .to_path_buf();
+        payload.segments[0].report_path = report_path.to_path_buf();
+        let mut report = json!({
+            "schema": RUNTIME_CAMPAIGN_EVIDENCE_SCHEMA,
+            "baseline": payload.baseline.path,
+            "refreshed_baseline": refreshed_baseline,
+            "observation_storage_contract": payload.observation_storage_contract,
+            "evidence_payload": {
+                "contract": {
+                    "observation_storage_contract": payload.observation_storage_contract
+                }
+            },
+            "metadata": {
+                "ty": {
+                    "git_commit": "source-revision",
+                    "build_worktree_dirty": false,
+                    "workspace_git_commit": "workspace-revision",
+                    "workspace_checkout": {},
+                    "binary": payload.runtime.ty_binary
+                },
+                "tlc": {"jar": payload.runtime.tlc_jar},
+                "community_modules": payload.runtime.community_modules,
+                "tla_library": null,
+                "java": {
+                    "argv": [payload.runtime.java_executable.path, "-version"],
+                    "executable": payload.runtime.java_executable,
+                    "java_home": payload.runtime.java_home,
+                    "version": "openjdk version \"21-test\"",
+                    "output": ["openjdk version \"21-test\""],
+                    "status": 0,
+                    "settings_argv": [
+                        payload.runtime.java_executable.path,
+                        "-XshowSettings:properties",
+                        "-version"
+                    ],
+                    "settings_output": ["java.home = /campaign/jdk"],
+                    "settings_status": 0
+                },
+                "examples_checkout": {},
+                "benchmark": {
+                    "mode": "enforce",
+                    "timeout_seconds": 300,
+                    "runs": 6,
+                    "production_runtime": true,
+                    "paired_statistic": STRICT_PAIRED_STATISTIC,
+                    "paired_schedule": STRICT_PAIRED_SCHEDULE,
+                    "os_cache_policy": strict_os_cache_policy(),
+                    "memory_metric": "cgroup_v2_memory_peak_process_tree",
+                    "min_runtime_speedup": STRICT_MIN_RUNTIME_SPEEDUP,
+                    "max_memory_ratio": STRICT_MAX_MEMORY_RATIO,
+                    "tlc_jvm_args": [],
+                    "ty_environment": {},
+                    "baseline": payload.baseline,
+                    "strict_corpus_manifest": {
+                        "path": "/campaign/manifest.json",
+                        "sha256": "78".repeat(32)
+                    }
+                }
+            }
+        });
+        payload.contract_attestations =
+            runtime_campaign_contract_attestations_from_report(&report).unwrap();
+        let campaign_id =
+            sha256_ty_canonical_json_v1_value(&serde_json::to_value(&payload).unwrap()).unwrap();
+        let plan = RuntimeCampaignPlan {
+            schema: RUNTIME_CAMPAIGN_PLAN_SCHEMA.to_string(),
+            campaign_id: campaign_id.clone(),
+            payload,
+        };
+        let plan_provenance = RuntimeFileProvenance {
+            path: report_path.with_file_name("campaign-plan.json"),
+            sha256: "90".repeat(32),
+            size_bytes: 1,
+        };
+        let binding = RuntimeCampaignReportBinding {
+            role: "segment".to_string(),
+            campaign_id,
+            campaign_plan: plan_provenance.clone(),
+            contract_attestations_sha256: sha256_ty_canonical_json_v1_value(
+                &plan.payload.contract_attestations,
+            )
+            .unwrap(),
+            segment_id: Some("segment-0001".to_string()),
+            merge_purpose: None,
+            planned_runtime_specs: vec!["Spec01".to_string()],
+            segments: Vec::new(),
+            machine_compatibility_sha256: None,
+            corpus_claim_complete: false,
+            corpus_claim_pass: false,
+        };
+        report["campaign"] = serde_json::to_value(binding).unwrap();
+        (plan, plan_provenance, report)
+    }
+
+    #[test]
+    fn campaign_segment_rejects_unfinalized_and_tampered_report_or_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical_dir = dir.path().canonicalize().unwrap();
+        let report_path = canonical_dir.join("runtime_evidence.json");
+        let missing_baseline = canonical_dir.join("missing-refreshed-baseline.json");
+        let (plan, plan_provenance, report) =
+            campaign_unfinalized_report_fixture(&report_path, &missing_baseline);
+        fs::write(&report_path, serde_json::to_string_pretty(&report).unwrap()).unwrap();
+        let error =
+            validate_campaign_segment_report(&plan, &plan_provenance, &report_path).unwrap_err();
+        assert!(
+            error.to_string().contains("has not been finalized"),
+            "unexpected validation error: {error:#}"
+        );
+
+        let mut tampered = report;
+        tampered["campaign"]["campaign_id"] = Value::String("00".repeat(32));
+        fs::write(
+            &report_path,
+            serde_json::to_string_pretty(&tampered).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            validate_campaign_segment_report(&plan, &plan_provenance, &report_path)
+                .unwrap_err()
+                .to_string()
+                .contains("not bound")
+        );
+
+        let receipt_path = canonical_dir.join("strict-evidence-receipt.json");
+        fs::write(&receipt_path, b"sealed receipt").unwrap();
+        let sealed = RuntimeFileProvenance::new(&receipt_path).unwrap();
+        fs::write(&receipt_path, b"tampered receipt").unwrap();
+        assert!(
+            validate_campaign_file_provenance(&sealed, "segment final receipt")
+                .unwrap_err()
+                .to_string()
+                .contains("changed")
+        );
+    }
+
+    #[test]
+    fn campaign_segment_baseline_must_link_back_to_exact_candidate_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let report_path = dir.path().join("candidate-runtime-evidence.json");
+        fs::write(&report_path, b"candidate report").unwrap();
+        let report_file = RuntimeFileProvenance::new(&report_path).unwrap();
+        let baseline_path = dir.path().join("segment-baseline.json");
+        let linked_baseline = json!({
+            "ty_refresh": {
+                "runtime_evidence_path": report_file.path
+            }
+        });
+        fs::write(
+            &baseline_path,
+            serde_json::to_vec(&linked_baseline).unwrap(),
+        )
+        .unwrap();
+        validate_campaign_segment_baseline_report_link(&linked_baseline, &report_file).unwrap();
+
+        let foreign_report = dir.path().join("sealed-foreign-report.json");
+        fs::write(&foreign_report, b"foreign report").unwrap();
+        let foreign_baseline = json!({
+            "ty_refresh": {
+                "runtime_evidence_path": foreign_report
+            }
+        });
+        fs::write(
+            &baseline_path,
+            serde_json::to_vec(&foreign_baseline).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            validate_campaign_segment_baseline_report_link(&foreign_baseline, &report_file)
+                .unwrap_err()
+                .to_string()
+                .contains("different runtime report")
+        );
     }
 
     #[test]

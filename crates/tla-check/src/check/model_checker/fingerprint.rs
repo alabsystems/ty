@@ -34,6 +34,88 @@ pub(super) fn symmetry_fp_cache_cap() -> usize {
     })
 }
 
+/// Default threshold for the adaptive zero-yield symmetry cutoff
+/// (sym-yield): the number of DISTINCT states (symmetry `fp_cache` misses)
+/// that must canonicalize with ZERO ORBIT MERGES (no two distinct raw
+/// fingerprints mapping to one canonical fingerprint — tracked exactly by
+/// `SymmetryState::yield_merge_probe`) before canonicalization is switched
+/// off for the rest of the run.
+///
+/// The firing condition is MERGE-freedom, NOT fp-identity: a symmetry group
+/// can move a large fraction of fingerprints (`canonical != raw`) while
+/// merging zero orbits. Measured on MultiPaxos_MC_small (declared SYMMETRY,
+/// S3 over Replicas): 142,152 of 343,796 distinct states have
+/// `canonical != raw`, yet default mode and `--no-reduction` both explore
+/// exactly 343,796 states — the group merges NOTHING. An identity-based
+/// check would never fire there; the merge-based check is what captures the
+/// waste class. Soundness of the mid-run switch does NOT rest on identity —
+/// see the orbit-coverage proof in `observe_symmetry_yield_probe`.
+///
+/// Why 2^15 = 32,768 distinct-state samples:
+/// - The decision basis is fp_cache MISSES (distinct raw states), not raw
+///   calls: a repeated state cannot produce a new merge (its miss already
+///   probed it), and misses are exactly the expensive canonicalizations.
+/// - False-fire risk: every real-yield spec we can measure merges early and
+///   densely (btree: 374,727 raw -> 64,685 canonical, merge density ~0.83;
+///   CigaretteSmokers: 4 of 6 raw states merge; symmetric siblings appear
+///   within the first BFS levels because the symmetric constants enter the
+///   state immediately). Observing 32,768 consecutive merge-free
+///   canonicalizations in BFS order means the merge density over the prefix
+///   is < 3.1e-5 — orders of magnitude below any observed real-yield spec.
+///   A spec that merges only after this prefix is handled by the
+///   over-exploration-only guarantee (see `observe_symmetry_yield_probe`):
+///   the verdict stays correct, at worst the (empirically zero-so-far)
+///   reduction benefit is lost.
+/// - Residual waste: the threshold caps the paid-for-nothing
+///   canonicalizations at 32,768, recovering >90% of the waste on the
+///   smallest interesting zero-yield corpus case (MultiPaxos_MC_small:
+///   343,796 distinct states, ZERO merged) and asymptotically ~100% on
+///   larger ones. It also bounds the merge-probe set at 32,768 entries
+///   (~1 MB transient, dropped at decision time).
+///
+/// Override via `TY_SYM_YIELD_CUTOFF_THRESHOLD` (0 = never fire).
+/// Kill switch: `TY_NO_SYM_YIELD_CUTOFF=1`.
+///
+/// The cutoff is also fail-closed when trace reconstruction or checkpointing
+/// is requested. Those persisted formats currently store fingerprints without
+/// a per-row canonical/raw domain tag, so they cannot represent the mixed key
+/// domain created by a mid-run switch.
+pub(super) const DEFAULT_SYM_YIELD_CUTOFF_THRESHOLD: u64 = 32_768;
+
+/// Read the sym-yield cutoff threshold from env or use the default.
+pub(super) fn sym_yield_cutoff_threshold() -> u64 {
+    static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("TY_SYM_YIELD_CUTOFF_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_SYM_YIELD_CUTOFF_THRESHOLD)
+    })
+}
+
+/// Kill switch for the adaptive zero-yield symmetry cutoff:
+/// `TY_NO_SYM_YIELD_CUTOFF=1` (default: cutoff enabled).
+fn sym_yield_cutoff_disabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("TY_NO_SYM_YIELD_CUTOFF").is_ok_and(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true")
+        })
+    })
+}
+
+/// `TY_SYM_YIELD_STATS=1`: print sym-yield counters at finalization.
+fn sym_yield_stats_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("TY_SYM_YIELD_STATS").is_ok_and(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true")
+        })
+    })
+}
+
 /// WP-11 slice 2 master gate: `TY_FLAT_SYMMETRY=1` (default OFF).
 ///
 /// Read fresh on each call (cold path, consulted once per run at install
@@ -343,6 +425,7 @@ impl<'a> ModelChecker<'a> {
     ///
     /// Returns whether the canonicalizer was installed. Declining leaves the
     /// run on the interpreter `SymmetryCanonical` domain, byte-identical.
+    #[cfg(test)]
     pub(in crate::check) fn install_flat_symmetry_canonicalizer_if_admissible(&mut self) -> bool {
         self.flat_symmetry_admission_outcome().is_ok()
     }
@@ -398,11 +481,9 @@ impl<'a> ModelChecker<'a> {
             &layout,
             &self.symmetry.perms,
         ) else {
-            return Err(
-                "FlatSymmetryCanonicalizer::compile declined the layout \
+            return Err("FlatSymmetryCanonicalizer::compile declined the layout \
                  (a variable kind is not provably equivariant-representable, \
-                 or the closed group exceeds the compiled-table caps)",
-            );
+                 or the closed group exceeds the compiled-table caps)");
         };
         self.flat_symmetry_canonicalizer = Some(std::sync::Arc::new(canon));
         Ok(())
@@ -617,6 +698,14 @@ impl<'a> ModelChecker<'a> {
 
         // For symmetry-based fingerprinting, use the cache.
         if !self.symmetry.mvperms.is_empty() {
+            // sym-yield ADAPTIVE ZERO-YIELD CUTOFF fast path: once the cutoff
+            // has fired (see `observe_symmetry_yield_probe` for the
+            // mixed-domain soundness proof), canonicalization is skipped and
+            // the raw fingerprint is the dedup key for the rest of the run.
+            if self.symmetry.yield_cutoff_active {
+                self.symmetry.yield_cutoff_skipped += 1;
+                return Ok(state.fingerprint());
+            }
             let original_fp = state.fingerprint();
             // Check cache first.
             if let Some(&canonical) = self.symmetry.fp_cache.get(&original_fp) {
@@ -631,6 +720,16 @@ impl<'a> ModelChecker<'a> {
             // will be identified with its canonical representative.
             if canonical != original_fp {
                 self.symmetry.states_folded += 1;
+            }
+
+            // sym-yield: probe for orbit merges on every DISTINCT state and
+            // fire the adaptive zero-yield cutoff at the threshold.
+            self.observe_symmetry_yield_probe(canonical);
+            if self.symmetry.yield_cutoff_active {
+                // Just fired. THIS state was canonicalized pre-switch, so its
+                // dedup key is its canonical fp (the caller stores it under
+                // this value); skip the (just-dropped) cache insert.
+                return Ok(canonical);
             }
 
             // Optional: validate symmetry canonicalization invariant for debugging (#86).
@@ -752,8 +851,29 @@ impl<'a> ModelChecker<'a> {
         // If symmetry is configured, fall back to State-based fingerprinting —
         // unless the flat-symmetry canonical domain is active (WP-11 slice 2),
         // which stays on the compiled flat hook below (the authority match
-        // canonicalizes the buffer; no Value-tree min-over-permutations).
+        // canonicalizes the buffer; no Value-tree min-over-permutations), OR
+        // the sym-yield zero-yield cutoff has fired: post-cutoff states are
+        // keyed by their RAW FP64 fingerprint (see the mixed-domain proof in
+        // `observe_symmetry_yield_probe`), which `ArrayState::fingerprint`
+        // computes directly — byte-identical to `State::fingerprint` (same
+        // `compute_var_salt` per-var salt, same `value_fingerprint`/
+        // `compact_value_fingerprint` leaf hashing — parity-tested in
+        // `value_hash_state.rs` — same salted-XOR combine and
+        // `finalize_fingerprint_xor` mix; registry order == OrdMap sorted
+        // order). Skipping the OrdMap conversion here removes the second half
+        // of the per-successor symmetry overhead.
         if !self.symmetry.perms.is_empty() && !compiled_domain_active {
+            if self.symmetry.yield_cutoff_active {
+                self.symmetry.yield_cutoff_skipped += 1;
+                let fp = array_state.fingerprint(&registry);
+                debug_assert_eq!(
+                    fp,
+                    array_state.to_state(&registry).fingerprint(),
+                    "sym-yield: ArrayState raw fp must equal State raw fp \
+                     (post-cutoff dedup domain would otherwise split)"
+                );
+                return Ok(fp);
+            }
             let state = array_state.to_state(&registry);
             return self.state_fingerprint(&state);
         }
@@ -779,6 +899,37 @@ impl<'a> ModelChecker<'a> {
     #[inline]
     pub(in crate::check) fn nested_set_monitors_active(&self) -> bool {
         !self.nested_set_monitors.is_empty()
+    }
+
+    /// True when the promoted nested-set MASK is usable as the compact
+    /// payload/collision witness (gap 1 — the memory win for `SlidingPuzzles`).
+    ///
+    /// Gated to the exact configuration where the monitored dedup fingerprint is
+    /// the state's key AND the whole state is the single promoted board variable,
+    /// so the 1-slot injective mask is a complete duplicate witness for the whole
+    /// state:
+    ///
+    /// * a nested-set monitor is installed (a set-of-sets var was promoted);
+    /// * the spec has exactly ONE state variable (the board) — the same
+    ///   single-variable shape the static slide recognizer requires — so the
+    ///   board mask injectively encodes the entire state;
+    /// * no VIEW / SYMMETRY / compiled-flat / flat-symmetry canonical domain and
+    ///   not a liveness-cache run — i.e. exactly the `monitored_array_state_fingerprint`
+    ///   dedup path (the board's `dedup_fp` byte-matches `value_fingerprint`).
+    ///
+    /// Everything else (multi-var nested specs, VIEW/SYMMETRY, liveness) keeps
+    /// the compound ArrayState witness — fail-closed, byte-identical.
+    #[inline]
+    pub(in crate::check) fn nested_set_mask_witness_active(&self) -> bool {
+        self.nested_set_monitors_active()
+            && self.ctx.var_registry().len() == 1
+            && self.compiled.cached_view_name.is_none()
+            && self.symmetry.perms.is_empty()
+            && !self.liveness_cache.cache_for_liveness
+            && !matches!(
+                self.bfs_fingerprint_domain(),
+                BfsFingerprintDomain::CompiledFlat | BfsFingerprintDomain::FlatSymmetryCanonical
+            )
     }
 
     /// THE monitored dedup fingerprint (nested-set A5). Routes EVERY monitored
@@ -921,6 +1072,151 @@ impl<'a> ModelChecker<'a> {
         super::invariants::fingerprint_flat_compiled(&scratch[..num_vars])
     }
 
+    /// sym-yield: observe one DISTINCT-state canonicalization (an `fp_cache`
+    /// MISS) in the orbit-merge probe, and fire the adaptive ZERO-YIELD
+    /// SYMMETRY CUTOFF at the threshold if the group has merged nothing.
+    ///
+    /// # Merge accounting (exact, not heuristic)
+    ///
+    /// A MISS is by definition a raw fingerprint never canonicalized before.
+    /// `yield_merge_probe` holds every canonical fp produced by misses so
+    /// far; an insert that finds `canonical` already present is therefore
+    /// precisely an ORBIT MERGE — two distinct raw fingerprints mapping to
+    /// one canonical fingerprint. This deliberately does NOT use
+    /// `states_folded` (`canonical != raw`): a group can move fingerprints
+    /// without merging orbits (MultiPaxos_MC_small: 142,152 of 343,796
+    /// states fp-changed, ZERO merged — and `--no-reduction` confirms the
+    /// state count is identical). Cache hits cannot hide a merge: a hit's
+    /// raw fp was probed at its own miss. (Both directions are modulo the
+    /// standard 64-bit fp-collision risk the fp-based dedup model already
+    /// accepts; a collision here at worst DECLINES the cutoff — fail closed
+    /// — or fires on a spec whose merges are themselves fp-collision
+    /// artifacts.)
+    ///
+    /// Fires — PERMANENTLY for the run — when ALL of:
+    /// - zero merges observed over at least
+    ///   [`DEFAULT_SYM_YIELD_CUTOFF_THRESHOLD`] distinct states (threshold
+    ///   rationale on the constant);
+    /// - the run is SAFETY-ONLY (no liveness properties, no liveness cache,
+    ///   no inline liveness): the liveness machinery evaluates canonical
+    ///   representatives through its own paths, so the cutoff fails closed
+    ///   there (AUTO symmetry already hard-disables under liveness — guard
+    ///   (c) in `symmetry_detect.rs` — and declared SYMMETRY under liveness
+    ///   is disabled-with-warning unless TY_MATCH_DECLARED_SYMMETRY=1, which
+    ///   this decline covers);
+    /// - trace reconstruction is disabled and no checkpoint directory is
+    ///   configured: neither persisted format currently carries the per-row
+    ///   fingerprint-domain tag required by a mid-run switch;
+    /// - the `TY_NO_SYM_YIELD_CUTOFF` kill switch is not set.
+    ///
+    /// # Soundness of the mid-run switch (the crux)
+    ///
+    /// After the switch the seen set holds a MIXED key domain: pre-switch
+    /// states under canonical fps, post-switch states under raw fps. Modulo
+    /// the standard fp-collision risk (raw and canonical fps live in the
+    /// same hash space computed by the same algorithm — no new collision
+    /// class), a post-switch candidate `u` keyed `raw(u)` hits a stored key
+    /// in exactly two ways:
+    ///
+    /// 1. `raw(u) == raw(t)` for a post-switch state `t` ⇒ `u == t`:
+    ///    a true duplicate — skipping is exact.
+    /// 2. `raw(u) == canonical(s)` for a pre-switch state `s`. Since
+    ///    `canonical(s)` IS `raw(lexmin(orbit(s)))` (the canonical fp is
+    ///    computed by fingerprinting the lexicographically minimal permuted
+    ///    state with the same algorithm — `compute_fingerprint_from_min_vals`
+    ///    == `compute_fingerprint`), this means `u == lexmin(orbit(s))`, so
+    ///    `orbit(u) == orbit(s)` and `canonical(u) == canonical(s)`. The
+    ///    never-switch run would ALSO skip `u` (its canonical key is
+    ///    present). Skipping an orbit sibling of an explored state is the
+    ///    standard symmetry-reduction step, resting on exactly the
+    ///    automorphism guards symmetry mode already assumes — no new
+    ///    assumption.
+    ///
+    /// There is NO other under-exploration path: dedup can only skip on a
+    /// present key, and both cases above are either exact duplicates or
+    /// orbit-covered states that the never-switch run skips identically.
+    /// The remaining divergence is OVER-exploration only: a post-switch
+    /// state `t` that WOULD have merged (`canonical(t)` present but
+    /// `raw(t)` absent) is admitted and explored. Invariants/deadlock are
+    /// checked on every concretely admitted state, so verdicts stay correct
+    /// — at worst the reduction benefit (zero for the entire observed
+    /// prefix) is lost.
+    ///
+    /// Consequently, on a run whose group never merges anything (the firing
+    /// case extended to the whole run), cutoff-on is STATE-COUNT-EXACT
+    /// against cutoff-off: case 2 skips match the never-switch behavior
+    /// one-for-one, and no post-switch state can merge (there are no
+    /// merges). A spec whose first merge would occur only after the switch
+    /// over-explores from that point — the documented, verdict-preserving
+    /// worst case.
+    ///
+    /// The BFS invariant maintained in every regime (and their mixture):
+    /// every reachable orbit retains at least one concretely explored
+    /// member, and per-state safety checks transfer across the orbit by the
+    /// automorphism guards.
+    ///
+    /// Trace and checkpoint persistence deliberately stay in one fingerprint
+    /// domain: the cutoff declines before firing whenever either facility is
+    /// configured. Neither format currently carries a per-row canonical/raw
+    /// domain tag, so replaying or restoring a mixed-domain run would be
+    /// ambiguous.
+    fn observe_symmetry_yield_probe(&mut self, canonical: Fingerprint) {
+        if self.symmetry.yield_cutoff_active || self.symmetry.yield_cutoff_declined {
+            return;
+        }
+        let threshold = sym_yield_cutoff_threshold();
+        if threshold == 0 || sym_yield_cutoff_disabled() {
+            // Probing disabled for the run: restore exact baseline behavior
+            // (no probe memory, no per-miss cost).
+            self.symmetry.yield_cutoff_declined = true;
+            self.symmetry.yield_merge_probe = Default::default();
+            return;
+        }
+        // Fail closed before allocating or consulting the merge probe under
+        // any persistence or liveness machinery that requires a stable
+        // fingerprint domain (see doc comment).
+        if self.trace.auto_create_trace_file
+            || self.trace.trace_file.is_some()
+            || self.checkpoint.dir.is_some()
+            || self.config.has_liveness_properties()
+            || self.liveness_cache.cache_for_liveness
+            || self.inline_liveness_active()
+        {
+            let sym = &mut self.symmetry;
+            sym.yield_cutoff_declined = true;
+            sym.yield_merge_probe = Default::default();
+            return;
+        }
+        if !self.symmetry.yield_merge_probe.insert(canonical) {
+            // REAL YIELD: two distinct raw fps canonicalized to one fp. The
+            // cutoff must never fire; latch and drop the probe memory.
+            self.symmetry.yield_merges += 1;
+            self.symmetry.yield_cutoff_declined = true;
+            self.symmetry.yield_merge_probe = Default::default();
+            return;
+        }
+        if self.symmetry.fp_cache_misses < threshold {
+            return;
+        }
+        // Threshold reached with ZERO merges: decide now (fire or decline) —
+        // the probe is dropped on every path below, bounding it at
+        // `threshold` entries.
+        let sym = &mut self.symmetry;
+        sym.yield_cutoff_active = true;
+        sym.yield_cutoff_fired_at = sym.fp_cache_misses;
+        // Neither the canonical-fp cache nor the probe is ever consulted
+        // again (the fast path returns first) — drop their memory now.
+        sym.fp_cache = Default::default();
+        sym.yield_merge_probe = Default::default();
+        telemetry_eprintln!(
+            "[sym-yield] zero-yield symmetry cutoff FIRED after {} distinct states \
+             (the group of {} permutations merged ZERO orbits) — canonicalization \
+             disabled for the rest of the run. Kill switch: TY_NO_SYM_YIELD_CUTOFF=1",
+            self.symmetry.yield_cutoff_fired_at,
+            self.symmetry.perms.len(),
+        );
+    }
+
     /// Populate symmetry reduction statistics into CheckStats.
     ///
     /// Called during finalization to transfer accumulated symmetry counters
@@ -928,6 +1224,28 @@ impl<'a> ModelChecker<'a> {
     pub(in crate::check) fn populate_symmetry_stats(&mut self) {
         if self.symmetry.perms.is_empty() {
             return;
+        }
+        if sym_yield_stats_enabled() {
+            eprintln!(
+                "[sym-yield] stats: canonicalizations={} (distinct={} cache_hits={}) \
+                 fp_changed(non-identity)={} merges_probed={} cutoff_fired_at={} \
+                 skipped_after_cutoff={}",
+                self.symmetry.fp_cache_hits + self.symmetry.fp_cache_misses,
+                self.symmetry.fp_cache_misses,
+                self.symmetry.fp_cache_hits,
+                self.symmetry.states_folded,
+                if self.symmetry.yield_cutoff_declined && self.symmetry.yield_merges > 0 {
+                    ">=1 (probe latched)".to_string()
+                } else {
+                    self.symmetry.yield_merges.to_string()
+                },
+                if self.symmetry.yield_cutoff_active {
+                    self.symmetry.yield_cutoff_fired_at.to_string()
+                } else {
+                    "never".to_string()
+                },
+                self.symmetry.yield_cutoff_skipped,
+            );
         }
         let stats = &mut self.stats.symmetry_reduction;
         stats.permutation_count = self.symmetry.perms.len();
@@ -959,7 +1277,6 @@ impl<'a> ModelChecker<'a> {
 
 #[cfg(test)]
 mod tests {
-    use tla_value::Rp;
     use super::super::bfs::compiled_step_trait::{
         BfsStepError, CompiledBfsLevel, CompiledLevelResult,
     };
@@ -967,6 +1284,7 @@ mod tests {
     use crate::config::Config;
     use crate::test_support::parse_module;
     use crate::value::{FuncValue, Value};
+    use tla_value::Rp;
 
     struct TestCompiledBfsLevel {
         has_fused_level: bool,
@@ -1629,9 +1947,8 @@ Next == x' = x
             vec!["Node".to_string()],
             Vec::new(),
         );
-        checker.homotopic_canonicalizer = Some(
-            super::super::bfs::topology::canonicalize::HomotopicCanonicalizer::new(&evidence),
-        );
+        checker.homotopic_canonicalizer =
+            Some(super::super::bfs::topology::canonicalize::HomotopicCanonicalizer::new(&evidence));
         assert_eq!(
             checker.flat_buffer_canonicalization_authority(),
             FlatBufferCanonicalizationAuthority::FlatSymmetry,
@@ -1767,7 +2084,10 @@ Next == x' = x
 
         // Symmetry but no fully-flat roundtrip-verified adapter: decline.
         let mut no_adapter = ModelChecker::new(&module, &config);
-        no_adapter.symmetry.perms.push(swap_perm("wp11fa", "wp11fb"));
+        no_adapter
+            .symmetry
+            .perms
+            .push(swap_perm("wp11fa", "wp11fb"));
         assert!(!no_adapter.install_flat_symmetry_canonicalizer_if_admissible());
         assert!(no_adapter.flat_symmetry_canonicalizer.is_none());
 
@@ -1775,7 +2095,10 @@ Next == x' = x
         // fingerprint-only increment).
         let mut full_state = ModelChecker::new(&module, &config);
         infer_scalar_flat_primary(&mut full_state);
-        full_state.symmetry.perms.push(swap_perm("wp11fa", "wp11fb"));
+        full_state
+            .symmetry
+            .perms
+            .push(swap_perm("wp11fa", "wp11fb"));
         full_state.set_store_states(true);
         assert!(!full_state.install_flat_symmetry_canonicalizer_if_admissible());
 
@@ -1943,6 +2266,193 @@ Mutex == \A p, q \in Procs : (st[p] = "cs" /\ st[q] = "cs") => p = q
             (flat_states, flat_transitions),
             (interp_states, interp_transitions),
             "flat-symmetry canonical arm must be state/transition-EXACT vs interpreter symmetry"
+        );
+    }
+
+    fn sym_yield_module() -> tla_core::ast::Module {
+        parse_module(
+            r#"
+---- MODULE SymYieldCutoff ----
+VARIABLE x
+Init == x = 0
+Next == x' = x
+====
+"#,
+        )
+    }
+
+    fn sym_yield_config() -> Config {
+        Config {
+            init: Some("Init".to_string()),
+            next: Some("Next".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_sym_yield_cutoff_fires_at_threshold_with_zero_merges_even_when_fps_changed() {
+        let module = sym_yield_module();
+        let config = sym_yield_config();
+        let mut checker = ModelChecker::new(&module, &config);
+        checker.set_auto_create_trace_file(false);
+        // Simulate the MultiPaxos shape: many canonicalizations CHANGED the
+        // fp (states_folded > 0) but every canonical fp is UNIQUE (zero
+        // orbit merges) — the cutoff keys on merges, not identity.
+        checker.symmetry.states_folded = 142_152;
+        for i in 0..DEFAULT_SYM_YIELD_CUTOFF_THRESHOLD {
+            checker.symmetry.fp_cache_misses += 1;
+            checker.observe_symmetry_yield_probe(Fingerprint(0x1000 + i));
+        }
+        assert!(
+            checker.symmetry.yield_cutoff_active,
+            "cutoff must fire at the threshold when the group merged zero orbits, \
+             regardless of how many fingerprints canonicalization moved"
+        );
+        assert_eq!(
+            checker.symmetry.yield_cutoff_fired_at,
+            DEFAULT_SYM_YIELD_CUTOFF_THRESHOLD
+        );
+        assert!(
+            checker.symmetry.fp_cache.is_empty() && checker.symmetry.yield_merge_probe.is_empty(),
+            "fp_cache and merge probe memory must be dropped on fire"
+        );
+    }
+
+    #[test]
+    fn test_sym_yield_cutoff_holds_below_threshold() {
+        let module = sym_yield_module();
+        let config = sym_yield_config();
+        let mut checker = ModelChecker::new(&module, &config);
+        checker.set_auto_create_trace_file(false);
+        for i in 0..(DEFAULT_SYM_YIELD_CUTOFF_THRESHOLD - 1) {
+            checker.symmetry.fp_cache_misses += 1;
+            checker.observe_symmetry_yield_probe(Fingerprint(0x1000 + i));
+        }
+        assert!(
+            !checker.symmetry.yield_cutoff_active,
+            "cutoff must not fire below the distinct-state threshold"
+        );
+        assert!(!checker.symmetry.yield_cutoff_declined);
+    }
+
+    #[test]
+    fn test_sym_yield_cutoff_never_fires_after_a_real_merge() {
+        let module = sym_yield_module();
+        let config = sym_yield_config();
+        let mut checker = ModelChecker::new(&module, &config);
+        checker.set_auto_create_trace_file(false);
+        // Two DISTINCT raw fps canonicalizing to the SAME fp = a real orbit
+        // merge; must latch the decline forever and drop the probe.
+        checker.symmetry.fp_cache_misses += 1;
+        checker.observe_symmetry_yield_probe(Fingerprint(7));
+        checker.symmetry.fp_cache_misses += 1;
+        checker.observe_symmetry_yield_probe(Fingerprint(7));
+        assert_eq!(checker.symmetry.yield_merges, 1);
+        assert!(
+            checker.symmetry.yield_cutoff_declined,
+            "a real merge must latch the decline"
+        );
+        assert!(
+            checker.symmetry.yield_merge_probe.is_empty(),
+            "probe memory must be dropped at the first merge"
+        );
+        // Even a huge merge-free run afterwards must not fire.
+        for i in 0..(2 * DEFAULT_SYM_YIELD_CUTOFF_THRESHOLD) {
+            checker.symmetry.fp_cache_misses += 1;
+            checker.observe_symmetry_yield_probe(Fingerprint(0x100_000 + i));
+        }
+        assert!(
+            !checker.symmetry.yield_cutoff_active,
+            "real yield observed once must keep the cutoff off for the whole run"
+        );
+    }
+
+    #[test]
+    fn test_sym_yield_cutoff_fails_closed_under_liveness() {
+        let module = sym_yield_module();
+        let config = sym_yield_config();
+        let mut checker = ModelChecker::new(&module, &config);
+        checker.set_auto_create_trace_file(false);
+        checker.liveness_cache.cache_for_liveness = true;
+        for i in 0..DEFAULT_SYM_YIELD_CUTOFF_THRESHOLD {
+            checker.symmetry.fp_cache_misses += 1;
+            checker.observe_symmetry_yield_probe(Fingerprint(0x1000 + i));
+        }
+        assert!(
+            !checker.symmetry.yield_cutoff_active,
+            "the cutoff must fail closed when liveness machinery is active"
+        );
+        assert!(
+            checker.symmetry.yield_cutoff_declined,
+            "the liveness decline must latch so the predicates are not re-run per miss"
+        );
+        assert!(
+            checker.symmetry.yield_merge_probe.is_empty(),
+            "probe memory must be dropped on decline"
+        );
+    }
+
+    #[test]
+    fn test_sym_yield_cutoff_fails_closed_when_trace_is_requested() {
+        let module = sym_yield_module();
+        let config = sym_yield_config();
+        let mut checker = ModelChecker::new(&module, &config);
+        checker.set_auto_create_trace_file(true);
+        for i in 0..DEFAULT_SYM_YIELD_CUTOFF_THRESHOLD {
+            checker.symmetry.fp_cache_misses += 1;
+            checker.observe_symmetry_yield_probe(Fingerprint(0x1000 + i));
+        }
+        assert!(
+            !checker.symmetry.yield_cutoff_active,
+            "a traceable run must remain in one canonical fingerprint domain"
+        );
+        assert!(
+            checker.symmetry.yield_cutoff_declined,
+            "the trace decline must latch"
+        );
+        assert!(checker.symmetry.yield_merge_probe.is_empty());
+    }
+
+    #[test]
+    fn test_sym_yield_cutoff_fails_closed_when_checkpointing_is_configured() {
+        let module = sym_yield_module();
+        let config = sym_yield_config();
+        let mut checker = ModelChecker::new(&module, &config);
+        checker.set_auto_create_trace_file(false);
+        let checkpoint_dir = tempfile::tempdir().expect("checkpoint temp dir");
+        checker.set_checkpoint(
+            checkpoint_dir.path().to_path_buf(),
+            std::time::Duration::from_secs(60),
+        );
+        for i in 0..DEFAULT_SYM_YIELD_CUTOFF_THRESHOLD {
+            checker.symmetry.fp_cache_misses += 1;
+            checker.observe_symmetry_yield_probe(Fingerprint(0x1000 + i));
+        }
+        assert!(
+            !checker.symmetry.yield_cutoff_active,
+            "a checkpointable run must remain in one canonical fingerprint domain"
+        );
+        assert!(
+            checker.symmetry.yield_cutoff_declined,
+            "the checkpoint decline must latch"
+        );
+        assert!(checker.symmetry.yield_merge_probe.is_empty());
+    }
+
+    #[test]
+    fn test_checkpoint_creation_defensively_rejects_a_mixed_domain() {
+        let module = sym_yield_module();
+        let config = sym_yield_config();
+        let mut checker = ModelChecker::new(&module, &config);
+        checker.symmetry.yield_cutoff_active = true;
+
+        let error = checker
+            .create_checkpoint(&std::collections::VecDeque::new(), None, None)
+            .expect_err("mixed-domain checkpoint creation must fail closed");
+
+        assert!(
+            error.to_string().contains("mixed fingerprint domain"),
+            "unexpected checkpoint refusal: {error}"
         );
     }
 

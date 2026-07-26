@@ -13,10 +13,12 @@
 //! Evaluates each used check once across the graph, storing results in
 //! `NodeInfo.state_check_mask` / `NodeInfo.action_check_masks` for O(1) SCC lookups.
 
-use super::check_mask::CheckMask;
+use super::check_mask::{ActionCheckMatrix, CheckMask};
 use super::ea_precompute_cache;
 use super::ea_precompute_enabled::{collect_enabled_nodes, EnabledInfo};
-use super::ea_precompute_leaf_batch::try_populate_action_masks_from_leaf_batches;
+use super::ea_precompute_leaf_batch::{
+    try_populate_action_masks_from_leaf_batches, ActionLeafBatchPlan,
+};
 use super::ea_precompute_profile::PopulateMasksProfile;
 use super::live_expr::LiveExpr;
 use super::{BehaviorGraph, BehaviorGraphNode, InlineCheckResults, LivenessChecker, TirProgram};
@@ -90,6 +92,18 @@ fn try_get_unique_state<'a>(
     unique_states.get(&fp)
 }
 
+fn resolve_state(
+    arr: &crate::state::ArrayState,
+    fp: Fingerprint,
+    unique_states_full: &FxHashMap<Fingerprint, crate::state::State>,
+    registry: &tla_core::VarRegistry,
+) -> crate::state::State {
+    match unique_states_full.get(&fp) {
+        Some(state) => state.clone(),
+        None => arr.to_state(registry),
+    }
+}
+
 impl LivenessChecker {
     /// Populate per-node check bitmasks in the behavior graph (#2572, #3065).
     ///
@@ -159,6 +173,20 @@ impl LivenessChecker {
             );
         }
 
+        // Exact raw on-the-fly exploration (or cross-group cache reuse) already
+        // populated every ENABLED result needed by the supported fairness
+        // forms. Reconstruct masks directly into graph nodes before allocating
+        // the fallback's state/transition maps.
+        if super::ea_precompute_exact_raw::try_populate_action_masks_from_exact_raw_fps(
+            self,
+            check_action,
+            check_state,
+            action_used,
+            state_used,
+        )? {
+            return Ok(());
+        }
+
         // Eval fallback: snapshot topology + clone each unique state once.
         // This path is only reached for symmetry/VIEW specs where inline
         // recording doesn't cover all tags.
@@ -173,7 +201,8 @@ impl LivenessChecker {
         // ArrayStates so no per-node `State` is retained.
         let registry = self.ctx.var_registry().clone();
 
-        let mut unique_states: FxHashMap<Fingerprint, crate::state::ArrayState> = FxHashMap::default();
+        let mut unique_states: FxHashMap<Fingerprint, crate::state::ArrayState> =
+            FxHashMap::default();
         // Part of #3746: skip nodes whose state is missing from the graph's
         // shared state cache (can happen in parallel/fingerprint-only mode).
         // Missing-state nodes get empty bitmasks, which is conservative:
@@ -181,20 +210,26 @@ impl LivenessChecker {
         let mut node_data: Vec<NodeData> = Vec::new();
         let mut fp_to_mask: FxHashMap<(Fingerprint, Fingerprint), CheckMask> = FxHashMap::default();
         let mut seen_transitions: FxHashSet<(Fingerprint, Fingerprint)> = FxHashSet::default();
-        let mut unique_transitions: Vec<(Fingerprint, Fingerprint, usize, usize)> = Vec::new();
+        let mut by_from: FxHashMap<Fingerprint, Vec<Fingerprint>> = FxHashMap::default();
 
         for node in self.graph.node_keys() {
             let info = match self.graph.try_get_node_info(&node)? {
                 Some(info) => info,
                 None => continue,
             };
-            match cache_graph_state(&mut unique_states, &self.graph, &node, "graph node", &registry) {
+            match cache_graph_state(
+                &mut unique_states,
+                &self.graph,
+                &node,
+                "graph node",
+                &registry,
+            ) {
                 Ok(false) => continue, // state missing — skip this node
                 Err(e) => return Err(e),
                 Ok(true) => {}
             }
-            let nd_idx = node_data.len();
-            for (succ_idx, succ) in info.successors.iter().enumerate() {
+            by_from.entry(node.state_fp).or_default();
+            for succ in info.successors() {
                 // Silently skip successors with missing states;
                 // they won't be in unique_states and downstream
                 // bitmask evaluation will produce default (false) masks.
@@ -208,11 +243,15 @@ impl LivenessChecker {
                 let from_fp = node.state_fp;
                 let to_fp = succ.state_fp;
                 if seen_transitions.insert((from_fp, to_fp)) {
-                    unique_transitions.push((from_fp, to_fp, nd_idx, succ_idx));
+                    by_from.entry(from_fp).or_default().push(to_fp);
                 }
             }
             node_data.push(NodeData { node });
         }
+
+        pf.unique_transition_count = seen_transitions.len();
+        pf.by_from_group_count = by_from.len();
+        drop(seen_transitions);
 
         // Empty-registry checkers (unit-test fixtures that register no variables)
         // cannot use the compact `ArrayState` form — `ArrayState::from_state`
@@ -231,13 +270,6 @@ impl LivenessChecker {
         } else {
             FxHashMap::default()
         };
-        let resolve_state = |arr: &crate::state::ArrayState, fp: Fingerprint| -> crate::state::State {
-            match unique_states_full.get(&fp) {
-                Some(s) => s.clone(),
-                None => arr.to_state(&registry),
-            }
-        };
-
         pf.node_count = node_data.len();
         pf.unique_state_count = unique_states.len();
         pf.state_check_start = Instant::now();
@@ -257,7 +289,7 @@ impl LivenessChecker {
                             || {
                                 self.eval_live_check_expr(
                                     check,
-                                    &resolve_state(arr, state_fp),
+                                    &resolve_state(arr, state_fp, &unique_states_full, &registry),
                                     None,
                                     tir,
                                 )
@@ -276,24 +308,9 @@ impl LivenessChecker {
         pf.state_total_count = state_used.len();
         pf.action_check_start = Instant::now();
 
-        // Evaluate action checks batched per unique (from_fp, to_fp) pair.
-        let mut by_from: FxHashMap<Fingerprint, Vec<(Fingerprint, usize, usize)>> =
-            FxHashMap::default();
-        for &(from_fp, to_fp, nd_idx, succ_idx) in &unique_transitions {
-            by_from
-                .entry(from_fp)
-                .or_default()
-                .push((to_fp, nd_idx, succ_idx));
-        }
-        for nd in &node_data {
-            by_from.entry(nd.node.state_fp).or_default();
-        }
-
         pf.subscript_start = Instant::now();
         // Always precompute subscripts on the eval fallback path.
         self.precompute_subscript_values(check_action, action_used, &unique_states)?;
-        pf.unique_transition_count = unique_transitions.len();
-        pf.by_from_group_count = by_from.len();
         pf.eval_loop_start = Instant::now();
 
         // The leaf-batch fast path binds the compact `ArrayState` directly, so it
@@ -304,7 +321,7 @@ impl LivenessChecker {
                 self,
                 check_action,
                 action_used,
-                &unique_states,
+                &mut unique_states,
                 &by_from,
                 &mut fp_to_mask,
                 &mut pf,
@@ -315,24 +332,34 @@ impl LivenessChecker {
                 pf.print();
             }
 
+            // Release evaluation scratch before allocating each node's final
+            // action-mask vector. The final write only needs the compact mask
+            // maps plus the topology keys in node_data.
+            drop(by_from);
+            drop(unique_states);
+            drop(unique_states_full);
+
             // Write results into NodeInfo.
             for nd in &node_data {
-                self.graph.update_node_info(&nd.node, |info| {
-                    info.state_check_mask = state_mask
-                        .get(&nd.node.state_fp)
-                        .cloned()
-                        .unwrap_or_default();
-                    info.action_check_masks = info
-                        .successors
-                        .iter()
-                        .map(|succ| {
-                            fp_to_mask
-                                .get(&(nd.node.state_fp, succ.state_fp))
-                                .cloned()
-                                .unwrap_or_default()
-                        })
-                        .collect();
-                })?;
+                self.graph.update_node_masks(
+                    &nd.node,
+                    |successors, state_check_mask, action_check_masks| {
+                        *state_check_mask = state_mask
+                            .get(&nd.node.state_fp)
+                            .cloned()
+                            .unwrap_or_default();
+                        *action_check_masks = ActionCheckMatrix::from_masks(
+                            check_action.len(),
+                            successors.iter().map(|succ| {
+                                fp_to_mask
+                                    .get(&(nd.node.state_fp, succ.state_fp))
+                                    .cloned()
+                                    .unwrap_or_default()
+                            }),
+                        );
+                        debug_assert_eq!(action_check_masks.len(), successors.len());
+                    },
+                )?;
             }
 
             return Ok(());
@@ -353,6 +380,13 @@ impl LivenessChecker {
                 .filter(|info| seen_tags.insert(info.tag))
                 .collect()
         };
+        let exact_raw_fp_plan = ActionLeafBatchPlan::from_checks(
+            check_action,
+            action_used,
+            self,
+            self.exact_raw_fp_leaf_fast_path_allowed,
+        )
+        .filter(ActionLeafBatchPlan::supports_fallback_fp_reconstruction);
 
         // Eval path: evaluate expressions directly without cross-property per-tag caches.
         {
@@ -376,6 +410,8 @@ impl LivenessChecker {
                                 let from_state = resolve_state(
                                     get_unique_state(&unique_states, state_fp, "ENABLED source")?,
                                     state_fp,
+                                    &unique_states_full,
+                                    &registry,
                                 );
                                 self.eval_enabled(
                                     &eval_ctx,
@@ -390,11 +426,12 @@ impl LivenessChecker {
                     }
                 }
                 for (from_fp, transitions) in &by_from {
-                    for &(to_fp, _, _) in transitions {
-                        pf.fresh_eval_transitions += 1;
+                    for &to_fp in transitions {
                         let from_state = resolve_state(
                             get_unique_state(&unique_states, *from_fp, "action source")?,
                             *from_fp,
+                            &unique_states_full,
+                            &registry,
                         );
                         // Part of #3746: skip transitions whose destination state
                         // is missing from the cache (parallel mode).
@@ -405,7 +442,16 @@ impl LivenessChecker {
                             fp_to_mask.insert((*from_fp, to_fp), CheckMask::new());
                             continue;
                         };
-                        let to_state = resolve_state(to_arr, to_fp);
+                        let to_state = resolve_state(to_arr, to_fp, &unique_states_full, &registry);
+
+                        if let Some(mask) = exact_raw_fp_plan.as_ref().and_then(|plan| {
+                            plan.try_check_mask_from_fps(check_action, action_used, *from_fp, to_fp)
+                        }) {
+                            pf.cache_hit_transitions += 1;
+                            fp_to_mask.insert((*from_fp, to_fp), mask);
+                            continue;
+                        }
+                        pf.fresh_eval_transitions += 1;
 
                         // Bind state variables for this transition (empty-registry path).
                         // eval_live_check_expr_inner assumes ctx is pre-configured.
@@ -471,8 +517,7 @@ impl LivenessChecker {
                     }
 
                     // Phase B: Evaluate action checks.
-                    for &(to_fp, _, _) in transitions {
-                        pf.fresh_eval_transitions += 1;
+                    for &to_fp in transitions {
                         // Part of #3746: skip transitions whose destination state
                         // is missing from the cache (parallel mode).
                         let Some(next_array) = try_get_unique_state(&unique_states, to_fp) else {
@@ -482,6 +527,14 @@ impl LivenessChecker {
                             fp_to_mask.insert((*from_fp, to_fp), CheckMask::new());
                             continue;
                         };
+                        if let Some(mask) = exact_raw_fp_plan.as_ref().and_then(|plan| {
+                            plan.try_check_mask_from_fps(check_action, action_used, *from_fp, to_fp)
+                        }) {
+                            pf.cache_hit_transitions += 1;
+                            fp_to_mask.insert((*from_fp, to_fp), mask);
+                            continue;
+                        }
+                        pf.fresh_eval_transitions += 1;
                         let next_state = next_array.to_state(&registry_cloned);
                         let cached_next_env = self.get_cached_env(&next_state);
                         let next_values = next_state.to_values(&registry_cloned);
@@ -512,29 +565,41 @@ impl LivenessChecker {
                 }
             }
         }
+        pf.enabled_info_count = enabled_infos.len();
         if profile {
-            pf.enabled_info_count = enabled_infos.len();
             pf.print();
         }
 
+        // enabled_infos borrows enabled_infos_raw, so release the references
+        // first. None of the remaining evaluation scratch is needed while the
+        // final per-node mask vectors are installed.
+        drop(enabled_infos);
+        drop(enabled_infos_raw);
+        drop(by_from);
+        drop(unique_states);
+        drop(unique_states_full);
+
         // Write results into NodeInfo.
         for nd in &node_data {
-            self.graph.update_node_info(&nd.node, |info| {
-                info.state_check_mask = state_mask
-                    .get(&nd.node.state_fp)
-                    .cloned()
-                    .unwrap_or_default();
-                info.action_check_masks = info
-                    .successors
-                    .iter()
-                    .map(|succ| {
-                        fp_to_mask
-                            .get(&(nd.node.state_fp, succ.state_fp))
-                            .cloned()
-                            .unwrap_or_default()
-                    })
-                    .collect();
-            })?;
+            self.graph.update_node_masks(
+                &nd.node,
+                |successors, state_check_mask, action_check_masks| {
+                    *state_check_mask = state_mask
+                        .get(&nd.node.state_fp)
+                        .cloned()
+                        .unwrap_or_default();
+                    *action_check_masks = ActionCheckMatrix::from_masks(
+                        check_action.len(),
+                        successors.iter().map(|succ| {
+                            fp_to_mask
+                                .get(&(nd.node.state_fp, succ.state_fp))
+                                .cloned()
+                                .unwrap_or_default()
+                        }),
+                    );
+                    debug_assert_eq!(action_check_masks.len(), successors.len());
+                },
+            )?;
         }
 
         Ok(())

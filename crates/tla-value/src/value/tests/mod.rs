@@ -8,8 +8,8 @@
 mod compose_perm_tests;
 mod concurrent_drop_tests;
 mod core_values;
-mod dense_apply_tests;
 mod dedup_fingerprint_tests;
+mod dense_apply_tests;
 mod empty_tuple_equality;
 mod equivalence;
 mod fingerprint_tests;

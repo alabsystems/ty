@@ -3,10 +3,10 @@
 // Licensed under the Apache License, Version 2.0
 
 use crate::kani_harnesses::kani_generators::*;
-use tla_value::Rp;
 use crate::state::State;
 use crate::value::{FuncValue, Value};
 use std::sync::Arc;
+use tla_value::Rp;
 
 // P2: Value Equality Reflexivity
 

@@ -492,16 +492,15 @@ mod tests {
         SEED_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Measurement harness (ignored): load a real PNML model directory from
+    /// Measurement harness: load a real PNML model directory from
     /// `TY_DD_BENCH_DIR`, build the sound DD spec, and time the ordered DD
     /// StateSpace dispatch. Run with, e.g.:
     ///
     /// ```text
     /// TY_DD_BENCH_DIR=tmp_benchmark_models/CSRepetitions-PT-03 \
-    ///   cargo test -p tla-petri --features dd-backend dd_bench -- --ignored --nocapture
+    ///   cargo test -p tla-petri --features dd-backend dd_bench -- --nocapture
     /// ```
     #[test]
-    #[ignore = "manual DD performance probe; needs TY_DD_BENCH_DIR"]
     fn dd_bench_statespace_from_env() {
         let Ok(dir) = std::env::var("TY_DD_BENCH_DIR") else {
             eprintln!("TY_DD_BENCH_DIR not set; skipping");
@@ -525,11 +524,7 @@ mod tests {
             "[dd-bench] gate passed: max per-place bound = {}",
             bounds.iter().copied().max().unwrap_or(0)
         );
-        let budget_secs: u64 = std::env::var("TY_DD_BENCH_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(25);
-        eprintln!("[dd-bench] running native tla-bdd metrics (budget {budget_secs}s)");
+        eprintln!("[dd-bench] running native tla-bdd metrics");
         let t1 = std::time::Instant::now();
         let m = crate::examinations::mdd_common::state_space_metrics_via_bdd(&spec);
         eprintln!(
@@ -544,15 +539,14 @@ mod tests {
         );
     }
 
-    /// Manual probe (ignored): which order candidate does the span guard
+    /// Manual probe: which order candidate does the span guard
     /// pick on a real PNML model, with and without the NUPN seed? Run with:
     ///
     /// ```text
     /// TY_DD_BENCH_DIR=tmp_benchmark_models/TokenRing-PT-010 \
-    ///   cargo test -p tla-petri --release dd_bench_nupn_seed -- --ignored --nocapture
+    ///   cargo test -p tla-petri --release dd_bench_nupn_seed -- --nocapture
     /// ```
     #[test]
-    #[ignore = "manual NUPN-seed ordering probe; needs TY_DD_BENCH_DIR"]
     fn dd_bench_nupn_seed_from_env() {
         let Ok(dir) = std::env::var("TY_DD_BENCH_DIR") else {
             eprintln!("TY_DD_BENCH_DIR not set; skipping");
@@ -606,7 +600,7 @@ mod tests {
         }
     }
 
-    /// Manual probe (ignored): the DIRECT MDD-size measurement — reachable-set
+    /// Manual probe: the DIRECT MDD-size measurement — reachable-set
     /// interior node count (the quantity the 8M cap bounds) under identity vs
     /// FORCE vs NUPN-seeded place order, on a real PNML model. This is the
     /// conclusive evidence (beyond the transition-span proxy) that the variable
@@ -614,11 +608,10 @@ mod tests {
     ///
     /// ```text
     /// TY_DD_BENCH_DIR=~/.cache/ty/corpus/2025/Philosophers-PT-000010 \
-    ///   cargo test -p tla-petri --features dd-backend mdd_node_count_from_env -- --ignored --nocapture
+    ///   cargo test -p tla-petri --features dd-backend mdd_node_count_from_env -- --nocapture
     /// ```
     #[cfg(feature = "dd-backend")]
     #[test]
-    #[ignore = "manual MDD-size ordering probe; needs TY_DD_BENCH_DIR"]
     fn mdd_node_count_from_env() {
         let Ok(dir) = std::env::var("TY_DD_BENCH_DIR") else {
             eprintln!("TY_DD_BENCH_DIR not set; skipping");

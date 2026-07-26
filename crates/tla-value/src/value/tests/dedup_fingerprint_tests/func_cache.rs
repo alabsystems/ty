@@ -7,12 +7,12 @@
 //! Part of #3168: additive state-dedup fingerprints must propagate nested errors
 //! and preserve cached values across targeted updates for function-like containers.
 
+use super::state_value_fingerprint_unwrap;
 use crate::dedup_fingerprint::state_value_fingerprint;
-use crate::value::FuncValue;
-use crate::{IntIntervalFunc, KSubsetValue, Value};
 use crate::rp::Rp as Arc;
 use crate::rp::Rp;
-use super::state_value_fingerprint_unwrap;
+use crate::value::FuncValue;
+use crate::{IntIntervalFunc, KSubsetValue, Value};
 
 fn cache_func_state_fp(func: &FuncValue) -> u64 {
     let fp = state_value_fingerprint_unwrap(&Value::Func(Rp::new(func.clone())));

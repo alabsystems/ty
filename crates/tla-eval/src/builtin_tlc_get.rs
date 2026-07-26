@@ -11,7 +11,6 @@ use super::{
 
 use num_traits::ToPrimitive;
 use tla_value::Rp;
-use std::sync::Arc;
 
 // Part of #3962 Wave 25: PROCESS_START_TIME thread_local has been consolidated
 // into EVAL_DEBUG_STATE in eval_debug.rs. Access via process_start_time() accessor.

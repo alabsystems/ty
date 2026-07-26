@@ -219,6 +219,24 @@ cargo clippy -p tla-cli --all-targets  # lint the CLI
 `scripts/check_ay_build_gate.sh` gates the `ay`-enabled configurations (gates
 run manually).
 
+To compare against TLC you also need TLC itself and the TLA+ proof library:
+
+```bash
+ty install-tlc install --with-proof-library   # TLC + CommunityModules + TLAPS library
+ty corpus doctor                              # which specs are actually comparable, and why
+```
+
+The proof library matters more than it sounds: 25 of the 141 comparable corpus
+specs `EXTENDS TLAPS` / `FiniteSetTheorems` / `NaturalsInduction`, and TLC dies
+in the parser without them. `ty install-tlc proof-library` fetches
+[tlapm](https://github.com/tlaplus/tlapm)'s `library/` at a pinned commit,
+verified per file by sha256.
+
+`ty corpus doctor` then reports, per spec, whether TLC can parse it, whether
+exact state-count parity with TLC is even possible (it is not where TLC applies
+a declared `SYMMETRY` to a liveness property — `ty` soundly refuses that orbit
+quotient and explores the full space), and whether a `ty` measurement exists.
+
 ## Acknowledgments
 
 `ty` builds on decades of research in model checking, temporal logic, and formal

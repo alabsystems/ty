@@ -72,6 +72,7 @@ pub(crate) use checker::clear_leaf_result_cache;
 pub(crate) use checker::clear_subscript_value_cache;
 pub(crate) use checker::eval_subscript_changed_array_cached;
 pub(crate) use checker::log_cache_stats;
+pub(crate) use checker::ExactRawStateGraphCache;
 // Part of #liveness-leaf-memo: canonical subscript classes for fairness leaves.
 pub(crate) use checker::register_subscript_tag_classes;
 // Part of #liveness-leaf-memo: ENABLED→ActionPred result sharing.
@@ -85,12 +86,12 @@ pub(crate) use checker::{extend_whole_next_action_tags, whole_next_action_tag};
 // production consumer reaches it via `checker::whole_next_enabled_tag`.
 pub(crate) use checker::set_enabled_action_pred_pairs;
 #[cfg(test)]
-pub(crate) use checker::whole_next_enabled_tag;
+pub(crate) use checker::{enabled_action_pred_pair, whole_next_enabled_tag};
 pub(crate) use enabled_eval::action_pins_all_vars;
 pub(crate) use enabled_eval::enabled_enum_decides_exactly;
 
 /// Return all current-thread inline-liveness TLS allocations after the
-/// mid-BFS regeneration trip disables their producer paths.
+/// mid-BFS hybrid trip disables their BFS inline producer paths.
 pub(crate) fn release_regen_thread_local_storage() {
     checker::release_enabled_cache_storage();
     checker::release_subscript_cache_storage();

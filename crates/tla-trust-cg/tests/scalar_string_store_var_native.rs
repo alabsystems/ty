@@ -7,11 +7,10 @@
 #![cfg(feature = "native")]
 
 use std::ffi::c_void;
-use std::sync::Arc;
 
 use tla_jit_abi::{CompoundLayout, JitCallOut, JitNextStateFn, JitStatus, StateLayout, VarLayout};
 use tla_tir::bytecode::{BytecodeFunction, ConstantPool, Opcode};
-use tla_value::Value;
+use tla_value::{Rp, Value};
 
 const SYMBOL: &str = "scalar_string_store_var_native";
 
@@ -87,7 +86,7 @@ fn eval(f: JitNextStateFn, state: &[i64]) -> (JitCallOut, Vec<i64>) {
 #[test]
 fn native_store_var_string_scalar_accepts_model_value_const_provenance() {
     let mut pool = ConstantPool::new();
-    let p2_idx = pool.add_value(Value::ModelValue(Arc::from("p2")));
+    let p2_idx = pool.add_value(Value::ModelValue(Rp::from("p2")));
     let func = action_load_const(p2_idx);
     let (_lib, f) = compile(&func, &pool);
     let (out, state_out) = eval(f, &[name("p1")]);

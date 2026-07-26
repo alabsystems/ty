@@ -4162,8 +4162,13 @@ impl<'cp> Ctx<'cp> {
             },
         );
         let elem = self.load_at_dynamic_offset(body_blk, source_ptr, source_slot);
-        let elem_bit =
-            self.emit_set_bitmask_universe_bit_i64(body_blk, elem, universe_len, universe, context)?;
+        let elem_bit = self.emit_set_bitmask_universe_bit_i64(
+            body_blk,
+            elem,
+            universe_len,
+            universe,
+            context,
+        )?;
         let zero_body = self.emit_i64_const(body_blk, 0);
         // Every in-universe element yields exactly one nonzero bit, so
         // `elem_bit == 0` iff the element lies outside the universe.
@@ -6331,12 +6336,8 @@ impl<'cp> Ctx<'cp> {
                 "SetIn: symbolic-domain membership",
             )?;
             let int_shape = super::AggregateShape::Scalar(super::ScalarShape::Int);
-            let member = self.emit_symbolic_domain_membership_i64(
-                block_idx,
-                raw,
-                Some(&int_shape),
-                domain,
-            )?;
+            let member =
+                self.emit_symbolic_domain_membership_i64(block_idx, raw, Some(&int_shape), domain)?;
             return self.store_reg_value(block_idx, rd, member);
         }
 

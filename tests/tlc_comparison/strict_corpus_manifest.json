@@ -1,0 +1,1323 @@
+{
+  "schema_version": 1,
+  "claim": "ty_vs_tlc_strict_superiority",
+  "source": {
+    "repository": "https://github.com/tlaplus/Examples.git",
+    "commit": "05c7256f153cd18e40e27eaa6dd4e60f4fcba15b",
+    "root": "specifications",
+    "enumeration": "all_cfg_files",
+    "default_tla_mapping": "same_stem",
+    "expected_cfg_count": 181
+  },
+  "eligibility": {
+    "default": "eligible",
+    "exclusions": {
+      "CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_1/MC.cfg": {
+        "reason_code": "semantic_assertion_only",
+        "detail": "The configuration supplies constants to a module whose work is performed by constant ASSUME/PrintT evaluation, not behavior exploration."
+      },
+      "CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_2/MC.cfg": {
+        "reason_code": "semantic_assertion_only",
+        "detail": "The configuration supplies constants to a module whose work is performed by constant ASSUME/PrintT evaluation, not behavior exploration."
+      },
+      "CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_3/MC.cfg": {
+        "reason_code": "semantic_assertion_only",
+        "detail": "The configuration supplies constants to a module whose work is performed by constant ASSUME/PrintT evaluation, not behavior exploration."
+      },
+      "CheckpointCoordination/MCCheckpointCoordinationFailure.cfg": {
+        "reason_code": "expected_violation_first_found_noncomparable",
+        "detail": "The configuration intentionally reaches its failure invariant; no stable equivalent-work or counterexample replay rule is declared."
+      },
+      "DieHard/DieHard.cfg": {
+        "reason_code": "expected_violation_first_found_noncomparable",
+        "detail": "The configured NotSolved invariant intentionally turns the first solution into a counterexample; no stable equivalent-work or replay rule is declared."
+      },
+      "DieHard/MCDieHarder.cfg": {
+        "reason_code": "expected_violation_first_found_noncomparable",
+        "detail": "The configured NotSolved invariant intentionally turns the first solution into a counterexample; no stable equivalent-work or replay rule is declared."
+      },
+      "EinsteinRiddle/Einstein.cfg": {
+        "reason_code": "expected_violation_first_found_noncomparable",
+        "detail": "The configuration is a solve-by-invariant-counterexample workload; no stable equivalent-work or counterexample replay rule is declared."
+      },
+      "FiniteMonotonic/MCCRDT.cfg": {
+        "reason_code": "expected_violation_first_found_noncomparable",
+        "detail": "Default TLC stops at an ASSUME violation before exhaustive exploration; no stable equivalent-work or replay rule is declared."
+      },
+      "FiniteMonotonic/MCDistributedReplicatedLog.cfg": {
+        "reason_code": "expected_violation_first_found_noncomparable",
+        "detail": "The configuration reaches an expected temporal-property violation; no typed equivalent liveness-work or replay rule is declared."
+      },
+      "FiniteMonotonic/MCReplicatedLog.cfg": {
+        "reason_code": "expected_violation_first_found_noncomparable",
+        "detail": "Default TLC stops at an ASSUME violation before exhaustive exploration; no stable equivalent-work or replay rule is declared."
+      },
+      "KnuthYao/SimKnuthYao.cfg": {
+        "reason_code": "simulation_only",
+        "detail": "The module requires TLC generate mode, calls RandomElement, and performs statistical/IO postprocessing."
+      },
+      "MisraReachability/MCReachabilityTestAllGraphs.cfg": {
+        "reason_code": "semantic_assertion_only",
+        "detail": "The configuration supplies constants to a reachability test evaluated as a constant assertion, not a reachable-state model."
+      },
+      "MisraReachability/MCReachabilityTestRandomGraphs.cfg": {
+        "reason_code": "randomized_external_operator",
+        "detail": "The configured SuccSet is produced with TLC RandomElement, so repeated runs do not perform a fixed state-space workload."
+      },
+      "MissionariesAndCannibals/MissionariesAndCannibals.cfg": {
+        "reason_code": "expected_violation_first_found_noncomparable",
+        "detail": "The configuration uses an invariant counterexample to report a solution; no stable equivalent-work or counterexample replay rule is declared."
+      },
+      "N-Queens/Queens.toolbox/FourQueens/MC.cfg": {
+        "reason_code": "expected_violation_first_found_noncomparable",
+        "detail": "The configured NoSolutions invariant intentionally turns the first solution into a counterexample; no stable equivalent-work or replay rule is declared."
+      },
+      "N-Queens/QueensPluscal.toolbox/FourQueens/MC.cfg": {
+        "reason_code": "expected_violation_first_found_noncomparable",
+        "detail": "The configured NoSolutions invariant intentionally turns the first solution into a counterexample; no stable equivalent-work or replay rule is declared."
+      },
+      "SDP_Verification/SDP_Attack_Spec/MC.cfg": {
+        "reason_code": "expected_violation_first_found_noncomparable",
+        "detail": "The attack configuration reaches an expected invariant or temporal counterexample; no stable equivalent-work or replay rule is declared."
+      },
+      "SlidingPuzzles/SlidingPuzzles.cfg": {
+        "reason_code": "expected_violation_first_found_noncomparable",
+        "detail": "The configuration uses an invariant counterexample to report a solved puzzle; no stable equivalent-work or counterexample replay rule is declared."
+      },
+      "SlidingPuzzles/SlidingPuzzles_anim.cfg": {
+        "reason_code": "expected_violation_first_found_noncomparable",
+        "detail": "The animation configuration uses its goal invariant to stop at a solved puzzle; no stable equivalent-work or counterexample replay rule is declared."
+      },
+      "SpanningTree/SpanTreeRandom.cfg": {
+        "reason_code": "randomized_external_operator",
+        "detail": "The graph is chosen with TLC RandomElement and is intentionally different across runs."
+      },
+      "SpecifyingSystems/AsynchronousInterface/PrintValues.cfg": {
+        "reason_code": "semantic_assertion_only",
+        "detail": "The empty configuration drives constant evaluation and printing only, not behavior exploration."
+      },
+      "SpecifyingSystems/RealTime/MCRealTimeHourClock.cfg": {
+        "reason_code": "expected_violation_first_found_noncomparable",
+        "detail": "The configuration reaches the expected ErrorTemporal property violation; no typed equivalent liveness-work or replay rule is declared."
+      },
+      "SpecifyingSystems/SimpleMath/SimpleMath.cfg": {
+        "reason_code": "semantic_assertion_only",
+        "detail": "The configuration supplies constants to a teaching module of constant assertions, not a reachable-state model."
+      },
+      "Stones/Stones.cfg": {
+        "reason_code": "semantic_assertion_only",
+        "detail": "The configuration supplies constants to an ASSUME/PrintT search expression, not behavior exploration."
+      },
+      "TransitiveClosure/TransitiveClosure.cfg": {
+        "reason_code": "semantic_assertion_only",
+        "detail": "The empty configuration drives constant transitive-closure assertions, not behavior exploration."
+      },
+      "acp/ACP_NB_WRONG_TLC.cfg": {
+        "reason_code": "expected_violation_first_found_noncomparable",
+        "detail": "The model intentionally reaches an invariant violation, but no stable equivalent-work or counterexample replay rule is declared."
+      },
+      "dag-consensus/BlockDagTest.cfg": {
+        "reason_code": "semantic_assertion_only",
+        "detail": "The empty config drives a constant ASSUME test module, not a behavior or reachable-state model."
+      },
+      "ewd426/SimTokenRing.cfg": {
+        "reason_code": "simulation_only",
+        "detail": "The module assumes TLC generate mode and writes simulation statistics through CSV/IO operators."
+      },
+      "ewd687a/EWD687a_anim.cfg": {
+        "reason_code": "external_io_side_effect",
+        "detail": "The configured ALIAS invokes IOExecTemplate to spawn a shell and write SVG frames, so it is not a confined direct model-check workload."
+      },
+      "ewd840/EWD840_anim.cfg": {
+        "reason_code": "simulation_only",
+        "detail": "The upstream module documents invocation with TLC -simulate and exists to emit an animation."
+      },
+      "ewd840/EWD840_json.cfg": {
+        "reason_code": "external_io_side_effect",
+        "detail": "The configured JsonInv invokes JsonSerialize to write trace.json during invariant evaluation, so it is not a confined pure state-space workload."
+      },
+      "ewd998/EWD998ChanID_export.cfg": {
+        "reason_code": "simulation_only",
+        "detail": "The baseline explicitly records simulation mode; the module exports traces and may invoke an external HTTP command."
+      },
+      "ewd998/EWD998ChanID_shiviz.cfg": {
+        "reason_code": "simulation_only",
+        "detail": "The baseline explicitly records simulation mode and intentionally emits ShiViz trace data."
+      },
+      "ewd998/EWD998ChanTrace.cfg": {
+        "reason_code": "external_io_dependency",
+        "detail": "TraceSpec reads an external NDJSON path through IOEnv/ndJsonDeserialize, so this is trace replay rather than the pinned exhaustive state-space rule."
+      },
+      "ewd998/SmokeEWD998.cfg": {
+        "reason_code": "simulation_only",
+        "detail": "The module assumes generate/simulate mode and selects randomized initial states."
+      },
+      "ewd998/SmokeEWD998_SC.cfg": {
+        "reason_code": "nested_tool_driver",
+        "detail": "The module launches nested randomized TLC simulations with IOEnvExec; it is an orchestration smoke test, not one fixed direct model-check workload."
+      },
+      "spanning/MC_spanning.cfg": {
+        "reason_code": "expected_violation_first_found_noncomparable",
+        "detail": "The configuration reaches an expected invariant counterexample; no stable equivalent-work or counterexample replay rule is declared."
+      },
+      "sums_even/MC_sums_even.cfg": {
+        "reason_code": "semantic_assertion_only",
+        "detail": "The configuration overrides a constant for a constant arithmetic assertion/proof check, not behavior exploration."
+      },
+      "tower_of_hanoi/Hanoi.toolbox/Model_1/MC.cfg": {
+        "reason_code": "expected_violation_first_found_noncomparable",
+        "detail": "The configured NotSolved invariant intentionally turns the first solution into a counterexample; no stable equivalent-work or replay rule is declared."
+      },
+      "tower_of_hanoi/Hanoi_anim.cfg": {
+        "reason_code": "expected_violation_first_found_noncomparable",
+        "detail": "The animation configuration uses NotSolved to stop at the first solution; no stable equivalent-work or counterexample replay rule is declared."
+      }
+    },
+    "parity_variants": {
+      "KeyValueStore/MCKVsnap.cfg": {
+        "row_name": "MCKVsnap",
+        "variant_path": "tests/tlc_comparison/parity_variants/MCKVsnap.nosym.cfg",
+        "sha256": "49499d53e77f20504ba49bbcd12d1867031a33cf9dd4ad775d6b225651cf9ee9",
+        "reason_code": "unsound_tlc_liveness_symmetry_quotient",
+        "detail": "The upstream cfg declares SYMMETRY alongside a PROPERTY that requires the genuine liveness checker. TLC applies the orbit quotient anyway, which is unsound for temporal properties; TY soundly refuses it and explores the full space, so the two tools perform different work and exact generated-work parity is unreachable on the upstream cfg. BOTH tools run this frozen variant, which removes only the SYMMETRY stanza and preserves every other byte. Verified exact parity after the change.",
+        "verified_parity": {
+          "distinct": 189664,
+          "raw_initial": 1,
+          "total_generated": 365596,
+          "note": "identical counts from BOTH TLC and TY on this variant"
+        }
+      },
+      "braf/BufferedRandomAccessFile.cfg": {
+        "row_name": "BufferedRandomAccessFile",
+        "variant_path": "tests/tlc_comparison/parity_variants/BufferedRandomAccessFile.nosym.cfg",
+        "sha256": "c69a366e5f9e9992efd8ee049ee645e33aaed61d3d0304ef00b0d5726bfab089",
+        "reason_code": "unsound_tlc_liveness_symmetry_quotient",
+        "detail": "The upstream cfg declares SYMMETRY alongside a PROPERTY that requires the genuine liveness checker. TLC applies the orbit quotient anyway, which is unsound for temporal properties; TY soundly refuses it and explores the full space, so the two tools perform different work and exact generated-work parity is unreachable on the upstream cfg. BOTH tools run this frozen variant, which removes only the SYMMETRY stanza and preserves every other byte. Verified exact parity after the change.",
+        "verified_parity": {
+          "distinct": 6376,
+          "raw_initial": 1,
+          "total_generated": 248698,
+          "note": "identical counts from BOTH TLC and TY on this variant"
+        }
+      }
+    }
+  },
+  "work_equivalence_policy": {
+    "schema_version": 1,
+    "default_eligible_rule_id": "exhaustive_generated_work_parity_v1",
+    "rules": {
+      "exhaustive_generated_work_parity_v1": {
+        "kind": "exhaustive_state_space",
+        "required_verdict": "holds",
+        "require_complete_exploration": true,
+        "distinct_state_parity": "exact",
+        "raw_initial_state_generation_parity": "exact",
+        "raw_successor_generation_parity": "exact",
+        "total_state_generation_parity": "exact",
+        "count_arm": "bfs_no_reduction_single_worker"
+      }
+    },
+    "outcome_dispositions": {
+      "expected_violation": "exclude_unless_predeclared_typed_rule",
+      "deadlock": "exclude_unless_predeclared_typed_rule",
+      "simulation": "exclude",
+      "randomized_external_operator": "exclude",
+      "external_io": "exclude",
+      "timeout": "missing_or_stale"
+    }
+  },
+  "tla_path_overrides": {
+    "CheckpointCoordination/MCCheckpointCoordinationFailure.cfg": "CheckpointCoordination/MCCheckpointCoordination.tla",
+    "CoffeeCan/CoffeeCan1000Beans.cfg": "CoffeeCan/CoffeeCan.tla",
+    "CoffeeCan/CoffeeCan100Beans.cfg": "CoffeeCan/CoffeeCan.tla",
+    "CoffeeCan/CoffeeCan3000Beans.cfg": "CoffeeCan/CoffeeCan.tla",
+    "Disruptor/Disruptor_MPMC_liveliness.cfg": "Disruptor/Disruptor_MPMC.tla",
+    "KeyValueStore/MCKVSSafetyLarge.cfg": "KeyValueStore/MCKVS.tla",
+    "KeyValueStore/MCKVSSafetyMedium.cfg": "KeyValueStore/MCKVS.tla",
+    "KeyValueStore/MCKVSSafetySmall.cfg": "KeyValueStore/MCKVS.tla",
+    "LeastCircularSubstring/MCLeastCircularSubstringMedium.cfg": "LeastCircularSubstring/MCLeastCircularSubstring.tla",
+    "LeastCircularSubstring/MCLeastCircularSubstringSmall.cfg": "LeastCircularSubstring/MCLeastCircularSubstring.tla",
+    "MisraReachability/MCReachabilityTestAllGraphs.cfg": "MisraReachability/MCReachabilityTest.tla",
+    "MisraReachability/MCReachabilityTestRandomGraphs.cfg": "MisraReachability/MCReachabilityTest.tla",
+    "Moving_Cat_Puzzle/CatEvenBoxes.cfg": "Moving_Cat_Puzzle/Cat.tla",
+    "Moving_Cat_Puzzle/CatOddBoxes.cfg": "Moving_Cat_Puzzle/Cat.tla",
+    "MultiCarElevator/ElevatorLivenessLarge.cfg": "MultiCarElevator/Elevator.tla",
+    "MultiCarElevator/ElevatorLivenessMedium.cfg": "MultiCarElevator/Elevator.tla",
+    "MultiCarElevator/ElevatorSafetyLarge.cfg": "MultiCarElevator/Elevator.tla",
+    "MultiCarElevator/ElevatorSafetyMedium.cfg": "MultiCarElevator/Elevator.tla",
+    "MultiCarElevator/ElevatorSafetySmall.cfg": "MultiCarElevator/Elevator.tla",
+    "MultiPaxos-SMR/MultiPaxos_MC_small.cfg": "MultiPaxos-SMR/MultiPaxos_MC.tla",
+    "NanoBlockchain/MCNanoLarge.cfg": "NanoBlockchain/MCNano.tla",
+    "NanoBlockchain/MCNanoMedium.cfg": "NanoBlockchain/MCNano.tla",
+    "NanoBlockchain/MCNanoSmall.cfg": "NanoBlockchain/MCNano.tla",
+    "PaxosHowToWinATuringAward/MCPaxosSmall.cfg": "PaxosHowToWinATuringAward/MCPaxos.tla",
+    "PaxosHowToWinATuringAward/MCPaxosTiny.cfg": "PaxosHowToWinATuringAward/MCPaxos.tla",
+    "Prisoners_Single_Switch/PrisonerLightUnknown.cfg": "Prisoners_Single_Switch/Prisoner.tla",
+    "Prisoners_Single_Switch/PrisonerSolo.cfg": "Prisoners_Single_Switch/Prisoner.tla",
+    "Prisoners_Single_Switch/PrisonerSoloLightUnknown.cfg": "Prisoners_Single_Switch/Prisoner.tla",
+    "SlushProtocol/SlushLarge.cfg": "SlushProtocol/Slush.tla",
+    "SlushProtocol/SlushMedium.cfg": "SlushProtocol/Slush.tla",
+    "SlushProtocol/SlushSmall.cfg": "SlushProtocol/Slush.tla",
+    "SpanningTree/SpanTreeTest4Nodes.cfg": "SpanningTree/SpanTreeTest.tla",
+    "SpanningTree/SpanTreeTest5Nodes.cfg": "SpanningTree/SpanTreeTest.tla",
+    "bcastByz/bcastByzNoBcast.cfg": "bcastByz/bcastByz.tla",
+    "ewd998/EWD998Small.cfg": "ewd998/EWD998.tla"
+  },
+  "baseline_gaps": {
+    "SlidingPuzzles/SlidingPuzzles_anim.cfg": {
+      "row_name": "SlidingPuzzles_anim",
+      "tla_path": "SlidingPuzzles/SlidingPuzzles_anim.tla",
+      "reason_code": "legacy_catalog_omission"
+    },
+    "dag-consensus/BlockDagTest.cfg": {
+      "row_name": "BlockDagTest",
+      "tla_path": "dag-consensus/BlockDagTest.tla",
+      "reason_code": "legacy_catalog_omission"
+    },
+    "dag-consensus/TLCSailfish1.cfg": {
+      "row_name": "TLCSailfish1",
+      "tla_path": "dag-consensus/TLCSailfish1.tla",
+      "reason_code": "legacy_catalog_omission"
+    },
+    "dag-consensus/TLCSailfish2.cfg": {
+      "row_name": "TLCSailfish2",
+      "tla_path": "dag-consensus/TLCSailfish2.tla",
+      "reason_code": "legacy_catalog_omission"
+    },
+    "tower_of_hanoi/Hanoi_anim.cfg": {
+      "row_name": "Hanoi_anim",
+      "tla_path": "tower_of_hanoi/Hanoi_anim.tla",
+      "reason_code": "legacy_catalog_omission"
+    }
+  },
+  "baseline_non_corpus": {
+    "expected_count": 48,
+    "apalache_removed": {
+      "classification": "stale_nonexistent",
+      "reason_code": "removed_apalache_fixture",
+      "detail": "These repo-local fixtures were deleted in TY commit 2b18f9e4a6d17801caae98b5df743116fc37a85d and Apalache parity is outside the TY-vs-TLC claim.",
+      "baseline_tla_prefix": "tests/apalache_parity/specs/",
+      "baseline_cfg_prefix": "tests/apalache_parity/configs/",
+      "names": [
+        "AssignOp",
+        "BmcIncrementalSafe",
+        "BmcMultiVar",
+        "BmcSafeCounter",
+        "BmcUnsafeCounter",
+        "CaseExpressions",
+        "ChooseBounded",
+        "ConstantsConfig",
+        "DisjunctiveActions",
+        "FoldSeqConcat",
+        "FoldSetSum",
+        "FunctionComposition",
+        "FunctionOperations",
+        "GuessNondet",
+        "IntegerArithmetic",
+        "ItfTrace",
+        "LambdaFold",
+        "LetInParametric",
+        "MkSeqDoubles",
+        "NestedExcept",
+        "NoConfigCliFlags",
+        "OptionOps",
+        "Quantifiers",
+        "RecordOperations",
+        "RecursiveFactorial",
+        "RecursiveFibonacci",
+        "RepeatAccum",
+        "SequenceOperations",
+        "SetAsFunPairs",
+        "SetOperations",
+        "SkolemIdentity",
+        "StringOperations",
+        "SubsetPowerset",
+        "TraceInvMonotonic",
+        "TraceInvViolation",
+        "TupleQuantifiers",
+        "TypeCheckBasics",
+        "VariantOps"
+      ]
+    },
+    "ty_repository_replacements": {
+      "classification": "exact_replacement",
+      "eligibility": "excluded_repo_owned_fixture",
+      "reason_code": "not_externally_authored_pinned_corpus",
+      "source_root": "ty_repository",
+      "historical_source_commit": "104c63f7fea1e44242efc99b778af00d41da6f53",
+      "entries": {
+        "MCAllDiffProp": {
+          "baseline_tla_path": "specs/ay/MCAllDiffProp.tla",
+          "baseline_cfg_path": "specs/ay/MCAllDiffProp.cfg",
+          "replacement_tla_path": "specs/ay/MCAllDiffProp.tla",
+          "replacement_cfg_path": "specs/ay/MCAllDiffProp.cfg"
+        },
+        "MCBCP": {
+          "baseline_tla_path": "specs/ay/MCBCP.tla",
+          "baseline_cfg_path": "specs/ay/MCBCP_noDeadlock.cfg",
+          "replacement_tla_path": "specs/ay/MCBCP.tla",
+          "replacement_cfg_path": "specs/ay/MCBCP_noDeadlock.cfg"
+        },
+        "MCBCP_Pigeon": {
+          "baseline_tla_path": "specs/ay/MCBCP_Pigeon.tla",
+          "baseline_cfg_path": "specs/ay/MCBCP_Pigeon.cfg",
+          "replacement_tla_path": "specs/ay/MCBCP_Pigeon.tla",
+          "replacement_cfg_path": "specs/ay/MCBCP_Pigeon.cfg"
+        },
+        "MCCDCL": {
+          "baseline_tla_path": "specs/ay/MCCDCL.tla",
+          "baseline_cfg_path": "specs/ay/MCCDCL.cfg",
+          "replacement_tla_path": "specs/ay/MCCDCL.tla",
+          "replacement_cfg_path": "specs/ay/MCCDCL.cfg"
+        },
+        "MCPDR": {
+          "baseline_tla_path": "specs/ay/MCPDR.tla",
+          "baseline_cfg_path": "specs/ay/MCPDR.cfg",
+          "replacement_tla_path": "specs/ay/MCPDR.tla",
+          "replacement_cfg_path": "specs/ay/MCPDR.cfg"
+        },
+        "cdcl_test": {
+          "baseline_tla_path": "specs/ay/cdcl_test.tla",
+          "baseline_cfg_path": "specs/ay/cdcl_test.cfg",
+          "replacement_tla_path": "specs/ay/cdcl_test.tla",
+          "replacement_cfg_path": "specs/ay/cdcl_test.cfg"
+        },
+        "sunder_cargo_lock": {
+          "baseline_tla_path": "../../ty/tests/specs/sunder/cargo_lock.tla",
+          "baseline_cfg_path": "../../ty/tests/specs/sunder/cargo_lock.cfg",
+          "replacement_tla_path": "tests/specs/trust-wp/cargo_lock.tla",
+          "replacement_cfg_path": "tests/specs/trust-wp/cargo_lock.cfg",
+          "replacement_evidence": "byte_identical"
+        },
+        "sunder_cargo_lock_with_toctou": {
+          "baseline_tla_path": "../../ty/tests/specs/sunder/cargo_lock_with_toctou.tla",
+          "baseline_cfg_path": "../../ty/tests/specs/sunder/cargo_lock_with_toctou.cfg",
+          "replacement_tla_path": "tests/specs/trust-wp/cargo_lock_with_toctou.tla",
+          "replacement_cfg_path": "tests/specs/trust-wp/cargo_lock_with_toctou.cfg",
+          "replacement_evidence": "byte_identical"
+        },
+        "sunder_iteration_tags": {
+          "baseline_tla_path": "../../ty/tests/specs/sunder/iteration_tags.tla",
+          "baseline_cfg_path": "../../ty/tests/specs/sunder/iteration_tags.cfg",
+          "replacement_tla_path": "tests/specs/trust-wp/iteration_tags.tla",
+          "replacement_cfg_path": "tests/specs/trust-wp/iteration_tags.cfg",
+          "replacement_evidence": "byte_identical"
+        },
+        "sunder_iteration_tags_with_commit_failure": {
+          "baseline_tla_path": "../../ty/tests/specs/sunder/iteration_tags_with_commit_failure.tla",
+          "baseline_cfg_path": "../../ty/tests/specs/sunder/iteration_tags_with_commit_failure.cfg",
+          "replacement_tla_path": "tests/specs/trust-wp/iteration_tags_with_commit_failure.tla",
+          "replacement_cfg_path": "tests/specs/trust-wp/iteration_tags_with_commit_failure.cfg",
+          "replacement_evidence": "byte_identical"
+        }
+      }
+    }
+  },
+  "rows": [
+    {
+      "name": "MCBakery",
+      "cfg_path": "Bakery-Boulangerie/MCBakery.cfg",
+      "tla_path": "Bakery-Boulangerie/MCBakery.tla"
+    },
+    {
+      "name": "MCBoulanger",
+      "cfg_path": "Bakery-Boulangerie/MCBoulanger.cfg",
+      "tla_path": "Bakery-Boulangerie/MCBoulanger.tla"
+    },
+    {
+      "name": "CarTalkPuzzle_M1",
+      "cfg_path": "CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_1/MC.cfg",
+      "tla_path": "CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_1/MC.tla"
+    },
+    {
+      "name": "CarTalkPuzzle_M2",
+      "cfg_path": "CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_2/MC.cfg",
+      "tla_path": "CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_2/MC.tla"
+    },
+    {
+      "name": "CarTalkPuzzle_M3",
+      "cfg_path": "CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_3/MC.cfg",
+      "tla_path": "CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_3/MC.tla"
+    },
+    {
+      "name": "Chameneos",
+      "cfg_path": "Chameneos/Chameneos.cfg",
+      "tla_path": "Chameneos/Chameneos.tla"
+    },
+    {
+      "name": "MCCheckpointCoordination",
+      "cfg_path": "CheckpointCoordination/MCCheckpointCoordination.cfg",
+      "tla_path": "CheckpointCoordination/MCCheckpointCoordination.tla"
+    },
+    {
+      "name": "MCCheckpointCoordinationFailure",
+      "cfg_path": "CheckpointCoordination/MCCheckpointCoordinationFailure.cfg",
+      "tla_path": "CheckpointCoordination/MCCheckpointCoordination.tla"
+    },
+    {
+      "name": "CigaretteSmokers",
+      "cfg_path": "CigaretteSmokers/CigaretteSmokers.cfg",
+      "tla_path": "CigaretteSmokers/CigaretteSmokers.tla"
+    },
+    {
+      "name": "CoffeeCan1000Beans",
+      "cfg_path": "CoffeeCan/CoffeeCan1000Beans.cfg",
+      "tla_path": "CoffeeCan/CoffeeCan.tla"
+    },
+    {
+      "name": "CoffeeCan100Beans",
+      "cfg_path": "CoffeeCan/CoffeeCan100Beans.cfg",
+      "tla_path": "CoffeeCan/CoffeeCan.tla"
+    },
+    {
+      "name": "CoffeeCan3000Beans",
+      "cfg_path": "CoffeeCan/CoffeeCan3000Beans.cfg",
+      "tla_path": "CoffeeCan/CoffeeCan.tla"
+    },
+    {
+      "name": "DieHard",
+      "cfg_path": "DieHard/DieHard.cfg",
+      "tla_path": "DieHard/DieHard.tla"
+    },
+    {
+      "name": "MCDieHarder",
+      "cfg_path": "DieHard/MCDieHarder.cfg",
+      "tla_path": "DieHard/MCDieHarder.tla"
+    },
+    {
+      "name": "DiningPhilosophers",
+      "cfg_path": "DiningPhilosophers/DiningPhilosophers.cfg",
+      "tla_path": "DiningPhilosophers/DiningPhilosophers.tla"
+    },
+    {
+      "name": "Disruptor_MPMC",
+      "cfg_path": "Disruptor/Disruptor_MPMC.cfg",
+      "tla_path": "Disruptor/Disruptor_MPMC.tla"
+    },
+    {
+      "name": "Disruptor_MPMC_liveliness",
+      "cfg_path": "Disruptor/Disruptor_MPMC_liveliness.cfg",
+      "tla_path": "Disruptor/Disruptor_MPMC.tla"
+    },
+    {
+      "name": "Disruptor_SPMC",
+      "cfg_path": "Disruptor/Disruptor_SPMC.cfg",
+      "tla_path": "Disruptor/Disruptor_SPMC.tla"
+    },
+    {
+      "name": "Einstein",
+      "cfg_path": "EinsteinRiddle/Einstein.cfg",
+      "tla_path": "EinsteinRiddle/Einstein.tla"
+    },
+    {
+      "name": "MCCRDT",
+      "cfg_path": "FiniteMonotonic/MCCRDT.cfg",
+      "tla_path": "FiniteMonotonic/MCCRDT.tla"
+    },
+    {
+      "name": "MCDistributedReplicatedLog",
+      "cfg_path": "FiniteMonotonic/MCDistributedReplicatedLog.cfg",
+      "tla_path": "FiniteMonotonic/MCDistributedReplicatedLog.tla"
+    },
+    {
+      "name": "MCReplicatedLog",
+      "cfg_path": "FiniteMonotonic/MCReplicatedLog.cfg",
+      "tla_path": "FiniteMonotonic/MCReplicatedLog.tla"
+    },
+    {
+      "name": "GameOfLife",
+      "cfg_path": "GameOfLife/GameOfLife.cfg",
+      "tla_path": "GameOfLife/GameOfLife.tla"
+    },
+    {
+      "name": "Huang",
+      "cfg_path": "Huang/Huang.cfg",
+      "tla_path": "Huang/Huang.tla"
+    },
+    {
+      "name": "MCKVSSafetyLarge",
+      "cfg_path": "KeyValueStore/MCKVSSafetyLarge.cfg",
+      "tla_path": "KeyValueStore/MCKVS.tla"
+    },
+    {
+      "name": "MCKVSSafetyMedium",
+      "cfg_path": "KeyValueStore/MCKVSSafetyMedium.cfg",
+      "tla_path": "KeyValueStore/MCKVS.tla"
+    },
+    {
+      "name": "MCKVSSafetySmall",
+      "cfg_path": "KeyValueStore/MCKVSSafetySmall.cfg",
+      "tla_path": "KeyValueStore/MCKVS.tla"
+    },
+    {
+      "name": "MCKVsnap",
+      "cfg_path": "KeyValueStore/MCKVsnap.cfg",
+      "tla_path": "KeyValueStore/MCKVsnap.tla"
+    },
+    {
+      "name": "SimKnuthYao",
+      "cfg_path": "KnuthYao/SimKnuthYao.cfg",
+      "tla_path": "KnuthYao/SimKnuthYao.tla"
+    },
+    {
+      "name": "MCFindHighest",
+      "cfg_path": "LearnProofs/MCFindHighest.cfg",
+      "tla_path": "LearnProofs/MCFindHighest.tla"
+    },
+    {
+      "name": "MCLeastCircularSubstringMedium",
+      "cfg_path": "LeastCircularSubstring/MCLeastCircularSubstringMedium.cfg",
+      "tla_path": "LeastCircularSubstring/MCLeastCircularSubstring.tla"
+    },
+    {
+      "name": "MCLeastCircularSubstringSmall",
+      "cfg_path": "LeastCircularSubstring/MCLeastCircularSubstringSmall.cfg",
+      "tla_path": "LeastCircularSubstring/MCLeastCircularSubstring.tla"
+    },
+    {
+      "name": "MCBinarySearch",
+      "cfg_path": "LoopInvariance/MCBinarySearch.cfg",
+      "tla_path": "LoopInvariance/MCBinarySearch.tla"
+    },
+    {
+      "name": "MCQuicksort",
+      "cfg_path": "LoopInvariance/MCQuicksort.cfg",
+      "tla_path": "LoopInvariance/MCQuicksort.tla"
+    },
+    {
+      "name": "MCMajority",
+      "cfg_path": "Majority/MCMajority.cfg",
+      "tla_path": "Majority/MCMajority.tla"
+    },
+    {
+      "name": "MCParReach",
+      "cfg_path": "MisraReachability/MCParReach.cfg",
+      "tla_path": "MisraReachability/MCParReach.tla"
+    },
+    {
+      "name": "MCReachabilityTestAllGraphs",
+      "cfg_path": "MisraReachability/MCReachabilityTestAllGraphs.cfg",
+      "tla_path": "MisraReachability/MCReachabilityTest.tla"
+    },
+    {
+      "name": "MCReachabilityTestRandomGraphs",
+      "cfg_path": "MisraReachability/MCReachabilityTestRandomGraphs.cfg",
+      "tla_path": "MisraReachability/MCReachabilityTest.tla"
+    },
+    {
+      "name": "MCReachable",
+      "cfg_path": "MisraReachability/MCReachable.cfg",
+      "tla_path": "MisraReachability/MCReachable.tla"
+    },
+    {
+      "name": "MissionariesAndCannibals",
+      "cfg_path": "MissionariesAndCannibals/MissionariesAndCannibals.cfg",
+      "tla_path": "MissionariesAndCannibals/MissionariesAndCannibals.tla"
+    },
+    {
+      "name": "CatEvenBoxes",
+      "cfg_path": "Moving_Cat_Puzzle/CatEvenBoxes.cfg",
+      "tla_path": "Moving_Cat_Puzzle/Cat.tla"
+    },
+    {
+      "name": "CatOddBoxes",
+      "cfg_path": "Moving_Cat_Puzzle/CatOddBoxes.cfg",
+      "tla_path": "Moving_Cat_Puzzle/Cat.tla"
+    },
+    {
+      "name": "ElevatorLivenessLarge",
+      "cfg_path": "MultiCarElevator/ElevatorLivenessLarge.cfg",
+      "tla_path": "MultiCarElevator/Elevator.tla"
+    },
+    {
+      "name": "ElevatorLivenessMedium",
+      "cfg_path": "MultiCarElevator/ElevatorLivenessMedium.cfg",
+      "tla_path": "MultiCarElevator/Elevator.tla"
+    },
+    {
+      "name": "ElevatorSafetyLarge",
+      "cfg_path": "MultiCarElevator/ElevatorSafetyLarge.cfg",
+      "tla_path": "MultiCarElevator/Elevator.tla"
+    },
+    {
+      "name": "ElevatorSafetyMedium",
+      "cfg_path": "MultiCarElevator/ElevatorSafetyMedium.cfg",
+      "tla_path": "MultiCarElevator/Elevator.tla"
+    },
+    {
+      "name": "ElevatorSafetySmall",
+      "cfg_path": "MultiCarElevator/ElevatorSafetySmall.cfg",
+      "tla_path": "MultiCarElevator/Elevator.tla"
+    },
+    {
+      "name": "MultiPaxos_MC",
+      "cfg_path": "MultiPaxos-SMR/MultiPaxos_MC.cfg",
+      "tla_path": "MultiPaxos-SMR/MultiPaxos_MC.tla"
+    },
+    {
+      "name": "MultiPaxos_MC_small",
+      "cfg_path": "MultiPaxos-SMR/MultiPaxos_MC_small.cfg",
+      "tla_path": "MultiPaxos-SMR/MultiPaxos_MC.tla"
+    },
+    {
+      "name": "N-Queens_FourQueens",
+      "cfg_path": "N-Queens/Queens.toolbox/FourQueens/MC.cfg",
+      "tla_path": "N-Queens/Queens.toolbox/FourQueens/MC.tla"
+    },
+    {
+      "name": "N-Queens_FourQueens_2",
+      "cfg_path": "N-Queens/QueensPluscal.toolbox/FourQueens/MC.cfg",
+      "tla_path": "N-Queens/QueensPluscal.toolbox/FourQueens/MC.tla"
+    },
+    {
+      "name": "MCNanoLarge",
+      "cfg_path": "NanoBlockchain/MCNanoLarge.cfg",
+      "tla_path": "NanoBlockchain/MCNano.tla"
+    },
+    {
+      "name": "MCNanoMedium",
+      "cfg_path": "NanoBlockchain/MCNanoMedium.cfg",
+      "tla_path": "NanoBlockchain/MCNano.tla"
+    },
+    {
+      "name": "MCNanoSmall",
+      "cfg_path": "NanoBlockchain/MCNanoSmall.cfg",
+      "tla_path": "NanoBlockchain/MCNano.tla"
+    },
+    {
+      "name": "MCConsensus",
+      "cfg_path": "Paxos/MCConsensus.cfg",
+      "tla_path": "Paxos/MCConsensus.tla"
+    },
+    {
+      "name": "MCPaxos",
+      "cfg_path": "Paxos/MCPaxos.cfg",
+      "tla_path": "Paxos/MCPaxos.tla"
+    },
+    {
+      "name": "MCVoting",
+      "cfg_path": "Paxos/MCVoting.cfg",
+      "tla_path": "Paxos/MCVoting.tla"
+    },
+    {
+      "name": "MCConsensus_2",
+      "cfg_path": "PaxosHowToWinATuringAward/MCConsensus.cfg",
+      "tla_path": "PaxosHowToWinATuringAward/MCConsensus.tla"
+    },
+    {
+      "name": "MCPaxosSmall",
+      "cfg_path": "PaxosHowToWinATuringAward/MCPaxosSmall.cfg",
+      "tla_path": "PaxosHowToWinATuringAward/MCPaxos.tla"
+    },
+    {
+      "name": "MCPaxosTiny",
+      "cfg_path": "PaxosHowToWinATuringAward/MCPaxosTiny.cfg",
+      "tla_path": "PaxosHowToWinATuringAward/MCPaxos.tla"
+    },
+    {
+      "name": "MCVoting_2",
+      "cfg_path": "PaxosHowToWinATuringAward/MCVoting.cfg",
+      "tla_path": "PaxosHowToWinATuringAward/MCVoting.tla"
+    },
+    {
+      "name": "Prisoners",
+      "cfg_path": "Prisoners/Prisoners.cfg",
+      "tla_path": "Prisoners/Prisoners.tla"
+    },
+    {
+      "name": "Prisoner",
+      "cfg_path": "Prisoners_Single_Switch/Prisoner.cfg",
+      "tla_path": "Prisoners_Single_Switch/Prisoner.tla"
+    },
+    {
+      "name": "PrisonerLightUnknown",
+      "cfg_path": "Prisoners_Single_Switch/PrisonerLightUnknown.cfg",
+      "tla_path": "Prisoners_Single_Switch/Prisoner.tla"
+    },
+    {
+      "name": "PrisonerSolo",
+      "cfg_path": "Prisoners_Single_Switch/PrisonerSolo.cfg",
+      "tla_path": "Prisoners_Single_Switch/Prisoner.tla"
+    },
+    {
+      "name": "PrisonerSoloLightUnknown",
+      "cfg_path": "Prisoners_Single_Switch/PrisonerSoloLightUnknown.cfg",
+      "tla_path": "Prisoners_Single_Switch/Prisoner.tla"
+    },
+    {
+      "name": "MC",
+      "cfg_path": "ReadersWriters/MC.cfg",
+      "tla_path": "ReadersWriters/MC.tla"
+    },
+    {
+      "name": "MC_2",
+      "cfg_path": "SDP_Verification/SDP_Attack_New_Solution_Spec/MC.cfg",
+      "tla_path": "SDP_Verification/SDP_Attack_New_Solution_Spec/MC.tla"
+    },
+    {
+      "name": "MC_3",
+      "cfg_path": "SDP_Verification/SDP_Attack_Spec/MC.cfg",
+      "tla_path": "SDP_Verification/SDP_Attack_Spec/MC.tla"
+    },
+    {
+      "name": "FastPaxos",
+      "cfg_path": "SimplifiedFastPaxos/FastPaxos.cfg",
+      "tla_path": "SimplifiedFastPaxos/FastPaxos.tla"
+    },
+    {
+      "name": "Paxos",
+      "cfg_path": "SimplifiedFastPaxos/Paxos.cfg",
+      "tla_path": "SimplifiedFastPaxos/Paxos.tla"
+    },
+    {
+      "name": "MC_4",
+      "cfg_path": "SingleLaneBridge/MC.cfg",
+      "tla_path": "SingleLaneBridge/MC.tla"
+    },
+    {
+      "name": "SlidingPuzzles",
+      "cfg_path": "SlidingPuzzles/SlidingPuzzles.cfg",
+      "tla_path": "SlidingPuzzles/SlidingPuzzles.tla"
+    },
+    {
+      "name": "SlidingPuzzles_anim",
+      "cfg_path": "SlidingPuzzles/SlidingPuzzles_anim.cfg",
+      "tla_path": "SlidingPuzzles/SlidingPuzzles_anim.tla"
+    },
+    {
+      "name": "SlushLarge",
+      "cfg_path": "SlushProtocol/SlushLarge.cfg",
+      "tla_path": "SlushProtocol/Slush.tla"
+    },
+    {
+      "name": "SlushMedium",
+      "cfg_path": "SlushProtocol/SlushMedium.cfg",
+      "tla_path": "SlushProtocol/Slush.tla"
+    },
+    {
+      "name": "SlushSmall",
+      "cfg_path": "SlushProtocol/SlushSmall.cfg",
+      "tla_path": "SlushProtocol/Slush.tla"
+    },
+    {
+      "name": "SpanTree",
+      "cfg_path": "SpanningTree/SpanTree.cfg",
+      "tla_path": "SpanningTree/SpanTree.tla"
+    },
+    {
+      "name": "SpanTreeRandom",
+      "cfg_path": "SpanningTree/SpanTreeRandom.cfg",
+      "tla_path": "SpanningTree/SpanTreeRandom.tla"
+    },
+    {
+      "name": "SpanTreeTest4Nodes",
+      "cfg_path": "SpanningTree/SpanTreeTest4Nodes.cfg",
+      "tla_path": "SpanningTree/SpanTreeTest.tla"
+    },
+    {
+      "name": "SpanTreeTest5Nodes",
+      "cfg_path": "SpanningTree/SpanTreeTest5Nodes.cfg",
+      "tla_path": "SpanningTree/SpanTreeTest.tla"
+    },
+    {
+      "name": "MCInnerSequential",
+      "cfg_path": "SpecifyingSystems/AdvancedExamples/MCInnerSequential.cfg",
+      "tla_path": "SpecifyingSystems/AdvancedExamples/MCInnerSequential.tla"
+    },
+    {
+      "name": "MCInnerSerial",
+      "cfg_path": "SpecifyingSystems/AdvancedExamples/MCInnerSerial.cfg",
+      "tla_path": "SpecifyingSystems/AdvancedExamples/MCInnerSerial.tla"
+    },
+    {
+      "name": "AsynchInterface",
+      "cfg_path": "SpecifyingSystems/AsynchronousInterface/AsynchInterface.cfg",
+      "tla_path": "SpecifyingSystems/AsynchronousInterface/AsynchInterface.tla"
+    },
+    {
+      "name": "Channel",
+      "cfg_path": "SpecifyingSystems/AsynchronousInterface/Channel.cfg",
+      "tla_path": "SpecifyingSystems/AsynchronousInterface/Channel.tla"
+    },
+    {
+      "name": "PrintValues",
+      "cfg_path": "SpecifyingSystems/AsynchronousInterface/PrintValues.cfg",
+      "tla_path": "SpecifyingSystems/AsynchronousInterface/PrintValues.tla"
+    },
+    {
+      "name": "MCInternalMemory",
+      "cfg_path": "SpecifyingSystems/CachingMemory/MCInternalMemory.cfg",
+      "tla_path": "SpecifyingSystems/CachingMemory/MCInternalMemory.tla"
+    },
+    {
+      "name": "MCWriteThroughCache",
+      "cfg_path": "SpecifyingSystems/CachingMemory/MCWriteThroughCache.cfg",
+      "tla_path": "SpecifyingSystems/CachingMemory/MCWriteThroughCache.tla"
+    },
+    {
+      "name": "MCInnerFIFO",
+      "cfg_path": "SpecifyingSystems/FIFO/MCInnerFIFO.cfg",
+      "tla_path": "SpecifyingSystems/FIFO/MCInnerFIFO.tla"
+    },
+    {
+      "name": "HourClock",
+      "cfg_path": "SpecifyingSystems/HourClock/HourClock.cfg",
+      "tla_path": "SpecifyingSystems/HourClock/HourClock.tla"
+    },
+    {
+      "name": "HourClock2",
+      "cfg_path": "SpecifyingSystems/HourClock/HourClock2.cfg",
+      "tla_path": "SpecifyingSystems/HourClock/HourClock2.tla"
+    },
+    {
+      "name": "LiveHourClock",
+      "cfg_path": "SpecifyingSystems/Liveness/LiveHourClock.cfg",
+      "tla_path": "SpecifyingSystems/Liveness/LiveHourClock.tla"
+    },
+    {
+      "name": "MCLiveInternalMemory",
+      "cfg_path": "SpecifyingSystems/Liveness/MCLiveInternalMemory.cfg",
+      "tla_path": "SpecifyingSystems/Liveness/MCLiveInternalMemory.tla"
+    },
+    {
+      "name": "MCLiveWriteThroughCache",
+      "cfg_path": "SpecifyingSystems/Liveness/MCLiveWriteThroughCache.cfg",
+      "tla_path": "SpecifyingSystems/Liveness/MCLiveWriteThroughCache.tla"
+    },
+    {
+      "name": "MCRealTimeHourClock",
+      "cfg_path": "SpecifyingSystems/RealTime/MCRealTimeHourClock.cfg",
+      "tla_path": "SpecifyingSystems/RealTime/MCRealTimeHourClock.tla"
+    },
+    {
+      "name": "SimpleMath",
+      "cfg_path": "SpecifyingSystems/SimpleMath/SimpleMath.cfg",
+      "tla_path": "SpecifyingSystems/SimpleMath/SimpleMath.tla"
+    },
+    {
+      "name": "ABCorrectness",
+      "cfg_path": "SpecifyingSystems/TLC/ABCorrectness.cfg",
+      "tla_path": "SpecifyingSystems/TLC/ABCorrectness.tla"
+    },
+    {
+      "name": "MCAlternatingBit",
+      "cfg_path": "SpecifyingSystems/TLC/MCAlternatingBit.cfg",
+      "tla_path": "SpecifyingSystems/TLC/MCAlternatingBit.tla"
+    },
+    {
+      "name": "Stones",
+      "cfg_path": "Stones/Stones.cfg",
+      "tla_path": "Stones/Stones.tla"
+    },
+    {
+      "name": "TestGraphs",
+      "cfg_path": "TLC/TestGraphs.cfg",
+      "tla_path": "TLC/TestGraphs.tla"
+    },
+    {
+      "name": "Simple",
+      "cfg_path": "TeachingConcurrency/Simple.cfg",
+      "tla_path": "TeachingConcurrency/Simple.tla"
+    },
+    {
+      "name": "SimpleRegular",
+      "cfg_path": "TeachingConcurrency/SimpleRegular.cfg",
+      "tla_path": "TeachingConcurrency/SimpleRegular.tla"
+    },
+    {
+      "name": "TransitiveClosure",
+      "cfg_path": "TransitiveClosure/TransitiveClosure.cfg",
+      "tla_path": "TransitiveClosure/TransitiveClosure.tla"
+    },
+    {
+      "name": "MCTwoPhase",
+      "cfg_path": "TwoPhase/MCTwoPhase.cfg",
+      "tla_path": "TwoPhase/MCTwoPhase.tla"
+    },
+    {
+      "name": "MCYoYoNoPruning",
+      "cfg_path": "YoYo/MCYoYoNoPruning.cfg",
+      "tla_path": "YoYo/MCYoYoNoPruning.tla"
+    },
+    {
+      "name": "MCYoYoPruning",
+      "cfg_path": "YoYo/MCYoYoPruning.cfg",
+      "tla_path": "YoYo/MCYoYoPruning.tla"
+    },
+    {
+      "name": "YoYoAllGraphs",
+      "cfg_path": "YoYo/YoYoAllGraphs.cfg",
+      "tla_path": "YoYo/YoYoAllGraphs.tla"
+    },
+    {
+      "name": "aba_asyn_byz",
+      "cfg_path": "aba-asyn-byz/aba_asyn_byz.cfg",
+      "tla_path": "aba-asyn-byz/aba_asyn_byz.tla"
+    },
+    {
+      "name": "ACP_NB_TLC",
+      "cfg_path": "acp/ACP_NB_TLC.cfg",
+      "tla_path": "acp/ACP_NB_TLC.tla"
+    },
+    {
+      "name": "ACP_NB_WRONG_TLC",
+      "cfg_path": "acp/ACP_NB_WRONG_TLC.cfg",
+      "tla_path": "acp/ACP_NB_WRONG_TLC.tla"
+    },
+    {
+      "name": "ACP_SB_TLC",
+      "cfg_path": "acp/ACP_SB_TLC.cfg",
+      "tla_path": "acp/ACP_SB_TLC.tla"
+    },
+    {
+      "name": "AllocatorImplementation",
+      "cfg_path": "allocator/AllocatorImplementation.cfg",
+      "tla_path": "allocator/AllocatorImplementation.tla"
+    },
+    {
+      "name": "AllocatorRefinement",
+      "cfg_path": "allocator/AllocatorRefinement.cfg",
+      "tla_path": "allocator/AllocatorRefinement.tla"
+    },
+    {
+      "name": "SchedulingAllocator",
+      "cfg_path": "allocator/SchedulingAllocator.cfg",
+      "tla_path": "allocator/SchedulingAllocator.tla"
+    },
+    {
+      "name": "SimpleAllocator",
+      "cfg_path": "allocator/SimpleAllocator.cfg",
+      "tla_path": "allocator/SimpleAllocator.tla"
+    },
+    {
+      "name": "Barrier",
+      "cfg_path": "barriers/Barrier.cfg",
+      "tla_path": "barriers/Barrier.tla"
+    },
+    {
+      "name": "Barriers",
+      "cfg_path": "barriers/Barriers.cfg",
+      "tla_path": "barriers/Barriers.tla"
+    },
+    {
+      "name": "bcastByz",
+      "cfg_path": "bcastByz/bcastByz.cfg",
+      "tla_path": "bcastByz/bcastByz.tla"
+    },
+    {
+      "name": "bcastByzNoBcast",
+      "cfg_path": "bcastByz/bcastByzNoBcast.cfg",
+      "tla_path": "bcastByz/bcastByz.tla"
+    },
+    {
+      "name": "bcastFolklore",
+      "cfg_path": "bcastFolklore/bcastFolklore.cfg",
+      "tla_path": "bcastFolklore/bcastFolklore.tla"
+    },
+    {
+      "name": "bosco",
+      "cfg_path": "bosco/bosco.cfg",
+      "tla_path": "bosco/bosco.tla"
+    },
+    {
+      "name": "BufferedRandomAccessFile",
+      "cfg_path": "braf/BufferedRandomAccessFile.cfg",
+      "tla_path": "braf/BufferedRandomAccessFile.tla"
+    },
+    {
+      "name": "btree",
+      "cfg_path": "btree/btree.cfg",
+      "tla_path": "btree/btree.tla"
+    },
+    {
+      "name": "kvstore",
+      "cfg_path": "btree/kvstore.cfg",
+      "tla_path": "btree/kvstore.tla"
+    },
+    {
+      "name": "VoucherCancel",
+      "cfg_path": "byihive/VoucherCancel.cfg",
+      "tla_path": "byihive/VoucherCancel.tla"
+    },
+    {
+      "name": "VoucherIssue",
+      "cfg_path": "byihive/VoucherIssue.cfg",
+      "tla_path": "byihive/VoucherIssue.tla"
+    },
+    {
+      "name": "VoucherLifeCycle",
+      "cfg_path": "byihive/VoucherLifeCycle.cfg",
+      "tla_path": "byihive/VoucherLifeCycle.tla"
+    },
+    {
+      "name": "VoucherRedeem",
+      "cfg_path": "byihive/VoucherRedeem.cfg",
+      "tla_path": "byihive/VoucherRedeem.tla"
+    },
+    {
+      "name": "VoucherTransfer",
+      "cfg_path": "byihive/VoucherTransfer.cfg",
+      "tla_path": "byihive/VoucherTransfer.tla"
+    },
+    {
+      "name": "BPConProof",
+      "cfg_path": "byzpaxos/BPConProof.cfg",
+      "tla_path": "byzpaxos/BPConProof.tla"
+    },
+    {
+      "name": "Consensus",
+      "cfg_path": "byzpaxos/Consensus.cfg",
+      "tla_path": "byzpaxos/Consensus.tla"
+    },
+    {
+      "name": "PConProof",
+      "cfg_path": "byzpaxos/PConProof.cfg",
+      "tla_path": "byzpaxos/PConProof.tla"
+    },
+    {
+      "name": "VoteProof",
+      "cfg_path": "byzpaxos/VoteProof.cfg",
+      "tla_path": "byzpaxos/VoteProof.tla"
+    },
+    {
+      "name": "c1cs",
+      "cfg_path": "c1cs/c1cs.cfg",
+      "tla_path": "c1cs/c1cs.tla"
+    },
+    {
+      "name": "cf1s_folklore",
+      "cfg_path": "cf1s-folklore/cf1s_folklore.cfg",
+      "tla_path": "cf1s-folklore/cf1s_folklore.tla"
+    },
+    {
+      "name": "MCChangRoberts",
+      "cfg_path": "chang_roberts/MCChangRoberts.cfg",
+      "tla_path": "chang_roberts/MCChangRoberts.tla"
+    },
+    {
+      "name": "BlockDagTest",
+      "cfg_path": "dag-consensus/BlockDagTest.cfg",
+      "tla_path": "dag-consensus/BlockDagTest.tla"
+    },
+    {
+      "name": "TLCSailfish1",
+      "cfg_path": "dag-consensus/TLCSailfish1.cfg",
+      "tla_path": "dag-consensus/TLCSailfish1.tla"
+    },
+    {
+      "name": "TLCSailfish2",
+      "cfg_path": "dag-consensus/TLCSailfish2.cfg",
+      "tla_path": "dag-consensus/TLCSailfish2.tla"
+    },
+    {
+      "name": "EnvironmentController",
+      "cfg_path": "detector_chan96/EnvironmentController.cfg",
+      "tla_path": "detector_chan96/EnvironmentController.tla"
+    },
+    {
+      "name": "dijkstra-mutex_LSpec-model",
+      "cfg_path": "dijkstra-mutex/DijkstraMutex.toolbox/LSpec-model/MC.cfg",
+      "tla_path": "dijkstra-mutex/DijkstraMutex.toolbox/LSpec-model/MC.tla"
+    },
+    {
+      "name": "dijkstra-mutex_Safety-4-processors",
+      "cfg_path": "dijkstra-mutex/DijkstraMutex.toolbox/Safety-4-processors/MC.cfg",
+      "tla_path": "dijkstra-mutex/DijkstraMutex.toolbox/Safety-4-processors/MC.tla"
+    },
+    {
+      "name": "MC_HDiskSynod",
+      "cfg_path": "diskpaxos/MC_HDiskSynod.cfg",
+      "tla_path": "diskpaxos/MC_HDiskSynod.tla"
+    },
+    {
+      "name": "MCEcho",
+      "cfg_path": "echo/MCEcho.cfg",
+      "tla_path": "echo/MCEcho.tla"
+    },
+    {
+      "name": "SimTokenRing",
+      "cfg_path": "ewd426/SimTokenRing.cfg",
+      "tla_path": "ewd426/SimTokenRing.tla"
+    },
+    {
+      "name": "TokenRing",
+      "cfg_path": "ewd426/TokenRing.cfg",
+      "tla_path": "ewd426/TokenRing.tla"
+    },
+    {
+      "name": "EWD687a_anim",
+      "cfg_path": "ewd687a/EWD687a_anim.cfg",
+      "tla_path": "ewd687a/EWD687a_anim.tla"
+    },
+    {
+      "name": "MCEWD687a",
+      "cfg_path": "ewd687a/MCEWD687a.cfg",
+      "tla_path": "ewd687a/MCEWD687a.tla"
+    },
+    {
+      "name": "EWD840",
+      "cfg_path": "ewd840/EWD840.cfg",
+      "tla_path": "ewd840/EWD840.tla"
+    },
+    {
+      "name": "EWD840_anim",
+      "cfg_path": "ewd840/EWD840_anim.cfg",
+      "tla_path": "ewd840/EWD840_anim.tla"
+    },
+    {
+      "name": "EWD840_json",
+      "cfg_path": "ewd840/EWD840_json.cfg",
+      "tla_path": "ewd840/EWD840_json.tla"
+    },
+    {
+      "name": "SyncTerminationDetection",
+      "cfg_path": "ewd840/SyncTerminationDetection.cfg",
+      "tla_path": "ewd840/SyncTerminationDetection.tla"
+    },
+    {
+      "name": "AsyncTerminationDetection",
+      "cfg_path": "ewd998/AsyncTerminationDetection.cfg",
+      "tla_path": "ewd998/AsyncTerminationDetection.tla"
+    },
+    {
+      "name": "EWD998",
+      "cfg_path": "ewd998/EWD998.cfg",
+      "tla_path": "ewd998/EWD998.tla"
+    },
+    {
+      "name": "EWD998Chan",
+      "cfg_path": "ewd998/EWD998Chan.cfg",
+      "tla_path": "ewd998/EWD998Chan.tla"
+    },
+    {
+      "name": "EWD998ChanID",
+      "cfg_path": "ewd998/EWD998ChanID.cfg",
+      "tla_path": "ewd998/EWD998ChanID.tla"
+    },
+    {
+      "name": "EWD998ChanID_export",
+      "cfg_path": "ewd998/EWD998ChanID_export.cfg",
+      "tla_path": "ewd998/EWD998ChanID_export.tla"
+    },
+    {
+      "name": "EWD998ChanID_shiviz",
+      "cfg_path": "ewd998/EWD998ChanID_shiviz.cfg",
+      "tla_path": "ewd998/EWD998ChanID_shiviz.tla"
+    },
+    {
+      "name": "EWD998ChanTrace",
+      "cfg_path": "ewd998/EWD998ChanTrace.cfg",
+      "tla_path": "ewd998/EWD998ChanTrace.tla"
+    },
+    {
+      "name": "EWD998PCal",
+      "cfg_path": "ewd998/EWD998PCal.cfg",
+      "tla_path": "ewd998/EWD998PCal.tla"
+    },
+    {
+      "name": "EWD998Small",
+      "cfg_path": "ewd998/EWD998Small.cfg",
+      "tla_path": "ewd998/EWD998.tla"
+    },
+    {
+      "name": "SmokeEWD998",
+      "cfg_path": "ewd998/SmokeEWD998.cfg",
+      "tla_path": "ewd998/SmokeEWD998.tla"
+    },
+    {
+      "name": "SmokeEWD998_SC",
+      "cfg_path": "ewd998/SmokeEWD998_SC.cfg",
+      "tla_path": "ewd998/SmokeEWD998_SC.tla"
+    },
+    {
+      "name": "clean",
+      "cfg_path": "glowingRaccoon/clean.cfg",
+      "tla_path": "glowingRaccoon/clean.tla"
+    },
+    {
+      "name": "product",
+      "cfg_path": "glowingRaccoon/product.cfg",
+      "tla_path": "glowingRaccoon/product.tla"
+    },
+    {
+      "name": "stages",
+      "cfg_path": "glowingRaccoon/stages.cfg",
+      "tla_path": "glowingRaccoon/stages.tla"
+    },
+    {
+      "name": "MCLamportMutex",
+      "cfg_path": "lamport_mutex/MCLamportMutex.cfg",
+      "tla_path": "lamport_mutex/MCLamportMutex.tla"
+    },
+    {
+      "name": "Lock",
+      "cfg_path": "locks_auxiliary_vars/Lock.cfg",
+      "tla_path": "locks_auxiliary_vars/Lock.tla"
+    },
+    {
+      "name": "LockHS",
+      "cfg_path": "locks_auxiliary_vars/LockHS.cfg",
+      "tla_path": "locks_auxiliary_vars/LockHS.tla"
+    },
+    {
+      "name": "Peterson",
+      "cfg_path": "locks_auxiliary_vars/Peterson.cfg",
+      "tla_path": "locks_auxiliary_vars/Peterson.tla"
+    },
+    {
+      "name": "nbacc_ray97",
+      "cfg_path": "nbacc_ray97/nbacc_ray97.cfg",
+      "tla_path": "nbacc_ray97/nbacc_ray97.tla"
+    },
+    {
+      "name": "nbacg_guer01",
+      "cfg_path": "nbacg_guer01/nbacg_guer01.cfg",
+      "tla_path": "nbacg_guer01/nbacg_guer01.tla"
+    },
+    {
+      "name": "MC_spanning",
+      "cfg_path": "spanning/MC_spanning.cfg",
+      "tla_path": "spanning/MC_spanning.tla"
+    },
+    {
+      "name": "MC_sums_even",
+      "cfg_path": "sums_even/MC_sums_even.cfg",
+      "tla_path": "sums_even/MC_sums_even.tla"
+    },
+    {
+      "name": "MCtcp",
+      "cfg_path": "tcp/MCtcp.cfg",
+      "tla_path": "tcp/MCtcp.tla"
+    },
+    {
+      "name": "tower_of_hanoi_M1",
+      "cfg_path": "tower_of_hanoi/Hanoi.toolbox/Model_1/MC.cfg",
+      "tla_path": "tower_of_hanoi/Hanoi.toolbox/Model_1/MC.tla"
+    },
+    {
+      "name": "Hanoi_anim",
+      "cfg_path": "tower_of_hanoi/Hanoi_anim.cfg",
+      "tla_path": "tower_of_hanoi/Hanoi_anim.tla"
+    },
+    {
+      "name": "2PCwithBTM",
+      "cfg_path": "transaction_commit/2PCwithBTM.cfg",
+      "tla_path": "transaction_commit/2PCwithBTM.tla"
+    },
+    {
+      "name": "PaxosCommit",
+      "cfg_path": "transaction_commit/PaxosCommit.cfg",
+      "tla_path": "transaction_commit/PaxosCommit.tla"
+    },
+    {
+      "name": "TCommit",
+      "cfg_path": "transaction_commit/TCommit.cfg",
+      "tla_path": "transaction_commit/TCommit.tla"
+    },
+    {
+      "name": "TwoPhase",
+      "cfg_path": "transaction_commit/TwoPhase.cfg",
+      "tla_path": "transaction_commit/TwoPhase.tla"
+    }
+  ]
+}

@@ -219,7 +219,10 @@ pub use self::cache::{
     enter_enabled_scope, enter_enabled_scope_with_ctx, evict_next_state_subst_entries,
     intern_let_def_arc, print_subst_cache_stats, EnabledScopeGuard,
 };
-pub use self::cache::{clear_openv_memos, merged_let_env_memoized, MergedLetSite};
+pub use self::cache::{
+    clear_openv_memos, merged_let_env_memoized, merged_let_env_memoized_with_ctx, MergedLetSite,
+};
+pub use self::cache::{clear_subst_chain_memo, print_subst_memo_stats};
 pub use self::core::{
     Env, EvalCtx, IdentHint, InstanceInfo, OpEnv, SharedCtx, TlcConfig, TlcRuntimeStats,
     DEFAULT_PER_STATE_SUCCESSOR_CAP, MAX_RECURSION_DEPTH,

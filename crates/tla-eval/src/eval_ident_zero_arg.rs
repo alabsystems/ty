@@ -14,7 +14,6 @@
 
 #[cfg(debug_assertions)]
 use super::debug_zero_cache;
-use tla_value::Rp;
 use super::{
     build_lazy_func_from_ctx, current_state_lookup_mode, eval, eval_builtin,
     materialize_setpred_to_vec, no_local_ops_cache, op_cache_entry_valid, propagate_cached_deps,
@@ -30,6 +29,7 @@ use tla_core::ast::{BoundVar, OperatorDef};
 use tla_core::expr_mentions_name_spanned_v;
 use tla_core::name_intern::intern_name;
 use tla_core::Spanned;
+use tla_value::Rp;
 
 /// Unified zero-arg operator caching. Consolidates the 10-step caching pattern
 /// from three call sites in `eval_ident.rs`.
@@ -551,9 +551,8 @@ fn eval_general_zero_arg(
     // nested/direct state rebinding within one boundary. LazyFunc retains its
     // established state-partition policy; this stricter rule applies only to
     // the newly preserved RecordSet-filter shape.
-    let store_primary = !deps.inconsistent
-        && !state_capturing_set_pred
-        && (!in_enabled || is_persistent);
+    let store_primary =
+        !deps.inconsistent && !state_capturing_set_pred && (!in_enabled || is_persistent);
 
     // Step 11 eligibility: Transition-partition store (implied-action
     // checking only). Strictly narrower than the state partition's:

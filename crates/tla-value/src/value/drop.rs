@@ -38,10 +38,9 @@
 #![allow(unsafe_code)]
 
 use super::Value;
+use crate::rp::Rp as Arc;
 use std::cell::Cell;
 use std::mem::ManuallyDrop;
-use crate::rp::Rp as Arc;
-use crate::rp::Rp;
 thread_local! {
     static DROP_STACK: std::cell::UnsafeCell<Vec<Value>> =
         const { std::cell::UnsafeCell::new(Vec::new()) };
@@ -242,12 +241,6 @@ fn drop_iterative(owned: Value) {
             drop_stack_push(*domain);
             drop_stack_push(*codomain);
         }
-        Value::SetCup(cup) => {
-            let set1: Box<Value> = unsafe { take(&cup.set1) };
-            let set2: Box<Value> = unsafe { take(&cup.set2) };
-            drop_stack_push(*set1);
-            drop_stack_push(*set2);
-        }
         Value::SetCap(cap) => {
             let set1: Box<Value> = unsafe { take(&cap.set1) };
             let set2: Box<Value> = unsafe { take(&cap.set2) };
@@ -305,10 +298,14 @@ fn drop_iterative(owned: Value) {
         Value::TupleSet(arc_ref) => {
             let _arc: Arc<super::TupleSetValue> = unsafe { take(arc_ref) };
         }
+        Value::SetCup(arc_ref) => {
+            let _arc: Arc<super::SetCupValue> = unsafe { take(arc_ref) };
+        }
 
         // Record is inline (not behind Arc) -- take its entries Arc
         Value::Record(rec) => {
-            let _entries: crate::rp::Rp<Vec<(tla_core::NameId, Value)>> = unsafe { take(&rec.entries) };
+            let _entries: crate::rp::Rp<Vec<(tla_core::NameId, Value)>> =
+                unsafe { take(&rec.entries) };
         }
 
         // SetPred is Box-wrapped
@@ -325,7 +322,6 @@ fn drop_iterative(owned: Value) {
 #[cfg(test)]
 mod tests {
     use super::super::*;
-    use std::sync::Arc;
 
     /// Dropping deeply nested Values must not overflow the stack.
     #[test]

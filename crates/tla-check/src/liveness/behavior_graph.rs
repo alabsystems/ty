@@ -20,9 +20,11 @@
 //! - `tlc2/tool/liveness/LiveCheck.java` - Product graph construction
 
 use crate::error::EvalResult;
-use crate::liveness::checker::CheckMask;
+use crate::liveness::checker::{ActionCheckMatrix, CheckMask};
 use crate::liveness::debug::{liveness_disk_graph_ptr_capacity, use_disk_graph};
-use crate::liveness::graph_store::{invariant_error, NodeInfoView, RuntimeGraphStore};
+use crate::liveness::graph_store::{
+    invariant_error, NodeInfoView, PackedTarjanView, RuntimeGraphStore, SuccessorRow,
+};
 use crate::state::{ArrayState, Fingerprint, State};
 use crate::var_index::VarRegistry;
 use rustc_hash::FxHashMap;
@@ -78,7 +80,7 @@ impl fmt::Display for BehaviorGraphNode {
 /// This structure tracks:
 /// - All visited (state, tableau) pairs
 /// - Transitions between pairs (for SCC detection)
-/// - Parent pointers (for counterexample trace reconstruction)
+/// - Initial-node roots (counterexample prefixes are reconstructed lazily)
 ///
 /// States are stored separately from graph topology, deduplicated by fingerprint.
 /// Multiple behavior graph nodes with the same state fingerprint (different tableau
@@ -87,7 +89,7 @@ impl fmt::Display for BehaviorGraphNode {
 /// (Approach I from the liveness-architecture design.)
 #[derive(Debug)]
 pub(crate) struct BehaviorGraph {
-    /// Graph topology storage: nodes, edges, parent pointers, check masks.
+    /// Graph topology storage: nodes, edges, initial roots, check masks.
     /// Part of #2732: runtime-selectable between the historical in-memory map
     /// and the new disk-backed node-record store.
     pub(crate) store: RuntimeGraphStore,
@@ -109,7 +111,8 @@ pub(crate) struct BehaviorGraph {
     /// regenerated path retain one compact `ArrayState` per fingerprint while
     /// dropping the much heavier local `State` and `Vec<State>` caches.
     /// Fingerprint-only APIs still require `shared_state_cache`: the owned mode
-    /// is only safe when exploration supplies each concrete state payload.
+    /// is only safe when exploration supplies each concrete state payload,
+    /// either as a transient `State` or an authoritative `ArrayState` root.
     owned_state_cache: Option<FxHashMap<Fingerprint, ArrayState>>,
     /// Registry for reconstructing `State` from compact ArrayStates on demand.
     /// Set together with either compact cache mode.
@@ -125,21 +128,26 @@ pub(crate) struct BehaviorGraph {
 pub(crate) struct NodeInfo {
     /// Successor nodes (Vec for cache-friendly iteration; typical out-degree 2-20)
     pub(crate) successors: Vec<BehaviorGraphNode>,
-    /// Parent node (for trace reconstruction)
-    pub(crate) parent: Option<BehaviorGraphNode>,
-    /// BFS depth
-    pub(crate) depth: usize,
+    /// Disk-backend trace parent.
+    ///
+    /// In-memory graphs leave this niche-optimized pointer empty and rebuild a
+    /// prefix from dense topology only when a violation needs one. Disk graphs
+    /// retain the parent so trace reconstruction stays O(path) without loading
+    /// the whole graph into RAM. Boxing keeps the successful in-memory node
+    /// cost to one pointer instead of an inline 24-byte `Option<BehaviorGraphNode>`.
+    pub(crate) trace_parent: Option<Box<BehaviorGraphNode>>,
     /// Precomputed state check bitmask (#2572, #2890).
     /// Bit i set means `check_state[i]` is true for this node's state.
     /// Populated by `populate_node_check_masks()` after BFS construction.
     /// Uses multi-word `CheckMask` to support >64 check indices.
     pub(crate) state_check_mask: CheckMask,
-    /// Precomputed action check bitmasks (#2572, #2890), aligned with `successors`.
-    /// `action_check_masks[j]` has bit i set if `check_action[i]` is true for
+    /// Precomputed action-check bit matrix (#2572, #2890), aligned with `successors`.
+    /// Row `j` has bit i set if `check_action[i]` is true for
     /// the transition `(this_node -> successors[j])`.
     /// Populated by `populate_node_check_masks()` after BFS construction.
-    /// Uses multi-word `CheckMask` to support >64 check indices.
-    pub(crate) action_check_masks: Vec<CheckMask>,
+    /// Rows are packed together to avoid one 24-byte `CheckMask` per edge while
+    /// still supporting more than 64 check indices.
+    pub(crate) action_check_masks: ActionCheckMatrix,
 }
 
 impl BehaviorGraph {
@@ -188,7 +196,9 @@ impl BehaviorGraph {
         }
 
         // Auto-detect: if estimated nodes exceed the threshold, use disk-backed.
-        use super::debug::{liveness_auto_disk_threshold, liveness_profile, liveness_ptr_rightsize};
+        use super::debug::{
+            liveness_auto_disk_threshold, liveness_profile, liveness_ptr_rightsize,
+        };
         if let Some(est) = estimated_nodes {
             let threshold = liveness_auto_disk_threshold();
             if est > threshold {
@@ -249,12 +259,39 @@ impl BehaviorGraph {
     /// fingerprint-only add APIs safe: those continue to require the
     /// pre-populated shared cache.
     pub(crate) fn enable_owned_state_cache(&mut self, registry: Arc<VarRegistry>) {
+        self.install_owned_state_cache(FxHashMap::default(), registry);
+    }
+
+    /// Install a compact payload cache transferred from an earlier exact-raw
+    /// on-the-fly checker. Ownership moves between behavior graphs so the next
+    /// liveness group can reuse state payloads without retaining a duplicate.
+    pub(crate) fn install_owned_state_cache(
+        &mut self,
+        cache: FxHashMap<Fingerprint, ArrayState>,
+        registry: Arc<VarRegistry>,
+    ) {
         assert!(
             self.shared_state_cache.is_none(),
             "owned and shared behavior-graph state caches are mutually exclusive"
         );
-        self.owned_state_cache = Some(FxHashMap::default());
+        assert!(
+            self.owned_state_cache.is_none(),
+            "an owned behavior-graph state cache is already installed"
+        );
+        self.owned_state_cache = Some(cache);
         self.compact_state_registry = Some(registry);
+    }
+
+    /// Move the owned compact payload cache out of this graph.
+    ///
+    /// Callers use this only after the graph has finished all checks and trace
+    /// reconstruction. The graph remains valid for topology/stat access, but
+    /// concrete state lookup is no longer available after the move.
+    pub(crate) fn take_owned_state_cache(&mut self) -> Option<FxHashMap<Fingerprint, ArrayState>> {
+        let cache = self.owned_state_cache.take()?;
+        debug_assert!(self.shared_state_cache.is_none());
+        self.compact_state_registry = None;
+        Some(cache)
     }
 
     /// Get the compact `ArrayState` for a fingerprint from either compact cache
@@ -302,6 +339,18 @@ impl BehaviorGraph {
         self.owned_state_cache.is_some()
     }
 
+    /// Number of compact payloads owned by this graph, if owned-cache mode is
+    /// active. Callers use this read-only view to size an exact cache before
+    /// moving it out after liveness checks complete.
+    pub(crate) fn owned_state_cache_len(&self) -> Option<usize> {
+        self.owned_state_cache.as_ref().map(FxHashMap::len)
+    }
+
+    /// Borrow one compact payload from the owned exact-raw cache.
+    pub(crate) fn owned_state_cache_get(&self, fp: Fingerprint) -> Option<&ArrayState> {
+        self.owned_state_cache.as_ref()?.get(&fp)
+    }
+
     /// Capture a concrete state in the owned compact cache, if enabled.
     /// Conversion happens only for a previously unseen fingerprint.
     pub(crate) fn cache_owned_state(&mut self, fp: Fingerprint, state: &State) {
@@ -315,6 +364,23 @@ impl BehaviorGraph {
         cache
             .entry(fp)
             .or_insert_with(|| ArrayState::from_state(state, registry));
+    }
+
+    /// Capture an already-compact state in the owned cache without a
+    /// `ArrayState -> State -> ArrayState` round trip.
+    ///
+    /// `clone_for_working` shares the value payload through `Arc` while
+    /// discarding any foreign fingerprint cache, so this is also the
+    /// bounded-memory way to seed very wide initial-state sets.
+    pub(crate) fn cache_owned_array_state(&mut self, fp: Fingerprint, state: &ArrayState) {
+        let Some(cache) = self.owned_state_cache.as_mut() else {
+            return;
+        };
+        // The source may carry a fingerprint cached in a different storage
+        // domain (for example CompiledFlat xxh3). Preserve the shared compact
+        // values but clear that cache before this raw-fingerprint graph adopts
+        // the payload.
+        cache.entry(fp).or_insert_with(|| state.clone_for_working());
     }
 
     #[cfg(test)]
@@ -345,6 +411,26 @@ impl BehaviorGraph {
         tableau_idx: usize,
     ) -> EvalResult<bool> {
         let node = BehaviorGraphNode::new(fp, tableau_idx);
+        self.store.add_init_node(node)
+    }
+
+    /// Add an initial node while seeding its authoritative compact payload.
+    ///
+    /// Unlike the general fingerprint-only API, this is safe for an owned
+    /// compact cache because the concrete payload accompanies the fingerprint.
+    pub(crate) fn try_add_init_array_state_with_fp(
+        &mut self,
+        state: &ArrayState,
+        state_fp: Fingerprint,
+        tableau_idx: usize,
+    ) -> EvalResult<bool> {
+        assert!(
+            self.owned_state_cache.is_some(),
+            "compact initial-state seeding requires an owned state cache"
+        );
+        self.store.ensure_topology_mutable()?;
+        self.cache_owned_array_state(state_fp, state);
+        let node = BehaviorGraphNode::new(state_fp, tableau_idx);
         self.store.add_init_node(node)
     }
 
@@ -384,6 +470,7 @@ impl BehaviorGraph {
         state_fp: Fingerprint,
         tableau_idx: usize,
     ) -> EvalResult<bool> {
+        self.store.ensure_topology_mutable()?;
         self.cache_owned_state(state_fp, state);
         let node = BehaviorGraphNode::new(state_fp, tableau_idx);
         if !self.store.add_init_node(node)? {
@@ -422,6 +509,7 @@ impl BehaviorGraph {
         to_fp: Fingerprint,
         to_tableau_idx: usize,
     ) -> EvalResult<bool> {
+        self.store.ensure_topology_mutable()?;
         self.cache_owned_state(to_fp, to_state);
         let to_node = BehaviorGraphNode::new(to_fp, to_tableau_idx);
         let is_new = self.store.add_successor(from, to_node)?;
@@ -459,13 +547,49 @@ impl BehaviorGraph {
         self.store.get_node_info(node)
     }
 
+    /// Inspect a node's logical successor row while keeping the topology's
+    /// physical representation private.
+    pub(crate) fn try_with_successors<R>(
+        &self,
+        node: &BehaviorGraphNode,
+        inspect: impl for<'row> FnOnce(SuccessorRow<'row>) -> R,
+    ) -> EvalResult<Option<R>> {
+        self.store.with_successors(node, inspect)
+    }
+
     /// Update a node's topology record in place.
+    #[cfg(test)]
     pub(crate) fn update_node_info<R>(
         &mut self,
         node: &BehaviorGraphNode,
         update: impl FnOnce(&mut NodeInfo) -> R,
     ) -> EvalResult<Option<R>> {
         self.store.update_node_info(node, update)
+    }
+
+    /// Update state/action masks against the logical successor row.
+    pub(crate) fn update_node_masks<R>(
+        &mut self,
+        node: &BehaviorGraphNode,
+        update: impl for<'row> FnOnce(SuccessorRow<'row>, &mut CheckMask, &mut ActionCheckMatrix) -> R,
+    ) -> EvalResult<Option<R>> {
+        self.store.update_node_masks(node, update)
+    }
+
+    /// Compact a completed in-memory behavior graph into dense-id CSR.
+    ///
+    /// Returns `true` for in-memory storage, including repeated calls after it
+    /// is already packed. Disk storage is intentionally unchanged and returns
+    /// `false`.
+    pub(crate) fn pack_inmemory_successors(&mut self) -> EvalResult<bool> {
+        self.store.pack_inmemory_successors()
+    }
+
+    /// Borrow completed packed topology for Tarjan without copying node keys,
+    /// node payloads, offsets, or targets.
+    #[inline]
+    pub(crate) fn packed_tarjan_view(&self) -> Option<PackedTarjanView<'_>> {
+        self.store.packed_tarjan_view()
     }
 
     #[cfg(test)]
@@ -527,14 +651,14 @@ impl BehaviorGraph {
 
     /// Get all node keys.
     ///
-    /// For the disk-backed store the returned order is the dense-id order:
+    /// The returned order is the dense-id order for both backends:
     /// `node_keys()[i]` is the node whose [`Self::node_dense_id`] is `i`.
     pub(crate) fn node_keys(&self) -> Vec<BehaviorGraphNode> {
         self.store.node_keys()
     }
 
-    /// True iff nodes can be resolved to a stable dense contiguous `u32` id
-    /// (disk-backed store only). See [`Self::node_dense_id`].
+    /// True iff nodes can be resolved to a stable dense contiguous `u32` id.
+    /// See [`Self::node_dense_id`].
     pub(crate) fn supports_dense_ids(&self) -> bool {
         self.store.supports_dense_ids()
     }

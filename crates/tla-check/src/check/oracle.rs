@@ -914,6 +914,7 @@ mod tests {
         assert_eq!(oracle.route(1), ActionRoute::BfsOnly);
         assert_eq!(oracle.route(99), ActionRoute::BfsOnly); // out of range
         assert_eq!(oracle.action_count(), 2);
+        assert_eq!(oracle.regret_ratio(), 0.0);
     }
 
     #[test]

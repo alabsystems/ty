@@ -149,7 +149,7 @@ impl LivenessChecker {
         _max_fairness_tag: u32,
         inline_results: Option<InlineCheckResults<'_>>,
     ) -> Result<(), crate::error::EvalError> {
-        use super::check_mask::CheckMask;
+        use super::check_mask::{ActionCheckMatrix, CheckMask};
 
         let empty_state_bitmasks: FxHashMap<Fingerprint, u64> = FxHashMap::default();
         let empty_action_bitmasks: FxHashMap<(Fingerprint, Fingerprint), u64> =
@@ -189,7 +189,7 @@ impl LivenessChecker {
                     })
                     .map(|info| NodeRef {
                         node,
-                        succ_fps: info.successors.iter().map(|s| s.state_fp).collect(),
+                        succ_fps: info.successors().iter().map(|s| s.state_fp).collect(),
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -205,68 +205,74 @@ impl LivenessChecker {
         // cache stays time-neutral (a duplicate edge only re-runs the cheap
         // per-check reconstruct, not the state-bitmask lookup).
         for nr in &node_refs {
-            self.graph.update_node_info(&nr.node, |info| {
-                let from_fp = nr.node.state_fp;
-                let state_bm = if multiword {
-                    state_tag_bits
-                        .get_bitmask_words(&from_fp)
-                        .unwrap_or_default()
-                } else {
-                    LiveBitmask::default()
-                };
-                let sbits = if multiword {
-                    0
-                } else {
-                    state_tag_bits.get_bits(&from_fp).unwrap_or(0)
-                };
+            self.graph.update_node_masks(
+                &nr.node,
+                |successors, state_check_mask, action_check_masks| {
+                    let from_fp = nr.node.state_fp;
+                    let state_bm = if multiword {
+                        state_tag_bits
+                            .get_bitmask_words(&from_fp)
+                            .unwrap_or_default()
+                    } else {
+                        LiveBitmask::default()
+                    };
+                    let sbits = if multiword {
+                        0
+                    } else {
+                        state_tag_bits.get_bits(&from_fp).unwrap_or(0)
+                    };
 
-                info.state_check_mask = {
-                    let mut mask = CheckMask::new();
-                    let empty_action = LiveBitmask::default();
-                    for (ci, check) in check_state.iter().enumerate() {
-                        if state_used.get(ci).copied().unwrap_or(false)
-                            && if multiword {
-                                reconstruct_check_from_bitmask(check, &state_bm, &empty_action)
-                            } else {
-                                reconstruct_check_from_tag_bits(check, sbits, 0)
-                            }
-                        {
-                            mask.set(ci);
-                        }
-                    }
-                    mask
-                };
-
-                info.action_check_masks = nr
-                    .succ_fps
-                    .iter()
-                    .map(|&to_fp| {
+                    *state_check_mask = {
                         let mut mask = CheckMask::new();
-                        if multiword {
-                            let action_bm = action_tag_bits
-                                .get_bitmask_words(&(from_fp, to_fp))
-                                .unwrap_or_default();
-                            for (ci, check) in check_action.iter().enumerate() {
-                                if action_used.get(ci).copied().unwrap_or(false)
-                                    && reconstruct_check_from_bitmask(check, &state_bm, &action_bm)
-                                {
-                                    mask.set(ci);
+                        let empty_action = LiveBitmask::default();
+                        for (ci, check) in check_state.iter().enumerate() {
+                            if state_used.get(ci).copied().unwrap_or(false)
+                                && if multiword {
+                                    reconstruct_check_from_bitmask(check, &state_bm, &empty_action)
+                                } else {
+                                    reconstruct_check_from_tag_bits(check, sbits, 0)
                                 }
-                            }
-                        } else {
-                            let abits = action_tag_bits.get_bits(&(from_fp, to_fp)).unwrap_or(0);
-                            for (ci, check) in check_action.iter().enumerate() {
-                                if action_used.get(ci).copied().unwrap_or(false)
-                                    && reconstruct_check_from_tag_bits(check, sbits, abits)
-                                {
-                                    mask.set(ci);
-                                }
+                            {
+                                mask.set(ci);
                             }
                         }
                         mask
-                    })
-                    .collect();
-            })?;
+                    };
+
+                    *action_check_masks = ActionCheckMatrix::from_masks(
+                        check_action.len(),
+                        nr.succ_fps.iter().map(|&to_fp| {
+                            let mut mask = CheckMask::new();
+                            if multiword {
+                                let action_bm = action_tag_bits
+                                    .get_bitmask_words(&(from_fp, to_fp))
+                                    .unwrap_or_default();
+                                for (ci, check) in check_action.iter().enumerate() {
+                                    if action_used.get(ci).copied().unwrap_or(false)
+                                        && reconstruct_check_from_bitmask(
+                                            check, &state_bm, &action_bm,
+                                        )
+                                    {
+                                        mask.set(ci);
+                                    }
+                                }
+                            } else {
+                                let abits =
+                                    action_tag_bits.get_bits(&(from_fp, to_fp)).unwrap_or(0);
+                                for (ci, check) in check_action.iter().enumerate() {
+                                    if action_used.get(ci).copied().unwrap_or(false)
+                                        && reconstruct_check_from_tag_bits(check, sbits, abits)
+                                    {
+                                        mask.set(ci);
+                                    }
+                                }
+                            }
+                            mask
+                        }),
+                    );
+                    debug_assert_eq!(action_check_masks.len(), successors.len());
+                },
+            )?;
         }
 
         Ok(())

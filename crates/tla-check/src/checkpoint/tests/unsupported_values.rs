@@ -6,8 +6,8 @@
 //! SetPred, infinite sets, LazyFunc, Closure.
 
 use super::*;
-use tla_value::Rp;
 use tla_core::kani_types::HashMap;
+use tla_value::Rp;
 
 /// Regression test for #2115: from_value must return an error for SetPred.
 #[cfg_attr(test, ntest::timeout(10000))]

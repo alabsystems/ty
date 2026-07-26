@@ -8,7 +8,6 @@ use super::{
 };
 use rustc_hash::FxHashSet;
 use tla_value::Rp;
-use std::sync::Arc;
 // FunctionsExt module operators — RestrictDomain, RestrictValues, IsRestriction, Pointwise, AntiFunction
 
 pub(super) fn eval_builtin_functions_ext(

@@ -26,26 +26,23 @@ use tla_core::Span;
 /// pattern from eval_ident (fast + slow paths) and eval_state_var_lookup (StateVar).
 pub(super) fn lazy_binding_cache_hit_deps(
     ctx: &EvalCtx,
-    lazy: &crate::binding_chain::LazyBinding,
+    _lazy: &crate::binding_chain::LazyBinding,
     source: crate::binding_chain::BindingSourceRef<'_>,
     cached: &Value,
     name_id: NameId,
-    mode: super::StateLookupMode,
+    _mode: super::StateLookupMode,
 ) {
     match source {
         crate::binding_chain::BindingSourceRef::Instance(_) => {
+            // Live INSTANCE lazy cache hits go through the fused
+            // `instance_lazy_cache_get_with_deps` path (one TLS access for
+            // value + deps); this arm only serves residual callers, which
+            // taint conservatively. Deps ride the epoch-scoped cache entry —
+            // not a per-LazyBinding OnceLock — because OpEvalDeps embeds read
+            // values and shared LazyBindings outlive states
+            // (cache::subst_chain_memo).
             if is_dep_tracking_active(ctx) {
-                if let Some(forced) = lazy.get_forced_deps(mode) {
-                    propagate_cached_deps(ctx, forced);
-                    // Fix #3447: Only taint if the forced deps are non-constant.
-                    // Constant INSTANCE bindings propagate no state dependency.
-                    if forced.instance_lazy_read {
-                        mark_instance_lazy_read(ctx);
-                    }
-                } else {
-                    // No forced deps available - conservative taint.
-                    mark_instance_lazy_read(ctx);
-                }
+                mark_instance_lazy_read(ctx);
             }
         }
         crate::binding_chain::BindingSourceRef::Local(stack_idx)
@@ -54,6 +51,41 @@ pub(super) fn lazy_binding_cache_hit_deps(
         }
         crate::binding_chain::BindingSourceRef::None => {}
     }
+}
+
+/// Fused INSTANCE lazy cache probe: cached value + dep propagation in ONE
+/// TLS access (see `instance_lazy_cache_get_with_deps`). Returns the cached
+/// value for this binding+mode if present, propagating the entry's stored
+/// deps (or conservatively tainting when the forcing captured none).
+#[inline]
+pub(super) fn instance_lazy_cache_hit(
+    ctx: &EvalCtx,
+    lazy: &crate::binding_chain::LazyBinding,
+    mode: super::StateLookupMode,
+) -> Option<Value> {
+    let lazy_ptr = lazy as *const crate::binding_chain::LazyBinding as usize;
+    let want_deps = is_dep_tracking_active(ctx);
+    let hit = crate::cache::small_caches::instance_lazy_cache_get_with_deps(
+        lazy_ptr,
+        mode as u8,
+        want_deps,
+        |forced| match forced {
+            Some(forced) => {
+                propagate_cached_deps(ctx, forced);
+                // Fix #3447: Only taint if the forced deps are non-constant.
+                // Constant INSTANCE bindings propagate no state dependency.
+                if forced.instance_lazy_read {
+                    mark_instance_lazy_read(ctx);
+                }
+            }
+            // No forced deps available - conservative taint.
+            None => mark_instance_lazy_read(ctx),
+        },
+    );
+    if hit.is_some() {
+        crate::cache::subst_chain_memo::count_instance_force_hit();
+    }
+    hit
 }
 
 /// Force a lazy binding: evaluate the deferred expression and cache the result.
@@ -72,6 +104,9 @@ pub(super) fn force_lazy_binding(
     mode: super::StateLookupMode,
 ) -> EvalResult<Value> {
     let is_instance = matches!(source, crate::binding_chain::BindingSourceRef::Instance(_));
+    if is_instance {
+        crate::cache::subst_chain_memo::count_instance_force();
+    }
     let mut eval_ctx = if is_instance {
         // Instance source: evaluate substitution RHS against the definition-site
         // binding chain while clearing current INSTANCE resolution metadata.
@@ -162,7 +197,20 @@ pub(super) fn force_lazy_binding(
             if !is_constant_binding {
                 deps.instance_lazy_read = true;
             }
-            lazy.set_forced_deps(deps.clone(), mode);
+            // Attach the deps to the epoch-scoped cache entry that holds the
+            // forced value (replaces the per-LazyBinding forced_deps OnceLock,
+            // which would pin first-force deps — with their embedded read
+            // values — across epochs once LazyBindings are shared by the
+            // subst-chain memo). Entry gone / mode flipped => deps dropped;
+            // later cache hits then taint conservatively.
+            {
+                let lazy_ptr = lazy as *const crate::binding_chain::LazyBinding as usize;
+                crate::cache::small_caches::instance_lazy_cache_set_deps(
+                    lazy_ptr,
+                    mode as u8,
+                    deps.clone(),
+                );
+            }
             if parent_dep_tracking_active {
                 propagate_cached_deps(ctx, &deps);
                 if !is_constant_binding {
@@ -426,18 +474,7 @@ pub(super) fn eval_state_var(
             }
             if let crate::binding_chain::BindingSourceRef::Instance(_) = source {
                 if let Some(lazy) = bv.as_lazy() {
-                    let lazy_ptr = lazy as *const crate::binding_chain::LazyBinding as usize;
-                    if let Some(cached) =
-                        crate::cache::small_caches::instance_lazy_cache_get(lazy_ptr, mode as u8)
-                    {
-                        lazy_binding_cache_hit_deps(
-                            ctx,
-                            lazy,
-                            source,
-                            &cached,
-                            lookup_name_id,
-                            mode,
-                        );
+                    if let Some(cached) = instance_lazy_cache_hit(ctx, lazy, mode) {
                         return Ok(cached);
                     }
                 }

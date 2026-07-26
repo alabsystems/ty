@@ -49,7 +49,6 @@
 
 use std::collections::BTreeMap;
 use tla_value::Rp;
-use std::sync::Arc;
 
 use tla_value::value::SortedSet;
 
@@ -209,6 +208,117 @@ pub(crate) fn derive_nested_set_universe(samples: &[&Value]) -> Option<Discovere
         outer_len,
         inner_len,
     })
+}
+
+/// STATIC (exploration-free) universe derivation for the rigid-slide nested-set
+/// class — the "cheap discovery" that replaces the full sampling BFS for
+/// `SlidingPuzzles`.
+///
+/// # When this is sound + complete
+///
+/// The caller must have a `slide_recognize` PROOF that the spec's `Next` is the
+/// rigid-unit-slide relation over the position grid `positions` (the same proof
+/// the DEFAULT slide-kernel arm requires). Under that proof every reachable
+/// board's pieces are rigid TRANSLATES of the INIT pieces: the slide relation
+/// only translates a piece by a unit vector (keeping it iff it stays in the grid
+/// and disjoint), so a piece is never reshaped, only moved. Therefore the
+/// COMPLETE set of piece-shapes that can EVER appear in any reachable board is
+/// exactly
+///
+/// ```text
+///   { all grid-fitting translates of every INIT piece }
+/// ```
+///
+/// This function enumerates that set directly (no BFS, no state retention) and
+/// reuses [`derive_nested_set_universe`] on a synthetic board that carries every
+/// translate as one piece, so the resulting `NestedSetBitmask` universe +
+/// bijection + caps are byte-identical in shape to the sampled path — only the
+/// COST differs (O(#pieces × grid) vs a full reachable-space re-exploration).
+///
+/// # Why 0 escapes (completeness)
+///
+/// The enumerated universe is a proven SUPERSET of every reachable piece-shape,
+/// so no reachable board can carry a piece outside it — the per-successor
+/// monitor (which still guards every board) sees 0 escapes. The extra shapes a
+/// static superset may include over the exact reachable set never appear as a
+/// present piece, so the monitored dedup fingerprint (a sum over PRESENT pieces
+/// only) is byte-identical either way — the verdict is unchanged. The monitor
+/// remains the fail-closed backstop: if the rigid-slide assumption were ever
+/// violated for some board, that board escapes and the var bails to raw
+/// `value_fingerprint` (never a wrong dedup).
+///
+/// Returns `None` (caller falls back to the sampling path) when there is no
+/// piece to enumerate, the grid is empty, or the derived universe exceeds the
+/// A3 codec caps.
+#[must_use]
+pub(crate) fn derive_nested_set_universe_static(
+    positions: &[(i64, i64)],
+    init_boards: &[&Value],
+) -> Option<DiscoveredNestedSet> {
+    use std::collections::BTreeSet;
+
+    // The exact grid membership set (handles non-rectangular grids with holes:
+    // a translate is kept ONLY when every cell is a real grid position).
+    let pos_set: BTreeSet<(i64, i64)> = positions.iter().copied().collect();
+    let min_x = pos_set.iter().map(|&(x, _)| x).min()?;
+    let max_x = pos_set.iter().map(|&(x, _)| x).max()?;
+    let min_y = pos_set.iter().map(|&(_, y)| y).min()?;
+    let max_y = pos_set.iter().map(|&(_, y)| y).max()?;
+
+    // Every distinct grid-fitting translate of every INIT piece, canonicalized
+    // as a sorted cell list so equal shapes-at-a-position collapse.
+    let mut translates: BTreeSet<Vec<(i64, i64)>> = BTreeSet::new();
+    let mut saw_piece = false;
+    for &board in init_boards {
+        let Value::Set(outer) = board else { continue };
+        for piece in outer.iter() {
+            let Value::Set(inner) = piece else {
+                return None;
+            };
+            let mut cells: Vec<(i64, i64)> = Vec::with_capacity(inner.len());
+            for elem in inner.iter() {
+                cells.push(super::nested_set_slide::value_to_pos(elem)?);
+            }
+            if cells.is_empty() {
+                continue;
+            }
+            saw_piece = true;
+            let pmin_x = cells.iter().map(|&(x, _)| x).min()?;
+            let pmax_x = cells.iter().map(|&(x, _)| x).max()?;
+            let pmin_y = cells.iter().map(|&(_, y)| y).min()?;
+            let pmax_y = cells.iter().map(|&(_, y)| y).max()?;
+            // Translation offsets that keep the piece's bounding box within the
+            // grid's bounding box; the per-cell membership test below then
+            // rejects any translate that lands on a grid hole.
+            for dx in (min_x - pmin_x)..=(max_x - pmax_x) {
+                for dy in (min_y - pmin_y)..=(max_y - pmax_y) {
+                    if cells
+                        .iter()
+                        .all(|&(x, y)| pos_set.contains(&(x + dx, y + dy)))
+                    {
+                        let mut t: Vec<(i64, i64)> =
+                            cells.iter().map(|&(x, y)| (x + dx, y + dy)).collect();
+                        t.sort_unstable();
+                        translates.insert(t);
+                    }
+                }
+            }
+        }
+    }
+    if !saw_piece || translates.is_empty() {
+        return None;
+    }
+
+    // One synthetic board carrying every translate as a piece, then reuse the
+    // sampled derivation (which builds the id bijection + applies the codec
+    // caps). A Value::Set holds each distinct translate as a distinct element.
+    let pieces = translates.into_iter().map(|cells| {
+        Value::Set(Rp::new(SortedSet::from_iter(cells.into_iter().map(
+            |(x, y)| Value::Tuple(Rp::from(vec![Value::SmallInt(x), Value::SmallInt(y)])),
+        ))))
+    });
+    let synthetic = Value::Set(Rp::new(SortedSet::from_iter(pieces)));
+    derive_nested_set_universe(&[&synthetic])
 }
 
 /// Canonicalize a board value (set-of-sets of arbitrary inner elements) into
@@ -676,6 +786,79 @@ mod tests {
         assert_eq!(report.sampled_boards, 1);
         assert_eq!(report.roundtrip_ok, 0);
         assert_eq!(report.escapes, 1);
+    }
+
+    /// The Klotski INIT board (the real `SlidingPuzzles` init), over the 4×5
+    /// grid, as a nested-set `Value`.
+    fn klotski_init_board() -> Value {
+        board(&[
+            vec![(0, 0), (0, 1)],
+            vec![(1, 0), (2, 0), (1, 1), (2, 1)],
+            vec![(3, 0), (3, 1)],
+            vec![(0, 2), (0, 3)],
+            vec![(1, 2), (2, 2)],
+            vec![(3, 2), (3, 3)],
+            vec![(1, 3)],
+            vec![(2, 3)],
+            vec![(0, 4)],
+            vec![(3, 4)],
+        ])
+    }
+
+    fn grid_4x5() -> Vec<(i64, i64)> {
+        let mut g = Vec::new();
+        for x in 0..4 {
+            for y in 0..5 {
+                g.push((x, y));
+            }
+        }
+        g
+    }
+
+    /// STATIC (exploration-free) discovery over the Klotski grid derives the
+    /// complete piece-shape universe: |inner|=20 (the 20 grid cells), |outer|=63
+    /// (all grid-fitting translates of the 4 distinct INIT shapes: vertical
+    /// domino 16 + horizontal domino 15 + 2×2 square 12 + singleton 20), a
+    /// SUPERSET of the 60 reachable shapes. It fits a single 64-bit slot.
+    #[test]
+    fn static_discovery_derives_complete_klotski_universe() {
+        let init = klotski_init_board();
+        let positions = grid_4x5();
+        let discovered = derive_nested_set_universe_static(&positions, &[&init])
+            .expect("static Klotski universe must derive");
+        assert_eq!(discovered.inner_len, 20, "20 grid cells");
+        assert_eq!(
+            discovered.outer_len, 63,
+            "all grid-fitting translates: 16+15+12+20"
+        );
+        assert_eq!(
+            discovered.layout.slot_count(),
+            1,
+            "63 shapes fit one u64 slot"
+        );
+    }
+
+    /// The static universe is a SUPERSET of the sampled one AND freezes into a
+    /// monitor that byte-matches `value_fingerprint` on the INIT board — the
+    /// property that keeps the promotion verdict-identical.
+    #[test]
+    fn static_universe_freezes_and_fp_matches_on_init() {
+        let init = klotski_init_board();
+        let positions = grid_4x5();
+        let discovered =
+            derive_nested_set_universe_static(&positions, &[&init]).expect("static universe");
+        let monitor = freeze_nested_set_var(0, &discovered).expect("freeze");
+        match monitor.encode_board(&init) {
+            NestedSetEncodeOutcome::Encoded { dedup_fp, slots } => {
+                assert_eq!(slots.len(), 1, "1-slot mask");
+                assert_eq!(
+                    dedup_fp,
+                    value_fingerprint(&init),
+                    "monitored dedup fp must byte-match value_fingerprint(init board)"
+                );
+            }
+            NestedSetEncodeOutcome::Escaped => panic!("INIT board must be in its own universe"),
+        }
     }
 
     #[test]

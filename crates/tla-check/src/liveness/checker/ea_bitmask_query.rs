@@ -108,7 +108,7 @@ impl EaEdgeCheck {
         let Some(from_info) = graph.try_get_node_info(from)? else {
             return Ok(false);
         };
-        let Some(succ_idx) = from_info.successors.iter().position(|s| s == to) else {
+        let Some(succ_idx) = from_info.successors().position(to) else {
             return Ok(false);
         };
         let Some(to_info) = graph.try_get_node_info(to)? else {
@@ -137,6 +137,36 @@ pub(super) struct SccAggregateMasks {
     pub(super) action_mask: CheckMask,
 }
 
+/// Small SCCs dominate many liveness graphs (CoffeeCan's largest group has
+/// roughly 500K two-node SCCs). Building and retaining one HashSet per SCC
+/// costs a heap allocation and a HashSet header for every component. Linear
+/// membership is cheaper at these sizes; genuinely large SCCs still get O(1)
+/// hashed lookup while their aggregate is built.
+const LINEAR_SCC_MEMBERSHIP_LIMIT: usize = 8;
+
+enum SccMembership<'a> {
+    Linear(&'a [BehaviorGraphNode]),
+    Hashed(FxHashSet<BehaviorGraphNode>),
+}
+
+impl<'a> SccMembership<'a> {
+    fn new(nodes: &'a [BehaviorGraphNode]) -> Self {
+        if nodes.len() <= LINEAR_SCC_MEMBERSHIP_LIMIT {
+            Self::Linear(nodes)
+        } else {
+            Self::Hashed(nodes.iter().copied().collect())
+        }
+    }
+
+    #[inline]
+    fn contains(&self, node: &BehaviorGraphNode) -> bool {
+        match self {
+            Self::Linear(nodes) => nodes.contains(node),
+            Self::Hashed(nodes) => nodes.contains(node),
+        }
+    }
+}
+
 impl LivenessChecker {
     /// Build aggregate bitmasks for each candidate SCC.
     ///
@@ -146,13 +176,12 @@ impl LivenessChecker {
     /// that eliminates O(PEM x SCC x scc_size) per-node iteration for AE checks.
     pub(super) fn try_build_scc_aggregates(
         candidate_sccs: &[&crate::liveness::tarjan::Scc],
-        scc_node_sets: &[FxHashSet<BehaviorGraphNode>],
         ea_check: Option<&EaEdgeCheck>,
         graph: &BehaviorGraph,
     ) -> EvalResult<Vec<SccAggregateMasks>> {
         let mut result = Vec::with_capacity(candidate_sccs.len());
-        for (scc_idx, scc) in candidate_sccs.iter().enumerate() {
-            let scc_set = &scc_node_sets[scc_idx];
+        for scc in candidate_sccs {
+            let membership = SccMembership::new(scc.nodes());
             let mut state_mask = CheckMask::new();
             let mut action_mask = CheckMask::new();
 
@@ -160,8 +189,8 @@ impl LivenessChecker {
                 if let Some(info) = graph.try_get_node_info(node)? {
                     state_mask.or_assign(&info.state_check_mask);
 
-                    for (succ_idx, succ) in info.successors.iter().enumerate() {
-                        if !scc_set.contains(succ) {
+                    for (succ_idx, succ) in info.successors().iter().enumerate() {
+                        if !membership.contains(succ) {
                             continue;
                         }
                         if let Some(ec) = ea_check {
@@ -174,7 +203,7 @@ impl LivenessChecker {
                             }
                         }
                         if let Some(mask) = info.action_check_masks.get(succ_idx) {
-                            action_mask.or_assign(mask);
+                            mask.or_into(&mut action_mask);
                         }
                     }
                 }
@@ -263,7 +292,7 @@ impl LivenessChecker {
             let mut found = false;
             for node in scc.nodes() {
                 if let Some(info) = graph.try_get_node_info(node)? {
-                    for (succ_idx, succ) in info.successors.iter().enumerate() {
+                    for (succ_idx, succ) in info.successors().iter().enumerate() {
                         if !scc_set.contains(succ) {
                             continue;
                         }
@@ -291,5 +320,37 @@ impl LivenessChecker {
             }
         }
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod membership_tests {
+    use super::*;
+    use crate::state::Fingerprint;
+
+    fn node(value: u64) -> BehaviorGraphNode {
+        BehaviorGraphNode::new(Fingerprint(value), 0)
+    }
+
+    #[test]
+    fn small_scc_membership_is_linear_and_exact() {
+        let nodes = [node(1), node(2)];
+        let membership = SccMembership::new(&nodes);
+        assert!(matches!(&membership, SccMembership::Linear(_)));
+        assert!(membership.contains(&node(1)));
+        assert!(membership.contains(&node(2)));
+        assert!(!membership.contains(&node(3)));
+    }
+
+    #[test]
+    fn large_scc_membership_is_hashed_and_exact() {
+        let nodes: Vec<_> = (0..=LINEAR_SCC_MEMBERSHIP_LIMIT)
+            .map(|value| node(value as u64))
+            .collect();
+        let membership = SccMembership::new(&nodes);
+        assert!(matches!(&membership, SccMembership::Hashed(_)));
+        assert!(membership.contains(&node(0)));
+        assert!(membership.contains(&node(LINEAR_SCC_MEMBERSHIP_LIMIT as u64)));
+        assert!(!membership.contains(&node(100)));
     }
 }

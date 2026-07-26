@@ -470,6 +470,13 @@ fn test_gate_reseed_preserves_owned_pre_pruning_successors_for_enabled() {
         .state_successor_fps
         .insert(current_fp, Arc::new(vec![current_fp, pruned_successor_fp]));
     checker
+        .state_successor_fps
+        .insert(pruned_successor_fp, Arc::new(Vec::new()));
+    assert!(
+        checker.freeze_complete_exact_raw_adjacency(),
+        "closed owned adjacency should freeze before ENABLED evaluation"
+    );
+    checker
         .state_successors
         .insert(current_fp, Arc::new(vec![current.clone()]));
 
@@ -479,7 +486,7 @@ fn test_gate_reseed_preserves_owned_pre_pruning_successors_for_enabled() {
         .expect("current behavior node");
     assert!(
         behavior_successors
-            .successors
+            .successors()
             .iter()
             .all(|successor| successor.state_fp != pruned_successor_fp),
         "the ENABLED witness must be absent from consistency-pruned behavior edges"
@@ -582,13 +589,17 @@ fn test_owned_compact_enabled_fails_closed_on_missing_adjacency() {
     let direct_error = checker
         .successor_states_for_enabled(current_fp)
         .expect_err("owned resolver must require an explicit adjacency entry");
-    assert!(direct_error.to_string().contains("missing successor adjacency"));
+    assert!(direct_error
+        .to_string()
+        .contains("missing successor adjacency"));
 
     let eval_error = checker
         .eval_check_on_state(&enabled_true, &current)
         .expect_err("missing owned adjacency must not turn ENABLED into false");
     assert!(
-        eval_error.to_string().contains("missing successor adjacency"),
+        eval_error
+            .to_string()
+            .contains("missing successor adjacency"),
         "unexpected missing-adjacency error: {eval_error}"
     );
 }
@@ -663,7 +674,9 @@ fn test_gate_reseed_owned_fails_closed_on_missing_adjacency() {
         .reseed_state_successors_for_gate(&[current_node])
         .expect_err("gate reseed must require complete owned adjacency");
     assert!(
-        error.to_string().contains("missing complete successor adjacency"),
+        error
+            .to_string()
+            .contains("missing complete successor adjacency"),
         "unexpected gate adjacency error: {error}"
     );
 }
@@ -671,10 +684,7 @@ fn test_gate_reseed_owned_fails_closed_on_missing_adjacency() {
 #[cfg_attr(test, ntest::timeout(10000))]
 #[test]
 fn test_owned_compact_enabled_fails_closed_on_missing_leaf_batch_adjacency() {
-    let enabled_true = LiveExpr::enabled(
-        Arc::new(spanned(Expr::Bool(true))),
-        4015,
-    );
+    let enabled_true = LiveExpr::enabled(Arc::new(spanned(Expr::Bool(true))), 4015);
     let current = State::from_pairs([("x", Value::int(0))]);
     let current_fp = current.fingerprint();
     let current_node = BehaviorGraphNode::new(current_fp, 0);

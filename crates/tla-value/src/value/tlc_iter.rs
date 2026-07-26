@@ -11,8 +11,8 @@
 
 use super::{FuncSetIterator, KSubsetIterator, SubsetIterator, Value};
 use crate::error::{EvalError, EvalResult};
-use std::cmp::Ordering;
 use crate::rp::Rp as Arc;
+use std::cmp::Ordering;
 // Part of #3073, #3063: Thread-local cache for TLC-normalized set element orders.
 //
 // When the evaluator iterates a set of non-safe types (Records, Tuples, etc.)

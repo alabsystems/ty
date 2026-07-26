@@ -178,7 +178,7 @@ fn test_detect_actions_preserves_exists_context() {
 
 #[cfg_attr(test, ntest::timeout(10000))]
 #[test]
-fn test_detect_actions_if_branches_get_guarded() {
+fn test_detect_actions_if_branches_preserve_condition_semantics() {
     let cond = Spanned::new(
         Expr::Ident("c".to_string(), NameId::INVALID),
         Span::new(FileId(0), 1, 2),
@@ -193,8 +193,8 @@ fn test_detect_actions_if_branches_get_guarded() {
     );
     let next_body = sp(Expr::If(
         Box::new(cond.clone()),
-        Box::new(then_branch),
-        Box::new(else_branch),
+        Box::new(then_branch.clone()),
+        Box::new(else_branch.clone()),
     ));
 
     let next_def = OperatorDef {
@@ -213,27 +213,66 @@ fn test_detect_actions_if_branches_get_guarded() {
     assert_eq!(actions.len(), 2);
     assert_eq!(actions[0].name, "A");
     assert_eq!(actions[1].name, "B");
-    assert_eq!(actions[0].id.span, actions[0].expr.span);
-    assert_eq!(actions[1].id.span, actions[1].expr.span);
+    assert_eq!(actions[0].id.span, then_branch.span);
+    assert_eq!(actions[1].id.span, else_branch.span);
 
     match &actions[0].expr.node {
-        Expr::And(g, a) => {
-            assert!(matches!(&g.node, Expr::Ident(name, _) if name == "c"));
+        Expr::If(c, a, f) => {
+            assert!(matches!(&c.node, Expr::Ident(name, _) if name == "c"));
             assert!(matches!(&a.node, Expr::Ident(name, _) if name == "A"));
+            assert!(matches!(&f.node, Expr::Bool(false)));
         }
-        other => panic!("expected And guard for THEN, got {other:?}"),
+        other => panic!("expected IF wrapper for THEN, got {other:?}"),
     }
 
     match &actions[1].expr.node {
-        Expr::And(g, b) => match &g.node {
-            Expr::Not(inner) => {
-                assert!(matches!(&inner.node, Expr::Ident(name, _) if name == "c"));
-                assert!(matches!(&b.node, Expr::Ident(name, _) if name == "B"));
-            }
-            other => panic!("expected Not(c) guard for ELSE, got {other:?}"),
-        },
-        other => panic!("expected And guard for ELSE, got {other:?}"),
+        Expr::If(c, f, b) => {
+            assert!(matches!(&c.node, Expr::Ident(name, _) if name == "c"));
+            assert!(matches!(&f.node, Expr::Bool(false)));
+            assert!(matches!(&b.node, Expr::Ident(name, _) if name == "B"));
+        }
+        other => panic!("expected IF wrapper for ELSE, got {other:?}"),
     }
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_detect_actions_cross_file_if_context_keeps_leaf_ids_distinct() {
+    let cond = Spanned::new(
+        Expr::Ident("c".to_string(), NameId::INVALID),
+        Span::new(FileId(0), 1, 2),
+    );
+    let then_branch = Spanned::new(
+        Expr::Ident("A".to_string(), NameId::INVALID),
+        Span::new(FileId(1), 10, 11),
+    );
+    let else_branch = Spanned::new(
+        Expr::Ident("B".to_string(), NameId::INVALID),
+        Span::new(FileId(1), 20, 21),
+    );
+    let next_def = OperatorDef {
+        name: Spanned::new("Next".to_string(), Span::dummy()),
+        params: Vec::new(),
+        body: sp(Expr::If(
+            Box::new(cond),
+            Box::new(then_branch.clone()),
+            Box::new(else_branch.clone()),
+        )),
+        local: false,
+        contains_prime: true,
+        guards_depend_on_prime: true,
+        has_primed_param: false,
+        is_recursive: false,
+        self_call_count: 0,
+    };
+
+    let actions = detect_actions(&next_def);
+    assert_eq!(actions.len(), 2);
+    assert_eq!(actions[0].id.span, then_branch.span);
+    assert_eq!(actions[1].id.span, else_branch.span);
+    assert_ne!(actions[0].id, actions[1].id);
+    assert_eq!(actions[0].expr.span, Span::dummy());
+    assert_eq!(actions[1].expr.span, Span::dummy());
 }
 
 #[cfg_attr(test, ntest::timeout(10000))]

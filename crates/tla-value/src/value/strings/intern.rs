@@ -2,10 +2,10 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
+use crate::rp::Rp as Arc;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{OnceLock};
-use crate::rp::Rp as Arc;
+use std::sync::OnceLock;
 
 /// Global string intern table for O(1) pointer-based string equality.
 ///

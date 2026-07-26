@@ -176,6 +176,7 @@ fn test_func_except_out_of_domain_reuses_storage() {
 fn test_func_except_changed_value_clones_only_values_when_shared() {
     let func = sample_func();
     let domain_ptr = func.domain_ptr();
+    let domain_descriptor_ptr = func.domain_descriptor_ptr();
     let values_ptr = func.values_ptr();
 
     let result = func.clone().except(Value::SmallInt(1), Value::Bool(false));
@@ -187,6 +188,11 @@ fn test_func_except_changed_value_clones_only_values_when_shared() {
         result.domain_ptr(),
         domain_ptr,
         "EXCEPT should share the immutable domain buffer"
+    );
+    assert_eq!(
+        result.domain_descriptor_ptr(),
+        domain_descriptor_ptr,
+        "EXCEPT should share all immutable domain metadata"
     );
     // Part of #3371: With lazy overlay, the values buffer is shared (not
     // cloned). The delta is stored in the overlay instead of COW-cloning.
@@ -208,11 +214,13 @@ fn test_func_except_changed_value_clones_only_values_when_shared() {
 fn test_func_except_changed_value_keeps_values_buffer_when_unique() {
     let func = sample_func();
     let domain_ptr = func.domain_ptr();
+    let domain_descriptor_ptr = func.domain_descriptor_ptr();
     let before_ptr = func.values_ptr();
 
     let result = func.except(Value::SmallInt(1), Value::Bool(false));
 
     assert_eq!(result.domain_ptr(), domain_ptr);
+    assert_eq!(result.domain_descriptor_ptr(), domain_descriptor_ptr);
     assert_eq!(result.values_ptr(), before_ptr);
     assert_eq!(result.apply(&Value::SmallInt(1)), Some(&Value::Bool(false)));
 }
@@ -224,13 +232,20 @@ fn test_func_except_preserves_tlc_order_cache_when_shared() {
     clear_tlc_string_tokens();
 
     let func = sample_string_domain_func();
+    let cloned = func.clone();
+    assert_eq!(cloned.domain_descriptor_ptr(), func.domain_descriptor_ptr());
+    assert_eq!(cloned.tlc_normalized_order(), None);
     let cached_order: Arc<[usize]> = vec![1, 0].into();
     func.cache_tlc_normalized_order(Arc::clone(&cached_order));
+    assert_eq!(
+        cloned.tlc_normalized_order(),
+        Some(cached_order.as_ref()),
+        "clones must observe the shared domain-only TLC cache"
+    );
 
-    let result = func
-        .clone()
-        .except(Value::string("alpha"), Value::Bool(false));
+    let result = cloned.except(Value::string("alpha"), Value::Bool(false));
 
+    assert_eq!(result.domain_descriptor_ptr(), func.domain_descriptor_ptr());
     assert_eq!(result.tlc_normalized_order(), Some(cached_order.as_ref()));
     assert_eq!(func.tlc_normalized_order(), Some(cached_order.as_ref()));
 

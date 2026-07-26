@@ -37,6 +37,7 @@ pub(crate) trait CheckerConfigurable {
     fn set_fingerprint_storage(&mut self, storage: Arc<dyn FingerprintSet>);
     fn set_max_states(&mut self, limit: usize);
     fn set_max_depth(&mut self, limit: usize);
+    fn set_deadline(&mut self, deadline: std::time::Instant);
     fn set_memory_limit(&mut self, limit_bytes: usize);
     fn set_disk_limit(&mut self, limit_bytes: usize);
     // AdaptiveChecker does not yet own checkpoint settings, but the shared
@@ -104,6 +105,9 @@ impl<'a> CheckerConfigurable for ModelChecker<'a> {
     fn set_max_depth(&mut self, limit: usize) {
         self.set_max_depth(limit);
     }
+    fn set_deadline(&mut self, deadline: std::time::Instant) {
+        self.set_deadline(deadline);
+    }
     fn set_memory_limit(&mut self, limit_bytes: usize) {
         self.set_memory_limit(limit_bytes);
     }
@@ -154,6 +158,9 @@ impl CheckerConfigurable for ParallelChecker {
     }
     fn set_max_depth(&mut self, limit: usize) {
         self.set_max_depth(limit);
+    }
+    fn set_deadline(&mut self, deadline: std::time::Instant) {
+        self.set_deadline(deadline);
     }
     fn set_memory_limit(&mut self, limit_bytes: usize) {
         self.set_memory_limit(limit_bytes);

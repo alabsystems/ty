@@ -50,6 +50,9 @@ impl ParallelChecker {
     ) -> Result<Option<Fingerprint>, CheckResult> {
         let var_registry = &**seed_ctx.var_registry;
         let cached_view_name = &seed_ctx.cached_view_name;
+        let raw_initial_states_generated = self
+            .total_raw_initial_states_generated
+            .load(Ordering::SeqCst);
         // State constraints (CONSTRAINT directive)
         match check_state_constraints_array(ctx, &self.config.constraints, arr_state) {
             Ok(true) => {}
@@ -59,6 +62,7 @@ impl ParallelChecker {
                 // ExitRequested maps to LimitReached(Exit).
                 let stats = CheckStats {
                     initial_states: num_initial + 1,
+                    raw_initial_states_generated,
                     states_found: self.states_count(),
                     ..Default::default()
                 };
@@ -76,6 +80,7 @@ impl ParallelChecker {
             // ExitRequested maps to LimitReached(Exit).
             let stats = CheckStats {
                 initial_states: num_initial + 1,
+                raw_initial_states_generated,
                 states_found: self.states_count(),
                 ..Default::default()
             };
@@ -96,6 +101,7 @@ impl ParallelChecker {
                 .map_err(|e| {
                     let stats = CheckStats {
                         initial_states: num_initial + 1,
+                        raw_initial_states_generated,
                         states_found: self.states_count(),
                         ..Default::default()
                     };
@@ -145,6 +151,7 @@ impl ParallelChecker {
                         error,
                         CheckStats {
                             initial_states: num_initial + 1,
+                            raw_initial_states_generated,
                             states_found: self.states_count(),
 
                             ..Default::default()
@@ -169,6 +176,7 @@ impl ParallelChecker {
                     limit_type: LimitType::States,
                     stats: CheckStats {
                         initial_states: num_initial,
+                        raw_initial_states_generated,
                         states_found: self.states_count(),
                         ..Default::default()
                     },
@@ -213,6 +221,7 @@ impl ParallelChecker {
                         let trace = Trace::from_states(vec![state]);
                         let stats = CheckStats {
                             initial_states: num_initial + 1,
+                            raw_initial_states_generated,
                             states_found: self.states_count(),
                             ..Default::default()
                         };
@@ -248,6 +257,7 @@ impl ParallelChecker {
                     // ExitRequested maps to LimitReached(Exit).
                     let stats = CheckStats {
                         initial_states: num_initial + 1,
+                        raw_initial_states_generated,
                         states_found: self.states_count(),
                         ..Default::default()
                     };
@@ -283,6 +293,7 @@ impl ParallelChecker {
                             trace,
                             stats: CheckStats {
                                 initial_states: num_initial + 1,
+                                raw_initial_states_generated,
                                 states_found: self.states_count(),
                                 ..Default::default()
                             },
@@ -293,6 +304,7 @@ impl ParallelChecker {
                 Err(error) => {
                     let stats = CheckStats {
                         initial_states: num_initial + 1,
+                        raw_initial_states_generated,
                         states_found: self.states_count(),
                         ..Default::default()
                     };

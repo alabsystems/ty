@@ -93,7 +93,9 @@ pub(super) fn eval_prime(
                     if let Some(idx) = ctx.var_registry().get(name) {
                         debug_assert!(idx.as_usize() < next_env.env_len());
                         // SAFETY: `next_env` is a live borrowed array and the registry index is bounded.
-                        tla_value::churn_stats::churn_count(tla_value::churn_stats::ChurnSite::StateVarReadPrime);
+                        tla_value::churn_stats::churn_count(
+                            tla_value::churn_stats::ChurnSite::StateVarReadPrime,
+                        );
                         let value = unsafe { next_env.get_value(idx.as_usize()) };
                         record_next_read(ctx, idx, &value);
                         return Ok(value);
@@ -114,7 +116,9 @@ pub(super) fn eval_prime(
                     let resolved_idx = ctx.resolve_state_var_slot(name.as_str(), *idx, *sv_name_id);
                     debug_assert!(resolved_idx.as_usize() < next_env.env_len());
                     // SAFETY: `resolved_idx` is validated against the current registry.
-                    tla_value::churn_stats::churn_count(tla_value::churn_stats::ChurnSite::StateVarReadPrime);
+                    tla_value::churn_stats::churn_count(
+                        tla_value::churn_stats::ChurnSite::StateVarReadPrime,
+                    );
                     let value = unsafe { next_env.get_value(resolved_idx.as_usize()) };
                     record_next_read(ctx, resolved_idx, &value);
                     return Ok(value);

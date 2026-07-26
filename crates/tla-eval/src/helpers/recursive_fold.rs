@@ -12,13 +12,13 @@ use super::super::{
     apply_builtin_binary_op, apply_named_binary_op, eval, EvalCtx, EvalError, EvalResult,
 };
 use super::closures::create_closure_from_arg;
-use tla_value::Rp;
 use super::function_values::apply_resolved_func_value;
 use crate::cache::small_caches::SMALL_CACHES;
 use crate::value::{intern_string, Value};
 use std::sync::Arc;
 use tla_core::ast::{Expr, OperatorDef};
 use tla_core::{ExprVisitor, Span, Spanned};
+use tla_value::Rp;
 
 // Part of #3962: FOLD_RESULT_CACHE consolidated into SMALL_CACHES.fold_result_cache.
 // Previously a standalone thread_local! in this file; now shares a single TLS
@@ -200,7 +200,7 @@ pub(crate) fn try_eval_recursive_fold(
 /// extensional. Lazy functions and closures are identity-like values whose
 /// `Hash`/`Eq` intentionally use stable ids; a function rebuilt for a different
 /// state can share the same id while producing different results.
-fn fold_cache_args_safe(args: &[Value]) -> bool {
+pub(crate) fn fold_cache_args_safe(args: &[Value]) -> bool {
     args.iter().all(fold_cache_value_safe)
 }
 

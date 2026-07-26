@@ -92,6 +92,14 @@ pub(crate) fn estimate_state_space(initial_states: usize, branching_factor: f64)
 ///   before adjusting the selector. See:
 ///   reports/perf/issue-3202-category-c-parallel-scaling-current.md
 pub(crate) fn select_strategy(estimated_states: usize, available_cores: usize) -> Strategy {
+    // A one-worker ParallelChecker cannot provide parallel speedup and carries
+    // materially higher setup/transport/storage overhead than ModelChecker.
+    // This also makes the selector robust to CPU-affinity/cgroup environments
+    // where available_parallelism() correctly reports a single allowed CPU.
+    if available_cores <= 1 {
+        return Strategy::Sequential;
+    }
+
     // Cap at 8 workers. #3202 shows even 8 workers provides only ~1.4x
     // speedup on MCKVSSafetySmall — the bottleneck is not the cap.
     let max_workers = 8.min(available_cores);
@@ -220,10 +228,24 @@ mod tests {
         // Edge case: 0 estimated states
         assert_eq!(select_strategy(0, 8), Strategy::Sequential);
 
-        // Edge case: 1 available core clamps parallel to 1
+        // One available core cannot benefit from ParallelChecker.
+        assert_eq!(select_strategy(PARALLEL_THRESHOLD, 1), Strategy::Sequential);
+
+        // Keep the single-core rule independent of the estimate band.
         assert_eq!(
-            select_strategy(PARALLEL_THRESHOLD, 1),
-            Strategy::Parallel(1)
+            select_strategy(MEDIUM_SPEC_THRESHOLD, 1),
+            Strategy::Sequential
+        );
+        assert_eq!(
+            select_strategy(LARGE_SPEC_THRESHOLD, 1),
+            Strategy::Sequential
+        );
+
+        // Defensive edge case: an unavailable/invalid zero-core report must
+        // never construct Parallel(0).
+        assert_eq!(
+            select_strategy(LARGE_SPEC_THRESHOLD, 0),
+            Strategy::Sequential
         );
     }
 }

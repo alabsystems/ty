@@ -115,19 +115,26 @@ Prop == []<>(x = 2)
         init: Some("Init".to_string()),
         next: Some("Next".to_string()),
         properties: vec!["Prop".to_string()],
+        liveness_execution: crate::LivenessExecutionMode::OnTheFly,
         ..Default::default()
     };
 
     let mut checker = ModelChecker::new(&module, &config);
     checker.set_store_states(true);
-    let storage = Arc::new(FlippingErrorFingerprintSet::new(1, 17));
-    checker.set_fingerprint_storage(storage.clone() as Arc<dyn FingerprintSet>);
+    let storage = FlippingErrorFingerprintSet::new(1, 17);
+    let has_errors_calls = Arc::clone(&storage.has_errors_calls);
+    checker.set_fingerprint_storage(Arc::new(storage) as Arc<dyn FingerprintSet>);
 
     let result = checker.check();
     assert_fingerprint_overflow_with_dropped(result, 17);
     assert!(
-        storage.has_errors_call_count() >= 2,
+        has_errors_calls.load(Ordering::Acquire) >= 2,
         "expected terminal gate to re-check storage errors after liveness result",
+    );
+    assert_eq!(
+        checker.test_retired_seen_fps_len(),
+        None,
+        "custom storage must retain membership unless it opts into terminal release"
     );
 }
 

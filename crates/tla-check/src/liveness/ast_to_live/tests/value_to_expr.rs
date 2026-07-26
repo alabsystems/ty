@@ -7,8 +7,8 @@
 //! Split from liveness/ast_to_live/tests.rs — Part of #2779
 
 use super::helpers::{assert_expr_range_int_bounds, make_ctx};
-use tla_value::Rp;
 use super::*;
+use tla_value::Rp;
 
 fn make_set_value(values: impl IntoIterator<Item = Value>) -> Value {
     let mut set = SetBuilder::new();

@@ -6,11 +6,11 @@
 //!
 //! Part of #3412: extracted from `parallel_intern.rs` (lines 44-125).
 
+use crate::rp::Rp as Arc;
 use rustc_hash::FxHashMap;
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, AtomicU32};
-use std::sync::{Mutex};
-use crate::rp::Rp as Arc;
+use std::sync::Mutex;
 
 use super::super::Value;
 

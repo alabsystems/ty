@@ -5,10 +5,10 @@
 //! UNCHANGED behavior tests for eval_unchanged.
 
 use super::*;
-use tla_value::Rp;
 use crate::StateEnvRef;
 use num_bigint::BigInt;
 use tla_value::CompactValue;
+use tla_value::Rp;
 
 // ==========================================================================
 // Hoist-cache regression for eval_unchanged (#3147)

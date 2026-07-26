@@ -4,7 +4,7 @@
 
 use num_bigint::BigInt;
 use std::collections::HashMap;
-use std::sync::Arc;
+use tla_value::Rp;
 
 use tla_check::{
     json_to_value, json_to_value_with_path, value_to_json, IntervalValue, JsonValue,
@@ -29,7 +29,7 @@ fn json_codec_big_int_round_trip_does_not_truncate() {
 fn json_codec_interval_round_trip_is_structured() {
     let lo = BigInt::from(1);
     let hi = BigInt::from(1_000_000_000i64);
-    let v = Value::Interval(Arc::new(IntervalValue::new(lo.clone(), hi.clone())));
+    let v = Value::Interval(Rp::new(IntervalValue::new(lo.clone(), hi.clone())));
 
     let json = value_to_json(&v);
     match json {

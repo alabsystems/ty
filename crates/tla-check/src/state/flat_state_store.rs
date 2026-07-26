@@ -48,6 +48,7 @@
 //! Part of #3986: JIT V2 Phase 3 flat state buffer.
 
 use std::sync::Arc;
+#[cfg(test)]
 use tla_value::Rp;
 
 use super::array_state::ArrayState;

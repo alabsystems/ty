@@ -358,3 +358,163 @@ TypeOK == x \in {0}
         "scalar no-trace run should keep flat_state_primary active while reporting TypeOK"
     );
 }
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn direct_flat_init_resets_array_state_map_according_to_witness_policy() {
+    let module = parse_module(
+        r#"
+---- MODULE DirectFlatInitSeenRelease ----
+EXTENDS Naturals
+
+VARIABLE x
+
+Init == x \in 0..255
+Next == FALSE /\ UNCHANGED x
+====
+"#,
+    );
+    let config = Config {
+        init: Some("Init".to_string()),
+        next: Some("Next".to_string()),
+        check_deadlock: false,
+        use_flat_state: Some(true),
+        use_compiled_bfs: Some(false),
+        ..Default::default()
+    };
+
+    let mut checker = ModelChecker::new(&module, &config);
+    checker.set_store_states(false);
+
+    let stats = match checker.check() {
+        CheckResult::Success(stats) => stats,
+        other => panic!("direct flat init check should succeed, got {other:?}"),
+    };
+    assert_eq!(stats.states_found, 256);
+    assert!(
+        checker.is_flat_state_primary(),
+        "scalar no-trace init wavefront should activate flat-primary storage"
+    );
+    if checker.fp_only_flat_witness_active() {
+        let telemetry = checker.test_pre_codegen_init_seen_telemetry();
+        assert!(telemetry.retired);
+        assert_eq!(telemetry.witnesses_before, 256);
+        assert_eq!(telemetry.witnesses_after_retire, 1);
+        assert!(telemetry.capacity_before >= 256);
+        assert!(telemetry.capacity_after_retire > 0);
+        assert!(telemetry.capacity_after_retire < telemetry.capacity_before);
+        assert!(!telemetry.reconstructed);
+        assert!(checker.test_seen_is_empty());
+        assert_eq!(
+            checker.test_seen_capacity(),
+            0,
+            "compact CompiledFlat witnesses must release the retired ArrayState map buckets"
+        );
+    } else {
+        assert!(
+            !checker.test_seen_is_empty(),
+            "without compact witnesses, re-admission must retain ArrayState witnesses"
+        );
+        assert!(
+            checker.test_seen_capacity() >= 256,
+            "without compact witnesses, re-admission should reuse enough map capacity"
+        );
+    }
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn pre_codegen_init_seen_retirement_reconstructs_array_fp64_fallback() {
+    let module = parse_module(
+        r#"
+---- MODULE PreCodegenSeenFallback ----
+EXTENDS Naturals
+
+VARIABLE x
+
+Init == x \in 0..255
+Next == x' = x
+ActionOK == TRUE
+====
+"#,
+    );
+    let config = Config {
+        init: Some("Init".to_string()),
+        next: Some("Next".to_string()),
+        action_constraints: vec!["ActionOK".to_string()],
+        check_deadlock: false,
+        use_flat_state: Some(true),
+        use_compiled_bfs: Some(false),
+        ..Default::default()
+    };
+
+    let mut checker = ModelChecker::new(&module, &config);
+    checker.set_store_states(false);
+
+    let stats = match checker.check() {
+        CheckResult::Success(stats) => stats,
+        other => panic!("ArrayFp64 fallback check should succeed, got {other:?}"),
+    };
+    assert_eq!(stats.states_found, 256);
+    let telemetry = checker.test_pre_codegen_init_seen_telemetry();
+    assert!(telemetry.retired);
+    assert_eq!(telemetry.witnesses_before, 256);
+    assert_eq!(telemetry.witnesses_after_retire, 1);
+    assert!(telemetry.reconstructed);
+    assert_eq!(telemetry.reconstructed_witnesses, 256);
+    assert!(!checker.test_seen_is_empty());
+    assert!(checker.test_seen_capacity() >= 256);
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn pre_codegen_init_seen_retirement_preserves_compound_jit_fp_gate() {
+    let module = parse_module(
+        r#"
+---- MODULE PreCodegenSeenCompoundGate ----
+EXTENDS Naturals
+
+VARIABLE board
+
+Cells == 1..8
+Init == board \in [Cells -> BOOLEAN]
+Next == FALSE /\ UNCHANGED board
+====
+"#,
+    );
+    let config = Config {
+        init: Some("Init".to_string()),
+        next: Some("Next".to_string()),
+        check_deadlock: false,
+        use_flat_state: Some(true),
+        use_compiled_bfs: Some(false),
+        ..Default::default()
+    };
+
+    let mut checker = ModelChecker::new(&module, &config);
+    checker.set_store_states(false);
+
+    let stats = match checker.check() {
+        CheckResult::Success(stats) => stats,
+        other => panic!("compound direct-flat init check should succeed, got {other:?}"),
+    };
+    assert_eq!(stats.states_found, 256);
+    assert!(checker.is_flat_state_primary());
+    assert!(
+        !checker.jit_compiled_fp_active,
+        "retirement must preserve a compound witness for the scalar fingerprint activation gate"
+    );
+
+    if checker.fp_only_flat_witness_active() {
+        let telemetry = checker.test_pre_codegen_init_seen_telemetry();
+        assert!(telemetry.retired);
+        assert_eq!(telemetry.witnesses_before, 256);
+        assert_eq!(telemetry.witnesses_after_retire, 1);
+        assert!(telemetry.capacity_before >= 256);
+        assert!(telemetry.capacity_after_retire > 0);
+        assert!(telemetry.capacity_after_retire < telemetry.capacity_before);
+        assert!(!telemetry.reconstructed);
+        assert!(checker.test_seen_is_empty());
+        assert_eq!(checker.test_seen_capacity(), 0);
+    }
+}

@@ -95,6 +95,7 @@ fn function_has_layout_sensitive_state_access(
             // VM-only fusions must never be treated as pre-layout native
             // candidates.
             Opcode::RoundStepEq { .. }
+            | Opcode::EdgeFilter { .. }
             | Opcode::SetEnumSubseteq { .. }
             | Opcode::Tuple2SelfEq { .. }
             | Opcode::Tuple2SelfSubseteq { .. } => {

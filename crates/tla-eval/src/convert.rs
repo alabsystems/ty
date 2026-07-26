@@ -3,11 +3,10 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::{EvalError, EvalResult, FuncValue, Value};
-use tla_value::Rp;
 use crate::value::intern_string;
 use num_traits::ToPrimitive;
-use std::sync::Arc;
 use tla_core::Span;
+use tla_value::Rp;
 // === SVG conversion helpers ===
 
 /// Convert an SVG element record to its string representation

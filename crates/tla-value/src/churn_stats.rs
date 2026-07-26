@@ -132,6 +132,36 @@ pub enum ChurnSite {
     /// State-var reads ELIDED by the borrowed fast paths (no clone, no drop).
     StateVarReadElided,
 
+    // --- Canonical-identity redundancy counters (value-canon) ---
+    /// state_value_fingerprint: cached additive fp HIT (O(1)) on a compound value.
+    FpAdditiveCacheHit,
+    /// state_value_fingerprint: additive fp COMPUTED (cache miss) on a Set.
+    FpAdditiveComputeSet,
+    /// ... on a Func.
+    FpAdditiveComputeFunc,
+    /// ... on a Record.
+    FpAdditiveComputeRecord,
+    /// ... on a Seq.
+    FpAdditiveComputeSeq,
+    /// ... on an IntFunc.
+    FpAdditiveComputeIntFunc,
+    /// Tuple additive fp computed (variant carries NO cache slot).
+    FpAdditiveComputeTuple,
+    /// Interval additive fp computed (variant carries NO cache slot).
+    FpAdditiveComputeInterval,
+    /// Compound same-type eq deep compare entered (ptr_eq missed).
+    EqCompoundDeep,
+    /// Compound same-type cmp deep compare entered (ptr_eq missed).
+    CmpCompoundDeep,
+    /// Symmetry: streaming permute-compare calls (allocation-free deep walk).
+    PermuteCmp,
+    /// Symmetry: permuted-value materializations (deep rebuild).
+    PermuteMaterialize,
+    /// Symmetry: permutation memo HIT (O(1), no rebuild).
+    PermuteMemoHit,
+    /// Symmetry: permutation memo MISS (uncached rebuild + insert).
+    PermuteMemoMiss,
+
     /// Number of sites (must be last).
     Count,
 }
@@ -187,6 +217,20 @@ static SITE_NAMES: [&str; NUM_SITES] = [
     "svar : state-var read via UNCHANGED (dep-tracked)",
     "svar : state-var read via ctx lookup/env snapshot",
     "svar : state-var read ELIDED (borrowed, no clone)",
+    "fp   : additive-fp cache HIT (O(1))",
+    "fp   : additive-fp COMPUTE on Set",
+    "fp   : additive-fp COMPUTE on Func",
+    "fp   : additive-fp COMPUTE on Record",
+    "fp   : additive-fp COMPUTE on Seq",
+    "fp   : additive-fp COMPUTE on IntFunc",
+    "fp   : additive-fp COMPUTE on Tuple (uncached kind)",
+    "fp   : additive-fp COMPUTE on Interval (uncached kind)",
+    "canon: compound eq deep compare (ptr_eq missed)",
+    "canon: compound cmp deep compare (ptr_eq missed)",
+    "canon: symmetry permute_cmp streaming walk",
+    "canon: symmetry permute materialization",
+    "canon: permute memo HIT (O(1))",
+    "canon: permute memo MISS (rebuild + insert)",
 ];
 
 // `const` block repeat-expr initializer: AtomicU64 is not Copy, so use the

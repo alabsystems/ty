@@ -11,7 +11,6 @@
 //! Part of #2744 decomposition from eval_cache.rs.
 
 use super::dep_tracking::{current_state_lookup_mode, OpEvalDeps, StateLookupMode};
-use tla_value::Rp;
 use super::zero_arg_cache::deps_are_persistent;
 use crate::value::Value;
 use crate::var_index::VarIndex;
@@ -20,6 +19,7 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::sync::Arc;
 use tla_core::name_intern::{intern_name, NameId};
+use tla_value::Rp;
 
 // Specs like bosco have guards that call the same operator multiple times with the same arguments:
 //   rcvd01(self) >= N - T /\ rcvd0(self) >= moreNplus3Tdiv2 /\ rcvd0(self) < moreNplus3Tdiv2
@@ -759,6 +759,7 @@ mod tests {
     use super::*;
     use crate::cache::dep_tracking::OpEvalDeps;
     use std::sync::Arc;
+    use tla_value::Rp;
 
     fn test_key() -> NaryOpCacheKey {
         NaryOpCacheKey {

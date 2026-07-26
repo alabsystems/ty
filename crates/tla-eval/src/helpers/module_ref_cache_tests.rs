@@ -367,3 +367,94 @@ fn test_clear_module_ref_caches_clears_all() {
         "clear_module_ref_caches must clear EAGER_BINDINGS_CACHE"
     );
 }
+
+// === #3447/#4170 epoch policy: run-lifetime scope memo lifecycle ===
+
+fn dummy_named_run_key(i: usize) -> RunNamedScopeKey {
+    RunNamedScopeKey {
+        shared_ptr: i,
+        instance_name_id: tla_core::name_intern::intern_name("RunMemoInst"),
+        inst_subs_ptr: 7,
+        local_ops_ptr: 9,
+    }
+}
+
+fn dummy_shared() -> Arc<crate::core::SharedCtx> {
+    crate::EvalCtx::new().shared.clone()
+}
+
+fn dummy_scope_entry() -> ModuleRefScopeEntry {
+    ModuleRefScopeEntry {
+        effective_subs_arc: Arc::new(Vec::new()),
+        local_ops_arc: Arc::new(OpEnv::default()),
+    }
+}
+
+/// The run memo must SURVIVE `clear_for_eval_scope_boundary()` — that is its
+/// purpose: the #3447 per-boundary clears of the pointer-keyed caches stay in
+/// place, and the memo (content/producer-keyed, no ABA) re-seeds them without
+/// re-running CES + the instance-ops merge.
+#[test]
+fn test_run_scope_memo_survives_eval_scope_boundary() {
+    clear_for_test_reset();
+    let entry = dummy_scope_entry();
+    let pinned_ptr = Arc::as_ptr(&entry.local_ops_arc) as usize;
+    let shared = dummy_shared();
+    let mut key = dummy_named_run_key(0);
+    key.shared_ptr = Arc::as_ptr(&shared) as usize;
+    run_named_scope_memo_insert(key.clone(), entry, &shared);
+    assert!(run_named_scope_memo_get(&key).is_some());
+    assert!(is_pinned_local_ops(pinned_ptr), "insert must pin local_ops");
+
+    clear_for_eval_scope_boundary();
+
+    assert!(
+        run_named_scope_memo_get(&key).is_some(),
+        "run scope memo must survive eval-scope boundary clears"
+    );
+    assert!(
+        is_pinned_local_ops(pinned_ptr),
+        "pin must survive eval-scope boundary clears"
+    );
+    clear_for_test_reset();
+}
+
+/// The run memo must be cleared (with its pins, atomically) on run reset —
+/// the PerRun lifecycle that prevents cross-run aliasing of reused shared ids.
+#[test]
+fn test_run_scope_memo_cleared_on_run_reset() {
+    clear_for_test_reset();
+    let entry = dummy_scope_entry();
+    let pinned_ptr = Arc::as_ptr(&entry.local_ops_arc) as usize;
+    let shared = dummy_shared();
+    let mut named_key = dummy_named_run_key(0);
+    named_key.shared_ptr = Arc::as_ptr(&shared) as usize;
+    run_named_scope_memo_insert(named_key.clone(), entry, &shared);
+    let chained = dummy_chained_ref_entry();
+    let chained_pin = Arc::as_ptr(&chained.merged_local_ops) as usize;
+    let chained_key = RunChainedScopeKey {
+        shared_ptr: Arc::as_ptr(&shared) as usize,
+        chain_key: "A!B".to_string(),
+        inst_subs_ptr: 1,
+        local_ops_ptr: 2,
+    };
+    run_chained_scope_memo_insert(chained_key.clone(), chained, &shared);
+    assert!(is_pinned_local_ops(pinned_ptr));
+    assert!(is_pinned_local_ops(chained_pin));
+
+    on_cache_event(CacheEvent::RunReset);
+
+    assert!(
+        run_named_scope_memo_get(&named_key).is_none(),
+        "run reset must clear the named run memo"
+    );
+    assert!(
+        run_chained_scope_memo_get(&chained_key).is_none(),
+        "run reset must clear the chained run memo"
+    );
+    assert!(
+        !is_pinned_local_ops(pinned_ptr) && !is_pinned_local_ops(chained_pin),
+        "run reset must clear the pinned-address set with the maps (atomic clear)"
+    );
+    clear_for_test_reset();
+}

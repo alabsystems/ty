@@ -16,7 +16,7 @@
 #[cfg(test)]
 use super::check_mask::CheckMask;
 use super::BehaviorGraph;
-use super::{LiveExpr, LivenessChecker};
+use super::{LiveExpr, LivenessChecker, StateSuccessorFingerprints};
 use crate::error::{EvalError, EvalResult};
 use crate::eval::{BindingChain, EvalCtx};
 use crate::liveness::live_expr_eval::{eval_live_expr_core, LiveExprEvaluator};
@@ -43,7 +43,7 @@ fn enabled_successors(
     state_fp_to_canon_fp: &Option<Arc<FxHashMap<Fingerprint, Fingerprint>>>,
     succ_witnesses: &Option<Arc<SuccessorWitnessMap>>,
     state_successors: &FxHashMap<Fingerprint, Arc<Vec<State>>>,
-    state_successor_fps: &FxHashMap<Fingerprint, Arc<Vec<Fingerprint>>>,
+    state_successor_fps: &StateSuccessorFingerprints,
     graph: &BehaviorGraph,
     registry: &VarRegistry,
     state_fp: Fingerprint,
@@ -111,7 +111,7 @@ struct CheckerEvaluator<'a> {
     state_fp_to_canon_fp: &'a Option<Arc<FxHashMap<Fingerprint, Fingerprint>>>,
     succ_witnesses: &'a Option<Arc<SuccessorWitnessMap>>,
     state_successors: &'a FxHashMap<Fingerprint, Arc<Vec<State>>>,
-    state_successor_fps: &'a FxHashMap<Fingerprint, Arc<Vec<Fingerprint>>>,
+    state_successor_fps: &'a StateSuccessorFingerprints,
     graph: &'a BehaviorGraph,
     /// Part of #2661: Registry needed for ArrayState→State conversion in
     /// enabled_successors when witness map contains ArrayState values.

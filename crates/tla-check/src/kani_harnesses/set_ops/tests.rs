@@ -3,11 +3,10 @@
 // Licensed under the Apache License, Version 2.0
 
 use crate::kani_harnesses::test_helpers::{choose, make_set};
-use tla_value::Rp;
 use crate::value::Value;
 use num_bigint::BigInt;
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use tla_value::Rp;
 
 #[cfg_attr(test, ntest::timeout(10000))]
 #[test]

@@ -33,8 +33,8 @@ mod set_ops;
 mod tests;
 
 use crate::TrustIrError;
-use compound_read::{CompoundReadPlan, CR_APPLY1_SYMBOL, CR_APPLY2_SYMBOL};
 pub use compound_read::compound_read_callout_vars;
+use compound_read::{CompoundReadPlan, CR_APPLY1_SYMBOL, CR_APPLY2_SYMBOL};
 use num_traits::ToPrimitive;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -455,7 +455,10 @@ pub const SANCTIONED_HANDLE_EXTERN_SITES: &[(SanctionedHandleExternSite, &[&str]
             "tla_set_enum_8",
         ],
     ),
-    (SanctionedHandleExternSite::HandleSetUnion, &["tla_set_union"]),
+    (
+        SanctionedHandleExternSite::HandleSetUnion,
+        &["tla_set_union"],
+    ),
     (
         SanctionedHandleExternSite::HandleStoreVar,
         &["tla_handle_store_to_scratch"],
@@ -579,7 +582,7 @@ pub fn compound_read_callout_extern_names(module: &Module) -> Vec<String> {
     names
 }
 
-/// Scaffold entry point for the multi-successor ("NextStateLoop") native ABI.
+/// Entry point for the multi-successor ("NextStateLoop") native ABI.
 ///
 /// This is the trust-ir-side hook for [`tla_jit_abi::NextStateLoopFn`]: a single
 /// compiled action that emits *N* successors at runtime by pushing each into a
@@ -588,29 +591,58 @@ pub fn compound_read_callout_extern_names(module: &Module) -> Vec<String> {
 /// `\E k \in <runtime domain> : x' = f(k)` whose domain cannot be unrolled at
 /// compile time.
 ///
-/// # Errors
+/// Runtime integer ranges are lowered as a real counted loop. The prefix before
+/// the residual `EXISTS` is evaluated once into a private successor template;
+/// each iteration then re-seeds a fresh successor from `state_in`, overlays the
+/// template, evaluates the binding-dependent body, and commits the complete
+/// successor to the caller-owned sink. Proven-closed record-set domains use the
+/// existing opt-in compile-time-unrolled kernel.
 ///
-/// Always returns an error today (see Status): [`TrustIrError::NotEligible`]
-/// when `func` carries no residual inner `EXISTS`, otherwise
-/// [`TrustIrError::UnsupportedOpcode`] because the multi-successor loop lowering
-/// is not yet implemented.
-///
-/// # Status: recognized, not yet lowered (fail-closed)
-///
-/// The genuine multi-successor loop lowering (a per-iteration loop that
-/// re-seeds the successor from `state_in`, evaluates the binding-dependent
-/// primed writes, and calls the sink push per iteration — distinct from the
-/// boolean any-witness `Ctx::lower_exists_begin`, which would collapse N
-/// successors into 1) is **not implemented yet**. Until it lands together with
-/// a soundness proof, this entry point fails closed with
-/// [`TrustIrError::UnsupportedOpcode`] so the caller routes the action to the
-/// interpreter. This keeps the ABI wired end-to-end without ever emitting a
-/// partial or wrong successor set.
+/// Every other residual-`EXISTS` shape fails closed with
+/// [`TrustIrError::UnsupportedOpcode`] and remains on the interpreter.
 pub fn lower_next_state_loop_scaffold(
     func: &BytecodeFunction,
     name: &str,
     const_pool: Option<&ConstantPool>,
     state_layout: Option<&JitStateLayout>,
+) -> Result<Module, TrustIrError> {
+    lower_next_state_loop_scaffold_impl(func, name, const_pool, state_layout, None, None)
+}
+
+/// Chunk-aware [`lower_next_state_loop_scaffold`] variant.
+///
+/// Runtime range bounds commonly call a user-defined helper (for example
+/// `natMin`). This variant resolves and lowers those callees from `chunk`, and
+/// optionally reuses the checker's precomputed callee-return shapes.
+///
+/// # Errors
+///
+/// Returns the same fail-closed errors as [`lower_next_state_loop_scaffold`],
+/// plus errors from a transitively reachable helper callee.
+pub fn lower_next_state_loop_with_chunk(
+    func: &BytecodeFunction,
+    chunk: &BytecodeChunk,
+    name: &str,
+    state_layout: Option<&JitStateLayout>,
+    callee_shapes: Option<&ChunkCalleeReturnShapes>,
+) -> Result<Module, TrustIrError> {
+    lower_next_state_loop_scaffold_impl(
+        func,
+        name,
+        Some(&chunk.constants),
+        state_layout,
+        Some(chunk),
+        callee_shapes,
+    )
+}
+
+fn lower_next_state_loop_scaffold_impl<'cp>(
+    func: &BytecodeFunction,
+    name: &str,
+    const_pool: Option<&'cp ConstantPool>,
+    state_layout: Option<&JitStateLayout>,
+    source_chunk: Option<&'cp BytecodeChunk>,
+    callee_shapes: Option<&ChunkCalleeReturnShapes>,
 ) -> Result<Module, TrustIrError> {
     // Sanity: this path is only meaningful for actions that still carry a
     // residual existential after action transformation. If there is no
@@ -625,7 +657,26 @@ pub fn lower_next_state_loop_scaffold(
         });
     }
 
-    // Gate: this native record-set multi-successor kernel is opt-in and
+    // Route A: a runtime integer range (`lo..hi`) gets a genuine dynamic
+    // multi-successor loop. This path is default-on: unlike the experimental
+    // record-set carrier below, its scalar binding and exact inclusive bounds
+    // need no inferred universe or environment gate.
+    if let Some((info, range_pc, lo_reg, hi_reg)) = runtime_range_next_state_loop_shape(func) {
+        return lower_runtime_range_next_state_loop(
+            func,
+            name,
+            const_pool,
+            state_layout,
+            source_chunk,
+            callee_shapes,
+            info,
+            range_pc,
+            lo_reg,
+            hi_reg,
+        );
+    }
+
+    // Route B gate: the native record-set multi-successor kernel is opt-in and
     // default-off. Every default (env-unset) invocation fails closed exactly as
     // before so the interpreter handles the action; only `TY_RECORD_SET_NATIVE=1`
     // reaches the loop lowering below.
@@ -660,6 +711,8 @@ pub fn lower_next_state_loop_scaffold(
             "NextStateLoop: disjunctive expansion would drop a sibling successor".to_string(),
         ));
     }
+
+    validate_record_set_next_state_loop_envelope(func, &info)?;
 
     // Resolve the domain register to a terminal `LoadVar { var_idx }` of a state
     // variable, chasing `Move` aliases over the pre-`ExistsBegin` prefix. Fails
@@ -749,7 +802,8 @@ pub fn lower_next_state_loop_scaffold(
         ));
     };
     let body_span = (info.begin_pc + 1)..info.next_pc;
-    let provably_true_unchanged = next_state_loop_provably_true_unchanged(func, const_pool);
+    let provably_true_unchanged =
+        next_state_loop_provably_true_unchanged(func, const_pool, source_chunk);
     validate_next_state_loop_body(func, body_span.clone(), r_body, &provably_true_unchanged)?;
 
     // -----------------------------------------------------------------
@@ -761,9 +815,16 @@ pub fn lower_next_state_loop_scaffold(
         LoweringMode::NextState,
         const_pool,
         state_layout,
-        None,
+        source_chunk,
         &[],
         None,
+    )?;
+    prepare_next_state_loop_callee_metadata(
+        &mut ctx,
+        func,
+        source_chunk,
+        state_layout,
+        callee_shapes,
     )?;
 
     // We build our own CFG straight-line from the recognized shape and never
@@ -1299,10 +1360,844 @@ pub fn lower_next_state_loop_scaffold(
     );
     emit_next_state_loop_ok_return(&mut ctx, ovf_block);
 
-    // WP-27 (item 8): no module leaves the lowering carrying a boxed
-    // handle-mode extern that bypassed its pinned emission site.
+    finish_next_state_loop_ctx(ctx, source_chunk)
+}
+
+/// Recover the narrow, proof-auditable runtime-range shape handled by the
+/// dynamic NextStateLoop kernel.
+///
+/// The range must directly produce the existential's domain and immediately
+/// precede `ExistsBegin`. Requiring adjacency deliberately excludes aliases or
+/// intervening consumers that would need the materialized set value; declining
+/// those shapes is preferable to treating an uninitialized aggregate register
+/// as meaningful.
+fn runtime_range_next_state_loop_shape(
+    func: &BytecodeFunction,
+) -> Option<(tla_tir::bytecode::InnerExistsInfo, usize, u8, u8)> {
+    let info = single_record_set_inner_exists(func)?;
+    let range_pc = info.begin_pc.checked_sub(1)?;
+    let Opcode::Range { rd, lo, hi } = func.instructions[range_pc] else {
+        return None;
+    };
+    if rd != info.r_domain {
+        return None;
+    }
+    Some((info, range_pc, lo, hi))
+}
+
+/// Simulate a suffix made only of register moves followed by a single return.
+/// The suffix is accepted iff the returned register still carries the value
+/// held by `source` when execution entered the suffix.
+fn move_ladder_returns_source(func: &BytecodeFunction, start_pc: usize, source: u8) -> bool {
+    let Some(postfix) = func.instructions.get(start_pc..) else {
+        return false;
+    };
+    let Some((Opcode::Ret { rs: ret_reg }, moves)) = postfix.split_last() else {
+        return false;
+    };
+
+    // `env[rd]` identifies the entry-time register whose value `rd` now holds.
+    let mut env: [u8; 256] = [0; 256];
+    for (reg, origin) in env.iter_mut().enumerate() {
+        *origin = reg as u8;
+    }
+    for op in moves {
+        let Opcode::Move { rd, rs } = *op else {
+            return false;
+        };
+        env[usize::from(rd)] = env[usize::from(rs)];
+    }
+    env[usize::from(*ret_reg)] == source
+}
+
+/// Prove that the bytecode ignored after `ExistsNext` returns exactly the
+/// existential result. A syntactically harmless move ladder is not sufficient:
+/// returning some other register would let the native kernel emit successors
+/// even when the bytecode action itself returns false.
+fn validate_next_state_loop_postfix(
+    func: &BytecodeFunction,
+    info: &tla_tir::bytecode::InnerExistsInfo,
+    context: &str,
+) -> Result<(), TrustIrError> {
+    let start_pc = info.next_pc.checked_add(1).ok_or_else(|| {
+        TrustIrError::UnsupportedOpcode(format!("{context}: ExistsNext postfix start overflows"))
+    })?;
+    if !move_ladder_returns_source(func, start_pc, info.rd) {
+        return Err(TrustIrError::UnsupportedOpcode(format!(
+            "{context}: EXISTS result must be terminal and returned exactly (only a Move ladder carrying r{} into the final Ret may follow ExistsNext)",
+            info.rd
+        )));
+    }
+    Ok(())
+}
+
+/// Record-set lowering does not execute the bytecode prefix or postfix. Accept
+/// only the exact state-domain producer chain it reconstructs, prove that the
+/// body cannot read any skipped prefix temporary, and prove that the postfix
+/// returns the existential result.
+fn validate_record_set_next_state_loop_envelope(
+    func: &BytecodeFunction,
+    info: &tla_tir::bytecode::InnerExistsInfo,
+) -> Result<(), TrustIrError> {
+    let mut domain_chain_reg = None;
+    for (pc, op) in func.instructions[..info.begin_pc].iter().enumerate() {
+        domain_chain_reg = match (*op, domain_chain_reg) {
+            (Opcode::LoadVar { rd, .. }, None) => Some(rd),
+            (Opcode::Move { rd, rs }, Some(previous)) if rs == previous => Some(rd),
+            _ => {
+                return Err(TrustIrError::UnsupportedOpcode(format!(
+                    "NextStateLoop record-set prefix opcode {op:?} at pc {pc} is not part of the single LoadVar/Move domain producer chain; skipped prefix semantics are unsupported"
+                )));
+            }
+        };
+    }
+    if domain_chain_reg != Some(info.r_domain) {
+        return Err(TrustIrError::UnsupportedOpcode(format!(
+            "NextStateLoop record-set prefix does not end in the EXISTS domain register r{}",
+            info.r_domain
+        )));
+    }
+
+    // At entry to the native unrolled body only the reconstructed domain and
+    // the materialized loop binding have values. Every other read must be fed
+    // by an earlier body definition, never by an ignored prefix temporary.
+    let mut initialized = HashSet::from([info.r_domain, info.r_binding]);
+    for pc in (info.begin_pc + 1)..info.next_pc {
+        let op = &func.instructions[pc];
+        let reads = match op {
+            Opcode::JumpFalse { rs, .. } => vec![*rs],
+            _ => next_state_loop_body_reads(op),
+        };
+        if let Some(reg) = reads.into_iter().find(|reg| !initialized.contains(reg)) {
+            return Err(TrustIrError::UnsupportedOpcode(format!(
+                "NextStateLoop record-set body reads r{reg} at pc {pc}, but that value is not produced in the body and would come from the skipped prefix"
+            )));
+        }
+        if let Some(rd) = op.dest_register() {
+            initialized.insert(rd);
+        }
+    }
+
+    validate_next_state_loop_postfix(func, info, "NextStateLoop record-set")
+}
+
+/// Validate the control-flow envelope around a runtime-range inner EXISTS.
+///
+/// The prefix may contain ordinary straight-line next-state work plus
+/// conjunction-failure `JumpFalse`s that leave the action. The postfix must be
+/// a pure move ladder into one final `Ret`, so the existential is the terminal
+/// successor-producing term. More general branching remains interpreter-only.
+fn validate_runtime_range_next_state_loop_envelope(
+    func: &BytecodeFunction,
+    info: &tla_tir::bytecode::InnerExistsInfo,
+    range_pc: usize,
+) -> Result<(), TrustIrError> {
+    if tla_tir::bytecode::static_expansion_drops_sibling_successor(func, std::slice::from_ref(info))
+    {
+        return Err(TrustIrError::UnsupportedOpcode(
+            "NextStateLoop range: disjunctive expansion would drop a sibling successor".to_string(),
+        ));
+    }
+    if range_pc + 1 != info.begin_pc {
+        return Err(TrustIrError::UnsupportedOpcode(
+            "NextStateLoop range: Range must immediately precede ExistsBegin".to_string(),
+        ));
+    }
+
+    for (pc, op) in func.instructions[..info.begin_pc].iter().enumerate() {
+        match *op {
+            Opcode::Range { .. } if pc == range_pc => {}
+            Opcode::JumpFalse { rs, offset } => {
+                let target = (pc as i64).checked_add(i64::from(offset)).ok_or_else(|| {
+                    TrustIrError::UnsupportedOpcode(format!(
+                        "NextStateLoop range: prefix JumpFalse at pc {pc} overflows"
+                    ))
+                })?;
+                let target_pc = usize::try_from(target).ok();
+                if target <= info.next_pc as i64
+                    || target_pc
+                        .is_none_or(|target_pc| !move_ladder_returns_source(func, target_pc, rs))
+                {
+                    return Err(TrustIrError::UnsupportedOpcode(format!(
+                        "NextStateLoop range: prefix JumpFalse at pc {pc} targets {target}, but its false tail does not return the failing guard r{rs}; only a proven outer-conjunction rejection is supported"
+                    )));
+                }
+            }
+            Opcode::Unchanged { .. } | Opcode::Call { .. } => {}
+            _ if next_state_loop_body_whitelisted(op) => {}
+            _ => {
+                return Err(TrustIrError::UnsupportedOpcode(format!(
+                    "NextStateLoop range: prefix opcode {op:?} at pc {pc} is not straight-line supported"
+                )));
+            }
+        }
+    }
+
+    validate_next_state_loop_postfix(func, info, "NextStateLoop range")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_runtime_range_next_state_loop<'cp>(
+    func: &BytecodeFunction,
+    name: &str,
+    const_pool: Option<&'cp ConstantPool>,
+    state_layout: Option<&JitStateLayout>,
+    source_chunk: Option<&'cp BytecodeChunk>,
+    callee_shapes: Option<&ChunkCalleeReturnShapes>,
+    info: tla_tir::bytecode::InnerExistsInfo,
+    range_pc: usize,
+    lo_reg: u8,
+    hi_reg: u8,
+) -> Result<Module, TrustIrError> {
+    validate_runtime_range_next_state_loop_envelope(func, &info, range_pc)?;
+    let Opcode::ExistsNext { r_body, .. } = func.instructions[info.next_pc] else {
+        return Err(TrustIrError::UnsupportedOpcode(
+            "NextStateLoop range: malformed ExistsNext".to_string(),
+        ));
+    };
+    let body_span = (info.begin_pc + 1)..info.next_pc;
+    let provably_true_unchanged =
+        next_state_loop_provably_true_unchanged(func, const_pool, source_chunk);
+    validate_next_state_loop_body(func, body_span.clone(), r_body, &provably_true_unchanged)?;
+
+    let layout = state_layout.ok_or_else(|| {
+        TrustIrError::UnsupportedOpcode(
+            "NextStateLoop range: a compact state layout is required".to_string(),
+        )
+    })?;
+    let compact_slots = layout.compact_slot_count();
+    let compact_slots_u32 = u32::try_from(compact_slots).map_err(|_| {
+        TrustIrError::UnsupportedOpcode(
+            "NextStateLoop range: compact state width does not fit u32".to_string(),
+        )
+    })?;
+    if compact_slots_u32 == 0 {
+        return Err(TrustIrError::UnsupportedOpcode(
+            "NextStateLoop range: zero-width state layouts are unsupported".to_string(),
+        ));
+    }
+    let min_required = i64::try_from(compact_slots).map_err(|_| {
+        TrustIrError::UnsupportedOpcode(
+            "NextStateLoop range: compact state width does not fit i64".to_string(),
+        )
+    })?;
+
+    let mut ctx = Ctx::new_with_action_local_set_domain_proofs(
+        func,
+        name,
+        LoweringMode::NextState,
+        const_pool,
+        state_layout,
+        source_chunk,
+        &[],
+        None,
+    )?;
+    prepare_next_state_loop_callee_metadata(
+        &mut ctx,
+        func,
+        source_chunk,
+        state_layout,
+        callee_shapes,
+    )?;
+
+    // The constructor gives parameter #2 the ordinary `state_out` role. In a
+    // NextStateLoop entrypoint that parameter is the sink pointer instead.
+    let sink_ptr = ctx.state_out_ptr.ok_or_else(|| {
+        TrustIrError::Emission("NextStateLoop range requires a sink pointer".to_string())
+    })?;
+    let state_in_ptr = ctx.state_in_ptr;
+
+    // We own the CFG from here. Discard blocks pre-created for bytecode branch
+    // targets, retaining the entry block and register allocas.
+    ctx.module.functions[ctx.func_idx].blocks.truncate(1);
+    ctx.block_map.clear();
+    ctx.block_map.insert(0, 0);
+    let entry = 0usize;
+
+    // Evaluate the prefix against a private, fully seeded successor template.
+    // This preserves outer primed writes, LoadPrime, and UNCHANGED semantics
+    // without mutating the sink or needing to replay prefix dataflow per k.
+    let template = ctx.alloc_aggregate(entry, compact_slots_u32);
+    for slot in 0..compact_slots_u32 {
+        let value = ctx.load_at_offset(entry, state_in_ptr, slot);
+        ctx.store_at_offset(entry, template, slot, value);
+    }
+    ctx.state_out_ptr = Some(template);
+
+    let disabled_block = ctx.new_aux_block("nsl_range_disabled");
+    let overflow_block = ctx.new_aux_block("nsl_range_ovf");
+    let ok_block = ctx.new_aux_block("nsl_range_ok");
+    let disabled_id = ctx.block_id_of(disabled_block);
+
+    let mut current = entry;
+    for pc in 0..info.begin_pc {
+        match func.instructions[pc] {
+            Opcode::Range { .. } if pc == range_pc => {
+                // The loop consumes the already-computed scalar endpoints
+                // directly; materializing the potentially enormous set would
+                // defeat the native multi-successor ABI.
+            }
+            Opcode::JumpFalse { rs, .. } => {
+                let guard = ctx.load_reg(current, rs)?;
+                let zero = ctx.emit_i64_const(current, 0);
+                let pass = ctx.emit_with_result(
+                    current,
+                    Inst::ICmp {
+                        op: ICmpOp::Ne,
+                        ty: Ty::I64,
+                        lhs: guard,
+                        rhs: zero,
+                    },
+                );
+                let next = ctx.new_aux_block("nsl_range_prefix_ok");
+                let next_id = ctx.block_id_of(next);
+                ctx.emit(
+                    current,
+                    InstrNode::new(Inst::CondBr {
+                        cond: pass,
+                        then_target: next_id,
+                        then_args: vec![],
+                        else_target: disabled_id,
+                        else_args: vec![],
+                    }),
+                );
+                current = next;
+            }
+            ref op => {
+                current = ctx
+                    .lower_opcode(pc, op, current, &func.instructions)?
+                    .ok_or_else(|| {
+                        TrustIrError::UnsupportedOpcode(format!(
+                            "NextStateLoop range: prefix opcode at pc {pc} produced no continuation"
+                        ))
+                    })?;
+            }
+        }
+    }
+
+    let lo = ctx.load_reg(current, lo_reg)?;
+    let hi = ctx.load_reg(current, hi_reg)?;
+    let k_alloca = ctx.emit_with_result(
+        current,
+        Inst::Alloca {
+            ty: Ty::I64,
+            count: None,
+            align: None,
+        },
+    );
+    let copy_idx = ctx.emit_with_result(
+        current,
+        Inst::Alloca {
+            ty: Ty::I64,
+            count: None,
+            align: None,
+        },
+    );
+    ctx.emit(
+        current,
+        InstrNode::new(Inst::Store {
+            ty: Ty::I64,
+            ptr: k_alloca,
+            value: lo,
+            align: None,
+            volatile: false,
+        }),
+    );
+
+    let loop_header = ctx.new_aux_block("nsl_range_hdr");
+    let reserve_block = ctx.new_aux_block("nsl_range_reserve");
+    let seed_block = ctx.new_aux_block("nsl_range_seed");
+    let copy_header = ctx.new_aux_block("nsl_range_copy_hdr");
+    let copy_body = ctx.new_aux_block("nsl_range_copy_body");
+    let body_entry = ctx.new_aux_block("nsl_range_body");
+    let advance_block = ctx.new_aux_block("nsl_range_advance");
+    let loop_header_id = ctx.block_id_of(loop_header);
+    let reserve_id = ctx.block_id_of(reserve_block);
+    let seed_id = ctx.block_id_of(seed_block);
+    let copy_header_id = ctx.block_id_of(copy_header);
+    let copy_body_id = ctx.block_id_of(copy_body);
+    let body_entry_id = ctx.block_id_of(body_entry);
+    let advance_id = ctx.block_id_of(advance_block);
+    let ok_id = ctx.block_id_of(ok_block);
+    let overflow_id = ctx.block_id_of(overflow_block);
+
+    ctx.emit(
+        current,
+        InstrNode::new(Inst::Br {
+            target: loop_header_id,
+            args: vec![],
+        }),
+    );
+
+    // Inclusive TLA interval. Signed comparison makes lo>hi empty. The
+    // advance block exits when k==hi before incrementing, so hi=i64::MAX is
+    // safe and no wraparound can make the loop non-terminating.
+    let k = ctx.emit_with_result(
+        loop_header,
+        Inst::Load {
+            ty: Ty::I64,
+            ptr: k_alloca,
+            align: None,
+            volatile: false,
+        },
+    );
+    let in_range = ctx.emit_with_result(
+        loop_header,
+        Inst::ICmp {
+            op: ICmpOp::Sle,
+            ty: Ty::I64,
+            lhs: k,
+            rhs: hi,
+        },
+    );
+    ctx.emit(
+        loop_header,
+        InstrNode::new(Inst::CondBr {
+            cond: in_range,
+            then_target: reserve_id,
+            then_args: vec![],
+            else_target: ok_id,
+            else_args: vec![],
+        }),
+    );
+
+    // Reserve one complete flat record before any sink write. The base GEP
+    // uses a signed i32 slot index in trust-codegen, so reject starts outside
+    // that representable range just like the record-set kernel.
+    let count = ctx.load_at_offset(reserve_block, sink_ptr, 3);
+    let state_len = ctx.load_at_offset(reserve_block, sink_ptr, 2);
+    let capacity = ctx.load_at_offset(reserve_block, sink_ptr, 1);
+    let start = ctx.emit_with_result(
+        reserve_block,
+        Inst::BinOp {
+            op: BinOp::Mul,
+            ty: Ty::I64,
+            lhs: count,
+            rhs: state_len,
+        },
+    );
+    let end = ctx.emit_with_result(
+        reserve_block,
+        Inst::BinOp {
+            op: BinOp::Add,
+            ty: Ty::I64,
+            lhs: start,
+            rhs: state_len,
+        },
+    );
+    let oob_capacity = ctx.emit_with_result(
+        reserve_block,
+        Inst::ICmp {
+            op: ICmpOp::Ugt,
+            ty: Ty::I64,
+            lhs: end,
+            rhs: capacity,
+        },
+    );
+    let i32_limit = ctx.emit_i64_const(reserve_block, 1i64 << 31);
+    let start_too_big = ctx.emit_with_result(
+        reserve_block,
+        Inst::ICmp {
+            op: ICmpOp::Uge,
+            ty: Ty::I64,
+            lhs: start,
+            rhs: i32_limit,
+        },
+    );
+    let min_width = ctx.emit_i64_const(reserve_block, min_required);
+    let too_small = ctx.emit_with_result(
+        reserve_block,
+        Inst::ICmp {
+            op: ICmpOp::Ult,
+            ty: Ty::I64,
+            lhs: state_len,
+            rhs: min_width,
+        },
+    );
+    let a = ctx.emit_with_result(
+        reserve_block,
+        Inst::Cast {
+            op: CastOp::ZExt,
+            src_ty: Ty::Bool,
+            dst_ty: Ty::I64,
+            operand: oob_capacity,
+        },
+    );
+    let b = ctx.emit_with_result(
+        reserve_block,
+        Inst::Cast {
+            op: CastOp::ZExt,
+            src_ty: Ty::Bool,
+            dst_ty: Ty::I64,
+            operand: start_too_big,
+        },
+    );
+    let c = ctx.emit_with_result(
+        reserve_block,
+        Inst::Cast {
+            op: CastOp::ZExt,
+            src_ty: Ty::Bool,
+            dst_ty: Ty::I64,
+            operand: too_small,
+        },
+    );
+    let ab = ctx.emit_with_result(
+        reserve_block,
+        Inst::BinOp {
+            op: BinOp::Or,
+            ty: Ty::I64,
+            lhs: a,
+            rhs: b,
+        },
+    );
+    let abc = ctx.emit_with_result(
+        reserve_block,
+        Inst::BinOp {
+            op: BinOp::Or,
+            ty: Ty::I64,
+            lhs: ab,
+            rhs: c,
+        },
+    );
+    let zero = ctx.emit_i64_const(reserve_block, 0);
+    let overflow = ctx.emit_with_result(
+        reserve_block,
+        Inst::ICmp {
+            op: ICmpOp::Ne,
+            ty: Ty::I64,
+            lhs: abc,
+            rhs: zero,
+        },
+    );
+    ctx.emit(
+        reserve_block,
+        InstrNode::new(Inst::CondBr {
+            cond: overflow,
+            then_target: overflow_id,
+            then_args: vec![],
+            else_target: seed_id,
+            else_args: vec![],
+        }),
+    );
+
+    let succ_buf_i64 = ctx.load_at_offset(seed_block, sink_ptr, 0);
+    let succ_buf = ctx.emit_with_result(
+        seed_block,
+        Inst::Cast {
+            op: CastOp::IntToPtr,
+            src_ty: Ty::I64,
+            dst_ty: Ty::Ptr,
+            operand: succ_buf_i64,
+        },
+    );
+    let base = ctx.emit_state_slot_ptr_at_dynamic_slot(seed_block, succ_buf, start);
+    let zero = ctx.emit_i64_const(seed_block, 0);
+    ctx.emit(
+        seed_block,
+        InstrNode::new(Inst::Store {
+            ty: Ty::I64,
+            ptr: copy_idx,
+            value: zero,
+            align: None,
+            volatile: false,
+        }),
+    );
+    ctx.emit(
+        seed_block,
+        InstrNode::new(Inst::Br {
+            target: copy_header_id,
+            args: vec![],
+        }),
+    );
+
+    // First copy the complete runtime-width parent. This preserves any ABI
+    // extension slots beyond the known compact layout. The fixed-width
+    // template overlay below then applies all prefix primed writes.
+    let copy_i = ctx.emit_with_result(
+        copy_header,
+        Inst::Load {
+            ty: Ty::I64,
+            ptr: copy_idx,
+            align: None,
+            volatile: false,
+        },
+    );
+    let copy_more = ctx.emit_with_result(
+        copy_header,
+        Inst::ICmp {
+            op: ICmpOp::Ult,
+            ty: Ty::I64,
+            lhs: copy_i,
+            rhs: state_len,
+        },
+    );
+    ctx.emit(
+        copy_header,
+        InstrNode::new(Inst::CondBr {
+            cond: copy_more,
+            then_target: copy_body_id,
+            then_args: vec![],
+            else_target: body_entry_id,
+            else_args: vec![],
+        }),
+    );
+    let copy_i = ctx.emit_with_result(
+        copy_body,
+        Inst::Load {
+            ty: Ty::I64,
+            ptr: copy_idx,
+            align: None,
+            volatile: false,
+        },
+    );
+    let parent_value = ctx.load_at_dynamic_offset(copy_body, state_in_ptr, copy_i);
+    ctx.store_at_dynamic_offset(copy_body, base, copy_i, parent_value);
+    let one = ctx.emit_i64_const(copy_body, 1);
+    let next_copy_i = ctx.emit_with_result(
+        copy_body,
+        Inst::BinOp {
+            op: BinOp::Add,
+            ty: Ty::I64,
+            lhs: copy_i,
+            rhs: one,
+        },
+    );
+    ctx.emit(
+        copy_body,
+        InstrNode::new(Inst::Store {
+            ty: Ty::I64,
+            ptr: copy_idx,
+            value: next_copy_i,
+            align: None,
+            volatile: false,
+        }),
+    );
+    ctx.emit(
+        copy_body,
+        InstrNode::new(Inst::Br {
+            target: copy_header_id,
+            args: vec![],
+        }),
+    );
+
+    for slot in 0..compact_slots_u32 {
+        let value = ctx.load_at_offset(body_entry, template, slot);
+        ctx.store_at_offset(body_entry, base, slot, value);
+    }
+    ctx.invalidate_reg_tracking(info.r_binding);
+    ctx.store_reg_value(body_entry, info.r_binding, k)?;
+    ctx.aggregate_shapes
+        .insert(info.r_binding, AggregateShape::Scalar(ScalarShape::Int));
+
+    let saved_state_out = ctx.state_out_ptr;
+    let saved_prime_mode = ctx.prime_mode;
+    ctx.state_out_ptr = Some(base);
+    ctx.prime_mode = false;
+    let mut body_block = body_entry;
+    for pc in body_span.clone() {
+        if let Opcode::Unchanged { rd, .. } = func.instructions[pc] {
+            let one = ctx.emit_i64_const(body_block, 1);
+            ctx.store_reg_value(body_block, rd, one)?;
+            continue;
+        }
+        if let Opcode::JumpFalse { rs, .. } = func.instructions[pc] {
+            let guard = ctx.load_reg(body_block, rs)?;
+            let zero = ctx.emit_i64_const(body_block, 0);
+            let pass = ctx.emit_with_result(
+                body_block,
+                Inst::ICmp {
+                    op: ICmpOp::Ne,
+                    ty: Ty::I64,
+                    lhs: guard,
+                    rhs: zero,
+                },
+            );
+            let next = ctx.new_aux_block("nsl_range_guard_ok");
+            let next_id = ctx.block_id_of(next);
+            ctx.emit(
+                body_block,
+                InstrNode::new(Inst::CondBr {
+                    cond: pass,
+                    then_target: next_id,
+                    then_args: vec![],
+                    else_target: advance_id,
+                    else_args: vec![],
+                }),
+            );
+            body_block = next;
+            continue;
+        }
+        body_block = ctx
+            .lower_opcode(pc, &func.instructions[pc], body_block, &func.instructions)?
+            .ok_or_else(|| {
+                TrustIrError::UnsupportedOpcode(format!(
+                    "NextStateLoop range: body opcode at pc {pc} produced no continuation"
+                ))
+            })?;
+    }
+    ctx.state_out_ptr = saved_state_out;
+    ctx.prime_mode = saved_prime_mode;
+
+    let one = ctx.emit_i64_const(body_block, 1);
+    let new_count = ctx.emit_with_result(
+        body_block,
+        Inst::BinOp {
+            op: BinOp::Add,
+            ty: Ty::I64,
+            lhs: count,
+            rhs: one,
+        },
+    );
+    ctx.store_at_offset(body_block, sink_ptr, 3, new_count);
+    ctx.emit(
+        body_block,
+        InstrNode::new(Inst::Br {
+            target: advance_id,
+            args: vec![],
+        }),
+    );
+
+    let last = ctx.emit_with_result(
+        advance_block,
+        Inst::ICmp {
+            op: ICmpOp::Eq,
+            ty: Ty::I64,
+            lhs: k,
+            rhs: hi,
+        },
+    );
+    let increment_block = ctx.new_aux_block("nsl_range_increment");
+    let increment_id = ctx.block_id_of(increment_block);
+    ctx.emit(
+        advance_block,
+        InstrNode::new(Inst::CondBr {
+            cond: last,
+            then_target: ok_id,
+            then_args: vec![],
+            else_target: increment_id,
+            else_args: vec![],
+        }),
+    );
+    let one = ctx.emit_i64_const(increment_block, 1);
+    let next_k = ctx.emit_with_result(
+        increment_block,
+        Inst::BinOp {
+            op: BinOp::Add,
+            ty: Ty::I64,
+            lhs: k,
+            rhs: one,
+        },
+    );
+    ctx.emit(
+        increment_block,
+        InstrNode::new(Inst::Store {
+            ty: Ty::I64,
+            ptr: k_alloca,
+            value: next_k,
+            align: None,
+            volatile: false,
+        }),
+    );
+    ctx.emit(
+        increment_block,
+        InstrNode::new(Inst::Br {
+            target: loop_header_id,
+            args: vec![],
+        }),
+    );
+
+    emit_next_state_loop_ok_return(&mut ctx, disabled_block);
+    emit_next_state_loop_ok_return(&mut ctx, ok_block);
+    emit_next_state_loop_overflow_return(&mut ctx, overflow_block, sink_ptr);
+    // Dynamic ranges are finite but not statically bounded; do not claim the
+    // stronger `Terminates` annotation solely from a compile-time bound.
+    ctx.has_unbounded_loop = true;
+
+    finish_next_state_loop_ctx(ctx, source_chunk)
+}
+
+fn prepare_next_state_loop_callee_metadata<'cp>(
+    ctx: &mut Ctx<'cp>,
+    entry_func: &BytecodeFunction,
+    source_chunk: Option<&'cp BytecodeChunk>,
+    state_layout: Option<&JitStateLayout>,
+    precomputed: Option<&ChunkCalleeReturnShapes>,
+) -> Result<(), TrustIrError> {
+    let Some(chunk) = source_chunk else {
+        return Ok(());
+    };
+    ctx.callee_return_shapes = match precomputed {
+        Some(shapes) => {
+            debug_assert_eq!(
+                *shapes.shapes,
+                infer_chunk_return_shapes(chunk, state_layout),
+                "precomputed NextStateLoop callee shapes diverged from the source chunk",
+            );
+            std::sync::Arc::clone(&shapes.shapes)
+        }
+        None => std::sync::Arc::new(infer_chunk_return_shapes(chunk, state_layout)),
+    };
+    ctx.callee_arg_shapes = collect_reachable_callee_arg_shapes(entry_func, chunk, state_layout)?;
+    Ok(())
+}
+
+fn finish_next_state_loop_ctx(
+    mut ctx: Ctx<'_>,
+    source_chunk: Option<&BytecodeChunk>,
+) -> Result<Module, TrustIrError> {
+    loop {
+        let pending = ctx.pending_callees();
+        if pending.is_empty() {
+            break;
+        }
+        let chunk = source_chunk.ok_or_else(|| {
+            TrustIrError::UnsupportedOpcode(
+                "NextStateLoop contains Call but no source chunk was supplied".to_string(),
+            )
+        })?;
+        for op_idx in pending {
+            let callee = chunk.functions.get(usize::from(op_idx)).ok_or_else(|| {
+                TrustIrError::Emission(format!(
+                    "NextStateLoop Call references function {op_idx}, but the chunk has only {} functions",
+                    chunk.functions.len()
+                ))
+            })?;
+            ctx.lower_callee(callee, op_idx)?;
+        }
+    }
     ctx.finish_sanctioned_handle_extern_audit()?;
     Ok(ctx.finish())
+}
+
+fn emit_next_state_loop_overflow_return(ctx: &mut Ctx<'_>, block_idx: usize, sink_ptr: ValueId) {
+    let ovf_offset = ctx.emit_i64_const(block_idx, OVERFLOWED_OFFSET as i64);
+    let ovf_ptr = ctx.emit_with_result(
+        block_idx,
+        Inst::GEP {
+            pointee_ty: Ty::I8,
+            base: sink_ptr,
+            indices: vec![ovf_offset],
+            inbounds: false,
+        },
+    );
+    let one = ctx.emit_with_result(
+        block_idx,
+        Inst::Const {
+            ty: Ty::I32,
+            value: Constant::Int(1),
+        },
+    );
+    ctx.emit(
+        block_idx,
+        InstrNode::new(Inst::Store {
+            ty: Ty::I32,
+            ptr: ovf_ptr,
+            value: one,
+            align: None,
+            volatile: false,
+        }),
+    );
+    emit_next_state_loop_ok_return(ctx, block_idx);
 }
 
 /// Byte offset of the `overflowed: u32` flag inside `NextStateLoopSink`.
@@ -1366,15 +2261,33 @@ fn single_record_set_inner_exists(
         let target = target as usize;
         let mut next_pc = None;
         for scan in (pc + 1)..len.min(target + 1) {
-            if let Opcode::ExistsNext { loop_begin, .. } = func.instructions[scan] {
+            if let Opcode::ExistsNext {
+                rd: next_rd,
+                r_binding: next_binding,
+                loop_begin,
+                ..
+            } = func.instructions[scan]
+            {
                 let jump_target = (scan as i64).checked_add(i64::from(loop_begin))?;
                 if jump_target == (pc as i64 + 1) {
+                    // A real back-edge to this begin must close the same
+                    // existential pair. Do not scan past a mismatched closer
+                    // and accidentally pair the begin with a later loop.
+                    if next_rd != rd || next_binding != r_binding {
+                        return None;
+                    }
                     next_pc = Some(scan);
                     break;
                 }
             }
         }
         let next_pc = next_pc?;
+        // ExistsBegin's empty-domain exit must land immediately after its
+        // matching ExistsNext. Otherwise the native loop would skip bytecode
+        // that the interpreter executes on the empty-domain path.
+        if target != next_pc.checked_add(1)? {
+            return None;
+        }
         found = Some(tla_tir::bytecode::InnerExistsInfo {
             begin_pc: pc,
             next_pc,
@@ -1478,19 +2391,18 @@ fn validate_next_state_loop_body(
             // so "skip this binding" matches the interpreter. Anything else is
             // unsupported control flow.
             let target = pc as i64 + i64::from(*offset);
-            let target_ok = target == span.end as i64
-                || (target > pc as i64
-                    && target < span.end as i64
-                    && move_tail_propagates_guard_to_r_body(
-                        func,
-                        target as usize..span.end,
-                        *rs,
-                        r_body,
-                    ));
+            let target_ok = target > pc as i64
+                && target <= span.end as i64
+                && move_tail_propagates_guard_to_r_body(
+                    func,
+                    target as usize..span.end,
+                    *rs,
+                    r_body,
+                );
             if !target_ok {
                 return Err(TrustIrError::UnsupportedOpcode(format!(
-                    "NextStateLoop: JumpFalse at pc {pc} targets {target}, which is neither the \
-                     body end {} nor a pure-Move tail that provably propagates the failing guard \
+                    "NextStateLoop: JumpFalse at pc {pc} targets {target}, but the suffix to body \
+                     end {} is not a pure-Move tail that provably propagates the failing guard \
                      r{rs} into the exists-result register; unsupported control flow",
                     span.end
                 )));
@@ -1585,6 +2497,32 @@ fn validate_next_state_loop_body(
             }
         }
     }
+    let Some(last_body_write) = span
+        .clone()
+        .rev()
+        .find(|pc| func.instructions[*pc].dest_register() == Some(r_body))
+    else {
+        return Err(TrustIrError::UnsupportedOpcode(format!(
+            "NextStateLoop: body never writes the exists-result register r{r_body}; the all-guards-pass success value is unproven"
+        )));
+    };
+    let success_is_true = body_value_chases_to_load_bool_true(
+        func,
+        span.clone(),
+        last_body_write,
+        r_body,
+        provably_true_unchanged,
+    );
+    let success_is_passing_guard = last_body_write + 1 < span.end
+        && matches!(
+            func.instructions[last_body_write + 1],
+            Opcode::JumpFalse { rs, .. } if rs == r_body
+        );
+    if !success_is_true && !success_is_passing_guard {
+        return Err(TrustIrError::UnsupportedOpcode(format!(
+            "NextStateLoop: the last write to exists-result r{r_body} at pc {last_body_write} does not prove a true all-guards-pass success value"
+        )));
+    }
     if store_count == 0 {
         return Err(TrustIrError::UnsupportedOpcode(
             "NextStateLoop: body has no primed StoreVar".to_string(),
@@ -1596,31 +2534,34 @@ fn validate_next_state_loop_body(
 /// PCs of `Unchanged` opcodes whose result is PROVABLY true in the
 /// NextStateLoop generation context: each successor is seeded from `state_in`
 /// before the body executes, so `UNCHANGED <vars>` over variables that no
-/// `StoreVar` in this function ever writes always compares equal. Resolution
-/// failures leave the pc out (fail-closed at validation).
+/// `StoreVar` in this function or any transitively called helper ever writes
+/// always compares equal. Resolution failures leave the pc out (fail-closed at
+/// validation).
 fn next_state_loop_provably_true_unchanged(
     func: &BytecodeFunction,
     constants: Option<&ConstantPool>,
+    source_chunk: Option<&BytecodeChunk>,
 ) -> HashSet<usize> {
     let mut out = HashSet::new();
     let Some(constants) = constants else {
         return out;
     };
-    let stored: HashSet<u16> = func
-        .instructions
-        .iter()
-        .filter_map(|op| match op {
-            Opcode::StoreVar { var_idx, .. } => Some(*var_idx),
-            _ => None,
-        })
-        .collect();
+    let Some(stored) = next_state_loop_transitive_stored_vars(func, source_chunk) else {
+        return out;
+    };
     'ops: for (pc, op) in func.instructions.iter().enumerate() {
         let Opcode::Unchanged { start, count, .. } = *op else {
             continue;
         };
         let mut vars = Vec::with_capacity(usize::from(count));
         for i in 0..u16::from(count) {
-            match constants.get_value(start + i) {
+            let Some(idx) = start.checked_add(i) else {
+                continue 'ops;
+            };
+            if usize::from(idx) >= constants.value_count() {
+                continue 'ops;
+            }
+            match constants.get_value(idx) {
                 Value::SmallInt(idx) if *idx >= 0 && *idx <= i64::from(u16::MAX) => {
                     vars.push(*idx as u16);
                 }
@@ -1632,6 +2573,39 @@ fn next_state_loop_provably_true_unchanged(
         }
     }
     out
+}
+
+/// Collect primed state writes through the complete `Call` graph used by an
+/// action. Missing chunk metadata or an invalid call target means no
+/// `UNCHANGED` result can be proven true: the native kernel must fail closed.
+fn next_state_loop_transitive_stored_vars(
+    func: &BytecodeFunction,
+    source_chunk: Option<&BytecodeChunk>,
+) -> Option<HashSet<u16>> {
+    fn scan(func: &BytecodeFunction, stored: &mut HashSet<u16>, pending: &mut Vec<u16>) {
+        for op in &func.instructions {
+            match *op {
+                Opcode::StoreVar { var_idx, .. } => {
+                    stored.insert(var_idx);
+                }
+                Opcode::Call { op_idx, .. } => pending.push(op_idx),
+                _ => {}
+            }
+        }
+    }
+
+    let mut stored = HashSet::new();
+    let mut pending = Vec::new();
+    let mut visited = HashSet::new();
+    scan(func, &mut stored, &mut pending);
+    while let Some(op_idx) = pending.pop() {
+        if !visited.insert(op_idx) {
+            continue;
+        }
+        let callee = source_chunk?.functions.get(usize::from(op_idx))?;
+        scan(callee, &mut stored, &mut pending);
+    }
+    Some(stored)
 }
 
 /// The boolean predicate opcode family for the NextStateLoop dead-value check:
@@ -3027,7 +4001,9 @@ enum AggregateShape {
     /// window, so a mixed-kind tuple (`<<Int, ModelValue>>`) keeps a statically
     /// known encode/decode per slot. Position `i` starts at
     /// `sum(elements[..i].compact_slot_count())`.
-    Tuple { elements: Vec<AggregateShape> },
+    Tuple {
+        elements: Vec<AggregateShape>,
+    },
     ExactIntSet {
         values: Vec<i64>,
     },
@@ -5336,8 +6312,7 @@ fn merge_compatible_shapes(
                 int_arm: right_arm,
                 proof_source: right_proof,
             },
-        ) if left_universe == right_universe && left_arm == right_arm =>
-        {
+        ) if left_universe == right_universe && left_arm == right_arm => {
             Some(AggregateShape::TaggedScalarUnion {
                 universe: left_universe.clone(),
                 int_arm: *left_arm,
@@ -9655,7 +10630,6 @@ fn infer_function_return_shape_with_params(
     summary.return_shape
 }
 
-
 /// Debug wrapper around [`apply_shape_transfer`] used by the CFG return-shape
 /// walker. A `None` transfer aborts the whole function's return-shape
 /// inference, so when `TY_TRUST_CG_SELF_RECURSIVE_DEBUG` is set this reports
@@ -9796,7 +10770,16 @@ fn infer_function_return_shape_cfg(
                 ..
             } => {
                 let mut next = summary;
-                apply_shape_transfer_traced(func, pc, &mut next, opcode, chunk, state_layout, cache, visiting)?;
+                apply_shape_transfer_traced(
+                    func,
+                    pc,
+                    &mut next,
+                    opcode,
+                    chunk,
+                    state_layout,
+                    cache,
+                    visiting,
+                )?;
                 let exit_target = shape_forward_target(pc, loop_end, len)?;
                 let mut exit_summary = next.clone();
                 exit_summary.clear_scalar(r_binding);
@@ -9809,7 +10792,16 @@ fn infer_function_return_shape_cfg(
             }
             Opcode::ChooseBegin { .. } => {
                 let mut next = summary;
-                apply_shape_transfer_traced(func, pc, &mut next, opcode, chunk, state_layout, cache, visiting)?;
+                apply_shape_transfer_traced(
+                    func,
+                    pc,
+                    &mut next,
+                    opcode,
+                    chunk,
+                    state_layout,
+                    cache,
+                    visiting,
+                )?;
                 let fallthrough = pc.checked_add(1)?;
                 if fallthrough < len {
                     push_shape_fact(&mut facts, &mut worklist, fallthrough, next)?;
@@ -9819,7 +10811,16 @@ fn infer_function_return_shape_cfg(
             | Opcode::ExistsNext { loop_begin, .. }
             | Opcode::ChooseNext { loop_begin, .. } => {
                 let mut next = summary;
-                apply_shape_transfer_traced(func, pc, &mut next, opcode, chunk, state_layout, cache, visiting)?;
+                apply_shape_transfer_traced(
+                    func,
+                    pc,
+                    &mut next,
+                    opcode,
+                    chunk,
+                    state_layout,
+                    cache,
+                    visiting,
+                )?;
                 let back_target = resolve_target(pc, loop_begin).ok()?;
                 if back_target < len {
                     push_shape_fact(&mut facts, &mut worklist, back_target, next.clone())?;
@@ -9831,7 +10832,16 @@ fn infer_function_return_shape_cfg(
             }
             _ => {
                 let mut next = summary;
-                apply_shape_transfer_traced(func, pc, &mut next, opcode, chunk, state_layout, cache, visiting)?;
+                apply_shape_transfer_traced(
+                    func,
+                    pc,
+                    &mut next,
+                    opcode,
+                    chunk,
+                    state_layout,
+                    cache,
+                    visiting,
+                )?;
                 let fallthrough = pc.checked_add(1)?;
                 if fallthrough < len {
                     push_shape_fact(&mut facts, &mut worklist, fallthrough, next)?;
@@ -15844,9 +16854,11 @@ impl<'cp> Ctx<'cp> {
             // copy. Centralized here so every compact-materialization caller
             // (FuncExcept range writes, StoreVar, callee returns) is covered.
             if matches!(expected_shape, AggregateShape::TaggedScalarUnion { .. }) {
-                if let Some(result) =
-                    self.compact_tagged_scalar_union_replacement_source(block_idx, reg, expected_shape)?
-                {
+                if let Some(result) = self.compact_tagged_scalar_union_replacement_source(
+                    block_idx,
+                    reg,
+                    expected_shape,
+                )? {
                     return Ok(result);
                 }
             }
@@ -15877,8 +16889,7 @@ impl<'cp> Ctx<'cp> {
                 universe,
             } = expected_shape
             {
-                if let Some(capacity) = self.dynamic_set_to_bitmask_source_capacity(reg, universe)
-                {
+                if let Some(capacity) = self.dynamic_set_to_bitmask_source_capacity(reg, universe) {
                     let (block_idx, mask) = self.emit_dynamic_materialized_set_bitmask_mask_i64(
                         block_idx,
                         reg,
@@ -16109,9 +17120,7 @@ impl<'cp> Ctx<'cp> {
             // function parameters, so the GEPs the copy emits are dominated by
             // the entry block regardless of which arm this edge is in. (Other
             // anchors would require a per-anchor dominance argument.)
-            if slot.source_ptr != self.state_in_ptr
-                && self.state_out_ptr != Some(slot.source_ptr)
-            {
+            if slot.source_ptr != self.state_in_ptr && self.state_out_ptr != Some(slot.source_ptr) {
                 continue;
             }
             if !self.multi_assignment_regs.contains(&reg) {
@@ -16124,8 +17133,7 @@ impl<'cp> Ctx<'cp> {
             {
                 continue;
             }
-            if self.has_handle_provenance(reg) || self.flat_funcdef_pair_list_regs.contains(&reg)
-            {
+            if self.has_handle_provenance(reg) || self.flat_funcdef_pair_list_regs.contains(&reg) {
                 continue;
             }
             let Some(shape) = self.aggregate_shapes.get(&reg) else {
@@ -16192,8 +17200,7 @@ impl<'cp> Ctx<'cp> {
             {
                 continue;
             }
-            if self.has_handle_provenance(reg) || self.flat_funcdef_pair_list_regs.contains(&reg)
-            {
+            if self.has_handle_provenance(reg) || self.flat_funcdef_pair_list_regs.contains(&reg) {
                 continue;
             }
             if self.aggregate_pointer_regs.get(&reg) != Some(&AggregatePointerKind::Compact) {
@@ -16264,7 +17271,10 @@ impl<'cp> Ctx<'cp> {
         self.load_imm_scalar_regs = first
             .load_imm_scalar_regs
             .iter()
-            .filter(|reg| rest.iter().all(|snap| snap.load_imm_scalar_regs.contains(*reg)))
+            .filter(|reg| {
+                rest.iter()
+                    .all(|snap| snap.load_imm_scalar_regs.contains(*reg))
+            })
             .copied()
             .collect();
         self.const_tuple_key_elements =
@@ -17287,7 +18297,8 @@ impl<'cp> Ctx<'cp> {
         let saved_precise_merge_pcs = std::mem::take(&mut self.precise_merge_pcs);
         let saved_merge_edge_snapshots = std::mem::take(&mut self.merge_edge_snapshots);
         let saved_last_reg_write_pcs = std::mem::take(&mut self.last_reg_write_pcs);
-        let saved_current_segment_start_pc = std::mem::replace(&mut self.current_segment_start_pc, 0);
+        let saved_current_segment_start_pc =
+            std::mem::replace(&mut self.current_segment_start_pc, 0);
         let saved_compound_read_plan = std::mem::take(&mut self.compound_read_plan);
 
         self.seed_callee_arg_shapes(op_idx, arity)?;
@@ -17457,9 +18468,14 @@ impl<'cp> Ctx<'cp> {
         pc: usize,
         rd: u8,
     ) -> Result<(), TrustIrError> {
-        let callout = self.compound_read_plan.callouts.get(&pc).cloned().ok_or_else(|| {
-            TrustIrError::Emission(format!("no compound-read callout planned at pc {pc}"))
-        })?;
+        let callout = self
+            .compound_read_plan
+            .callouts
+            .get(&pc)
+            .cloned()
+            .ok_or_else(|| {
+                TrustIrError::Emission(format!("no compound-read callout planned at pc {pc}"))
+            })?;
 
         // Materialize the operands in ABI order (var, keys…, expected kind) so
         // the emitted IR reads the way the callout signature does.
@@ -18620,8 +19636,7 @@ impl<'cp> Ctx<'cp> {
                                 universe,
                                 "StoreVar compact SetBitmask dynamic set source",
                             )?;
-                        let ptr =
-                            self.emit_state_slot_ptr_at_slot(block_idx, state_out, dst_base);
+                        let ptr = self.emit_state_slot_ptr_at_slot(block_idx, state_out, dst_base);
                         self.emit(
                             block_idx,
                             InstrNode::new(Inst::Store {
@@ -20319,11 +21334,8 @@ impl<'cp> Ctx<'cp> {
         // way it would if this mirrored `compound_read_plan`'s
         // set-per-body-and-restore-in-`lower_callee` discipline.
         if !self.is_callee {
-            self.action_touches_unknown_universe_set_var = self
-                .config
-                .state_layout
-                .as_ref()
-                .is_some_and(|layout| {
+            self.action_touches_unknown_universe_set_var =
+                self.config.state_layout.as_ref().is_some_and(|layout| {
                     bytecode_touches_unknown_universe_set_var(&bytecode_func.instructions, layout)
                 });
             self.set_union_operand_regs =
@@ -20337,12 +21349,9 @@ impl<'cp> Ctx<'cp> {
         // call in `lower_callee`, so the in-degree accounting matches the block
         // set actually lowered.
         let compact_return_edges = self.is_callee && self.callee_return_abi_shape.is_some();
-        let body_block_targets = collect_block_targets_for_lowering(
-            &bytecode_func.instructions,
-            compact_return_edges,
-        )?;
-        let body_merges =
-            collect_merge_block_pcs(&bytecode_func.instructions, &body_block_targets);
+        let body_block_targets =
+            collect_block_targets_for_lowering(&bytecode_func.instructions, compact_return_edges)?;
+        let body_merges = collect_merge_block_pcs(&bytecode_func.instructions, &body_block_targets);
         // Escape hatch (default ON, mirrors the POR fixes): with
         // `TY_TRUST_CG_MERGE_PROVENANCE=0` no merge is treated as precise, so
         // every merge takes the blanket invalidation exactly as before WP-18

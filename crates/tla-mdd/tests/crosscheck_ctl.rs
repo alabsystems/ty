@@ -934,8 +934,12 @@ fn arb_formula(np: usize, nt: usize) -> impl Strategy<Value = F> {
             (inner.clone(), inner.clone()).prop_map(|(a, b)| F::AU(Box::new(a), Box::new(b))),
             inner.clone().prop_map(|f| F::EGF(Box::new(f))),
             // Forced alternation: AG(EF ·), EF(AG ·), and the fair-cycle nest.
-            inner.clone().prop_map(|f| F::AG(Box::new(F::EF(Box::new(f))))),
-            inner.clone().prop_map(|f| F::EF(Box::new(F::AG(Box::new(f))))),
+            inner
+                .clone()
+                .prop_map(|f| F::AG(Box::new(F::EF(Box::new(f))))),
+            inner
+                .clone()
+                .prop_map(|f| F::EF(Box::new(F::AG(Box::new(f))))),
             inner.prop_map(|f| F::EGF(Box::new(F::Or(vec![f, F::Atom(Pred::True)])))),
         ]
     })
@@ -1038,7 +1042,13 @@ fn formula_indices_in_range(f: &F, np: usize, nt: usize) -> bool {
     fn walk(f: &F, np: usize, nt: usize) -> bool {
         match f {
             F::Atom(p) => pred_ok(p, np, nt),
-            F::Not(i) | F::EX(i) | F::AX(i) | F::EF(i) | F::AF(i) | F::EG(i) | F::AG(i)
+            F::Not(i)
+            | F::EX(i)
+            | F::AX(i)
+            | F::EF(i)
+            | F::AF(i)
+            | F::EG(i)
+            | F::AG(i)
             | F::EGF(i) => walk(i, np, nt),
             F::And(cs) | F::Or(cs) => cs.iter().all(|c| walk(c, np, nt)),
             F::EU(a, b) | F::AU(a, b) => walk(a, np, nt) && walk(b, np, nt),

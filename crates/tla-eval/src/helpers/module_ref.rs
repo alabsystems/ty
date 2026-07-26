@@ -40,8 +40,8 @@ debug_flag!(debug_param_instance, "TY_DEBUG_PARAM_INSTANCE");
 
 // Re-export cache lifecycle functions for existing callers via `helpers::module_ref::*`.
 pub use super::module_ref_cache::{
-    clear_eager_bindings_cache, clear_module_ref_caches, evict_next_state_eager_bindings,
-    trim_module_ref_caches,
+    clear_eager_bindings_cache, clear_module_ref_caches, clear_module_ref_run_memos,
+    evict_next_state_eager_bindings, trim_module_ref_caches,
 };
 
 // Re-export instance resolution functions for existing callers and sibling modules.

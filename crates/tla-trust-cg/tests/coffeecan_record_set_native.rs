@@ -6,18 +6,19 @@
 
 #![cfg(feature = "native")]
 
-use std::sync::Arc;
-
 use num_bigint::BigInt;
 use tla_jit_abi::{CompoundLayout, JitCallOut, JitInvariantFn, JitStatus, StateLayout, VarLayout};
 use tla_tir::bytecode::{BytecodeChunk, BytecodeFunction, ConstantPool, Opcode};
-use tla_value::value::{IntervalValue, Value};
+use tla_value::{
+    value::{IntervalValue, Value},
+    Rp,
+};
 
 const COFFEECAN_SYMBOL: &str = "coffeecan_record_set_typeinvariant_native";
 const MCL_SYMBOL: &str = "mcl_nested_typeok_native_compile";
 
 fn interval(lo: i64, hi: i64) -> Value {
-    Value::Interval(Arc::new(IntervalValue::new(
+    Value::Interval(Rp::new(IntervalValue::new(
         BigInt::from(lo),
         BigInt::from(hi),
     )))

@@ -8,7 +8,6 @@ use super::{
 };
 use num_traits::ToPrimitive;
 use tla_value::Rp;
-use std::sync::Arc;
 // SVG module operators — SVGElemToString, NodeOfRingNetwork, DirectedGraphToSVG, etc.
 
 pub(super) fn eval_builtin_svg(

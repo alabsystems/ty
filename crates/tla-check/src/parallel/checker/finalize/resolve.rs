@@ -119,8 +119,12 @@ impl ParallelChecker {
                 .copied()
                 .unwrap_or_else(|| self.states_count()),
             initial_states: num_initial,
+            raw_initial_states_generated: self
+                .total_raw_initial_states_generated
+                .load(Ordering::SeqCst),
             max_queue_depth: self.max_queue_depth.load(Ordering::SeqCst),
             transitions: total_stats.transitions,
+            raw_successors_generated: total_stats.raw_successors_generated,
             max_depth: self.max_depth.load(Ordering::SeqCst),
             detected_actions,
             detected_action_ids,
@@ -138,6 +142,7 @@ impl ParallelChecker {
             por_reduction: Default::default(),
             property_check: self.run_diagnostics.property_check_snapshot(),
             backend_capability_report: None,
+            engine_provenance: None,
             // V2/V3 vacuity WARNINGs are populated below once final_stats exists.
             vacuity_warnings: Vec::new(),
         };

@@ -602,3 +602,25 @@ fn init() {
         }
     }
 }
+
+#[cfg(all(test, feature = "time"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clock_gettime_syscall_fallback_is_callable() {
+        let mut timestamp = MaybeUninit::<Timespec>::uninit();
+        // SAFETY: `timestamp` points to writable storage for the complete
+        // result and `ClockId::Monotonic` is guaranteed to be supported.
+        let status = unsafe {
+            rustix_clock_gettime_via_syscall(ClockId::Monotonic as c::c_int, timestamp.as_mut_ptr())
+        };
+        assert_eq!(status, 0, "clock_gettime syscall fallback failed");
+        // SAFETY: A zero status means the fallback initialized `timestamp`.
+        let timestamp = unsafe { timestamp.assume_init() };
+        assert!(
+            (0..1_000_000_000).contains(&timestamp.tv_nsec),
+            "clock_gettime syscall fallback returned invalid nanoseconds"
+        );
+    }
+}

@@ -83,6 +83,56 @@ fn test_direct_mapped_cache_collision_evicts_only_colliding_slot() {
 }
 
 #[test]
+fn test_shrink_cache_drops_stale_entries_and_preserves_graph() {
+    let mut graph = DiskSuccessorGraph::with_cache_slots(4).unwrap();
+    let fp_a = Fingerprint(10);
+    let fp_b = Fingerprint(11);
+    graph.insert(fp_a, vec![Fingerprint(100)]);
+    graph.insert(fp_b, vec![Fingerprint(200)]);
+    assert_eq!(graph.cache_slots(), 4);
+    assert_eq!(graph.cache_len(), 2);
+
+    graph.shrink_cache_to(1);
+    assert_eq!(graph.cache_slots(), 1);
+    assert_eq!(graph.cache_len(), 0);
+    assert_eq!(graph.get(&fp_a), Some(vec![Fingerprint(100)]));
+    assert_eq!(graph.get(&fp_b), Some(vec![Fingerprint(200)]));
+    assert_eq!(graph.cache_len(), 1);
+
+    graph.shrink_cache_to(3);
+    assert_eq!(
+        graph.cache_slots(),
+        1,
+        "the memory guard must not grow caches"
+    );
+    assert_eq!(graph.cache_len(), 1);
+    assert_eq!(graph.get(&fp_a), Some(vec![Fingerprint(100)]));
+}
+
+#[test]
+fn test_shrink_cache_preserves_overwrite_accounting_after_eviction() {
+    let mut graph = DiskSuccessorGraph::with_cache_slots(4).unwrap();
+    let fp_a = Fingerprint(10);
+    let fp_b = Fingerprint(11);
+    graph.insert(fp_a, vec![Fingerprint(100), Fingerprint(101)]);
+    graph.insert(fp_b, vec![Fingerprint(200)]);
+
+    graph.shrink_cache_to(1);
+    graph.insert(fp_a, vec![Fingerprint(102)]);
+    assert_eq!(graph.len(), 2);
+    assert_eq!(graph.total_successors(), 2);
+    assert_eq!(graph.get(&fp_a), Some(vec![Fingerprint(102)]));
+    assert_eq!(graph.get(&fp_b), Some(vec![Fingerprint(200)]));
+}
+
+#[test]
+#[should_panic(expected = "cache_slots must be non-zero")]
+fn test_shrink_cache_rejects_zero_slots() {
+    let mut graph = DiskSuccessorGraph::with_cache_slots(1).unwrap();
+    graph.shrink_cache_to(0);
+}
+
+#[test]
 fn test_overwrite_after_direct_mapped_eviction_counts_live_successors() {
     let mut graph = DiskSuccessorGraph::with_cache_slots(1).unwrap();
     let fp_a = Fingerprint(10);

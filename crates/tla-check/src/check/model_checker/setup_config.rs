@@ -594,7 +594,7 @@ impl<'a> ModelChecker<'a> {
     /// ```
     pub fn set_fingerprint_storage(&mut self, storage: Arc<dyn FingerprintSet>) {
         self.refresh_liveness_successor_storage(storage.as_ref());
-        self.state_storage.seen_fps = storage;
+        self.state_storage.replace_seen_fps(storage);
     }
 
     /// Enable disk-based trace storage for large state space exploration.

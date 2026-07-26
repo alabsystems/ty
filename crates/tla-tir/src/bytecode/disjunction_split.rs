@@ -574,6 +574,9 @@ fn reads_register(op: &Opcode, reg: Register) -> bool {
             start, count, set, ..
         } => *set == reg || in_range(*start, *count as Register),
         Opcode::RoundStepEq { child, parent, .. } => *child == reg || *parent == reg,
+        Opcode::EdgeFilter {
+            first, arg, domain, ..
+        } => *first == reg || *arg == reg || *domain == reg,
         Opcode::FuncApply { func, arg, .. } => *func == reg || *arg == reg,
         Opcode::FuncSet { domain, range, .. } => *domain == reg || *range == reg,
         Opcode::FuncExcept {
@@ -989,6 +992,7 @@ fn resolve_guardless_body_start_d0(
             Opcode::StoreVar { .. }
             | Opcode::LoadPrime { .. }
             | Opcode::RoundStepEq { .. }
+            | Opcode::EdgeFilter { .. }
             | Opcode::SetPrimeMode { .. }
             | Opcode::Unchanged { .. }
             | Opcode::Call { .. }
@@ -1151,6 +1155,13 @@ fn record_source_registers(op: &Opcode, seen: &mut [bool; 256]) {
         Opcode::RoundStepEq { child, parent, .. } => {
             mark(child);
             mark(parent);
+        }
+        Opcode::EdgeFilter {
+            first, arg, domain, ..
+        } => {
+            mark(first);
+            mark(arg);
+            mark(domain);
         }
         Opcode::FuncApply { func, arg, .. } => {
             mark(func);

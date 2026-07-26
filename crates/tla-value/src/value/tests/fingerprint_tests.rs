@@ -7,10 +7,9 @@
 //! Split from value_fingerprint.rs (#3006) to stay under the 500-line file limit.
 
 use crate::fingerprint::{fp64_extend_i32, fp64_extend_i64, value_tags::*};
+use crate::rp::Rp;
 use crate::value::{FuncBuilder, IntIntervalFunc};
 use crate::Value;
-use crate::rp::Rp as Arc;
-use crate::rp::Rp;
 #[test]
 fn test_intfunc_fingerprint_normal_range() {
     let func = IntIntervalFunc::new(

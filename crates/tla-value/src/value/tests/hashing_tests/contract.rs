@@ -7,7 +7,6 @@
 
 use super::super::super::*;
 use super::hash_value;
-use crate::rp::Rp as Arc;
 use crate::rp::Rp;
 // === Hash/Eq contract: a == b implies hash(a) == hash(b) ===
 

@@ -6,9 +6,8 @@
 
 use super::super::{FuncValue, Value};
 use crate::error::EvalResult;
-use std::cmp::Ordering;
-use crate::rp::Rp as Arc;
 use crate::rp::Rp;
+use std::cmp::Ordering;
 /// Compare tuple/seq values per TLC rules.
 ///
 /// Handles fast path for Tuple-Tuple comparison (Part of #2955) and fallback

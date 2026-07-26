@@ -631,7 +631,7 @@ impl CompleteActionProof<'_> {
             }
             self.record_unshadowed(name);
             if crate::eval::should_prefer_builtin_override(name, def, 0, ctx) {
-                return is_replay_stable_named_builtin(name);
+                return is_replay_stable_named_builtin(name, 0);
             }
             return self.with_operator_body(ctx, def, |proof, ctx, body| {
                 proof.stable_prime_free(ctx, body, depth + 1)
@@ -668,7 +668,7 @@ impl CompleteActionProof<'_> {
         }
         self.record_unshadowed(name);
         let Some(def) = ctx.get_op(name) else {
-            return is_replay_stable_named_builtin(name);
+            return is_replay_stable_named_builtin(name, args.len());
         };
         if ctx.instance_substitutions().is_some()
             || !self.definition_call_is_safe(def, args.len())
@@ -677,7 +677,7 @@ impl CompleteActionProof<'_> {
             return false;
         }
         if crate::eval::should_prefer_builtin_override(name, def, args.len(), ctx) {
-            return is_replay_stable_named_builtin(name);
+            return is_replay_stable_named_builtin(name, args.len());
         }
         self.with_operator_body(ctx, def, |proof, ctx, body| {
             proof.stable_prime_free(ctx, body, depth + 1)
@@ -1070,27 +1070,25 @@ fn resolved_dynamic_value_is_concrete(ctx: &EvalCtx, name: &str) -> bool {
 /// Positive list of name-dispatched builtins whose value is a deterministic
 /// function of their already-certified arguments.  Future/unknown builtins
 /// fail closed.
-fn is_replay_stable_named_builtin(name: &str) -> bool {
+pub(crate) fn is_replay_stable_named_builtin(name: &str, arity: usize) -> bool {
     matches!(
-        name,
-        "Append"
-            | "Cardinality"
-            | "Front"
-            | "Head"
-            | "IsFiniteSet"
-            | "Last"
-            | "Len"
-            | "Max"
-            | "Mean"
-            | "Min"
-            | "Permutations"
-            | "Product"
-            | "Reverse"
-            | "SetToSeq"
-            | "SubSeq"
-            | "Sum"
-            | "Tail"
-            | "TLCModelValue"
+        (name, arity),
+        ("Append", 2)
+            | ("Cardinality", 1)
+            | ("Front", 1)
+            | ("Head", 1)
+            | ("IsFiniteSet", 1)
+            | ("Last", 1)
+            | ("Len", 1)
+            | ("Max", 1)
+            | ("Mean", 1)
+            | ("Min", 1)
+            | ("Permutations", 1)
+            | ("Product", 1)
+            | ("Reverse", 1)
+            | ("Seq", 1)
+            | ("Sum", 1)
+            | ("Tail", 1)
     )
 }
 

@@ -5,8 +5,8 @@
 //! Compound lazy set materialization tests (RecordSet, TupleSet, KSubset).
 
 use super::super::super::*;
-use std::sync::Arc;
 use crate::rp::Rp;
+use std::sync::Arc;
 #[cfg_attr(test, ntest::timeout(10000))]
 #[test]
 fn test_additional_lazy_sets_to_sorted_set_match_expected_contents() {

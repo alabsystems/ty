@@ -23,6 +23,19 @@ fn bmc_array(k: usize) -> BmcTranslator {
     BmcTranslator::new_with_arrays(k).unwrap()
 }
 
+/// Declare an Int-keyed function with a complete finite DOMAIN, as required
+/// by logical function equality, EXCEPT assignment, and UNCHANGED.
+fn declare_exact_int_func(bmc: &mut BmcTranslator, name: &str, keys: &[i64]) {
+    bmc.declare_var(
+        name,
+        TlaSort::Function {
+            domain_keys: keys.iter().map(|key| format!("int:{key}")).collect(),
+            range: Box::new(TlaSort::Int),
+        },
+    )
+    .unwrap();
+}
+
 /// Helper: create an Ident expression with INVALID NameId.
 fn ident(name: &str) -> Spanned<Expr> {
     Spanned::dummy(Expr::Ident(
@@ -51,7 +64,6 @@ fn primed(name: &str) -> Spanned<Expr> {
 /// Next: UNCHANGED S
 /// Check: membership at step 1 is preserved from step 0
 #[cfg_attr(test, ntest::timeout(10000))]
-#[ignore = "ay-align(2026-06-20): AY soundly abstains (Unknown) on set-membership via a stored-domain free array after its false-SAT hardening (ay 589685fa..08940ef6); needs a concrete-witness encoder adaptation. Not a wrong verdict. See docs/ay-alignment-followup-2026-06-20.md"]
 #[test]
 fn test_compound_e2e_set_init_next_membership() {
     let mut bmc = bmc_array(1);
@@ -140,7 +152,7 @@ fn test_compound_e2e_set_membership_violation() {
 #[test]
 fn test_compound_e2e_func_except_step_transition() {
     let mut bmc = bmc_array(1);
-    bmc.declare_func_var("f", TlaSort::Int).unwrap();
+    declare_exact_int_func(&mut bmc, "f", &[1, 2]);
 
     // Init: f[1] = 10, f[2] = 20
     let map0 = bmc.get_func_mapping_at_step("f", 0).unwrap();
@@ -196,7 +208,7 @@ fn test_compound_e2e_func_except_step_transition() {
 #[test]
 fn test_compound_e2e_func_except_contradiction_unsat() {
     let mut bmc = bmc_array(1);
-    bmc.declare_func_var("f", TlaSort::Int).unwrap();
+    declare_exact_int_func(&mut bmc, "f", &[1]);
 
     // Init: f[1] = 10
     let map0 = bmc.get_func_mapping_at_step("f", 0).unwrap();
@@ -236,7 +248,7 @@ fn test_compound_e2e_func_except_contradiction_unsat() {
 #[test]
 fn test_compound_e2e_func_unchanged() {
     let mut bmc = bmc_array(1);
-    bmc.declare_func_var("f", TlaSort::Int).unwrap();
+    declare_exact_int_func(&mut bmc, "f", &[1]);
 
     // Init: f[1] = 42
     let map0 = bmc.get_func_mapping_at_step("f", 0).unwrap();
@@ -271,7 +283,7 @@ fn test_compound_e2e_func_unchanged() {
 #[test]
 fn test_compound_e2e_func_unchanged_blocks_mutation() {
     let mut bmc = bmc_array(1);
-    bmc.declare_func_var("f", TlaSort::Int).unwrap();
+    declare_exact_int_func(&mut bmc, "f", &[1]);
 
     // Init: f[1] = 42
     let map0 = bmc.get_func_mapping_at_step("f", 0).unwrap();
@@ -307,20 +319,11 @@ fn test_compound_e2e_func_unchanged_blocks_mutation() {
 /// Init: s = <<10>>
 /// Next: s' = Append(s, 20)
 /// Check: Len(s') = 2, s'[1] = 10 (original), s'[2] = 20 (appended)
-// IGNORED (fix-forward, 2026-07-14): the Append case does a `store` at a
-// SYMBOLIC index (len0 + 1) with `select`s at constant indices. The ay array
-// theory regressed SEVERELY on this pattern across ed035b88..current ay main
-// (656 commits dominated by array wrong-model SOUNDNESS closures — storechain /
-// same-array-read congruence, validation-bypass): it now exceeds 60s (was well
-// under 10s), a non-bounded blowup rather than a mild slowdown. The VERDICT is
-// unaffected (still Sat, still correct) — this is a PERF regression, the price
-// of those soundness fixes, on a TLA+ sequence-BMC path (not an MCC lane).
-// Ignored to land the ay bump to a sound array theory; tracked for root-cause
-// in the ay array theory. The sibling Tail / UNCHANGED / literal cases use only
-// constant-index selects, are unaffected, and still run at 10s.
+// This is the symbolic-index Append regression: `store` uses `len0 + 1` while
+// the checks use constant-index `select`s. Keep it active so array-theory
+// soundness or performance regressions cannot disappear behind test metadata.
 #[cfg_attr(test, ntest::timeout(60000))]
 #[test]
-#[ignore = "ay array-theory perf regression on symbolic store-index BMC (>60s); verdict unaffected, tracked for root-cause"]
 fn test_compound_e2e_seq_append_verify_head_and_len() {
     let mut bmc = bmc_array(1);
     bmc.declare_seq_var("s", TlaSort::Int, 5).unwrap();
@@ -515,7 +518,7 @@ fn test_compound_e2e_seq_unchanged_blocks_length_change() {
 #[test]
 fn test_compound_e2e_func_and_scalar_mixed() {
     let mut bmc = bmc_array(1);
-    bmc.declare_func_var("f", TlaSort::Int).unwrap();
+    declare_exact_int_func(&mut bmc, "f", &[1]);
     bmc.declare_var("x", TlaSort::Int).unwrap();
 
     // Init: f[1] = 10, x = 0
@@ -825,7 +828,6 @@ fn test_compound_dispatch_membership_in_set_minus() {
 ///
 /// After UNCHANGED S, x \in S' should work like x \in S.
 #[cfg_attr(test, ntest::timeout(10000))]
-#[ignore = "ay-align(2026-06-20): AY soundly abstains (Unknown) on set-membership via a stored-domain free array after its false-SAT hardening (ay 589685fa..08940ef6); needs a concrete-witness encoder adaptation. Not a wrong verdict. See docs/ay-alignment-followup-2026-06-20.md"]
 #[test]
 fn test_compound_dispatch_membership_in_primed_set() {
     let mut bmc = bmc_array(1);

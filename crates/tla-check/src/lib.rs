@@ -75,11 +75,6 @@ pub(crate) mod action_instance;
 pub(crate) mod adaptive;
 pub mod analytical;
 
-/// Single blessed choke point for process-environment mutation (test/CLI
-/// plumbing). Always compiled so both in-crate `#[cfg(test)]` tests and
-/// out-of-crate integration tests reach the same choke point.
-#[doc(hidden)]
-pub mod env_guard;
 pub(crate) mod arena;
 mod cfg_overrides;
 pub(crate) mod check;
@@ -95,6 +90,11 @@ pub(crate) mod coverage;
 mod disabled_action_stats;
 pub(crate) mod enabled;
 pub(crate) mod enumerate;
+/// Single blessed choke point for process-environment mutation (test/CLI
+/// plumbing). Always compiled so both in-crate `#[cfg(test)]` tests and
+/// out-of-crate integration tests reach the same choke point.
+#[doc(hidden)]
+pub mod env_guard;
 pub(crate) mod error;
 pub(crate) mod error_policy;
 /// Compatibility shim — prefer crate-root exports or direct `tla_eval` imports (#3039).
@@ -500,7 +500,7 @@ pub fn register_state_vars_for_symbolic(
 #[cfg(feature = "ay")]
 pub use ay_bmc::{check_bmc, check_bmc_with_portfolio, BmcConfig, BmcError, BmcResult};
 #[cfg(feature = "ay")]
-pub use tla_ay::{BmcState, BmcValue};
+pub use tla_ay::{BmcScalarSymbol, BmcState, BmcTranslator, BmcValue};
 // k-Induction-based symbolic safety proving (Part of #3722)
 #[cfg(feature = "ay")]
 pub use ay_kinduction::{

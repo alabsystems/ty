@@ -32,8 +32,12 @@ impl ParallelChecker {
         CheckStats {
             states_found: self.states_count(),
             initial_states: num_initial,
+            raw_initial_states_generated: self
+                .total_raw_initial_states_generated
+                .load(Ordering::SeqCst),
             max_queue_depth: self.max_queue_depth.load(Ordering::SeqCst),
             transitions: self.total_transitions.load(Ordering::SeqCst),
+            raw_successors_generated: self.total_raw_successors_generated.load(Ordering::SeqCst),
             max_depth: self.max_depth.load(Ordering::SeqCst),
             detected_actions: detected_actions.to_vec(),
             detected_action_ids: detected_action_ids.to_vec(),
@@ -51,6 +55,7 @@ impl ParallelChecker {
             por_reduction: Default::default(),
             property_check: self.run_diagnostics.property_check_snapshot(),
             backend_capability_report: None,
+            engine_provenance: None,
             vacuity_warnings: Vec::new(),
         }
     }

@@ -88,10 +88,8 @@ fn test_eval_except_at_reference() {
 #[cfg_attr(test, ntest::timeout(10000))]
 #[test]
 fn test_eval_except_three_level_path_spill_preserves_nested_siblings() {
-    let value = eval_str(
-        r"[ [a |-> [b |-> [c |-> 1, keep |-> 9]]] EXCEPT !.a.b.c = @ + 6 ]",
-    )
-    .expect("three-level AST EXCEPT should evaluate");
+    let value = eval_str(r"[ [a |-> [b |-> [c |-> 1, keep |-> 9]]] EXCEPT !.a.b.c = @ + 6 ]")
+        .expect("three-level AST EXCEPT should evaluate");
     let outer = value.as_record().expect("outer value should be a record");
     let a = outer
         .get(&Arc::from("a"))

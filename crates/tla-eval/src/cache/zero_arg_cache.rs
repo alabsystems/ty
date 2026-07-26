@@ -392,10 +392,16 @@ pub(crate) fn zero_arg_probe_all(
     primary_validator: impl Fn(&CachedOpResult) -> bool,
     transition_validator: impl Fn(&CachedOpResult) -> bool,
 ) -> Option<ZeroArgProbeHit> {
-    zero_arg_probe_all_inner(key, tkey, canonical_key, primary_validator, transition_validator)
-        .inspect(|_| {
-            tla_value::churn_stats::churn_count(tla_value::churn_stats::ChurnSite::ZeroArgCacheHit);
-        })
+    zero_arg_probe_all_inner(
+        key,
+        tkey,
+        canonical_key,
+        primary_validator,
+        transition_validator,
+    )
+    .inspect(|_| {
+        tla_value::churn_stats::churn_count(tla_value::churn_stats::ChurnSite::ZeroArgCacheHit);
+    })
 }
 
 fn zero_arg_probe_all_inner(

@@ -18,7 +18,34 @@ use super::{
     ModelChecker, VecDeque,
 };
 use crate::TraceLocationStorage;
-use crate::{ConfigCheckError, RuntimeCheckError};
+use crate::{ConfigCheckError, EvalCheckError, RuntimeCheckError};
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(in crate::check) struct PreCodegenInitSeenTelemetry {
+    pub retired: bool,
+    pub witnesses_before: usize,
+    pub witnesses_after_retire: usize,
+    pub capacity_before: usize,
+    pub capacity_after_retire: usize,
+    pub reconstructed: bool,
+    pub reconstructed_witnesses: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static PRE_CODEGEN_INIT_SEEN_TELEMETRY:
+        std::cell::Cell<PreCodegenInitSeenTelemetry> =
+            const { std::cell::Cell::new(PreCodegenInitSeenTelemetry {
+                retired: false,
+                witnesses_before: 0,
+                witnesses_after_retire: 0,
+                capacity_before: 0,
+                capacity_after_retire: 0,
+                reconstructed: false,
+                reconstructed_witnesses: 0,
+            }) };
+}
 
 impl<'a> ModelChecker<'a> {
     /// mem2 (dead bulk-init drop) kill-switch.
@@ -42,6 +69,184 @@ impl<'a> ModelChecker<'a> {
         if let Some(depth) = self.trace.depths.remove(&old_fp) {
             self.trace.depths.insert(new_fp, depth);
         }
+    }
+
+    /// Whether the FP64 init payload map can be retired while post-layout
+    /// trust-codegen specialization runs.
+    ///
+    /// The bulk store plus its queue handles remain the exact reconstruction
+    /// authority. Keep this gate narrower than ordinary flat-BFS admission:
+    /// every generated bulk row must have one queued, fingerprinted handle in
+    /// index order, and liveness must not retain a second init-state tree.
+    fn can_retire_init_seen_before_codegen(
+        &self,
+        bulk_initial: &BulkStateStorage,
+        queue: &VecDeque<(NoTraceQueueEntry, usize, u64)>,
+    ) -> bool {
+        Self::drop_dead_bulk_init_enabled()
+            && self.fp_only_flat_witness_policy_enabled()
+            && (self.flat_state_primary || self.native_fused_flat_frontier_admission_candidate())
+            && self.should_use_flat_bfs()
+            && self.liveness_cache.init_states.is_empty()
+            && !self.state_storage.seen.is_empty()
+            && self.state_storage.seen.len() == queue.len()
+            && queue.len() == bulk_initial.len()
+            && self
+                .flat_bfs_adapter
+                .as_ref()
+                .is_some_and(|adapter| adapter.is_fully_flat())
+            && queue
+                .iter()
+                .enumerate()
+                .all(|(expected_idx, (entry, _, _))| match entry {
+                    NoTraceQueueEntry::Bulk(handle) => {
+                        handle.index as usize == expected_idx
+                            && handle
+                                .fingerprint
+                                .is_some_and(|fp| self.state_storage.seen.contains_key(&fp))
+                    }
+                    NoTraceQueueEntry::Owned { .. }
+                    | NoTraceQueueEntry::Witness { .. }
+                    | NoTraceQueueEntry::Flat { .. } => false,
+                })
+    }
+
+    /// Drop all but one entry from the wide FP64 -> ArrayState init witness
+    /// table before codegen.
+    ///
+    /// The retained representative is required by
+    /// `try_activate_compiled_fingerprinting`: an empty map makes that decision
+    /// fall back to `flat_state_primary`, which is also valid for fully-flat
+    /// compound layouts and would therefore misclassify them as scalar. No
+    /// state admission occurs until the map is either rebuilt or superseded by
+    /// the CompiledFlat re-fingerprint pass.
+    fn retire_init_seen_before_codegen(
+        &mut self,
+        bulk_initial: &BulkStateStorage,
+        queue: &VecDeque<(NoTraceQueueEntry, usize, u64)>,
+    ) -> bool {
+        #[cfg(test)]
+        PRE_CODEGEN_INIT_SEEN_TELEMETRY.with(|telemetry| {
+            telemetry.set(PreCodegenInitSeenTelemetry::default());
+        });
+        if !self.can_retire_init_seen_before_codegen(bulk_initial, queue) {
+            return false;
+        }
+
+        #[cfg(test)]
+        let witnesses_before = self.state_storage.seen.len();
+        #[cfg(test)]
+        let capacity_before = self.state_storage.seen.capacity();
+        let retained_witness = self
+            .state_storage
+            .seen
+            .iter()
+            .next()
+            .map(|(fp, state)| (*fp, state.clone()));
+        self.state_storage.seen = crate::state::fp_hashmap();
+        if let Some((fp, state)) = retained_witness {
+            self.state_storage.seen.insert(fp, state);
+        }
+
+        #[cfg(test)]
+        PRE_CODEGEN_INIT_SEEN_TELEMETRY.with(|telemetry| {
+            telemetry.set(PreCodegenInitSeenTelemetry {
+                retired: true,
+                witnesses_before,
+                witnesses_after_retire: self.state_storage.seen.len(),
+                capacity_before,
+                capacity_after_retire: self.state_storage.seen.capacity(),
+                reconstructed: false,
+                reconstructed_witnesses: 0,
+            });
+        });
+        true
+    }
+
+    /// Rebuild the exact ArrayState collision witnesses for the queued init
+    /// subset after codegen selects a non-CompiledFlat fingerprint domain.
+    ///
+    /// Queue membership is authoritative. The current retirement gate requires
+    /// the queue and bulk store to be an exact one-to-one, index-ordered initial
+    /// wavefront. Build into a fresh map and publish only after every handle
+    /// validates and materializes.
+    #[allow(clippy::result_large_err)]
+    fn reconstruct_init_seen_from_bulk_queue(
+        &mut self,
+        bulk_initial: &BulkStateStorage,
+        queue: &VecDeque<(NoTraceQueueEntry, usize, u64)>,
+        scratch: &mut ArrayState,
+    ) -> Result<(), CheckResult> {
+        let mut rebuilt = crate::state::fp_hashmap_with_capacity(queue.len());
+        for (entry, _, _) in queue {
+            let NoTraceQueueEntry::Bulk(handle) = entry else {
+                return Err(CheckResult::from_error(
+                    RuntimeCheckError::Internal(
+                        "pre-codegen init witness reconstruction requires Bulk-only queue entries"
+                            .to_string(),
+                    )
+                    .into(),
+                    self.stats.clone(),
+                ));
+            };
+            if handle.index as usize >= bulk_initial.len() {
+                return Err(CheckResult::from_error(
+                    RuntimeCheckError::Internal(format!(
+                        "pre-codegen init witness handle {} exceeds bulk length {}",
+                        handle.index,
+                        bulk_initial.len(),
+                    ))
+                    .into(),
+                    self.stats.clone(),
+                ));
+            }
+            let Some(fp) = handle.fingerprint else {
+                return Err(CheckResult::from_error(
+                    RuntimeCheckError::Internal(
+                        "pre-codegen init witness reconstruction requires cached fingerprints"
+                            .to_string(),
+                    )
+                    .into(),
+                    self.stats.clone(),
+                ));
+            };
+
+            scratch.overwrite_from_slice(bulk_initial.get_state(handle.index));
+            crate::materialize::materialize_array_state(
+                &self.ctx,
+                scratch,
+                self.compiled.spec_may_produce_lazy,
+            )
+            .map_err(|error| {
+                check_error_to_result(EvalCheckError::Eval(error).into(), &self.stats)
+            })?;
+            if rebuilt.insert(fp, scratch.clone()).is_some() {
+                return Err(CheckResult::from_error(
+                    RuntimeCheckError::Internal(format!(
+                        "duplicate queued init fingerprint {fp:?} during witness reconstruction",
+                    ))
+                    .into(),
+                    self.stats.clone(),
+                ));
+            }
+        }
+        self.state_storage.seen = rebuilt;
+
+        #[cfg(test)]
+        PRE_CODEGEN_INIT_SEEN_TELEMETRY.with(|telemetry| {
+            let mut row = telemetry.get();
+            row.reconstructed = true;
+            row.reconstructed_witnesses = self.state_storage.seen.len();
+            telemetry.set(row);
+        });
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(in crate::check) fn test_pre_codegen_init_seen_telemetry(
+        &self,
+    ) -> PreCodegenInitSeenTelemetry {
+        PRE_CODEGEN_INIT_SEEN_TELEMETRY.with(std::cell::Cell::get)
     }
 
     /// Terminal result for a state that cannot be encoded in the fixed flat
@@ -102,8 +307,23 @@ impl<'a> ModelChecker<'a> {
             .seen_fps
             .fresh_empty_clone()
             .map_err(|fault| self.storage_fault_result(fault))?;
-        self.state_storage.seen_fps = fresh_seen_fps;
-        self.state_storage.seen.clear();
+        self.state_storage.replace_seen_fps(fresh_seen_fps);
+        // Initial-state admission happened before the flat layout and compiled
+        // fingerprint domain were available, so fingerprint-only mode retained
+        // an ArrayState payload witness for every FP64 init state in `seen`.
+        // This direct path re-admits every init state from `bulk_initial` into
+        // the CompiledFlat domain, where compact flat payload witnesses replace
+        // those tree-form states. Replace the map instead of clearing it so its
+        // now-dead bucket allocation is released before the flat frontier is
+        // built. If compact witnesses are disabled, however, re-admission needs
+        // the ArrayState map again; retain its capacity in that fallback mode.
+        // The non-direct re-fingerprint path keeps its existing `clear` and
+        // capacity reuse behavior.
+        if self.fp_only_flat_witness_active() {
+            self.state_storage.seen = crate::state::fp_hashmap();
+        } else {
+            self.state_storage.seen.clear();
+        }
 
         if !self.liveness_cache.init_states.is_empty() {
             let mut liveness_buffer = vec![0i64; layout.total_slots()];
@@ -214,6 +434,7 @@ impl<'a> ModelChecker<'a> {
             self.solve_predicate_for_states_to_bulk_prechecked(init_name)?
         {
             let init_generated_count = bulk_init.enumeration.generated;
+            self.stats.raw_initial_states_generated = init_generated_count;
             let storage = bulk_init.storage;
             let mut queue: VecDeque<(NoTraceQueueEntry, usize, u64)> = VecDeque::new();
             queue.reserve(storage.len());
@@ -266,6 +487,7 @@ impl<'a> ModelChecker<'a> {
             match self.generate_initial_states_to_bulk(init_name) {
                 Ok(Some(bulk_init)) => {
                     let init_generated_count = bulk_init.enumeration.generated;
+                    self.stats.raw_initial_states_generated = init_generated_count;
                     let storage = bulk_init.storage;
                     // Streaming successful! Process states from BulkStateStorage directly.
                     let mut queue: VecDeque<(NoTraceQueueEntry, usize, u64)> = VecDeque::new();
@@ -349,9 +571,9 @@ impl<'a> ModelChecker<'a> {
                 }
                 Ok(None) => {
                     // Streaming not possible - fall back to Vec<State> path
-                    let initial_states = self.constrained_initial_states(init_name)?;
-                    // Part of #2163: capture pre-dedup count for states_generated reporting
-                    init_generated = initial_states.len();
+                    let (initial_states, raw_initial_states_generated) =
+                        self.constrained_initial_states(init_name)?;
+                    init_generated = raw_initial_states_generated;
 
                     // Part of #254: Set TLC level for TLCGet("level") - TLC uses 1-based indexing
                     // Initial states are at level 1 in TLC
@@ -489,6 +711,14 @@ impl<'a> ModelChecker<'a> {
             // activate while POR is set. Sound: releasing auto-POR never changes
             // the reachable-state set. See the method doc for the full rationale.
             self.maybe_release_auto_por_for_native_fused_admission();
+            // The native compiler's transient allocations overlap the full FP64
+            // initial-state collision map. On direct-flat candidates the bulk
+            // arena + cached queue handles are an exact reconstruction authority,
+            // so release only the redundant map during codegen. The map is either
+            // superseded by compact CompiledFlat witnesses below or reconstructed
+            // before BFS if final engine selection stays in ArrayFp64.
+            let retired_initial_seen_before_codegen =
+                self.retire_init_seen_before_codegen(&bulk_initial, &queue);
             self.upgrade_jit_cache_with_layout(&bulk_scratch);
             // AUTO engine-selection post-compile coverage gate: now that the
             // trust-cg cache is in final (layout-promoted) form, route to the
@@ -597,6 +827,15 @@ impl<'a> ModelChecker<'a> {
             );
             let need_flat_domain_refp =
                 self.uses_compiled_bfs_fingerprint_domain() || flat_symmetry_domain_refp;
+            if retired_initial_seen_before_codegen && !need_flat_domain_refp {
+                if let Err(candidate) = self.reconstruct_init_seen_from_bulk_queue(
+                    &bulk_initial,
+                    &queue,
+                    &mut bulk_scratch,
+                ) {
+                    return self.finalize_terminal_result_with_storage(candidate);
+                }
+            }
             // The direct flat-frontier init path stores raw buffers whose queue
             // fingerprints are computed inside
             // `refingerprint_initial_states_into_flat_frontier` without the
@@ -631,7 +870,7 @@ impl<'a> ModelChecker<'a> {
                             return self.finalize_terminal_result_with_storage(candidate);
                         }
                     };
-                    self.state_storage.seen_fps = fresh_seen_fps;
+                    self.state_storage.replace_seen_fps(fresh_seen_fps);
                     self.state_storage.seen.clear();
 
                     let mut init_states = std::mem::take(&mut self.liveness_cache.init_states);
@@ -1050,8 +1289,10 @@ impl<'a> ModelChecker<'a> {
                         } else {
                             "auto-detected (all-scalar, fully JIT-compiled)"
                         };
-                        telemetry_eprintln!("[compiled-bfs] activating compiled BFS loop ({source})");
-                        self.emit_execution_tier(true);
+                        telemetry_eprintln!(
+                            "[compiled-bfs] activating compiled BFS loop ({source})"
+                        );
+                        self.record_engine_tier(true);
                         let result = self.run_compiled_bfs_loop(&mut storage, &mut flat_queue);
                         flat_queue.report_stats();
                         return result;
@@ -1086,7 +1327,7 @@ impl<'a> ModelChecker<'a> {
                 }
             }
 
-            self.emit_execution_tier(false);
+            self.record_engine_tier(false);
             // Part B (Tier-1 #5, auto tier-up): drive the interpreter BFS loop,
             // but allow a one-time hot-swap to the compiled BFS loop once an
             // AUTO-mode lazy trust-cg compile fires mid-run and installs
@@ -1119,20 +1360,20 @@ impl<'a> ModelChecker<'a> {
                      BFS loop at a level boundary ({} flat parents remaining)",
                     flat_queue.remaining_flat_count(),
                 );
-                self.emit_execution_tier(true);
+                self.record_engine_tier(true);
                 result = self.run_compiled_bfs_loop(&mut storage, &mut flat_queue);
             }
             flat_queue.report_stats();
             result
         } else if use_array_witness_frontier {
-            self.emit_execution_tier(false);
+            self.record_engine_tier(false);
             let mut witness_queue = super::bfs::witness_frontier::WitnessBfsFrontier::new();
             while let Some(entry) = queue.pop_front() {
                 witness_queue.push(entry);
             }
             self.run_bfs_loop(&mut storage, &mut witness_queue)
         } else {
-            self.emit_execution_tier(false);
+            self.record_engine_tier(false);
             self.run_bfs_loop(&mut storage, &mut queue)
         }
     }

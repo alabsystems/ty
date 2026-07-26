@@ -64,10 +64,7 @@ fn zero_arg_def(name: &str, body: Spanned<TirExpr>) -> TirLetDef {
 
 fn compiler_with_state_vars(vars: &[(&str, u16)]) -> BytecodeCompiler {
     let mut compiler = BytecodeCompiler::new();
-    let map: HashMap<String, u16> = vars
-        .iter()
-        .map(|(n, i)| ((*n).to_string(), *i))
-        .collect();
+    let map: HashMap<String, u16> = vars.iter().map(|(n, i)| ((*n).to_string(), *i)).collect();
     compiler.set_state_vars(map);
     compiler
 }

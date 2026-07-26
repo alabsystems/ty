@@ -11,11 +11,10 @@
 //! Part of #2018: Materialize before fingerprinting.
 
 use super::super::{eval, eval_iter_set, EvalCtx, EvalError, EvalResult};
-use tla_value::Rp;
 use super::{build_lazy_func_ctx, into_bind_local_bound_var};
 use crate::value::{ComponentDomain, FuncBuilder, LazyDomain, LazyFuncValue, Value};
-use std::sync::Arc;
 use tla_core::ast::BoundPattern;
+use tla_value::Rp;
 
 /// Materialize a `LazyFuncValue` to a concrete `Value::Func`.
 ///

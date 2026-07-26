@@ -46,12 +46,15 @@ impl<'a> ModelChecker<'a> {
         }
         let property_check = self.run_diagnostics.property_check_snapshot();
         let backend_capability_report = self.backend_capability_report_json();
+        let engine_provenance = self.engine_provenance_json();
         let result = if let Some(storage_error) = self.check_fingerprint_storage_errors() {
             storage_error.with_property_check_stats(property_check)
         } else {
             candidate.with_property_check_stats(property_check)
         };
-        result.with_backend_capability_report(backend_capability_report)
+        result
+            .with_backend_capability_report(backend_capability_report)
+            .with_engine_provenance(engine_provenance)
     }
 
     /// Post-BFS finalization shared by both normal and resume paths.

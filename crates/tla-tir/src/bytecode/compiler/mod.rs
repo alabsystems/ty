@@ -97,6 +97,13 @@ pub struct BytecodeCompiler {
     /// Off by default and additionally gated on `tuple2_set_in` at the match
     /// site; see `enable_set_filter_projection_hoist` for the proof contract.
     set_filter_projection_hoist: bool,
+    /// Replace the whole VM-only SetFilter comprehension
+    /// `{ c \in D : <<v, c>> \in Edges(dag) }` with one `EdgeFilter` opcode that
+    /// range-scans the sorted edge set instead of iterating `D`. Off by default;
+    /// reuses the `set_filter_projection_hoist` match (and its `tuple2_set_in`
+    /// gate). The opcode is VM-only and native-lowered chunks must never contain
+    /// it; see `enable_edge_filter`.
+    edge_filter: bool,
     /// Replace a call to a complete one-parameter global operator whose body
     /// is exactly `IF p = <<>> THEN 0 ELSE p[2]` with one VM builtin dispatch.
     /// Off by default: the builtin is VM-only and native-lowered chunks must
@@ -154,6 +161,7 @@ impl BytecodeCompiler {
             tuple2_self_eq: false,
             tuple2_self_subseteq: false,
             set_filter_projection_hoist: false,
+            edge_filter: false,
             round_shape_apply: false,
             round_step_eq: false,
             except_at_free_rhs: false,
@@ -225,6 +233,18 @@ impl BytecodeCompiler {
         self.set_filter_projection_hoist = true;
     }
 
+    /// Enable the VM-only `EdgeFilter` comprehension fusion.
+    ///
+    /// This reuses the [`Self::enable_set_filter_projection_hoist`] match (and
+    /// its `tuple2_set_in` gate) to recognize `{c \in D : <<outer, c>> \in
+    /// S(arg)}` with `S(p) == p[k]`, but emits a single `EdgeFilter` opcode that
+    /// range-scans the sorted edge set for the `<<outer, *>>` prefix instead of
+    /// iterating `D`. The opcode is VM-only; callers whose chunks can reach
+    /// native lowering must leave it disabled.
+    pub fn enable_edge_filter(&mut self) {
+        self.edge_filter = true;
+    }
+
     /// Enable the exact, VM-only Round-shape call superinstruction.
     ///
     /// The call-site matcher requires an unreplaced, non-external, complete
@@ -290,6 +310,7 @@ impl BytecodeCompiler {
             state.tuple2_self_eq = self.tuple2_self_eq;
             state.tuple2_self_subseteq = self.tuple2_self_subseteq;
             state.set_filter_projection_hoist = self.set_filter_projection_hoist;
+            state.edge_filter = self.edge_filter;
             state.round_shape_apply = self.round_shape_apply;
             state.round_step_eq = self.round_step_eq;
             state.except_at_free_rhs = self.except_at_free_rhs;
@@ -343,6 +364,7 @@ impl BytecodeCompiler {
             state.tuple2_self_eq = self.tuple2_self_eq;
             state.tuple2_self_subseteq = self.tuple2_self_subseteq;
             state.set_filter_projection_hoist = self.set_filter_projection_hoist;
+            state.edge_filter = self.edge_filter;
             state.round_shape_apply = self.round_shape_apply;
             state.round_step_eq = self.round_step_eq;
             state.except_at_free_rhs = self.except_at_free_rhs;
@@ -449,6 +471,7 @@ impl BytecodeCompiler {
             state.tuple2_self_eq = self.tuple2_self_eq;
             state.tuple2_self_subseteq = self.tuple2_self_subseteq;
             state.set_filter_projection_hoist = self.set_filter_projection_hoist;
+            state.edge_filter = self.edge_filter;
             state.round_shape_apply = self.round_shape_apply;
             state.round_step_eq = self.round_step_eq;
             state.except_at_free_rhs = self.except_at_free_rhs;
@@ -630,6 +653,8 @@ struct FnCompileState<'a> {
     pub(super) tuple2_self_subseteq: bool,
     /// See `BytecodeCompiler::set_filter_projection_hoist`.
     pub(super) set_filter_projection_hoist: bool,
+    /// See `BytecodeCompiler::edge_filter`.
+    pub(super) edge_filter: bool,
     /// See `BytecodeCompiler::round_shape_apply`.
     pub(super) round_shape_apply: bool,
     /// See `BytecodeCompiler::round_step_eq`.
@@ -669,6 +694,7 @@ impl<'a> FnCompileState<'a> {
             tuple2_self_eq: false,
             tuple2_self_subseteq: false,
             set_filter_projection_hoist: false,
+            edge_filter: false,
             round_shape_apply: false,
             round_step_eq: false,
             except_at_free_rhs: false,

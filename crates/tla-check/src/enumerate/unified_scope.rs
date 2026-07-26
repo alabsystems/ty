@@ -108,8 +108,8 @@ pub(super) fn conjunct_let(
     // ambient scope + the interned defs — no per-state HAMT clone/insert/id
     // derivation (see tla-eval cache/openv_memo.rs). Recursive LETs rebuild
     // fresh per entry (per-frame Arc identity preserved).
-    let (merged, merged_id, merged_recursive) = tla_eval::merged_let_env_memoized(
-        ctx.local_ops().as_ref(),
+    let (merged, merged_id, merged_recursive) = tla_eval::merged_let_env_memoized_with_ctx(
+        ctx,
         defs,
         tla_eval::MergedLetSite::EnumConjunct,
         |_| true,

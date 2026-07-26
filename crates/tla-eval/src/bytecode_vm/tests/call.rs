@@ -6,9 +6,8 @@
 //! caller-register preservation, and recursion-depth guard.
 
 use super::{make_func, BytecodeChunk, BytecodeVm, ConstantPool, Opcode, Value, VmError};
-use tla_value::Rp;
-use std::sync::Arc;
 use tla_value::FuncValue;
+use tla_value::Rp;
 
 /// Test Call opcode: callee is a separate function in the chunk.
 /// Add(x, y) == x + y, Main calls Add(3, 4) → 7

@@ -31,6 +31,7 @@ impl Value {
             (Value::Seq(a), Value::Seq(b)) => Arc::ptr_eq(a, b),
             (Value::Record(a), Value::Record(b)) => a.ptr_eq(b),
             (Value::Tuple(a), Value::Tuple(b)) => Arc::ptr_eq(a, b),
+            (Value::SetCup(a), Value::SetCup(b)) => Rp::ptr_eq(a, b),
             (Value::Closure(a), Value::Closure(b)) => Arc::ptr_eq(a, b),
             (Value::ModelValue(a), Value::ModelValue(b)) => Arc::ptr_eq(a, b),
             _ => false,

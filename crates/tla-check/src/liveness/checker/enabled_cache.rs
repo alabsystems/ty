@@ -196,12 +196,36 @@ pub(crate) fn clear_enabled_cache() {
 /// Drop the thread-local ENABLED cache's backing allocation.
 ///
 /// Ordinary lifecycle clears intentionally retain capacity for reuse. The
-/// mid-BFS regeneration trip calls this stronger operation because caching is
-/// disabled for the remainder of BFS and retaining a multi-million-entry
-/// allocation would defeat the trip's peak-memory bound.
+/// mid-BFS hybrid trip calls this stronger operation because the BFS inline
+/// producer is disabled for the remaining exploration. The post-BFS checker
+/// may populate a fresh cache, but retaining millions of stale entries here
+/// would defeat the trip's release.
 pub(crate) fn release_enabled_cache_storage() {
     ENABLED_CACHE.with(|c| c.borrow_mut().release_storage());
     ENABLED_EVICTION_WARNED.with(|warned| warned.set(false));
+}
+
+/// Whether an exact-raw streaming prefill can retain all projected facts until
+/// its later completeness pass without triggering retain-half eviction.
+///
+/// Exact-raw callers operate on the current property's raw state domain, so an
+/// existing bitmap entry is one of `max_state_count` states. The legacy backend
+/// stores one entry per pair and therefore uses the conservative upper bound of
+/// every projected tag being new for every state.
+pub(crate) fn can_retain_exact_raw_enabled_prefill(
+    max_state_count: usize,
+    projected_tag_count: usize,
+) -> bool {
+    ENABLED_CACHE.with(|cache| match &*cache.borrow() {
+        EnabledCacheImpl::Bitmap(map) => {
+            map.len().max(max_state_count) <= ENABLED_CACHE_STATE_SOFT_CAP
+        }
+        EnabledCacheImpl::Legacy(map) => {
+            map.len()
+                .saturating_add(max_state_count.saturating_mul(projected_tag_count))
+                <= ENABLED_CACHE_SOFT_CAP
+        }
+    })
 }
 
 /// Trim ENABLED_CACHE if it exceeds the soft cap (#4083).
@@ -266,6 +290,13 @@ fn get_enabled_cached_internal(state_fp: Fingerprint, tag: u32) -> Option<bool> 
         }
         result
     })
+}
+
+/// Read a previously computed ENABLED value without evaluating a fallback.
+/// Used by exact-raw mask reconstruction only after the caller has completed
+/// the authoritative per-state ENABLED phase.
+pub(crate) fn get_enabled_cached(state_fp: Fingerprint, tag: u32) -> Option<bool> {
+    get_enabled_cached_internal(state_fp, tag)
 }
 
 /// Evaluate ENABLED with shared thread-local caching.

@@ -76,8 +76,21 @@ fn test_bug_3118_mcalternatingbit_state_count_parity() {
     if config.next.is_none() {
         config.next = Some(resolved.next.clone());
     }
+    // This is a TLC state-count parity test, so use the same unreduced work
+    // equivalence as `ty check --bfs-only --no-reduction`. Automatic POR and
+    // symmetry are enabled by default and may soundly reduce the count.
+    config.auto_por = Some(false);
+    let runtime_config = config.runtime_model_config();
 
-    let mut checker = ModelChecker::new_with_extends(&module, &checker_modules, &config);
+    let mut checker = ModelChecker::new_with_extends(&module, &checker_modules, &runtime_config);
+    checker
+        .register_inline_next(&resolved)
+        .expect("resolved inline Next should register");
+    checker.set_auto_symmetry(false);
+    // Match the production sequential runner: its default dead-action tracking
+    // preserves TLC's per-action `doNext` enumeration while remaining silent
+    // unless a dead action is found.
+    checker.set_default_dead_action_coverage();
     checker.set_store_states(true);
     checker.set_fairness(resolved.fairness);
     checker.set_stuttering_allowed(resolved.stuttering_allowed);
@@ -86,7 +99,7 @@ fn test_bug_3118_mcalternatingbit_state_count_parity() {
         CheckResult::Success(stats) => {
             assert_eq!(
                 stats.states_found, 240,
-                "Bug #3118 regression: MCAlternatingBit should match TLC's 240 states"
+                "Bug #3118 regression: MCAlternatingBit should match TLC's 240 states; {stats:?}"
             );
         }
         other => {

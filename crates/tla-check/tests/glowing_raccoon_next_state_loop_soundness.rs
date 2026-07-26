@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
-//! Cross-backend soundness + multi-successor ("NextStateLoop") scaffold target
+//! Cross-backend soundness + multi-successor ("NextStateLoop") coverage
 //! for the `glowingRaccoon/clean.tla` spec.
 //!
 //! The `anneal` action contains a runtime-domain inner existential:
@@ -24,25 +24,17 @@
 //!
 //! This file pins two guarantees:
 //!
-//! 1. (active) Cross-backend parity: the interpreter and the trust-codegen
-//!    native backend agree on the reachable-state count for `clean`. With the
-//!    native multi-successor codegen still unimplemented, `anneal` is
-//!    *recognized* as the NextStateLoop ABI target and routed to the
-//!    interpreter (fail-closed) — the run must NOT drop or fabricate states.
-//!    The other three actions (`heat`, `cool`, `extend`) compile natively.
+//! 1. The interpreter and trust-codegen native backend agree on the exact
+//!    reachable-state count for `clean`.
 //!
-//! 2. (`#[ignore]`d) The eventual target: once the multi-successor
-//!    `tla_jit_abi::NextStateLoopFn` codegen lands, `anneal` should compile
-//!    natively and every action instance should be covered
-//!    (`compiled == total`) while parity is preserved. This test documents the
-//!    finish line; un-ignore it when the codegen is implemented.
+//! 2. `anneal` compiles through the runtime-range `NextStateLoopFn`; all four
+//!    actions are natively covered, so parity cannot be supplied by a hidden
+//!    per-action interpreter fallback.
 
 mod common;
 
-use tla_check::{check_module, CheckResult, Config};
+use tla_check::{CheckResult, Config, ModelChecker, StateGraphSnapshot};
 use tla_eval::clear_for_test_reset;
-
-use tla_check::ModelChecker;
 
 /// The `clean.tla` source, embedded so the test is self-contained and does not
 /// depend on `~/tlaplus-examples` being present.
@@ -133,123 +125,148 @@ NEXT Next
 /// the interpreter and trust-cg backends).
 const EXPECTED_STATES: usize = 63;
 
-fn states_found(label: &str, result: &CheckResult) -> usize {
-    match result {
-        CheckResult::Success(stats) => stats.states_found,
-        other => panic!("{label}: expected Success, got {other:?}"),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RunSummary {
+    states_found: usize,
+    initial_states: usize,
+    transitions: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GraphRun {
+    summary: RunSummary,
+    graph: StateGraphSnapshot,
+    trust_cg_action_coverage: Option<(usize, usize)>,
+    trust_cg_next_state_loop_recognized: Option<usize>,
+}
+
+/// Run one backend with graph capture enabled. The `exhaustive_env` mode also
+/// clears the alternative compiled/flat-engine selectors; the minimal mode
+/// changes only backend-selection knobs shared by the paired runs.
+fn run_graph(trust_cg: bool, exhaustive_env: bool) -> GraphRun {
+    let _trust_cg = common::EnvVarGuard::set("TY_TRUST_CG", trust_cg.then_some("1"));
+    let _legacy_trust_cg = common::EnvVarGuard::remove("TY_trust_cg");
+    let _trust_cg_bfs = common::EnvVarGuard::remove("TY_TRUST_CG_BFS");
+    let _no_compiled = common::EnvVarGuard::set("TY_NO_COMPILED_BFS", (!trust_cg).then_some("1"));
+    let _compiled_env = exhaustive_env.then(|| common::EnvVarGuard::remove("TY_COMPILED_BFS"));
+    let _no_flat = exhaustive_env.then(|| common::EnvVarGuard::remove("TY_NO_FLAT_BFS"));
+    let _flat_env = exhaustive_env.then(|| common::EnvVarGuard::remove("TY_FLAT_BFS"));
+    let _no_jit = common::EnvVarGuard::remove("TY_JIT");
+    let _auto_por = common::EnvVarGuard::set("TY_AUTO_POR", Some("0"));
+
+    clear_for_test_reset();
+    tla_trust_cg::compile::clear_jit_cache();
+
+    let module = common::parse_module(CLEAN_TLA);
+    let mut config = Config::parse(CLEAN_CFG).expect("valid cfg");
+    config.use_compiled_bfs = Some(trust_cg);
+
+    let mut checker = ModelChecker::new(&module, &config);
+    checker.set_store_states(false);
+    checker.enable_state_graph_capture_for_testing();
+
+    let stats = match checker.check() {
+        CheckResult::Success(stats) => stats,
+        other => panic!("expected successful model check, got {other:?}"),
+    };
+    let graph = checker.state_graph_snapshot_for_testing();
+    assert_eq!(
+        graph.nodes.len(),
+        stats.states_found,
+        "captured graph nodes must match the explored state count"
+    );
+    assert_eq!(
+        graph.successor_count, stats.transitions,
+        "captured graph edges must match the explored transition count"
+    );
+
+    GraphRun {
+        summary: RunSummary {
+            states_found: stats.states_found,
+            initial_states: stats.initial_states,
+            transitions: stats.transitions,
+        },
+        graph,
+        trust_cg_action_coverage: checker.trust_cg_action_coverage_for_testing(),
+        trust_cg_next_state_loop_recognized: checker
+            .trust_cg_next_state_loop_recognized_for_testing(),
     }
 }
 
 // ============================================================================
-// Active: interpreter / trust-cg parity. `anneal` falls back (fail-closed).
+// Interpreter / trust-cg parity with native runtime-range execution.
 // ============================================================================
 
 /// Interpreter baseline: `clean` has 63 reachable states with no violation.
 #[cfg_attr(test, ntest::timeout(30000))]
 #[test]
 fn glowing_raccoon_interpreter_state_count() {
-    let _no_compiled = common::EnvVarGuard::set("TY_NO_COMPILED_BFS", Some("1"));
-    let _no_jit = common::EnvVarGuard::remove("TY_JIT");
-    clear_for_test_reset();
-
-    let module = common::parse_module(CLEAN_TLA);
-    let config = Config::parse(CLEAN_CFG).expect("valid cfg");
-    let result = check_module(&module, &config);
+    let baseline = run_graph(false, true);
     assert_eq!(
-        states_found("interpreter baseline", &result),
-        EXPECTED_STATES,
+        baseline.summary.states_found, EXPECTED_STATES,
         "interpreter reachable-state count"
     );
 }
 
 /// trust-cg native backend: must reach the identical reachable-state count as
-/// the interpreter. `anneal` is recognized as the runtime-domain
-/// multi-successor (NextStateLoop) shape and routed to the interpreter
-/// (fail-closed); the other three actions compile natively. The whole point is
-/// that recognizing-but-falling-back does NOT change the state set.
+/// the interpreter. `anneal` executes as a runtime-domain multi-successor
+/// NextStateLoop action; all four actions compile natively.
 #[cfg_attr(test, ntest::timeout(60000))]
 #[test]
-fn glowing_raccoon_trust_cg_parity_with_anneal_fallback() {
-    let _trust_cg = common::EnvVarGuard::set("TY_TRUST_CG", Some("1"));
-    let _trust_cg_bfs = common::EnvVarGuard::remove("TY_TRUST_CG_BFS");
-    let _no_compiled = common::EnvVarGuard::remove("TY_NO_COMPILED_BFS");
-    let _compiled_env = common::EnvVarGuard::remove("TY_COMPILED_BFS");
-    let _no_flat = common::EnvVarGuard::remove("TY_NO_FLAT_BFS");
-    let _flat_env = common::EnvVarGuard::remove("TY_FLAT_BFS");
-    let _no_jit = common::EnvVarGuard::remove("TY_JIT");
-    let _auto_por = common::EnvVarGuard::set("TY_AUTO_POR", Some("0"));
-
-    clear_for_test_reset();
-    tla_trust_cg::compile::clear_jit_cache();
-
-    let module = common::parse_module(CLEAN_TLA);
-    let mut config = Config::parse(CLEAN_CFG).expect("valid cfg");
-    config.use_compiled_bfs = Some(true);
-
-    let mut checker = ModelChecker::new(&module, &config);
-    let result = checker.check();
-
-    let coverage = checker.trust_cg_action_coverage_for_testing();
-    let recognized = checker.trust_cg_next_state_loop_recognized_for_testing();
+fn glowing_raccoon_trust_cg_parity_with_native_anneal() {
+    let baseline = run_graph(false, true);
+    let trust_cg = run_graph(true, true);
 
     assert_eq!(
-        states_found("trust-cg native run", &result),
-        EXPECTED_STATES,
-        "trust-cg reachable-state count must match the interpreter"
+        trust_cg.summary, baseline.summary,
+        "trust-cg run summary must match the interpreter"
+    );
+    assert_eq!(
+        trust_cg.graph, baseline.graph,
+        "trust-cg must reproduce the interpreter's exact reachable state graph"
     );
 
-    // Scaffold contract: `anneal` is recognized as a NextStateLoop target and
-    // routed to the interpreter, so exactly 3 of 4 actions compile natively.
-    let (compiled, total) = coverage.expect("trust-cg run should record action coverage");
+    // Native contract: every action, including the dynamic-range `anneal`, is
+    // executable through trust-codegen.
+    let (compiled, total) = trust_cg
+        .trust_cg_action_coverage
+        .expect("trust-cg run should record action coverage");
     assert_eq!(total, 4, "clean has four top-level actions");
     assert_eq!(
-        compiled, 3,
-        "heat/cool/extend compile natively; anneal falls back (fail-closed)"
+        compiled, 4,
+        "heat/cool/extend and runtime-range anneal must all compile natively"
     );
     assert_eq!(
-        recognized,
-        Some(1),
-        "anneal must be recognized as the runtime-domain multi-successor (NextStateLoop) target"
+        trust_cg.trust_cg_next_state_loop_recognized,
+        Some(0),
+        "no runtime-domain NextStateLoop action should remain recognized-but-unsupported"
     );
 }
 
 // ============================================================================
-// Target (ignored): full native multi-successor execution of `anneal`.
+// Minimal-environment regression for full native execution of `anneal`.
 // ============================================================================
 
-/// TARGET for the multi-successor `NextStateLoopFn` codegen.
-///
-/// When a sound native multi-successor lowering lands (a per-iteration loop
-/// that re-seeds each successor from `state_in` and pushes one record per `k`
-/// into a `tla_jit_abi::NextStateLoopSink`, distinct from the boolean
-/// any-witness exists loop), `anneal` should compile natively: all four action
-/// instances covered AND parity preserved. Remove `#[ignore]` then.
-#[ignore = "multi-successor NextStateLoop codegen not yet implemented; scaffold falls back for anneal"]
+/// The same native/parity guarantee with only the public trust-cg selection
+/// knobs set, guarding against accidentally depending on the more exhaustive
+/// environment cleanup in the test above.
 #[cfg_attr(test, ntest::timeout(60000))]
 #[test]
-fn glowing_raccoon_trust_cg_anneal_compiles_natively_target() {
-    let _trust_cg = common::EnvVarGuard::set("TY_TRUST_CG", Some("1"));
-    let _no_compiled = common::EnvVarGuard::remove("TY_NO_COMPILED_BFS");
-    let _no_jit = common::EnvVarGuard::remove("TY_JIT");
-    let _auto_por = common::EnvVarGuard::set("TY_AUTO_POR", Some("0"));
-
-    clear_for_test_reset();
-    tla_trust_cg::compile::clear_jit_cache();
-
-    let module = common::parse_module(CLEAN_TLA);
-    let mut config = Config::parse(CLEAN_CFG).expect("valid cfg");
-    config.use_compiled_bfs = Some(true);
-
-    let mut checker = ModelChecker::new(&module, &config);
-    let result = checker.check();
-    let coverage = checker.trust_cg_action_coverage_for_testing();
+fn glowing_raccoon_trust_cg_anneal_compiles_natively_minimal_env() {
+    let baseline = run_graph(false, false);
+    let trust_cg = run_graph(true, false);
 
     assert_eq!(
-        states_found("trust-cg native run (target)", &result),
-        EXPECTED_STATES,
-        "parity must be preserved once anneal compiles natively"
+        trust_cg.summary, baseline.summary,
+        "minimal-env trust-cg run summary must match the interpreter"
     );
-    let (compiled, total) = coverage.expect("trust-cg run should record action coverage");
+    assert_eq!(
+        trust_cg.graph, baseline.graph,
+        "minimal-env trust-cg must reproduce the interpreter's exact reachable state graph"
+    );
+    let (compiled, total) = trust_cg
+        .trust_cg_action_coverage
+        .expect("trust-cg run should record action coverage");
     assert_eq!(
         (compiled, total),
         (4, 4),

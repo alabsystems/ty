@@ -245,9 +245,14 @@ fn pmot() -> Expr {
 /// `TyReflectPExp` — deep scalar value syntax. Constructor order is [`PEXP_CTORS`].
 fn pexp_decl() -> InductiveDecl {
     let e = || c(PEXP);
-    let un = |name: &str| Constructor { name: nm(name), type_: Expr::arrow(nat(), e()) };
-    let bin =
-        |name: &str| Constructor { name: nm(name), type_: Expr::arrow(e(), Expr::arrow(e(), e())) };
+    let un = |name: &str| Constructor {
+        name: nm(name),
+        type_: Expr::arrow(nat(), e()),
+    };
+    let bin = |name: &str| Constructor {
+        name: nm(name),
+        type_: Expr::arrow(e(), Expr::arrow(e(), e())),
+    };
     InductiveDecl {
         level_params: vec![],
         num_params: 0,
@@ -275,10 +280,14 @@ fn pexp_decl() -> InductiveDecl {
 fn ppred_decl() -> InductiveDecl {
     let p = || c(PPRED);
     let e = || c(PEXP);
-    let pbin =
-        |name: &str| Constructor { name: nm(name), type_: Expr::arrow(p(), Expr::arrow(p(), p())) };
-    let cmp =
-        |name: &str| Constructor { name: nm(name), type_: Expr::arrow(e(), Expr::arrow(e(), p())) };
+    let pbin = |name: &str| Constructor {
+        name: nm(name),
+        type_: Expr::arrow(p(), Expr::arrow(p(), p())),
+    };
+    let cmp = |name: &str| Constructor {
+        name: nm(name),
+        type_: Expr::arrow(e(), Expr::arrow(e(), p())),
+    };
     InductiveDecl {
         level_params: vec![],
         num_params: 0,
@@ -288,17 +297,26 @@ fn ppred_decl() -> InductiveDecl {
             constructors: vec![
                 pbin(PPRED_AND),
                 pbin(PPRED_OR),
-                Constructor { name: nm(PPRED_NOT), type_: Expr::arrow(p(), p()) },
+                Constructor {
+                    name: nm(PPRED_NOT),
+                    type_: Expr::arrow(p(), p()),
+                },
                 pbin(PPRED_IMPLIES),
                 pbin(PPRED_EQUIV),
-                Constructor { name: nm(PPRED_BOOLLIT), type_: Expr::arrow(boolc(), p()) },
+                Constructor {
+                    name: nm(PPRED_BOOLLIT),
+                    type_: Expr::arrow(boolc(), p()),
+                },
                 cmp(PPRED_EQ),
                 cmp(PPRED_NEQ),
                 cmp(PPRED_LT),
                 cmp(PPRED_LEQ),
                 cmp(PPRED_GT),
                 cmp(PPRED_GEQ),
-                Constructor { name: nm(PPRED_UNCHANGED), type_: Expr::arrow(nat(), p()) },
+                Constructor {
+                    name: nm(PPRED_UNCHANGED),
+                    type_: Expr::arrow(nat(), p()),
+                },
                 // inRange x lo hi — interval membership `x ∈ lo..hi` (AST-direct fragment).
                 Constructor {
                     name: nm(PPRED_INRANGE),
@@ -395,7 +413,10 @@ fn evalv_def() -> Declaration {
                             list_nat(),
                             lam(
                                 list_nat(),
-                                ap(c(op), [ap(bv(3), [bv(1), bv(0)]), ap(bv(2), [bv(1), bv(0)])]),
+                                ap(
+                                    c(op),
+                                    [ap(bv(3), [bv(1), bv(0)]), ap(bv(2), [bv(1), bv(0)])],
+                                ),
                             ),
                         ),
                     ),
@@ -447,14 +468,22 @@ fn evalp_def() -> Declaration {
     let pbin = |body: Expr| {
         lam(
             c(PPRED),
-            lam(c(PPRED), lam(pmot(), lam(pmot(), lam(list_nat(), lam(list_nat(), body))))),
+            lam(
+                c(PPRED),
+                lam(pmot(), lam(pmot(), lam(list_nat(), lam(list_nat(), body)))),
+            ),
         )
     };
     let ihp = || ap(bv(3), [bv(1), bv(0)]);
     let ihq = || ap(bv(2), [bv(1), bv(0)]);
     // comparison minors: fun (a b : PExp) (s sp) => body   (a=3 b=2 s=1 sp=0; PExp args are
     // non-recursive in PPred, so the recursor supplies no IHs for them)
-    let cmp = |body: Expr| lam(c(PEXP), lam(c(PEXP), lam(list_nat(), lam(list_nat(), body))));
+    let cmp = |body: Expr| {
+        lam(
+            c(PEXP),
+            lam(c(PEXP), lam(list_nat(), lam(list_nat(), body))),
+        )
+    };
     let va = || ap(c(EVALV), [bv(3), bv(1), bv(0)]);
     let vb = || ap(c(EVALV), [bv(2), bv(1), bv(0)]);
     let inc = |e: Expr| ap(c("Nat.add"), [e, nl(1)]);
@@ -469,7 +498,10 @@ fn evalp_def() -> Declaration {
                 // not: fun (p : PPred) (ihp) (s sp) => Bool.not (ihp s sp)   (ihp=2 s=1 sp=0)
                 lam(
                     c(PPRED),
-                    lam(pmot(), lam(list_nat(), lam(list_nat(), bnot(ap(bv(2), [bv(1), bv(0)]))))),
+                    lam(
+                        pmot(),
+                        lam(list_nat(), lam(list_nat(), bnot(ap(bv(2), [bv(1), bv(0)])))),
+                    ),
                 ),
                 pbin(ap(c("Bool.or"), [bnot(ihp()), ihq()])), // implies ↦ ¬a ∨ b
                 pbin(ap(
@@ -600,13 +632,19 @@ fn evalp_def() -> Declaration {
 
 /// `List.{0} (List.{0} Nat) : Type` — the type of a quoted tuple SET.
 fn list_list_nat() -> Expr {
-    Expr::app(Expr::const_str_levels("List", vec![Level::zero()]), list_nat())
+    Expr::app(
+        Expr::const_str_levels("List", vec![Level::zero()]),
+        list_nat(),
+    )
 }
 
 /// `List.rec.{1,0}` over element type `alpha` at the CONSTANT `Bool` motive:
 /// `List.rec.{1,0} alpha (fun _ : List alpha => Bool) nil_case cons_case major`.
 fn list_rec_bool(alpha: Expr, nil_case: Expr, cons_case: Expr, major: Expr) -> Expr {
-    let list_alpha = Expr::app(Expr::const_str_levels("List", vec![Level::zero()]), alpha.clone());
+    let list_alpha = Expr::app(
+        Expr::const_str_levels("List", vec![Level::zero()]),
+        alpha.clone(),
+    );
     ap(
         Expr::const_str_levels("List.rec", vec![Level::succ(Level::zero()), Level::zero()]),
         [alpha, lam(list_alpha, boolc()), nil_case, cons_case, major],
@@ -692,11 +730,20 @@ fn mem_def() -> Declaration {
     //   Bool.or (TyReflectTupEq x h) ih          (ih=0 t=1 h=2 s=3 x=4)
     let cons_case = lam(
         list_nat(),
-        lam(list_list_nat(), lam(boolc(), ap(c("Bool.or"), [ap(c(TUPEQ), [bv(4), bv(2)]), bv(0)]))),
+        lam(
+            list_list_nat(),
+            lam(
+                boolc(),
+                ap(c("Bool.or"), [ap(c(TUPEQ), [bv(4), bv(2)]), bv(0)]),
+            ),
+        ),
     );
     let value = lam(
         list_nat(),
-        lam(list_list_nat(), list_rec_bool(list_nat(), c("Bool.false"), cons_case, bv(0))),
+        lam(
+            list_list_nat(),
+            list_rec_bool(list_nat(), c("Bool.false"), cons_case, bv(0)),
+        ),
     );
     Declaration::Definition {
         name: nm(MEM),
@@ -715,7 +762,13 @@ fn allmem_def() -> Declaration {
     //   Bool.and (TyReflectMem h ys) ih          (ih=0 t=1 h=2 ys=3 xs=4)
     let cons_case = lam(
         list_nat(),
-        lam(list_list_nat(), lam(boolc(), ap(c("Bool.and"), [ap(c(MEM), [bv(2), bv(3)]), bv(0)]))),
+        lam(
+            list_list_nat(),
+            lam(
+                boolc(),
+                ap(c("Bool.and"), [ap(c(MEM), [bv(2), bv(3)]), bv(0)]),
+            ),
+        ),
     );
     let value = lam(
         list_list_nat(),
@@ -772,7 +825,10 @@ fn subseq_def() -> Declaration {
             list_list_nat(),
             lam(
                 Expr::arrow(list_list_nat(), boolc()),
-                lam(list_list_nat(), list_rec_bool(list_nat(), c("Bool.true"), inner_cons, bv(0))),
+                lam(
+                    list_list_nat(),
+                    list_rec_bool(list_nat(), c("Bool.true"), inner_cons, bv(0)),
+                ),
             ),
         ),
     );
@@ -782,7 +838,10 @@ fn subseq_def() -> Declaration {
         list_rec_bool(
             list_nat(),
             c("Bool.true"),
-            lam(list_nat(), lam(list_list_nat(), lam(boolc(), c("Bool.false")))),
+            lam(
+                list_nat(),
+                lam(list_list_nat(), lam(boolc(), c("Bool.false"))),
+            ),
             bv(0),
         ),
     );
@@ -926,7 +985,10 @@ fn quote_set(ir: &SetIR) -> Option<Expr> {
         SetIR::Digit { pack, place, base } => ap(
             c(PEXP_MOD),
             [
-                ap(c(PEXP_DIV), [quote_val(pack)?, ap(c(PEXP_LIT), [nl(*place)])]),
+                ap(
+                    c(PEXP_DIV),
+                    [quote_val(pack)?, ap(c(PEXP_LIT), [nl(*place)])],
+                ),
                 ap(c(PEXP_LIT), [nl(*base)]),
             ],
         ),
@@ -937,7 +999,13 @@ fn quote_set(ir: &SetIR) -> Option<Expr> {
 /// The deep bit-`e`-of-`mask` `Nat` value `land(shr(mask, e), 1)` — reduces to `0` or `1` — mirroring
 /// the shallow [`crate::cleancic`]'s `set_mem_bit` core `Nat.land(Nat.shiftRight mask e, 1)`.
 fn set_bit(mask: Expr, e: u64) -> Expr {
-    ap(c(PEXP_LAND), [ap(c(PEXP_SHR), [mask, ap(c(PEXP_LIT), [nl(e)])]), ap(c(PEXP_LIT), [nl(1)])])
+    ap(
+        c(PEXP_LAND),
+        [
+            ap(c(PEXP_SHR), [mask, ap(c(PEXP_LIT), [nl(e)])]),
+            ap(c(PEXP_LIT), [nl(1)]),
+        ],
+    )
 }
 
 /// Quote `boolToNat(P)` as a deep `TyReflectPExp` term reducing to EXACTLY `1` (P true) / `0` (P false),
@@ -970,13 +1038,18 @@ fn quote_bool_to_nat(p: &PredIR) -> Option<Expr> {
         PredIR::Not(a) => sub(one(), quote_bool_to_nat(a)?),
         PredIR::And(a, b) => mul(quote_bool_to_nat(a)?, quote_bool_to_nat(b)?),
         // ∨ ≡ ¬(¬a ∧ ¬b): 1 ∸ ((1∸ba)·(1∸bb)).
-        PredIR::Or(a, b) => {
-            sub(one(), mul(sub(one(), quote_bool_to_nat(a)?), sub(one(), quote_bool_to_nat(b)?)))
-        }
+        PredIR::Or(a, b) => sub(
+            one(),
+            mul(
+                sub(one(), quote_bool_to_nat(a)?),
+                sub(one(), quote_bool_to_nat(b)?),
+            ),
+        ),
         // a ⇒ b ≡ ¬(a ∧ ¬b): 1 ∸ (ba·(1∸bb)).
-        PredIR::Implies(a, b) => {
-            sub(one(), mul(quote_bool_to_nat(a)?, sub(one(), quote_bool_to_nat(b)?)))
-        }
+        PredIR::Implies(a, b) => sub(
+            one(),
+            mul(quote_bool_to_nat(a)?, sub(one(), quote_bool_to_nat(b)?)),
+        ),
         PredIR::Equiv(a, b) => eq_ind(quote_bool_to_nat(a)?, quote_bool_to_nat(b)?),
         PredIR::Eq(a, b) => eq_ind(quote_val(a)?, quote_val(b)?),
         PredIR::Neq(a, b) => sub(one(), eq_ind(quote_val(a)?, quote_val(b)?)),
@@ -1060,9 +1133,10 @@ pub fn quote_pred(ir: &PredIR) -> Option<Expr> {
         PredIR::Not(a) => ap(c(PPRED_NOT), [quote_pred(a)?]),
         PredIR::Implies(a, b) => ap(c(PPRED_IMPLIES), [quote_pred(a)?, quote_pred(b)?]),
         PredIR::Equiv(a, b) => ap(c(PPRED_EQUIV), [quote_pred(a)?, quote_pred(b)?]),
-        PredIR::BoolLit(b) => {
-            ap(c(PPRED_BOOLLIT), [c(if *b { "Bool.true" } else { "Bool.false" })])
-        }
+        PredIR::BoolLit(b) => ap(
+            c(PPRED_BOOLLIT),
+            [c(if *b { "Bool.true" } else { "Bool.false" })],
+        ),
         PredIR::Eq(a, b) => ap(c(PPRED_EQ), [quote_val(a)?, quote_val(b)?]),
         PredIR::Neq(a, b) => ap(c(PPRED_NEQ), [quote_val(a)?, quote_val(b)?]),
         PredIR::Lt(a, b) => ap(c(PPRED_LT), [quote_val(a)?, quote_val(b)?]),
@@ -1075,12 +1149,14 @@ pub fn quote_pred(ir: &PredIR) -> Option<Expr> {
         PredIR::SetEq(a, b) => ap(c(PPRED_EQ), [quote_set(a)?, quote_set(b)?]),
         PredIR::SetNeq(a, b) => ap(c(PPRED_NEQ), [quote_set(a)?, quote_set(b)?]),
         // e ∈ S ↦ Nat.beq (land(shr maskS e) 1) 1  (the `eq` arm over the bit-test term).
-        PredIR::SetMem(e, set) => {
-            ap(c(PPRED_EQ), [set_bit(quote_set(set)?, *e), ap(c(PEXP_LIT), [nl(1)])])
-        }
-        PredIR::SetNotMem(e, set) => {
-            ap(c(PPRED_NEQ), [set_bit(quote_set(set)?, *e), ap(c(PEXP_LIT), [nl(1)])])
-        }
+        PredIR::SetMem(e, set) => ap(
+            c(PPRED_EQ),
+            [set_bit(quote_set(set)?, *e), ap(c(PEXP_LIT), [nl(1)])],
+        ),
+        PredIR::SetNotMem(e, set) => ap(
+            c(PPRED_NEQ),
+            [set_bit(quote_set(set)?, *e), ap(c(PEXP_LIT), [nl(1)])],
+        ),
         // S ⊆ T ↦ Nat.beq (lor maskS maskT) maskT  (every bit of S is a bit of T).
         PredIR::SetSubseteq(a, b) => {
             let (qa, qb) = (quote_set(a)?, quote_set(b)?);
@@ -1097,9 +1173,15 @@ pub fn quote_pred(ir: &PredIR) -> Option<Expr> {
 
 /// Quote a concrete state tuple as a `List.{0} Nat` cons chain of `Nat` literals.
 pub fn quote_state(s: &[u64]) -> Expr {
-    let nil = ap(Expr::const_str_levels("List.nil", vec![Level::zero()]), [nat()]);
+    let nil = ap(
+        Expr::const_str_levels("List.nil", vec![Level::zero()]),
+        [nat()],
+    );
     s.iter().rev().fold(nil, |acc, v| {
-        ap(Expr::const_str_levels("List.cons", vec![Level::zero()]), [nat(), nl(*v), acc])
+        ap(
+            Expr::const_str_levels("List.cons", vec![Level::zero()]),
+            [nat(), nl(*v), acc],
+        )
     })
 }
 
@@ -1107,7 +1189,10 @@ pub fn quote_state(s: &[u64]) -> Expr {
 /// (a fold, not recursion in `|set|`: at the CoffeeCan scale the chain is thousands deep and a
 /// recursive builder would risk the Rust stack; the kernel side is already stack-safe).
 pub fn quote_state_set(set: &[Vec<u64>]) -> Expr {
-    let nil = ap(Expr::const_str_levels("List.nil", vec![Level::zero()]), [list_nat()]);
+    let nil = ap(
+        Expr::const_str_levels("List.nil", vec![Level::zero()]),
+        [list_nat()],
+    );
     set.iter().rev().fold(nil, |acc, s| {
         ap(
             Expr::const_str_levels("List.cons", vec![Level::zero()]),
@@ -1207,7 +1292,10 @@ pub(crate) fn kernel_eval_quoted_pred(quoted: &Expr, s: &[u64], sp: &[u64]) -> O
         return None;
     }
     let tc = TypeChecker::new(&renv.env);
-    kernel_bool_verdict(&tc, &ap(c(EVALP), [quoted.clone(), quote_state(s), quote_state(sp)]))
+    kernel_bool_verdict(
+        &tc,
+        &ap(c(EVALP), [quoted.clone(), quote_state(s), quote_state(sp)]),
+    )
 }
 
 /// Kernel-reduce the reflected implication `⟦quoted⟧(s,sp) ⇒ mem∈R` — i.e.
@@ -1399,7 +1487,10 @@ pub fn reflect_agrees_with_shallow(ir: &PredIR, s: &[u64], sp: &[u64]) -> Option
         return None;
     }
     let tc = TypeChecker::new(&renv.env);
-    let deep = kernel_bool_verdict(&tc, &ap(c(EVALP), [quoted, quote_state(s), quote_state(sp)]))?;
+    let deep = kernel_bool_verdict(
+        &tc,
+        &ap(c(EVALP), [quoted, quote_state(s), quote_state(sp)]),
+    )?;
     let shallow = kernel_bool_verdict(&tc, &crate::cleancic::embed_pred_ir(ir, s, sp))?;
     Some(deep == shallow)
 }
@@ -1455,7 +1546,10 @@ pub fn reflect_safety_over_reachable(
         match reflect_corroborate(safety_ir, s, s, true) {
             ReflectOutcome::Corroborated => {}
             ReflectOutcome::Disagree(msg) => {
-                return ReflectSafetyOutcome::NotSafe { state: s.clone(), detail: msg };
+                return ReflectSafetyOutcome::NotSafe {
+                    state: s.clone(),
+                    detail: msg,
+                };
             }
             ReflectOutcome::Unavailable(reason) => {
                 return ReflectSafetyOutcome::Inconclusive(format!("state {s:?}: {reason}"));
@@ -1637,14 +1731,19 @@ pub fn reflect_init_completeness_over_domain(
         match reflect_implies_mem(init_ir, s, s, s, reachable) {
             ReflectOutcome::Corroborated => {}
             ReflectOutcome::Disagree(detail) => {
-                return ReflectInitOutcome::NotComplete { s: s.clone(), detail };
+                return ReflectInitOutcome::NotComplete {
+                    s: s.clone(),
+                    detail,
+                };
             }
             ReflectOutcome::Unavailable(reason) => {
                 return ReflectInitOutcome::Inconclusive(format!("s={s:?}: {reason}"));
             }
         }
     }
-    ReflectInitOutcome::Complete { states: domain.len() }
+    ReflectInitOutcome::Complete {
+        states: domain.len(),
+    }
 }
 
 // ===========================================================================
@@ -1657,7 +1756,9 @@ pub fn reflect_init_completeness_over_domain(
 /// unboundedly — the obligation itself is rebuilt from re-derived data, never from the cert)
 /// while never starving a genuine obligation. Floor at the kernel default.
 fn reflect_subset_heartbeats(n_elems: usize) -> u32 {
-    let scaled = (n_elems as u64).saturating_mul(4096).saturating_add(1 << 21);
+    let scaled = (n_elems as u64)
+        .saturating_mul(4096)
+        .saturating_add(1 << 21);
     u32::try_from(scaled).unwrap_or(u32::MAX)
 }
 
@@ -1708,10 +1809,51 @@ fn reflect_accepts(renv: &ReflectEnv, term: &Expr, expected: &Expr, heartbeats: 
 pub fn reflect_certify_subset(xs: &[Vec<u64>], ys: &[Vec<u64>]) -> Option<Vec<u8>> {
     let renv = cached_env()?;
     let (ty, pf) = reflect_subset_bool_eq(xs, ys);
-    if !reflect_accepts(renv, &pf, &ty, reflect_subset_heartbeats(xs.len() + ys.len())) {
-        return None;
+    if reflect_accepts(
+        renv,
+        &pf,
+        &ty,
+        reflect_subset_heartbeats(xs.len() + ys.len()),
+    ) {
+        return crate::cleancic::expr_to_bytes(&pf);
     }
+    reflect_check_subset_partitioned(renv, xs, ys, &pf)?;
     crate::cleancic::expr_to_bytes(&pf)
+}
+
+/// LHS elements per fallback reflected-subset obligation. Each canonical LHS chunk is checked against
+/// the canonical RHS window spanning the same ordered values; the windows are literal slices of `ys`,
+/// so proving every `chunk ⊆ window` proves their union `xs ⊆ ys`. This keeps TokenRing's 46,656
+/// six-wide tuples below the per-term 2M-node boundary without trusting a membership verdict from Rust.
+const REFLECT_SUBSET_CHUNK_ELEMS: usize = 4_096;
+
+fn reflect_check_subset_partitioned(
+    renv: &ReflectEnv,
+    xs: &[Vec<u64>],
+    ys: &[Vec<u64>],
+    proof: &Expr,
+) -> Option<()> {
+    if xs.is_empty() {
+        let (ty, _) = reflect_subset_bool_eq(&[], &[]);
+        return reflect_accepts(renv, proof, &ty, reflect_subset_heartbeats(0)).then_some(());
+    }
+    for chunk in xs.chunks(REFLECT_SUBSET_CHUNK_ELEMS) {
+        let first = chunk.first()?;
+        let last = chunk.last()?;
+        let lo = ys.partition_point(|y| y < first);
+        let hi = ys.partition_point(|y| y <= last);
+        let window = &ys[lo..hi];
+        let (ty, _) = reflect_subset_bool_eq(chunk, window);
+        if !reflect_accepts(
+            renv,
+            proof,
+            &ty,
+            reflect_subset_heartbeats(chunk.len() + window.len()),
+        ) {
+            return None;
+        }
+    }
+    Some(())
 }
 
 /// RE-CHECK a stored reflected-subset proof against the obligation REBUILT from the re-derived
@@ -1725,7 +1867,15 @@ pub fn reflect_verify_subset(xs: &[Vec<u64>], ys: &[Vec<u64>], bytes: &[u8]) -> 
         return false;
     };
     let (ty, _) = reflect_subset_bool_eq(xs, ys);
-    reflect_accepts(renv, &term, &ty, reflect_subset_heartbeats(xs.len() + ys.len()))
+    if reflect_accepts(
+        renv,
+        &term,
+        &ty,
+        reflect_subset_heartbeats(xs.len() + ys.len()),
+    ) {
+        return true;
+    }
+    reflect_check_subset_partitioned(renv, xs, ys, &term).is_some()
 }
 
 // ===========================================================================
@@ -1778,7 +1928,10 @@ mod tests {
     /// A 2-column obligation exercising the Lt / Implies / Unchanged arms:
     /// `x < 5 ∧ ((3 ≤ y) ⇒ y < y') ∧ UNCHANGED x`.
     fn two_col_ir() -> PredIR {
-        band(lt(v(0), l(5)), band(imp(leq(l(3), v(1)), lt(v(1), p(1))), PredIR::Unchanged(0)))
+        band(
+            lt(v(0), l(5)),
+            band(imp(leq(l(3), v(1)), lt(v(1), p(1))), PredIR::Unchanged(0)),
+        )
     }
 
     /// (a) The env admits: every ledger entry went through a CHECKED path — the ledger is
@@ -1787,7 +1940,12 @@ mod tests {
     #[test]
     fn reflect_env_builds_with_fully_checked_ledger() {
         let ledger = env_ledger().expect("reflect env must build");
-        let entry = |n: &str| ledger.iter().find(|(name, _)| name == n).map(|(_, e)| e.clone());
+        let entry = |n: &str| {
+            ledger
+                .iter()
+                .find(|(name, _)| name == n)
+                .map(|(_, e)| e.clone())
+        };
         assert_eq!(entry(PEXP), Some(ReflectLedgerEntry::Inductive));
         assert_eq!(entry(PPRED), Some(ReflectLedgerEntry::Inductive));
         for ctor in PEXP_CTORS.iter().chain(PPRED_CTORS.iter()) {
@@ -1812,7 +1970,10 @@ mod tests {
     fn reflect_corroborates_true_and_disagrees_false_two_column() {
         let ir = two_col_ir();
         // s = (x=2, y=3), sp = (x=2, y=4): 2<5 ∧ (3≤3 ⇒ 3<4) ∧ x unchanged ⇒ TRUE.
-        assert_eq!(reflect_corroborate(&ir, &[2, 3], &[2, 4], true), ReflectOutcome::Corroborated);
+        assert_eq!(
+            reflect_corroborate(&ir, &[2, 3], &[2, 4], true),
+            ReflectOutcome::Corroborated
+        );
         // Expecting FALSE of a true obligation is a definitive disagreement, not Unavailable.
         assert!(matches!(
             reflect_corroborate(&ir, &[2, 3], &[2, 4], false),
@@ -1823,7 +1984,10 @@ mod tests {
             reflect_corroborate(&ir, &[2, 3], &[9, 4], true),
             ReflectOutcome::Disagree(_)
         ));
-        assert_eq!(reflect_corroborate(&ir, &[2, 3], &[9, 4], false), ReflectOutcome::Corroborated);
+        assert_eq!(
+            reflect_corroborate(&ir, &[2, 3], &[9, 4], false),
+            ReflectOutcome::Corroborated
+        );
     }
 
     /// (c) Out-of-scope IR (a Set node) is `Unavailable` — declined by the quoter,
@@ -1853,12 +2017,18 @@ mod tests {
                 c(PEXP),
                 pi(
                     c(PEXP),
-                    pi(list_nat(), pi(list_nat(), ap(c1("Eq"), [ty.clone(), lhs, rhs.clone()]))),
+                    pi(
+                        list_nat(),
+                        pi(list_nat(), ap(c1("Eq"), [ty.clone(), lhs, rhs.clone()])),
+                    ),
                 ),
             );
             let proof = lam(
                 c(PEXP),
-                lam(c(PEXP), lam(list_nat(), lam(list_nat(), ap(c1("Eq.refl"), [ty, rhs])))),
+                lam(
+                    c(PEXP),
+                    lam(list_nat(), lam(list_nat(), ap(c1("Eq.refl"), [ty, rhs]))),
+                ),
             );
             tc.check_type(&proof, &goal)
         };
@@ -1890,13 +2060,26 @@ mod tests {
         let rhs = ap(c("Bool.and"), [pa(), pb()]);
         let goal = pi(
             c(PPRED),
-            pi(c(PPRED), pi(list_nat(), pi(list_nat(), ap(c1("Eq"), [boolc(), lhs, rhs.clone()])))),
+            pi(
+                c(PPRED),
+                pi(
+                    list_nat(),
+                    pi(list_nat(), ap(c1("Eq"), [boolc(), lhs, rhs.clone()])),
+                ),
+            ),
         );
         let proof = lam(
             c(PPRED),
-            lam(c(PPRED), lam(list_nat(), lam(list_nat(), ap(c1("Eq.refl"), [boolc(), rhs])))),
+            lam(
+                c(PPRED),
+                lam(
+                    list_nat(),
+                    lam(list_nat(), ap(c1("Eq.refl"), [boolc(), rhs])),
+                ),
+            ),
         );
-        tc.check_type(&proof, &goal).expect("and equation must be definitional");
+        tc.check_type(&proof, &goal)
+            .expect("and equation must be definitional");
     }
 
     /// (d′) AST-direct ctor DEFINITIONAL equations (design pivot increment 1): `inRange` and
@@ -1913,10 +2096,16 @@ mod tests {
             let evx = || ap(c(EVALV), [bv(4), bv(1), bv(0)]);
             let evlo = ap(c(EVALV), [bv(3), bv(1), bv(0)]);
             let evhi = ap(c(EVALV), [bv(2), bv(1), bv(0)]);
-            let lhs = ap(c(EVALP), [ap(c(PPRED_INRANGE), [bv(4), bv(3), bv(2)]), bv(1), bv(0)]);
+            let lhs = ap(
+                c(EVALP),
+                [ap(c(PPRED_INRANGE), [bv(4), bv(3), bv(2)]), bv(1), bv(0)],
+            );
             let rhs = ap(
                 c("Bool.and"),
-                [ap(c("Nat.ble"), [evlo, evx()]), ap(c("Nat.ble"), [evx(), evhi])],
+                [
+                    ap(c("Nat.ble"), [evlo, evx()]),
+                    ap(c("Nat.ble"), [evx(), evhi]),
+                ],
             );
             let goal = pi(
                 c(PEXP),
@@ -1924,7 +2113,10 @@ mod tests {
                     c(PEXP),
                     pi(
                         c(PEXP),
-                        pi(list_nat(), pi(list_nat(), ap(c1("Eq"), [boolc(), lhs, rhs.clone()]))),
+                        pi(
+                            list_nat(),
+                            pi(list_nat(), ap(c1("Eq"), [boolc(), lhs, rhs.clone()])),
+                        ),
                     ),
                 ),
             );
@@ -1934,7 +2126,10 @@ mod tests {
                     c(PEXP),
                     lam(
                         c(PEXP),
-                        lam(list_nat(), lam(list_nat(), ap(c1("Eq.refl"), [boolc(), rhs]))),
+                        lam(
+                            list_nat(),
+                            lam(list_nat(), ap(c1("Eq.refl"), [boolc(), rhs])),
+                        ),
                     ),
                 ),
             );
@@ -1949,8 +2144,14 @@ mod tests {
             let evt = ap(c(EVALV), [bv(3), bv(1), bv(0)]);
             let evf = ap(c(EVALV), [bv(2), bv(1), bv(0)]);
             let evc = ap(c(EVALP), [bv(4), bv(1), bv(0)]);
-            let lhs =
-                ap(c(EVALP), [ap(c(PPRED_EQITE), [bv(5), bv(4), bv(3), bv(2)]), bv(1), bv(0)]);
+            let lhs = ap(
+                c(EVALP),
+                [
+                    ap(c(PPRED_EQITE), [bv(5), bv(4), bv(3), bv(2)]),
+                    bv(1),
+                    bv(0),
+                ],
+            );
             let rhs = ap(
                 c("Nat.beq"),
                 [
@@ -1985,7 +2186,10 @@ mod tests {
                         c(PEXP),
                         lam(
                             c(PEXP),
-                            lam(list_nat(), lam(list_nat(), ap(c1("Eq.refl"), [boolc(), rhs]))),
+                            lam(
+                                list_nat(),
+                                lam(list_nat(), ap(c1("Eq.refl"), [boolc(), rhs])),
+                            ),
                         ),
                     ),
                 ),
@@ -2074,7 +2278,11 @@ mod tests {
         // NEGATIVE CONTROL: Eq.refl at TRUE for the non-member must be REJECTED.
         let bad_ty = ap(
             c1("Eq"),
-            [boolc(), ap(c(MEM), [quote_state(&[1, 5]), quote_state_set(&s)]), c("Bool.true")],
+            [
+                boolc(),
+                ap(c(MEM), [quote_state(&[1, 5]), quote_state_set(&s)]),
+                c("Bool.true"),
+            ],
         );
         let refl_true = ap(c1("Eq.refl"), [boolc(), c("Bool.true")]);
         assert!(
@@ -2106,7 +2314,10 @@ mod tests {
         // declined (false) even though it is a set-subset — fail-closed, never unsound.
         let out_of_order: Vec<Vec<u64>> = vec![vec![2, 3], vec![0, 5]];
         assert_eq!(
-            verdict(ap(c(SUBSEQ), [quote_state_set(&out_of_order), quote_state_set(&s)])),
+            verdict(ap(
+                c(SUBSEQ),
+                [quote_state_set(&out_of_order), quote_state_set(&s)]
+            )),
             Some(false),
             "out-of-order xs must fail closed (sortedness is the completeness precondition)"
         );
@@ -2124,29 +2335,61 @@ mod tests {
         let r: Vec<Vec<u64>> = vec![vec![0, 5], vec![1, 4], vec![2, 3]];
         let xs: Vec<Vec<u64>> = vec![vec![0, 5], vec![2, 3]];
         let bytes = reflect_certify_subset(&xs, &r).expect("genuine subset must certify");
-        assert!(reflect_verify_subset(&xs, &r, &bytes), "round-trip verifies");
+        assert!(
+            reflect_verify_subset(&xs, &r, &bytes),
+            "round-trip verifies"
+        );
         // Superset swap: the same bytes cannot prove R ⊆ xs.
-        assert!(!reflect_verify_subset(&r, &xs, &bytes), "superset swap must reject");
+        assert!(
+            !reflect_verify_subset(&r, &xs, &bytes),
+            "superset swap must reject"
+        );
         // Mutated bytes: garbage and a WRONG-CONSTANT proof term both reject.
         assert!(!reflect_verify_subset(&xs, &r, b"garbage"));
         let wrong = crate::cleancic::expr_to_bytes(&ap(c1("Eq.refl"), [boolc(), c("Bool.false")]))
             .expect("serialize");
-        assert!(!reflect_verify_subset(&xs, &r, &wrong), "Eq.refl at false must reject");
+        assert!(
+            !reflect_verify_subset(&xs, &r, &wrong),
+            "Eq.refl at false must reject"
+        );
         // A non-subset never certifies (the kernel reduces Subseq to false — fail-closed).
         let non: Vec<Vec<u64>> = vec![vec![9, 9]];
         assert!(reflect_certify_subset(&non, &r).is_none());
     }
 
-    /// SCALE PROBE (run explicitly: `cargo test ... reflect_subset_scale_probe -- --ignored
-    /// --nocapture`): the reflected subset legs at the CoffeeCan-100 magnitude — |R| = 5151
-    /// 1-wide tuples, |xs| = 5050 — certify + verify within the scaled heartbeat budget and a
-    /// debug-build-friendly wall clock. This is the evidence gating the
-    /// `DEFAULT_FIXPOINT_STATE_CAP` raise.
+    /// The resource fallback proves each canonical LHS chunk against a literal ordered window of the
+    /// RHS. Pin both directions directly: complete chunk coverage accepts, while one foreign tuple is
+    /// rejected even though the stored proof token is the same constant `Eq.refl` used by real certs.
     #[test]
-    #[ignore = "scale probe — run explicitly with --ignored"]
+    fn reflect_subset_partition_fallback_is_exact() {
+        let renv = cached_env().expect("reflect env");
+        let ys: Vec<Vec<u64>> = (0..32u64).map(|i| vec![i, 31 - i]).collect();
+        let xs: Vec<Vec<u64>> = ys.iter().step_by(2).cloned().collect();
+        let (_, proof) = reflect_subset_bool_eq(&[], &[]);
+        assert!(
+            reflect_check_subset_partitioned(renv, &xs, &ys, &proof).is_some(),
+            "every partition is a genuine subset of its RHS window"
+        );
+        let mut bad = xs;
+        bad.push(vec![99, 99]);
+        bad.sort_unstable();
+        assert!(
+            reflect_check_subset_partitioned(renv, &bad, &ys, &proof).is_none(),
+            "a foreign tuple must refute its partition"
+        );
+    }
+
+    /// Required scale regression: the reflected subset legs at the CoffeeCan-100 magnitude —
+    /// |R| = 5151 1-wide tuples, |xs| = 5050 — certify + verify within the scaled heartbeat
+    /// budget and a debug-build-friendly wall clock. This is the evidence gating the
+    /// `DEFAULT_FIXPOINT_STATE_CAP` raise, so it belongs in the normal suite.
+    #[test]
     fn reflect_subset_scale_probe() {
         let ys: Vec<Vec<u64>> = (0..5151u64).map(|v| vec![v]).collect();
-        let xs: Vec<Vec<u64>> = (0..5151u64).filter(|v| v % 51 != 0).map(|v| vec![v]).collect();
+        let xs: Vec<Vec<u64>> = (0..5151u64)
+            .filter(|v| v % 51 != 0)
+            .map(|v| vec![v])
+            .collect();
         let t0 = std::time::Instant::now();
         let bytes = reflect_certify_subset(&xs, &ys).expect("5K-scale subset must certify");
         let mint = t0.elapsed();
@@ -2168,11 +2411,20 @@ mod tests {
     #[test]
     fn reflect_agrees_with_shallow_embedder() {
         let ir = two_col_ir();
-        assert_eq!(reflect_agrees_with_shallow(&ir, &[2, 3], &[2, 4]), Some(true));
-        assert_eq!(reflect_agrees_with_shallow(&ir, &[2, 3], &[9, 4]), Some(true));
+        assert_eq!(
+            reflect_agrees_with_shallow(&ir, &[2, 3], &[2, 4]),
+            Some(true)
+        );
+        assert_eq!(
+            reflect_agrees_with_shallow(&ir, &[2, 3], &[9, 4]),
+            Some(true)
+        );
         let set_ir = out_of_frag();
         assert_eq!(reflect_agrees_with_shallow(&set_ir, &[0], &[0]), None);
-        assert_eq!(reflect_agrees_with_shallow(&lt(v(5), l(1)), &[2, 3], &[2, 3]), None);
+        assert_eq!(
+            reflect_agrees_with_shallow(&lt(v(5), l(1)), &[2, 3], &[2, 3]),
+            None
+        );
     }
 
     // ── SET-fragment extension (bitmask Set*/SetCard/CountFold) — the kernel is the arbiter ─────────
@@ -2199,8 +2451,16 @@ mod tests {
         corr(&PredIR::SetEq(SetIR::Var(0), SetIR::Lit(4)), &[5], false);
         corr(&PredIR::SetNeq(SetIR::Var(0), SetIR::Lit(4)), &[5], true);
         // S ⊆ T : {0}⊆{0,2} true; {1}⊄{0,2} false.
-        corr(&PredIR::SetSubseteq(SetIR::Lit(1), SetIR::Var(0)), &[5], true);
-        corr(&PredIR::SetSubseteq(SetIR::Lit(2), SetIR::Var(0)), &[5], false);
+        corr(
+            &PredIR::SetSubseteq(SetIR::Lit(1), SetIR::Var(0)),
+            &[5],
+            true,
+        );
+        corr(
+            &PredIR::SetSubseteq(SetIR::Lit(2), SetIR::Var(0)),
+            &[5],
+            false,
+        );
         // Cup / Cap: {0}∪{1}={0,1}=3 ; {1,2}∩{0,2}={2}=4.
         corr(
             &PredIR::SetEq(
@@ -2239,7 +2499,13 @@ mod tests {
     #[test]
     fn reflect_setcard_popcount_definitional() {
         let card_eq = |mask: u64, k: u64, want: bool| {
-            let ir = PredIR::Eq(ValIR::SetCard { set: SetIR::Var(0), universe: 4 }, ValIR::Lit(k));
+            let ir = PredIR::Eq(
+                ValIR::SetCard {
+                    set: SetIR::Var(0),
+                    universe: 4,
+                },
+                ValIR::Lit(k),
+            );
             assert_eq!(
                 reflect_corroborate(&ir, &[mask], &[mask], want),
                 ReflectOutcome::Corroborated,
@@ -2254,7 +2520,13 @@ mod tests {
         card_eq(15, 3, false);
         // Cardinality inside an ORDERING: |S| ≤ 2 holds for mask 5, fails for mask 7 (=3 bits).
         let leq2 = |mask: u64, want: bool| {
-            let ir = PredIR::Leq(ValIR::SetCard { set: SetIR::Var(0), universe: 4 }, ValIR::Lit(2));
+            let ir = PredIR::Leq(
+                ValIR::SetCard {
+                    set: SetIR::Var(0),
+                    universe: 4,
+                },
+                ValIR::Lit(2),
+            );
             assert_eq!(
                 reflect_corroborate(&ir, &[mask], &[mask], want),
                 ReflectOutcome::Corroborated
@@ -2271,7 +2543,12 @@ mod tests {
     fn reflect_countfold_counts_definitional() {
         let terms = vec![eqp(v(0), l(1)), eqp(v(1), l(1)), eqp(v(2), l(1))];
         let count_eq = |s: &[u64], k: u64, want: bool| {
-            let ir = PredIR::Eq(ValIR::CountFold { terms: terms.clone() }, ValIR::Lit(k));
+            let ir = PredIR::Eq(
+                ValIR::CountFold {
+                    terms: terms.clone(),
+                },
+                ValIR::Lit(k),
+            );
             assert_eq!(
                 reflect_corroborate(&ir, s, s, want),
                 ReflectOutcome::Corroborated,
@@ -2309,8 +2586,20 @@ mod tests {
                     SetIR::Cap(Box::new(SetIR::Var(0)), Box::new(SetIR::Lit(6))),
                     SetIR::Lit(m & 6),
                 ),
-                PredIR::Eq(ValIR::SetCard { set: SetIR::Var(0), universe: 4 }, ValIR::Lit(2)),
-                PredIR::Leq(ValIR::SetCard { set: SetIR::Var(0), universe: 4 }, ValIR::Lit(2)),
+                PredIR::Eq(
+                    ValIR::SetCard {
+                        set: SetIR::Var(0),
+                        universe: 4,
+                    },
+                    ValIR::Lit(2),
+                ),
+                PredIR::Leq(
+                    ValIR::SetCard {
+                        set: SetIR::Var(0),
+                        universe: 4,
+                    },
+                    ValIR::Lit(2),
+                ),
             ];
             for ir in &preds {
                 assert_eq!(
@@ -2330,8 +2619,12 @@ mod tests {
             for b in 0..2u64 {
                 for cc in 0..2u64 {
                     for k in 0..4u64 {
-                        let ir =
-                            PredIR::Eq(ValIR::CountFold { terms: terms.clone() }, ValIR::Lit(k));
+                        let ir = PredIR::Eq(
+                            ValIR::CountFold {
+                                terms: terms.clone(),
+                            },
+                            ValIR::Lit(k),
+                        );
                         assert_eq!(
                             reflect_agrees_with_shallow(&ir, &[a, b, cc], &[a, b, cc]),
                             Some(true),
@@ -2350,9 +2643,15 @@ mod tests {
         // `And(Leq(Lit(1), Var(0)), Leq(Var(0), Lit(12)))` — exactly HourClock's recognized IR.
         let safety = band(leq(l(1), v(0)), leq(v(0), l(12)));
         let r: Vec<Vec<u64>> = (1..=12u64).map(|h| vec![h]).collect();
-        assert_eq!(reflect_safety_over_reachable(&safety, &r), ReflectSafetyOutcome::Safe);
+        assert_eq!(
+            reflect_safety_over_reachable(&safety, &r),
+            ReflectSafetyOutcome::Safe
+        );
         // Vacuous: an empty reachable set is `Safe` (no state falsifies the invariant).
-        assert_eq!(reflect_safety_over_reachable(&safety, &[]), ReflectSafetyOutcome::Safe);
+        assert_eq!(
+            reflect_safety_over_reachable(&safety, &[]),
+            ReflectSafetyOutcome::Safe
+        );
     }
 
     /// THE DECISIVE SOUNDNESS TEST: a VIOLATED invariant `hr < 12` over a reachable set that
@@ -2369,7 +2668,10 @@ mod tests {
         // Restricting R to the states that DO satisfy `hr < 12` flips it back to Safe — the
         // outcome tracks the actual states, not the predicate alone.
         let r_ok: Vec<Vec<u64>> = (1..=11u64).map(|h| vec![h]).collect();
-        assert_eq!(reflect_safety_over_reachable(&bad, &r_ok), ReflectSafetyOutcome::Safe);
+        assert_eq!(
+            reflect_safety_over_reachable(&bad, &r_ok),
+            ReflectSafetyOutcome::Safe
+        );
     }
 
     /// The reflected eval and the shallow embedder AGREE on the HourClock safety obligation across
@@ -2380,6 +2682,7 @@ mod tests {
     fn reflect_safety_agrees_with_shallow_on_hourclock() {
         let ok = band(leq(l(1), v(0)), leq(v(0), l(12))); // 1 ≤ hr ∧ hr ≤ 12
         let bad = lt(v(0), l(12)); // hr < 12
+
         // Both the true invariant and the violated one, over every state hr ∈ 1..=13.
         for hr in 1..=13u64 {
             for ir in [&ok, &bad] {
@@ -2419,9 +2722,15 @@ mod tests {
         let r: Vec<Vec<u64>> = vec![vec![1], vec![2]];
         // Eq(x,2) at s=[2], mem=[2]∈R: antecedent TRUE, member ⇒ Corroborated.
         let ir = eqp(v(0), l(2));
-        assert_eq!(reflect_implies_mem(&ir, &[2], &[2], &[2], &r), ReflectOutcome::Corroborated);
+        assert_eq!(
+            reflect_implies_mem(&ir, &[2], &[2], &[2], &r),
+            ReflectOutcome::Corroborated
+        );
         // Eq(x,2) at s=[3], mem=[3]∉R: antecedent FALSE ⇒ implication VACUOUSLY true.
-        assert_eq!(reflect_implies_mem(&ir, &[3], &[3], &[3], &r), ReflectOutcome::Corroborated);
+        assert_eq!(
+            reflect_implies_mem(&ir, &[3], &[3], &[3], &r),
+            ReflectOutcome::Corroborated
+        );
         // Eq(x,3) at s=[3], mem=[3]∉R: antecedent TRUE but non-member ⇒ Disagree (Bool.false).
         let ir2 = eqp(v(0), l(3));
         assert!(matches!(
@@ -2466,7 +2775,10 @@ mod tests {
                 PredIR::Neq(v(0), l(12)),
                 PredIR::Eq(p(0), ValIR::Add(Box::new(v(0)), Box::new(l(1)))),
             )),
-            Box::new(band(PredIR::Not(Box::new(PredIR::Neq(v(0), l(12)))), PredIR::Eq(p(0), l(1)))),
+            Box::new(band(
+                PredIR::Not(Box::new(PredIR::Neq(v(0), l(12)))),
+                PredIR::Eq(p(0), l(1)),
+            )),
         );
         let domain: Vec<Vec<u64>> = (0..=13u64).map(|h| vec![h]).collect();
         let r: Vec<Vec<u64>> = (1..=12u64).map(|h| vec![h]).collect();

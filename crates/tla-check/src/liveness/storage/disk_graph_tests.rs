@@ -5,24 +5,19 @@
 //! Tests for [`DiskGraphStore`].
 
 use super::*;
-use crate::liveness::checker::CheckMask;
+use crate::liveness::checker::{ActionCheckMatrix, CheckMask};
 use crate::state::Fingerprint;
 
 fn make_node(fp: u64, tidx: usize) -> BehaviorGraphNode {
     BehaviorGraphNode::new(Fingerprint(fp), tidx)
 }
 
-fn make_info(
-    successors: Vec<BehaviorGraphNode>,
-    parent: Option<BehaviorGraphNode>,
-    depth: usize,
-) -> NodeInfo {
+fn make_info(successors: Vec<BehaviorGraphNode>, parent: Option<BehaviorGraphNode>) -> NodeInfo {
     NodeInfo {
         successors,
-        parent,
-        depth,
+        trace_parent: parent.map(Box::new),
         state_check_mask: CheckMask::new(),
-        action_check_masks: Vec::new(),
+        action_check_masks: ActionCheckMatrix::new(),
     }
 }
 
@@ -32,16 +27,15 @@ fn test_append_and_read_single_node() {
     let mut store = DiskGraphStore::with_capacity(dir.path(), 64).unwrap();
 
     let node = make_node(42, 0);
-    let info = make_info(vec![], None, 0);
+    let info = make_info(vec![], None);
 
     store.append_node(node, &info).unwrap();
     assert_eq!(store.node_count(), 1);
     assert!(store.contains(node));
 
     let read_info = store.read_node(node).unwrap().unwrap();
-    assert_eq!(read_info.depth, 0);
     assert!(read_info.successors.is_empty());
-    assert!(read_info.parent.is_none());
+    assert!(read_info.trace_parent.is_none());
 }
 
 #[test]
@@ -54,15 +48,14 @@ fn test_append_and_read_with_successors() {
     let succ_a = make_node(30, 0);
     let succ_b = make_node(40, 2);
 
-    let parent_info = make_info(vec![child], None, 0);
-    let child_info = make_info(vec![succ_a, succ_b], Some(parent), 1);
+    let parent_info = make_info(vec![child], None);
+    let child_info = make_info(vec![succ_a, succ_b], Some(parent));
 
     store.append_node(parent, &parent_info).unwrap();
     store.append_node(child, &child_info).unwrap();
 
     let read_child = store.read_node(child).unwrap().unwrap();
-    assert_eq!(read_child.parent, Some(parent));
-    assert_eq!(read_child.depth, 1);
+    assert_eq!(read_child.trace_parent.as_deref(), Some(&parent));
     assert_eq!(read_child.successors.len(), 2);
     assert_eq!(read_child.successors[0], succ_a);
     assert_eq!(read_child.successors[1], succ_b);
@@ -89,7 +82,8 @@ fn test_multiple_nodes_random_access() {
         .collect();
 
     for (i, &node) in nodes.iter().enumerate() {
-        let info = make_info(vec![], None, i);
+        let identity = make_node(10_000 + i as u64, i % 7);
+        let info = make_info(vec![identity], None);
         store.append_node(node, &info).unwrap();
     }
     assert_eq!(store.node_count(), 50);
@@ -97,7 +91,10 @@ fn test_multiple_nodes_random_access() {
     // Read in reverse order (forces disk reads for cache misses).
     for (i, &node) in nodes.iter().enumerate().rev() {
         let read_info = store.read_node(node).unwrap().unwrap();
-        assert_eq!(read_info.depth, i);
+        assert_eq!(
+            read_info.successors,
+            vec![make_node(10_000 + i as u64, i % 7)]
+        );
     }
 }
 
@@ -107,14 +104,13 @@ fn test_cache_hit_avoids_disk_read() {
     let mut store = DiskGraphStore::with_capacity(dir.path(), 64).unwrap();
 
     let node = make_node(42, 0);
-    let info = make_info(vec![make_node(99, 1)], None, 7);
+    let info = make_info(vec![make_node(99, 1)], None);
     store.append_node(node, &info).unwrap();
 
     // First read populates cache via append.
     // Second read should hit cache.
     let read1 = store.read_node(node).unwrap().unwrap();
     let read2 = store.read_node(node).unwrap().unwrap();
-    assert_eq!(read1.depth, read2.depth);
     assert_eq!(read1.successors, read2.successors);
 }
 
@@ -151,10 +147,9 @@ fn test_with_check_masks() {
 
     let info = NodeInfo {
         successors: vec![succ],
-        parent: None,
-        depth: 0,
+        trace_parent: None,
         state_check_mask: state_mask,
-        action_check_masks: vec![action_mask],
+        action_check_masks: vec![action_mask].into(),
     };
 
     store.append_node(node, &info).unwrap();
@@ -166,7 +161,7 @@ fn test_with_check_masks() {
     assert!(read_info.state_check_mask.get(3));
     assert!(read_info.state_check_mask.get(64));
     assert!(!read_info.state_check_mask.get(4));
-    assert!(read_info.action_check_masks[0].get(7));
+    assert!(read_info.action_check_masks.get(0).unwrap().get(7));
 }
 
 #[test]
@@ -175,10 +170,8 @@ fn test_update_node_rewrites_pointer_and_preserves_count() {
     let mut store = DiskGraphStore::with_capacity(dir.path(), 64).unwrap();
 
     let node = make_node(42, 0);
-    store
-        .append_node(node, &make_info(vec![], None, 0))
-        .unwrap();
-    let mut updated = make_info(vec![make_node(7, 1)], None, 9);
+    store.append_node(node, &make_info(vec![], None)).unwrap();
+    let mut updated = make_info(vec![make_node(7, 1)], None);
     updated.state_check_mask.set(3);
 
     store.update_node(node, &updated).unwrap();
@@ -187,7 +180,6 @@ fn test_update_node_rewrites_pointer_and_preserves_count() {
     assert_eq!(store.all_nodes(), &[node]);
 
     let read_info = store.read_node(node).unwrap().unwrap();
-    assert_eq!(read_info.depth, 9);
     assert_eq!(read_info.successors, vec![make_node(7, 1)]);
     assert!(read_info.state_check_mask.get(3));
 }
@@ -200,22 +192,15 @@ fn test_update_node_succeeds_at_pointer_table_load_limit() {
     let node_a = make_node(11, 0);
     let node_b = make_node(22, 0);
     let node_c = make_node(33, 0);
-    store
-        .append_node(node_a, &make_info(vec![], None, 0))
-        .unwrap();
-    store
-        .append_node(node_b, &make_info(vec![], None, 1))
-        .unwrap();
-    store
-        .append_node(node_c, &make_info(vec![], None, 2))
-        .unwrap();
+    store.append_node(node_a, &make_info(vec![], None)).unwrap();
+    store.append_node(node_b, &make_info(vec![], None)).unwrap();
+    store.append_node(node_c, &make_info(vec![], None)).unwrap();
 
-    let updated = make_info(vec![make_node(44, 1)], Some(node_a), 7);
+    let updated = make_info(vec![make_node(44, 1)], Some(node_a));
     store.update_node(node_b, &updated).unwrap();
 
     let read_info = store.read_node(node_b).unwrap().unwrap();
-    assert_eq!(read_info.parent, Some(node_a));
-    assert_eq!(read_info.depth, 7);
+    assert_eq!(read_info.trace_parent.as_deref(), Some(&node_a));
     assert_eq!(read_info.successors, vec![make_node(44, 1)]);
     assert_eq!(store.node_count(), 3);
 }
@@ -226,7 +211,7 @@ fn test_flush() {
     let mut store = DiskGraphStore::with_capacity(dir.path(), 64).unwrap();
 
     let node = make_node(42, 0);
-    let info = make_info(vec![], None, 0);
+    let info = make_info(vec![], None);
     store.append_node(node, &info).unwrap();
 
     // Flush should not error.
@@ -244,21 +229,29 @@ fn test_same_fp_different_tidx() {
     let node_c = make_node(42, 2);
 
     store
-        .append_node(node_a, &make_info(vec![], None, 0))
+        .append_node(node_a, &make_info(vec![make_node(100, 0)], None))
         .unwrap();
     store
-        .append_node(node_b, &make_info(vec![], None, 1))
+        .append_node(node_b, &make_info(vec![make_node(101, 0)], None))
         .unwrap();
     store
-        .append_node(node_c, &make_info(vec![], None, 2))
+        .append_node(node_c, &make_info(vec![make_node(102, 0)], None))
         .unwrap();
 
     assert_eq!(store.node_count(), 3);
 
-    // Each has a distinct record.
-    assert_eq!(store.read_node(node_a).unwrap().unwrap().depth, 0);
-    assert_eq!(store.read_node(node_b).unwrap().unwrap().depth, 1);
-    assert_eq!(store.read_node(node_c).unwrap().unwrap().depth, 2);
+    assert_eq!(
+        store.read_node(node_a).unwrap().unwrap().successors,
+        vec![make_node(100, 0)]
+    );
+    assert_eq!(
+        store.read_node(node_b).unwrap().unwrap().successors,
+        vec![make_node(101, 0)]
+    );
+    assert_eq!(
+        store.read_node(node_c).unwrap().unwrap().successors,
+        vec![make_node(102, 0)]
+    );
 }
 
 #[test]
@@ -275,9 +268,7 @@ fn test_dense_id_matches_all_nodes_position() {
         make_node(40, 0),
     ];
     for node in nodes {
-        store
-            .append_node(node, &make_info(vec![], None, 0))
-            .unwrap();
+        store.append_node(node, &make_info(vec![], None)).unwrap();
     }
 
     // dense_id_of(all_nodes()[i]) == Some(i) — the core Tarjan invariant.
@@ -294,7 +285,7 @@ fn test_dense_id_matches_all_nodes_position() {
     let node_c = make_node(20, 0); // dense id 2
     assert_eq!(store.dense_id_of(node_c), Some(2));
     store
-        .update_node(node_c, &make_info(vec![make_node(40, 0)], None, 5))
+        .update_node(node_c, &make_info(vec![make_node(40, 0)], None))
         .unwrap();
     assert_eq!(store.dense_id_of(node_c), Some(2));
     // Every other node's dense id is unchanged as well.
@@ -314,9 +305,9 @@ fn test_store_grows_ptr_table_and_preserves_reads_and_dense_ids() {
     let n = 300u64;
     for i in 0..n {
         let node = make_node(i + 1, (i % 4) as usize);
-        // depth encodes identity so we can verify the record survived rehash.
+        let identity = make_node(20_000 + i, (i % 5) as usize);
         store
-            .append_node(node, &make_info(vec![], None, i as usize))
+            .append_node(node, &make_info(vec![identity], None))
             .unwrap();
     }
     assert_eq!(store.node_count(), n as usize);
@@ -326,7 +317,10 @@ fn test_store_grows_ptr_table_and_preserves_reads_and_dense_ids() {
         // dense id == append position, stable across all the intervening grows.
         assert_eq!(store.dense_id_of(node), Some(i as u32));
         let info = store.read_node(node).unwrap().unwrap();
-        assert_eq!(info.depth, i as usize);
+        assert_eq!(
+            info.successors,
+            vec![make_node(20_000 + i, (i % 5) as usize)]
+        );
     }
 
     // all_nodes ordering still matches dense ids after growth.

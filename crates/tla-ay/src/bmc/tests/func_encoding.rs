@@ -16,6 +16,31 @@ fn bmc_array(k: usize) -> BmcTranslator {
     BmcTranslator::new_with_arrays(k).unwrap()
 }
 
+fn func_ident(name: &str) -> Spanned<Expr> {
+    spanned(Expr::Ident(
+        name.to_string(),
+        tla_core::name_intern::NameId::INVALID,
+    ))
+}
+
+fn int_expr(value: i64) -> Spanned<Expr> {
+    spanned(Expr::Int(num_bigint::BigInt::from(value)))
+}
+
+/// Declare an Int-keyed function with a statically exact finite DOMAIN.
+/// Whole-function equality is only sound when the encoder has this complete
+/// key cover; `declare_func_var` intentionally represents an unknown domain.
+fn declare_exact_int_func(bmc: &mut BmcTranslator, name: &str, keys: &[i64], range: TlaSort) {
+    bmc.declare_var(
+        name,
+        TlaSort::Function {
+            domain_keys: keys.iter().map(|key| format!("int:{key}")).collect(),
+            range: Box::new(range),
+        },
+    )
+    .unwrap();
+}
+
 // --- declare_func_var ---
 
 #[cfg_attr(test, ntest::timeout(10000))]
@@ -666,7 +691,7 @@ fn test_bmc_func_except_nested_path_scalar_range_errors() {
 #[test]
 fn test_bmc_func_except_via_eq_dispatch() {
     let mut bmc = bmc_array(1);
-    bmc.declare_func_var("f", TlaSort::Int).unwrap();
+    declare_exact_int_func(&mut bmc, "f", &[1], TlaSort::Int);
 
     // Step 0: set f[1] = 10
     bmc.current_step = 0;
@@ -725,7 +750,7 @@ fn test_bmc_func_except_via_eq_dispatch() {
 #[test]
 fn test_bmc_func_except_via_eq_preserves_unchanged_keys() {
     let mut bmc = bmc_array(1);
-    bmc.declare_func_var("f", TlaSort::Int).unwrap();
+    declare_exact_int_func(&mut bmc, "f", &[1, 2], TlaSort::Int);
 
     // Step 0: set f[1] = 10 and f[2] = 20
     bmc.current_step = 0;
@@ -781,7 +806,7 @@ fn test_bmc_func_except_via_eq_preserves_unchanged_keys() {
 fn test_bmc_func_except_via_eq_reversed_operands() {
     // Test: [f EXCEPT ![1] = 99] = f' (EXCEPT on left, variable on right)
     let mut bmc = bmc_array(1);
-    bmc.declare_func_var("f", TlaSort::Int).unwrap();
+    declare_exact_int_func(&mut bmc, "f", &[1], TlaSort::Int);
 
     let except_eq = spanned(Expr::Eq(
         Box::new(spanned(Expr::Except(
@@ -1374,10 +1399,9 @@ fn test_bmc_func_construct_string_int_key_nonalias() {
 }
 
 /// #5 (declared-variable into-path): `f = [k \in {"a"} |-> 7]` where `f` is a
-/// declared function variable. The variable is declared `Int`-keyed by default
-/// (the `TlaSort::Function` declaration loses key types) and must be upgraded
-/// in place to a native `String`-keyed encoding so the construction's string
-/// keys land in a `(Array String _)` map.
+/// declared function variable. The exact `TlaSort::Function` domain spelling
+/// preserves the String key kind and allocates a native `(Array String _)` map
+/// immediately.
 #[cfg_attr(test, ntest::timeout(10000))]
 #[test]
 fn test_bmc_func_construct_string_domain_into_declared_var() {
@@ -1412,4 +1436,362 @@ fn test_bmc_func_construct_string_domain_into_declared_var() {
     let term = bmc.translate_init(&init).unwrap();
     bmc.assert(term);
     assert!(matches!(bmc.check_sat(), SolveResult::Sat));
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_bmc_func_bound_scalar_shadow_is_exactly_restored() {
+    let mut bmc = bmc_array(1);
+    bmc.declare_var("x", TlaSort::Bool).unwrap();
+    let original_terms = bmc.vars.get("x").unwrap().terms.clone();
+
+    let bounds = vec![BoundVar {
+        name: spanned("x".to_string()),
+        domain: Some(Box::new(spanned(Expr::SetEnum(vec![spanned(Expr::Int(
+            num_bigint::BigInt::from(1),
+        ))])))),
+        pattern: None,
+    }];
+    let body = spanned(Expr::Ident(
+        "x".to_string(),
+        tla_core::name_intern::NameId::INVALID,
+    ));
+    bmc.translate_func_construct_bmc(&bounds, &body).unwrap();
+
+    let restored = bmc.vars.get("x").unwrap();
+    assert_eq!(restored.sort, TlaSort::Bool);
+    assert_eq!(restored.terms, original_terms);
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_bmc_func_bound_shadow_restores_after_body_error() {
+    let mut bmc = bmc_array(1);
+    bmc.declare_var("x", TlaSort::Int).unwrap();
+    let original_terms = bmc.vars.get("x").unwrap().terms.clone();
+    let bounds = vec![BoundVar {
+        name: spanned("x".to_string()),
+        domain: Some(Box::new(spanned(Expr::SetEnum(vec![spanned(Expr::Int(
+            num_bigint::BigInt::from(1),
+        ))])))),
+        pattern: None,
+    }];
+
+    // The Bool result kind is known, so translation enters the temporary `x`
+    // binding before the unknown inner identifier triggers the error.
+    let failing_body = spanned(Expr::Eq(
+        Box::new(func_ident("missing")),
+        Box::new(int_expr(0)),
+    ));
+    assert!(bmc
+        .translate_func_construct_bmc(&bounds, &failing_body)
+        .is_err());
+    let restored = bmc.vars.get("x").unwrap();
+    assert_eq!(restored.sort, TlaSort::Int);
+    assert_eq!(restored.terms, original_terms);
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_bmc_func_bound_record_collision_fails_closed() {
+    let mut bmc = bmc_array(0);
+    bmc.declare_record_var("r", vec![("a".to_string(), TlaSort::Int)])
+        .unwrap();
+    let bounds = vec![BoundVar {
+        name: spanned("r".to_string()),
+        domain: Some(Box::new(spanned(Expr::SetEnum(vec![spanned(Expr::Int(
+            num_bigint::BigInt::from(1),
+        ))])))),
+        pattern: None,
+    }];
+
+    assert!(bmc
+        .translate_func_construct_bmc(&bounds, &spanned(Expr::Int(num_bigint::BigInt::from(0))),)
+        .is_err());
+    assert!(bmc.record_vars.contains_key("r"));
+    assert!(!bmc.vars.contains_key("r"));
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_bmc_function_metadata_and_key_kinds_fail_closed() {
+    let mut bmc = bmc_array(0);
+    bmc.declare_func_var("ints", TlaSort::Int).unwrap();
+    bmc.declare_func_var("strings", TlaSort::String).unwrap();
+    let equality = spanned(Expr::Eq(
+        Box::new(spanned(Expr::Ident(
+            "ints".to_string(),
+            tla_core::name_intern::NameId::INVALID,
+        ))),
+        Box::new(spanned(Expr::Ident(
+            "strings".to_string(),
+            tla_core::name_intern::NameId::INVALID,
+        ))),
+    ));
+    assert!(bmc.translate_init(&equality).is_err());
+
+    let alias_key = spanned(Expr::FuncApply(
+        Box::new(spanned(Expr::Ident(
+            "ints".to_string(),
+            tla_core::name_intern::NameId::INVALID,
+        ))),
+        Box::new(spanned(Expr::String("collision".to_string()))),
+    ));
+    let alias_equality = spanned(Expr::Eq(
+        Box::new(alias_key),
+        Box::new(spanned(Expr::Int(num_bigint::BigInt::from(
+            -1_000_000_007_i64,
+        )))),
+    ));
+    assert!(bmc.translate_init(&alias_equality).is_err());
+}
+
+/// Function values are extensional over DOMAIN only. Different values in the
+/// backing arrays at a key outside DOMAIN must neither break `=` nor satisfy
+/// `#`.
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_bmc_function_equality_ignores_out_of_domain_ghost_cells() {
+    for inequality in [false, true] {
+        let mut bmc = bmc_array(0);
+        declare_exact_int_func(&mut bmc, "f", &[1], TlaSort::Int);
+        declare_exact_int_func(&mut bmc, "g", &[1], TlaSort::Int);
+
+        let f_map = bmc.get_func_mapping_at_step("f", 0).unwrap();
+        let g_map = bmc.get_func_mapping_at_step("g", 0).unwrap();
+        let one = bmc.solver.int_const(1);
+        let ghost = bmc.solver.int_const(999);
+        for (mapping, key, value) in [
+            (f_map, one, 10),
+            (g_map, one, 10),
+            (f_map, ghost, 111),
+            (g_map, ghost, 222),
+        ] {
+            let selected = bmc.solver.try_select(mapping, key).unwrap();
+            let expected = bmc.solver.int_const(value);
+            let equal = bmc.solver.try_eq(selected, expected).unwrap();
+            bmc.assert(equal);
+        }
+
+        let comparison = if inequality {
+            Expr::Neq(Box::new(func_ident("f")), Box::new(func_ident("g")))
+        } else {
+            Expr::Eq(Box::new(func_ident("f")), Box::new(func_ident("g")))
+        };
+        let term = bmc.translate_init(&spanned(comparison)).unwrap();
+        bmc.assert(term);
+        let verdict = bmc.check_sat();
+        if inequality {
+            assert!(
+                matches!(verdict, SolveResult::Unsat(_)),
+                "ghost-only difference must not make exact-domain functions unequal: {verdict:?}"
+            );
+        } else {
+            assert!(
+                matches!(verdict, SolveResult::Sat),
+                "ghost-only difference must not break exact-domain equality: {verdict:?}"
+            );
+        }
+    }
+}
+
+/// UNCHANGED preserves the abstract mapping, not arbitrary backing-array cells
+/// outside the declared finite DOMAIN.
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_bmc_function_unchanged_ignores_out_of_domain_ghost_cells() {
+    let mut bmc = bmc_array(1);
+    declare_exact_int_func(&mut bmc, "f", &[1], TlaSort::Int);
+    let map0 = bmc.get_func_mapping_at_step("f", 0).unwrap();
+    let map1 = bmc.get_func_mapping_at_step("f", 1).unwrap();
+    let one = bmc.solver.int_const(1);
+    let ghost = bmc.solver.int_const(999);
+    for (mapping, key, value) in [
+        (map0, one, 10),
+        (map1, one, 10),
+        (map0, ghost, 111),
+        (map1, ghost, 222),
+    ] {
+        let selected = bmc.solver.try_select(mapping, key).unwrap();
+        let expected = bmc.solver.int_const(value);
+        let equal = bmc.solver.try_eq(selected, expected).unwrap();
+        bmc.assert(equal);
+    }
+
+    let unchanged = spanned(Expr::Unchanged(Box::new(func_ident("f"))));
+    let term = bmc.translate_init(&unchanged).unwrap();
+    bmc.assert(term);
+    assert!(matches!(bmc.check_sat(), SolveResult::Sat));
+}
+
+/// Directed EXCEPT equality likewise compares only live DOMAIN keys. The
+/// target's ghost cell is unrelated to the source store-chain's ghost cell.
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_bmc_function_except_equality_ignores_out_of_domain_ghost_cells() {
+    let mut bmc = bmc_array(1);
+    declare_exact_int_func(&mut bmc, "f", &[1], TlaSort::Int);
+    let map0 = bmc.get_func_mapping_at_step("f", 0).unwrap();
+    let map1 = bmc.get_func_mapping_at_step("f", 1).unwrap();
+    let one = bmc.solver.int_const(1);
+    let ghost = bmc.solver.int_const(999);
+    for (mapping, key, value) in [
+        (map0, one, 10),
+        (map1, one, 99),
+        (map0, ghost, 111),
+        (map1, ghost, 222),
+    ] {
+        let selected = bmc.solver.try_select(mapping, key).unwrap();
+        let expected = bmc.solver.int_const(value);
+        let equal = bmc.solver.try_eq(selected, expected).unwrap();
+        bmc.assert(equal);
+    }
+
+    let except = spanned(Expr::Except(
+        Box::new(func_ident("f")),
+        vec![ExceptSpec {
+            path: vec![ExceptPathElement::Index(int_expr(1))],
+            value: int_expr(99),
+        }],
+    ));
+    let equality = spanned(Expr::Eq(
+        Box::new(spanned(Expr::Prime(Box::new(func_ident("f"))))),
+        Box::new(except),
+    ));
+    let term = bmc.translate_init(&equality).unwrap();
+    bmc.assert(term);
+    assert!(matches!(bmc.check_sat(), SolveResult::Sat));
+}
+
+/// A generic function declaration has a genuinely unknown DOMAIN. Without a
+/// finite key cover, equality, UNCHANGED, and directed EXCEPT assignment must
+/// decline instead of silently comparing whole backing arrays.
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_bmc_unknown_domain_whole_function_relations_fail_closed() {
+    let mut equality = bmc_array(1);
+    equality.declare_func_var("f", TlaSort::Int).unwrap();
+    equality.declare_func_var("g", TlaSort::Int).unwrap();
+    let eq = spanned(Expr::Eq(
+        Box::new(func_ident("f")),
+        Box::new(func_ident("g")),
+    ));
+    assert!(equality.translate_init(&eq).is_err());
+
+    let mut unchanged = bmc_array(1);
+    unchanged.declare_func_var("f", TlaSort::Int).unwrap();
+    let expr = spanned(Expr::Unchanged(Box::new(func_ident("f"))));
+    assert!(unchanged.translate_init(&expr).is_err());
+
+    let mut except = bmc_array(1);
+    except.declare_func_var("f", TlaSort::Int).unwrap();
+    let update = spanned(Expr::Except(
+        Box::new(func_ident("f")),
+        vec![ExceptSpec {
+            path: vec![ExceptPathElement::Index(int_expr(1))],
+            value: int_expr(99),
+        }],
+    ));
+    let assignment = spanned(Expr::Eq(
+        Box::new(spanned(Expr::Prime(Box::new(func_ident("f"))))),
+        Box::new(update),
+    ));
+    assert!(except.translate_init(&assignment).is_err());
+}
+
+/// Boolean ranges must produce Bool-valued arrays in both standalone function
+/// construction and directed construction/EXCEPT assignment.
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_bmc_bool_range_function_construction_and_except() {
+    let bounds = vec![BoundVar {
+        name: spanned("x".to_string()),
+        domain: Some(Box::new(spanned(Expr::SetEnum(vec![int_expr(1)])))),
+        pattern: None,
+    }];
+
+    let mut standalone = bmc_array(0);
+    let (_, mapping) = standalone
+        .translate_func_construct_bmc(&bounds, &spanned(Expr::Bool(true)))
+        .unwrap();
+    let one = standalone.solver.int_const(1);
+    let selected = standalone.solver.try_select(mapping, one).unwrap();
+    standalone.assert(selected);
+    assert!(matches!(standalone.check_sat(), SolveResult::Sat));
+
+    let mut directed = bmc_array(1);
+    declare_exact_int_func(&mut directed, "f", &[1], TlaSort::Bool);
+    let definition = spanned(Expr::FuncDef(bounds, Box::new(spanned(Expr::Bool(false)))));
+    let init = spanned(Expr::Eq(Box::new(func_ident("f")), Box::new(definition)));
+    let init_term = directed.translate_init(&init).unwrap();
+    directed.assert(init_term);
+
+    let update = spanned(Expr::Except(
+        Box::new(func_ident("f")),
+        vec![ExceptSpec {
+            path: vec![ExceptPathElement::Index(int_expr(1))],
+            value: spanned(Expr::Bool(true)),
+        }],
+    ));
+    let next = spanned(Expr::Eq(
+        Box::new(spanned(Expr::Prime(Box::new(func_ident("f"))))),
+        Box::new(update),
+    ));
+    let next_term = directed.translate_init(&next).unwrap();
+    directed.assert(next_term);
+    let map1 = directed.get_func_mapping_at_step("f", 1).unwrap();
+    let one = directed.solver.int_const(1);
+    let selected = directed.solver.try_select(map1, one).unwrap();
+    directed.assert(selected);
+    assert!(matches!(directed.check_sat(), SolveResult::Sat));
+}
+
+/// An Int-keyed carrier may be replaced by a native String carrier only before
+/// any term has referenced it. This protects already-emitted constraints from
+/// being abandoned while retaining the first-use construction path.
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_bmc_string_key_upgrade_is_first_use_only() {
+    fn string_definition() -> Spanned<Expr> {
+        spanned(Expr::FuncDef(
+            vec![BoundVar {
+                name: spanned("k".to_string()),
+                domain: Some(Box::new(spanned(Expr::SetEnum(vec![spanned(
+                    Expr::String("a".to_string()),
+                )])))),
+                pattern: None,
+            }],
+            Box::new(int_expr(7)),
+        ))
+    }
+
+    let mut first_use = bmc_array(0);
+    first_use.declare_func_var("f", TlaSort::Int).unwrap();
+    let assignment = spanned(Expr::Eq(
+        Box::new(func_ident("f")),
+        Box::new(string_definition()),
+    ));
+    let term = first_use.translate_init(&assignment).unwrap();
+    first_use.assert(term);
+    assert!(matches!(first_use.check_sat(), SolveResult::Sat));
+
+    let mut referenced = bmc_array(0);
+    referenced.declare_func_var("f", TlaSort::Int).unwrap();
+    let _observed_int_carrier = referenced.get_func_mapping_at_step("f", 0).unwrap();
+    let assignment = spanned(Expr::Eq(
+        Box::new(func_ident("f")),
+        Box::new(string_definition()),
+    ));
+    let error = referenced
+        .translate_init(&assignment)
+        .expect_err("referenced Int carrier must not be silently replaced");
+    assert!(error
+        .to_string()
+        .contains("after its Int carrier was referenced"));
+
+    let mut symbolic = bmc_array(0);
+    symbolic
+        .declare_funcsym_var("f", 1, "N".to_string(), 0, TlaSort::Int)
+        .unwrap();
+    assert!(symbolic.upgrade_func_key_sort_to_string("f").is_err());
 }

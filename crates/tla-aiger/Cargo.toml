@@ -24,7 +24,7 @@ tla-gpu = { path = "../tla-gpu" }
 tla-bdd = { path = "../tla-bdd" }
 tla-hw-evidence = { path = "../tla-hw-evidence" }
 ay-chc = { workspace = true }
-ay-sat = { workspace = true, features = ["unsafe-bcp"] }
+ay-sat = { workspace = true, features = ["raw-pointer-bcp"] }
 
 [features]
 # Gate for the HWMCC /unsafe/ soundness canary suite (tests/unsafe_canary_smoke.rs).

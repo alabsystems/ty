@@ -12,8 +12,10 @@
 //! `bodyless_external_declaration_names`, type aliases, imports) are pulled in
 //! via `use super::*`.
 
+#[cfg(feature = "native")]
 use super::*;
 
+#[cfg(feature = "native")]
 pub(super) fn maybe_dump_trust_ir_on_failure(stage: &str, module: &Module, err: &TrustCgError) {
     if std::env::var_os("TY_TRUST_CG_DUMP_TRUST_IR_ON_FAILURE").is_none() {
         return;
@@ -24,6 +26,7 @@ pub(super) fn maybe_dump_trust_ir_on_failure(stage: &str, module: &Module, err: 
     );
 }
 
+#[cfg(feature = "native")]
 pub(super) fn maybe_dump_trust_ir(stage: &str, module: &Module) {
     let Ok(value) = std::env::var("TY_TRUST_CG_DUMP_TRUST_IR") else {
         return;
@@ -36,6 +39,7 @@ pub(super) fn maybe_dump_trust_ir(stage: &str, module: &Module) {
     }
 }
 
+#[cfg(any(feature = "native", test))]
 pub(super) fn should_dump_trust_ir(value: &str, module_name: &str) -> bool {
     let value = value.trim();
     !value.is_empty()

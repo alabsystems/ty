@@ -31,6 +31,8 @@ pub struct GpuProgram {
     pub slots: usize,
     /// Row-major initial states (`len % slots == 0`), pre-dedup.
     pub init_rows: Vec<i64>,
+    /// Initial states generated before external constraints and deduplication.
+    pub raw_initial_states_generated: usize,
     /// Planned single-successor action functions (after exists expansion).
     pub actions: Vec<GpuFunction>,
     /// Invariant functions in `config.invariants` order.
@@ -383,6 +385,7 @@ impl ModelChecker<'_> {
         let Some(bulk_init) = bulk else {
             return Err("streaming initial-state enumeration unavailable for this spec".into());
         };
+        let raw_initial_states_generated = bulk_init.enumeration.generated;
         let init_count = bulk_init.storage.len();
         if gpu_debug() {
             eprintln!("[gpu] admission: {init_count} initial states; inferring layout...");
@@ -563,9 +566,15 @@ impl ModelChecker<'_> {
             eprintln!("[gpu] admission: lowering actions/invariants to trust-ir...");
         }
         // --- Lower everything to trust-ir via the native tier's ladders. ---
-        let jit_layout = std::sync::Arc::new(
-            crate::state::layout_bridge::check_layout_to_jit_layout(&layout),
-        );
+        let Some(jit_layout) = crate::state::layout_bridge::try_check_layout_to_jit_layout(&layout)
+        else {
+            return Err(
+                "GPU admission declined: flat layout has no byte-exact, structurally compatible \
+                 JIT ABI carrier"
+                    .into(),
+            );
+        };
+        let jit_layout = std::sync::Arc::new(jit_layout);
         let const_pool = std::sync::Arc::new(action_bc.chunk.constants.clone());
         let chunk = std::sync::Arc::new(action_bc.chunk.clone());
         let invariant_chunk = self.bytecode.as_ref().map(|bc| &bc.chunk);
@@ -583,6 +592,7 @@ impl ModelChecker<'_> {
         Ok(GpuProgram {
             slots,
             init_rows,
+            raw_initial_states_generated,
             actions: lowered
                 .actions
                 .into_iter()

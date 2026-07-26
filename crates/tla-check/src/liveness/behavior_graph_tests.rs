@@ -64,11 +64,334 @@ fn test_behavior_graph_add_successor() {
     assert!(graph.add_successor(init_node, &s1, 0).unwrap());
     assert_eq!(graph.len(), 2);
 
-    // Check parent pointer
     let succ_node = BehaviorGraphNode::from_state(&s1, 0);
     let info = graph.get_node_info(&succ_node).unwrap();
-    assert_eq!(info.parent, Some(init_node));
-    assert_eq!(info.depth, 1);
+    assert!(info.trace_parent.is_none());
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_logical_successor_rows_preserve_order_duplicates_and_indices() {
+    for mut graph in [
+        BehaviorGraph::new(),
+        BehaviorGraph::new_disk_backed(64).unwrap(),
+    ] {
+        let source_state = State::from_pairs([("x", Value::int(0))]);
+        let first_state = State::from_pairs([("x", Value::int(1))]);
+        let second_state = State::from_pairs([("x", Value::int(2))]);
+        assert!(graph.try_add_init_node(&source_state, 0).unwrap());
+        let source = BehaviorGraphNode::from_state(&source_state, 0);
+        let first = BehaviorGraphNode::from_state(&first_state, 1);
+        let second = BehaviorGraphNode::from_state(&second_state, 2);
+
+        assert!(graph.add_successor(source, &first_state, 1).unwrap());
+        assert!(graph.add_successor(source, &second_state, 2).unwrap());
+        assert!(!graph.add_successor(source, &first_state, 1).unwrap());
+        let expected = vec![first, second, first];
+
+        let info = graph.try_get_node_info(&source).unwrap().unwrap();
+        let row = info.successors();
+        assert_eq!(row.len(), expected.len());
+        assert!(!row.is_empty());
+        assert_eq!(row.get(1), Some(&second));
+        assert!(row.contains(&first));
+        assert_eq!(row.position(&first), Some(0));
+        assert_eq!(row.iter().copied().collect::<Vec<_>>(), expected);
+        drop(info);
+
+        let via_graph = graph
+            .try_with_successors(&source, |row| row.iter().copied().collect::<Vec<_>>())
+            .unwrap()
+            .unwrap();
+        assert_eq!(via_graph, expected);
+
+        let update_row = graph
+            .update_node_masks(&source, |row, state_check_mask, action_check_masks| {
+                state_check_mask.set(4);
+                *action_check_masks = vec![CheckMask::from_indices(&[5]); row.len()].into();
+                row.iter().copied().collect::<Vec<_>>()
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(update_row, expected);
+        let updated = graph.try_get_node_info(&source).unwrap().unwrap();
+        assert!(updated.state_check_mask.get(4));
+        assert_eq!(updated.action_check_masks.len(), expected.len());
+        assert!(updated.action_check_masks.iter().all(|mask| mask.get(5)));
+        drop(updated);
+
+        let terminal = graph.try_get_node_info(&first).unwrap().unwrap();
+        assert!(terminal.successors().is_empty());
+    }
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_packed_inmemory_successors_preserve_topology_masks_and_trace() {
+    let mut graph = BehaviorGraph::new();
+    let s0 = State::from_pairs([("x", Value::int(0))]);
+    let s1 = State::from_pairs([("x", Value::int(1))]);
+    let s2 = State::from_pairs([("x", Value::int(2))]);
+    let s3 = State::from_pairs([("x", Value::int(3))]);
+    assert!(graph.try_add_init_node(&s0, 0).unwrap());
+    let n0 = BehaviorGraphNode::from_state(&s0, 0);
+    let n1 = BehaviorGraphNode::from_state(&s1, 1);
+    let n2 = BehaviorGraphNode::from_state(&s2, 2);
+
+    assert!(graph.add_successor(n0, &s1, 1).unwrap());
+    assert!(!graph.add_successor(n0, &s0, 0).unwrap());
+    assert!(!graph.add_successor(n0, &s1, 1).unwrap());
+    assert!(graph.add_successor(n1, &s2, 2).unwrap());
+
+    let expected_n0 = vec![n1, n0, n1];
+    graph
+        .update_node_masks(&n0, |row, state_mask, action_masks| {
+            assert_eq!(row.iter().copied().collect::<Vec<_>>(), expected_n0);
+            state_mask.set(7);
+            *action_masks = ActionCheckMatrix::from_masks(
+                8,
+                [
+                    CheckMask::from_indices(&[1]),
+                    CheckMask::from_indices(&[3]),
+                    CheckMask::from_indices(&[5]),
+                ],
+            );
+        })
+        .unwrap()
+        .unwrap();
+    let trace_before = graph.reconstruct_fingerprint_trace(n2).unwrap();
+
+    assert!(graph.pack_inmemory_successors().unwrap());
+    let packed = graph.packed_tarjan_view().expect("packed in-memory view");
+    assert_eq!(packed.node_keys, &[n0, n1, n2]);
+    assert_eq!(packed.offsets, &[0, 3, 4, 4]);
+    assert_eq!(packed.targets, &[1, 0, 1, 2]);
+    assert_eq!(packed.node_infos.len(), 3);
+    assert!(packed
+        .node_infos
+        .iter()
+        .all(|info| info.successors.is_empty()));
+
+    let info = graph.try_get_node_info(&n0).unwrap().unwrap();
+    assert_eq!(
+        info.successors().iter().copied().collect::<Vec<_>>(),
+        expected_n0
+    );
+    assert_eq!(info.successors().get(1), Some(&n0));
+    assert_eq!(info.successors().position(&n1), Some(0));
+    assert!(info.state_check_mask.get(7));
+    assert!(info.action_check_masks.get(0).unwrap().get(1));
+    assert!(info.action_check_masks.get(1).unwrap().get(3));
+    assert!(info.action_check_masks.get(2).unwrap().get(5));
+    drop(info);
+    assert!(graph
+        .try_get_node_info(&n2)
+        .unwrap()
+        .unwrap()
+        .successors()
+        .is_empty());
+    assert_eq!(
+        graph.reconstruct_fingerprint_trace(n2).unwrap(),
+        trace_before
+    );
+
+    // Retry paths may repopulate masks after topology packing.
+    graph
+        .update_node_masks(&n0, |row, state_mask, action_masks| {
+            assert_eq!(row.iter().copied().collect::<Vec<_>>(), expected_n0);
+            *state_mask = CheckMask::from_indices(&[11]);
+            *action_masks = ActionCheckMatrix::from_masks(
+                13,
+                row.iter()
+                    .enumerate()
+                    .map(|(edge_idx, _)| CheckMask::from_indices(&[edge_idx + 9])),
+            );
+        })
+        .unwrap()
+        .unwrap();
+    let retried = graph.try_get_node_info(&n0).unwrap().unwrap();
+    assert!(retried.state_check_mask.get(11));
+    for edge_idx in 0..3 {
+        assert!(retried
+            .action_check_masks
+            .get(edge_idx)
+            .unwrap()
+            .get(edge_idx + 9));
+    }
+    drop(retried);
+
+    // An idempotent retry must still fail closed if a future mask writer ever
+    // loses edge alignment after the topology has already been packed.
+    graph
+        .update_node_masks(&n0, |_row, _state_mask, action_masks| {
+            *action_masks = ActionCheckMatrix::from_masks(1, [CheckMask::from_indices(&[0])]);
+        })
+        .unwrap()
+        .unwrap();
+    assert!(graph.pack_inmemory_successors().is_err());
+    graph
+        .update_node_masks(&n0, |row, _state_mask, action_masks| {
+            *action_masks = ActionCheckMatrix::from_masks(
+                0,
+                std::iter::repeat_with(CheckMask::new).take(row.len()),
+            );
+        })
+        .unwrap()
+        .unwrap();
+
+    // Packing is idempotent and completed topology is immutable.
+    assert!(graph.pack_inmemory_successors().unwrap());
+    assert_eq!(graph.packed_tarjan_view().unwrap().targets, &[1, 0, 1, 2]);
+    let node_count = graph.len();
+    let cached_state_count = graph.state_cache.len();
+    assert!(graph.try_add_init_node(&s3, 3).is_err());
+    assert!(graph.add_successor(n2, &s3, 3).is_err());
+    assert_eq!(graph.len(), node_count);
+    assert_eq!(graph.state_cache.len(), cached_state_count);
+    assert!(graph.update_node_info(&n0, |_| ()).is_err());
+    assert!(graph.get_node_info_mut(&n0).is_none());
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_successor_packing_is_transactional_on_mask_misalignment() {
+    let mut graph = BehaviorGraph::new();
+    let s0 = State::from_pairs([("x", Value::int(0))]);
+    let s1 = State::from_pairs([("x", Value::int(1))]);
+    let s2 = State::from_pairs([("x", Value::int(2))]);
+    assert!(graph.try_add_init_node(&s0, 0).unwrap());
+    let n0 = BehaviorGraphNode::from_state(&s0, 0);
+    assert!(graph.add_successor(n0, &s1, 0).unwrap());
+    assert!(graph.add_successor(n0, &s2, 0).unwrap());
+    let expected = vec![
+        BehaviorGraphNode::from_state(&s1, 0),
+        BehaviorGraphNode::from_state(&s2, 0),
+    ];
+    graph
+        .update_node_info(&n0, |info| {
+            info.action_check_masks =
+                ActionCheckMatrix::from_masks(1, [CheckMask::from_indices(&[0])]);
+        })
+        .unwrap()
+        .unwrap();
+
+    let error = graph
+        .pack_inmemory_successors()
+        .expect_err("misaligned masks must reject packing");
+    assert!(error.to_string().contains("do not align"));
+    assert!(graph.packed_tarjan_view().is_none());
+    assert_eq!(
+        graph
+            .try_get_node_info(&n0)
+            .unwrap()
+            .unwrap()
+            .successors()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        expected
+    );
+
+    graph
+        .update_node_info(&n0, |info| {
+            info.action_check_masks = ActionCheckMatrix::new();
+        })
+        .unwrap()
+        .unwrap();
+
+    let missing = BehaviorGraphNode::new(Fingerprint(0xfeed_cafe), 7);
+    graph
+        .get_node_info_mut(&n0)
+        .unwrap()
+        .successors
+        .push(missing);
+    let error = graph
+        .pack_inmemory_successors()
+        .expect_err("missing successor target must reject packing");
+    assert!(error.to_string().contains("missing target"));
+    assert!(graph.packed_tarjan_view().is_none());
+    assert_eq!(
+        graph
+            .get_node_info(&n0)
+            .unwrap()
+            .successors()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        [expected.as_slice(), &[missing]].concat()
+    );
+    graph.get_node_info_mut(&n0).unwrap().successors.pop();
+
+    assert!(graph.pack_inmemory_successors().unwrap());
+    assert_eq!(
+        graph
+            .try_get_node_info(&n0)
+            .unwrap()
+            .unwrap()
+            .successors()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        expected
+    );
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_successor_packing_is_disk_noop() {
+    let mut graph = BehaviorGraph::new_disk_backed(64).unwrap();
+    let s0 = State::from_pairs([("x", Value::int(0))]);
+    let s1 = State::from_pairs([("x", Value::int(1))]);
+    assert!(graph.try_add_init_node(&s0, 0).unwrap());
+    let n0 = BehaviorGraphNode::from_state(&s0, 0);
+
+    assert!(!graph.pack_inmemory_successors().unwrap());
+    assert!(graph.packed_tarjan_view().is_none());
+    assert!(graph.add_successor(n0, &s1, 1).unwrap());
+    assert_eq!(
+        graph
+            .try_get_node_info(&n0)
+            .unwrap()
+            .unwrap()
+            .successors()
+            .len(),
+        1
+    );
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_in_memory_dense_ids_follow_stable_node_key_order() {
+    let mut graph = BehaviorGraph::new();
+    assert!(graph.supports_dense_ids());
+
+    let s0 = State::from_pairs([("x", Value::int(0))]);
+    let s1 = State::from_pairs([("x", Value::int(1))]);
+    let s2 = State::from_pairs([("x", Value::int(2))]);
+    assert!(graph.add_init_node(&s0, 1));
+    let n0 = BehaviorGraphNode::from_state(&s0, 1);
+    assert!(graph.add_successor(n0, &s1, 0).unwrap());
+    let n1 = BehaviorGraphNode::from_state(&s1, 0);
+    assert!(graph.add_successor(n1, &s2, 2).unwrap());
+    let n2 = BehaviorGraphNode::from_state(&s2, 2);
+    assert!(!graph.add_init_node(&s0, 1));
+
+    let expected = vec![n0, n1, n2];
+    assert_eq!(graph.node_keys(), expected);
+    assert_eq!(graph.init_nodes(), vec![n0]);
+    for (dense_id, node) in expected.iter().enumerate() {
+        assert_eq!(graph.node_dense_id(node), Some(dense_id as u32));
+    }
+
+    // Existing-node edges and payload updates must not perturb dense ids.
+    assert!(!graph.add_successor(n2, &s0, 1).unwrap());
+    graph
+        .update_node_info(&n1, |info| info.state_check_mask.set(7))
+        .unwrap()
+        .expect("existing in-memory node");
+    assert_eq!(graph.node_keys(), expected);
+    assert_eq!(graph.node_dense_id(&n1), Some(1));
+    assert!(graph.get_node_info(&n1).unwrap().state_check_mask.get(7));
 }
 
 #[cfg_attr(test, ntest::timeout(10000))]
@@ -124,6 +447,41 @@ fn test_behavior_graph_fingerprint_trace_reconstruction() {
             (s2.fingerprint(), 1),
         ]
     );
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_branching_multi_init_trace_matches_in_memory_and_disk() {
+    fn build_and_trace(mut graph: BehaviorGraph) -> Vec<(Fingerprint, usize)> {
+        let a = State::from_pairs([("x", Value::int(0))]);
+        let b = State::from_pairs([("x", Value::int(1))]);
+        let branch = State::from_pairs([("x", Value::int(2))]);
+        let end = State::from_pairs([("x", Value::int(3))]);
+
+        assert!(graph.try_add_init_node(&a, 0).unwrap());
+        assert!(graph.try_add_init_node(&b, 0).unwrap());
+        let a_node = BehaviorGraphNode::from_state(&a, 0);
+        let b_node = BehaviorGraphNode::from_state(&b, 0);
+
+        // Match production multi-root BFS insertion order: both roots expand
+        // before the child of the first root. The second root therefore first
+        // discovers `end`, while the longer branch reaches it later.
+        assert!(graph.add_successor(a_node, &branch, 0).unwrap());
+        assert!(graph.add_successor(b_node, &end, 1).unwrap());
+        let branch_node = BehaviorGraphNode::from_state(&branch, 0);
+        assert!(!graph.add_successor(branch_node, &end, 1).unwrap());
+
+        let end_node = BehaviorGraphNode::from_state(&end, 1);
+        // In-memory reconstruction now walks dense target ids directly;
+        // disk-backed packing is a no-op and retains its parent chain.
+        graph.pack_inmemory_successors().unwrap();
+        graph.reconstruct_fingerprint_trace(end_node).unwrap()
+    }
+
+    let in_memory = build_and_trace(BehaviorGraph::new());
+    let disk = build_and_trace(BehaviorGraph::new_disk_backed(64).unwrap());
+    assert_eq!(in_memory, disk);
+    assert_eq!(in_memory.len(), 2);
 }
 
 /// Part of #3746: resolve_fingerprint_trace now tolerates partial missing
@@ -196,14 +554,12 @@ fn test_behavior_graph_trace_reconstruction_missing_node_errors() {
     graph.add_init_node(&s0, 0);
     let n0 = BehaviorGraphNode::from_state(&s0, 0);
     graph.add_successor(n0, &s1, 0).unwrap();
-    let n1 = BehaviorGraphNode::from_state(&s1, 0);
 
-    let bogus_parent = BehaviorGraphNode::new(Fingerprint(0xDEADBEEF), 0);
-    graph.get_node_info_mut(&n1).unwrap().parent = Some(bogus_parent);
+    let missing = BehaviorGraphNode::new(Fingerprint(0xDEADBEEF), 0);
 
     let err = graph
-        .reconstruct_trace(n1)
-        .expect_err("missing parent node must not produce a truncated trace");
+        .reconstruct_trace(missing)
+        .expect_err("missing endpoint must not produce a truncated trace");
     assert!(
         matches!(err, EvalError::Internal { .. }),
         "expected internal invariant error, got {err:?}"
@@ -303,6 +659,45 @@ fn test_owned_compact_state_cache_reconstructs_without_local_states() {
 
 #[cfg_attr(test, ntest::timeout(10000))]
 #[test]
+fn test_owned_array_root_shares_payload_and_drops_foreign_fingerprint_cache() {
+    let registry = Arc::new(VarRegistry::from_names(["x"]));
+    let state = State::from_pairs([("x", Value::int(7))]);
+    let raw_fp = state.fingerprint();
+    let mut array = ArrayState::from_state_with_fp(&state, &registry);
+    let foreign_fp = Fingerprint(raw_fp.0 ^ 0x9e37_79b9_7f4a_7c15);
+    array
+        .fp_cache
+        .as_mut()
+        .expect("from_state_with_fp cache")
+        .fingerprint = foreign_fp;
+    let source_values = array.compact_values_arc();
+
+    let mut graph = BehaviorGraph::new();
+    graph.enable_owned_state_cache(Arc::clone(&registry));
+    assert!(graph
+        .try_add_init_array_state_with_fp(&array, raw_fp, 0)
+        .unwrap());
+
+    let stored = graph
+        .get_array_state_by_fp(raw_fp)
+        .expect("owned compact root");
+    assert!(
+        Arc::ptr_eq(&source_values, &stored.compact_values_arc()),
+        "compact root insertion must share the value payload"
+    );
+    assert!(
+        stored.fp_cache.is_none(),
+        "a storage-domain fingerprint cache must not enter the raw graph"
+    );
+    assert!(
+        graph.state_cache.is_empty(),
+        "no full State may be retained"
+    );
+    assert_eq!(graph.get_state_by_fp(raw_fp), Some(state));
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
 fn test_owned_compact_state_cache_trace_fails_closed_on_missing_payload() {
     let mut graph = BehaviorGraph::new();
     graph.enable_owned_state_cache(Arc::new(VarRegistry::from_names(["x"])));
@@ -348,8 +743,7 @@ fn test_disk_backed_behavior_graph_add_successor_and_trace() {
     let n1 = BehaviorGraphNode::from_state(&s1, 0);
 
     let info = graph.try_get_node_info(&n1).unwrap().unwrap();
-    assert_eq!(info.parent, Some(n0));
-    assert_eq!(info.depth, 1);
+    assert_eq!(info.trace_parent.as_deref(), Some(&n0));
 
     graph
         .update_node_info(&n0, |info| {

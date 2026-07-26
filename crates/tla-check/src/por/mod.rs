@@ -38,7 +38,9 @@ mod visibility;
 mod tests;
 
 pub(crate) use dependencies::{check_static_independence, ActionDependencies};
-pub(crate) use dependencies_ast::extract_dependencies_ast_expr;
+pub(crate) use dependencies_ast::{
+    extract_dependencies_ast_expr, replay_expr_context_rejection, replay_expr_is_context_free,
+};
 pub(crate) use visibility::VisibilitySet;
 
 use crate::coverage::DetectedAction;

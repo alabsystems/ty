@@ -157,6 +157,11 @@ pub struct JsonOutput {
     /// Backend capability/admission evidence consumed by capability summarizers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backend_capability_report: Option<serde_json::Value>,
+    /// Engine-provenance record: the execution tier that actually ran this
+    /// check (plus value-action VM engagement). Benchmark harnesses read this
+    /// to attribute every measured row to its engine.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub engine_provenance: Option<serde_json::Value>,
     /// Action coverage information
     #[serde(
         skip_serializing_if = "Vec::is_empty",
@@ -306,10 +311,20 @@ pub struct SourceLocation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct StatisticsInfo {
-    /// Total number of states generated (including duplicates).
+    /// Number of distinct states found.
     pub states_found: usize,
     /// Number of distinct initial states.
     pub states_initial: usize,
+    /// Initial states generated before state constraints and deduplication.
+    #[serde(default)]
+    pub raw_initial_states_generated: usize,
+    /// Successors generated before state/action constraints and reductions.
+    #[serde(default)]
+    pub raw_successors_generated: usize,
+    /// Total number of states generated, including initial states and duplicate
+    /// successors, using TLC's pre-constraint accounting boundary.
+    #[serde(default)]
+    pub states_generated: usize,
     /// Number of distinct states stored, if tracked separately from `states_found`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub states_distinct: Option<usize>,
@@ -526,6 +541,9 @@ impl JsonOutput {
             statistics: StatisticsInfo {
                 states_found: 0,
                 states_initial: 0,
+                raw_initial_states_generated: 0,
+                raw_successors_generated: 0,
+                states_generated: 0,
                 states_distinct: None,
                 transitions: 0,
                 suppressed_guard_errors: None,
@@ -543,6 +561,7 @@ impl JsonOutput {
                 print_outputs: Vec::new(),
             },
             backend_capability_report: None,
+            engine_provenance: None,
             actions_detected: Vec::new(),
         }
     }

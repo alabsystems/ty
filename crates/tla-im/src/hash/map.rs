@@ -23,10 +23,10 @@
 //! [std::hash::Hash]: https://doc.rust-lang.org/std/hash/trait.Hash.html
 //! [std::collections::hash_map::RandomState]: https://doc.rust-lang.org/std/collections/hash_map/struct.RandomState.html
 
+use crate::hash::fx::DefaultHashBuilder;
 use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections;
-use crate::hash::fx::DefaultHashBuilder;
 use std::fmt::{Debug, Error, Formatter};
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::iter::{FromIterator, FusedIterator, Sum};

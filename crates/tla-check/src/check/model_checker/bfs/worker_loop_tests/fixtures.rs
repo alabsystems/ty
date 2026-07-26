@@ -13,8 +13,10 @@ fn empty_stats() -> CheckStats {
     CheckStats {
         states_found: 0,
         initial_states: 0,
+        raw_initial_states_generated: 0,
         max_queue_depth: 0,
         transitions: 0,
+        raw_successors_generated: 0,
         max_depth: 0,
         detected_actions: Vec::new(),
         detected_action_ids: Vec::new(),
@@ -38,6 +40,7 @@ fn empty_stats() -> CheckStats {
         por_reduction: Default::default(),
         property_check: Default::default(),
         backend_capability_report: None,
+        engine_provenance: None,
         vacuity_warnings: Vec::new(),
     }
 }

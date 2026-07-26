@@ -43,7 +43,6 @@ use super::compound_layout::{
     deserialize_value, infer_var_layout, serialize_value, CompoundLayout, StateLayout, VarLayout,
 };
 use super::error::JitRuntimeError;
-use tla_value::Rp;
 use tla_value::Value;
 
 // ============================================================================
@@ -521,6 +520,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tla_value::value::{FuncValue, RecordValue, SeqValue, SortedSet};
+    use tla_value::Rp;
 
     // ========================================================================
     // Schema construction

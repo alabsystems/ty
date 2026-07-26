@@ -2,10 +2,9 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
+use crate::rp::Rp;
 use crate::{FuncBuilder, IntIntervalFunc, Value};
 use std::cmp::Ordering;
-use crate::rp::Rp as Arc;
-use crate::rp::Rp;
 // === Ord/Eq consistency ===
 
 #[cfg_attr(test, ntest::timeout(10000))]

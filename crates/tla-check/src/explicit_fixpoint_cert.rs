@@ -52,9 +52,10 @@
 
 #[cfg(feature = "clean-cic")]
 use std::collections::BTreeSet;
-use tla_value::Rp;
 #[cfg(feature = "clean-cic")]
 use std::sync::Arc;
+#[cfg(test)]
+use tla_value::Rp;
 
 #[cfg(feature = "clean-cic")]
 use crate::config::Config;
@@ -269,7 +270,10 @@ pub enum ColSort {
         /// pure-Int `Seq` cert stays BYTE-IDENTICAL (the `elem` byte only appears for an atom/Bool sequence).
         /// Part of the column IDENTITY (`PartialEq`): an Int-element and an atom-element `Seq` are DIFFERENT
         /// sorts, so a column mixing Int and atom sequences fails the cross-state `col_sorts` agreement.
-        #[serde(default = "cellsort_int_default", skip_serializing_if = "cellsort_is_int")]
+        #[serde(
+            default = "cellsort_int_default",
+            skip_serializing_if = "cellsort_is_int"
+        )]
         elem: CellSort,
     },
     /// A FINITE-ENUM column — a state variable holding a `String` (or model value) drawn from a small
@@ -1230,23 +1234,23 @@ pub fn memory_derived_state_cap() -> usize {
 /// on the honest kernel-checked enumerated `image ⊆ R` leg (the enumerator-ASSISTED tier), never a hang.
 /// Sound: declining a leg only ever weakens the CLAIM, never the check.
 ///
-/// Since [`certify_general_completeness`] proves the obligation PER SOURCE STATE for a large product
-/// domain (see [`GENERAL_COMPLETENESS_MONOLITH_CAP`]), the PER-CALL kernel cost is bounded at `|D|` legs
-/// (heartbeat/memory-safe) regardless of `|R|`, so this cap is a pure wall-clock budget for the `|R|`
-/// bounded kernel calls — not a per-call heartbeat proxy. Sized to admit VoucherLifeCycle's canonical
+/// Since [`certify_general_completeness`] proves the obligation in PER-SOURCE, BOUNDED-DOMAIN chunks
+/// for a large product (see [`GENERAL_COMPLETENESS_MONOLITH_CAP`]), the per-call kernel cost is bounded
+/// independently of `|R|` and `|D|`. This cap is therefore a pure wall-clock bound on total work.
+/// Sized to admit VoucherLifeCycle's canonical
 /// `V={v1,v2,v3}` two-FuncEnum product (`64 × 1728 = 110592`), comfortably above every other corpus spec
 /// (no other spec reaches this filter — all decline earlier on recognition / a non-universe axis bound).
 #[cfg(feature = "clean-cic")]
 pub const GENERAL_COMPLETENESS_WORK_CAP: usize = 131_072;
 
 /// PER-KERNEL-CALL size cap for the GENERAL `Next`-completeness leg — the boundary between the historical
-/// SINGLE-term obligation (`⋀_{s∈R,sp∈D} leg`, one `kernel_accepts`) and the PER-SOURCE-STATE decomposition
-/// (`⋀_{sp∈D} leg(s,·)` per `s∈R`, `|R|` bounded `kernel_accepts` calls). At/below this product size the
+/// SINGLE-term obligation (`⋀_{s∈R,sp∈D} leg`, one `kernel_accepts`) and the per-source/domain decomposition.
+/// At/below this product size the
 /// single-term path runs — BYTE-IDENTICAL certs and unchanged ck0 corroboration for every existing
 /// enumerator-free spec (all `≤` this). Above it, the monolith would exhaust the kernel's 2M-step heartbeat
-/// / blow memory (VoucherLifeCycle V=3's `110592`-leg term hit both at ~34 GB), so the leg is proved per
-/// source state instead. Each chunk is `|D| ≤ DEFAULT_FIXPOINT_STATE_CAP` legs — WITHIN this same budget —
-/// so every kernel call stays in the regime this cap already deems safe. The decomposition is a logical
+/// / blow memory (VoucherLifeCycle V=3's `110592`-leg term hit both at ~34 GB), so the leg is partitioned
+/// across source states and bounded slices of `D`. Every kernel call stays safely below the structural
+/// term limit. The decomposition is a logical
 /// identity (`⋀_s ⋀_sp = ⋀_{s,sp}`): the domain `D` and the `D ⊇ Succ(R)` coverage are UNCHANGED, and a
 /// non-closed `R` still fails (the escaping successor's source-state chunk `≠ Bool.true`).
 #[cfg(feature = "clean-cic")]
@@ -1285,7 +1289,10 @@ pub const PER_MEMBER_UNIT_CAP: u128 = 900_000;
 #[inline]
 pub fn use_reflected_membership_lane(r_len: usize, ncols: usize) -> bool {
     r_len > REFLECTED_MEMBERSHIP_THRESHOLD
-        || (r_len as u128).saturating_pow(3).saturating_mul(ncols as u128) > PER_MEMBER_UNIT_CAP
+        || (r_len as u128)
+            .saturating_pow(3)
+            .saturating_mul(ncols as u128)
+            > PER_MEMBER_UNIT_CAP
 }
 
 /// The element-universe BIT WIDTH `K` of a `Set` column's bitmask encoding (ALWAYS compiled so
@@ -1563,7 +1570,11 @@ fn cell_code(val: &crate::value::Value) -> Option<(u64, CellSort)> {
 /// keeps its full-length vector (`cells.len() == arity`).
 #[cfg(feature = "clean-cic")]
 fn normalize_cells(cells: Vec<CellSort>) -> Vec<CellSort> {
-    if cells.iter().all(|c| matches!(c, CellSort::Int)) { Vec::new() } else { cells }
+    if cells.iter().all(|c| matches!(c, CellSort::Int)) {
+        Vec::new()
+    } else {
+        cells
+    }
 }
 
 /// One positional-compound cell CLASSIFIED for the value-type leaf, one level richer than [`cell_code`]:
@@ -1648,9 +1659,13 @@ fn encode_compound_at(
                 CellClass::Enum(kind, label) => match pos_labels.get(p).and_then(|o| o.as_ref()) {
                     Some(ec) if ec.kind == kind => match ec.labels.iter().position(|l| *l == label)
                     {
-                        Some(idx) => {
-                            (idx as u64, CellSort::Enum { labels: ec.labels.clone(), kind })
-                        }
+                        Some(idx) => (
+                            idx as u64,
+                            CellSort::Enum {
+                                labels: ec.labels.clone(),
+                                kind,
+                            },
+                        ),
                         None => return Err(CompoundStop::Grow(p, kind, label)),
                     },
                     // Position recorded as the OTHER enum kind ⇒ heterogeneous ⇒ fail closed (a `String`
@@ -1666,7 +1681,9 @@ fn encode_compound_at(
         // A code needing a WIDER radix ⇒ `Widen` to the smallest admitting base (`max_code + 1`), mirroring
         // `compound_min_base`'s single-jump derivation (byte-identical FINAL base, fewer restarts).
         if max_code >= base {
-            return Err(CompoundStop::Widen(max_code.checked_add(1).ok_or(CompoundStop::Fail)?));
+            return Err(CompoundStop::Widen(
+                max_code.checked_add(1).ok_or(CompoundStop::Fail)?,
+            ));
         }
         let mut pack: u64 = 0;
         let mut cells: Vec<CellSort> = Vec::with_capacity(codes.len());
@@ -1691,7 +1708,14 @@ fn encode_compound_at(
                 values.push(v);
             }
             let (cells, pack) = pack_positions(&values)?;
-            Ok((ColSort::Record { base, fields, cells: normalize_cells(cells) }, pack))
+            Ok((
+                ColSort::Record {
+                    base,
+                    fields,
+                    cells: normalize_cells(cells),
+                },
+                pack,
+            ))
         }
         Value::Func(f) => {
             let n = f.domain_len();
@@ -1880,7 +1904,14 @@ fn pack_seq<'a>(
         // shifted digit (a+1) so digit 0 marks the end ⇒ self-delimiting ⇒ canonical
         pack = pack.checked_add((a + 1).checked_mul(place)?)?;
     }
-    Some((ColSort::Seq { base, max_len: SEQ_MAX_LEN, elem: CellSort::Int }, pack))
+    Some((
+        ColSort::Seq {
+            base,
+            max_len: SEQ_MAX_LEN,
+            elem: CellSort::Int,
+        },
+        pack,
+    ))
 }
 
 /// Pack a bounded ATOM / `Bool` sequence into the SELF-DELIMITING radix-`D` Nat `pack = Σ_i (code_i+1)·D^i`
@@ -1933,9 +1964,18 @@ fn pack_atom_seq<'a>(
         };
         let place = d.checked_pow(i as u32).ok_or(None)?;
         // shifted digit (code+1) so digit 0 marks the end ⇒ self-delimiting ⇒ canonical.
-        pack = pack.checked_add((code + 1).checked_mul(place).ok_or(None)?).ok_or(None)?;
+        pack = pack
+            .checked_add((code + 1).checked_mul(place).ok_or(None)?)
+            .ok_or(None)?;
     }
-    Ok((ColSort::Seq { base, max_len: SEQ_MAX_LEN, elem: elem.clone() }, pack))
+    Ok((
+        ColSort::Seq {
+            base,
+            max_len: SEQ_MAX_LEN,
+            elem: elem.clone(),
+        },
+        pack,
+    ))
 }
 
 /// Classify a SEQUENCE ELEMENT's value-type leaf for the un-marked-column decision in the certify loop:
@@ -1956,9 +1996,10 @@ fn classify_seq_first_elem(v: &crate::value::Value) -> Option<Result<(), CellSor
             Some(Ok(()))
         }
         Value::Bool(_) => Some(Err(CellSort::Bool)),
-        Value::String(s) => {
-            Some(Err(CellSort::Enum { labels: vec![s.as_ref().to_string()], kind: EnumKind::Str }))
-        }
+        Value::String(s) => Some(Err(CellSort::Enum {
+            labels: vec![s.as_ref().to_string()],
+            kind: EnumKind::Str,
+        })),
         Value::ModelValue(s) => Some(Err(CellSort::Enum {
             labels: vec![s.as_ref().to_string()],
             kind: EnumKind::Model,
@@ -2024,7 +2065,13 @@ pub(crate) fn func_enum_view(
             if min == 0 {
                 // Int-prefix `0..n-1` domain ⇒ empty `dom` ⇒ the skip-serialized `Model` default kind
                 // (byte-identical to the historical shape).
-                Some((labels.len() as u32, is_model, labels, Vec::new(), EnumKind::Model))
+                Some((
+                    labels.len() as u32,
+                    is_model,
+                    labels,
+                    Vec::new(),
+                    EnumKind::Model,
+                ))
             } else {
                 // A general non-0-based interval `min..min+len-1` ⇒ an `Int`-keyed domain (keys stored as
                 // decimal texts in sorted-by-value order; `f[k]` ⇒ slot `k − min`).
@@ -2068,7 +2115,13 @@ pub(crate) fn func_enum_view(
 #[cfg(feature = "clean-cic")]
 pub(crate) fn funcsetmask_view(
     val: &crate::value::Value,
-) -> Option<(u32, Vec<String>, EnumKind, Vec<Vec<String>>, Option<EnumKind>)> {
+) -> Option<(
+    u32,
+    Vec<String>,
+    EnumKind,
+    Vec<Vec<String>>,
+    Option<EnumKind>,
+)> {
     use crate::value::{IntIntervalFunc, Value};
     // The domain keys/kind + the per-slot value list (canonical `Value::cmp` order, aligned with the pack).
     let (fdom, fdom_kind, value_sets): (Vec<String>, EnumKind, Vec<&Value>) = match val {
@@ -2132,7 +2185,10 @@ fn int_interval_domain_keys(lo: i64, len: usize) -> Option<(Vec<String>, EnumKin
         return None; // empty function ⇒ no key fixes a bounded Int domain (plain arms handle it)
     }
     let hi_excl = i64::try_from(len).ok()?.checked_add(lo)?; // lo + len (overflow ⇒ fail-closed)
-    Some(((lo..hi_excl).map(|k| k.to_string()).collect(), EnumKind::Int))
+    Some((
+        (lo..hi_excl).map(|k| k.to_string()).collect(),
+        EnumKind::Int,
+    ))
 }
 
 /// The DOMAIN SHAPE of a `Value::Func` for the positional-pack FuncEnum fragment, as `(names, kind)`:
@@ -2152,7 +2208,9 @@ pub(crate) fn func_enum_domain_keys(
 ) -> Option<(Vec<String>, EnumKind)> {
     use crate::value::Value;
     // 0-based Int prefix? (positions are the keys ⇒ empty `dom` ⇒ byte-identical to a pre-domain cert.)
-    if f.domain_iter().enumerate().all(|(d, key)| nonneg_small_int(key, u64::MAX) == Some(d as u64))
+    if f.domain_iter()
+        .enumerate()
+        .all(|(d, key)| nonneg_small_int(key, u64::MAX) == Some(d as u64))
     {
         return Some((Vec::new(), EnumKind::Model));
     }
@@ -2233,7 +2291,12 @@ pub fn value_cell_encode_at(val: &crate::value::Value, rf_base: u64) -> Option<(
                 }
                 mask |= 1u64 << e;
             }
-            Some((ColSort::Set { universe: SET_UNIVERSE_BITS }, mask))
+            Some((
+                ColSort::Set {
+                    universe: SET_UNIVERSE_BITS,
+                },
+                mask,
+            ))
         }
         // A bounded RECORD packs POSITIONALLY into one Nat: a FIXED canonical field order (fields
         // sorted by name, via `iter_str`) with each value's digit CODE `code_i < rf_base` ⇒ `pack = Σ
@@ -2261,7 +2324,14 @@ pub fn value_cell_encode_at(val: &crate::value::Value, rf_base: u64) -> Option<(
                 let place = rf_base.checked_pow(i as u32)?;
                 pack = pack.checked_add(code.checked_mul(place)?)?;
             }
-            Some((ColSort::Record { base: rf_base, fields, cells: normalize_cells(cells) }, pack))
+            Some((
+                ColSort::Record {
+                    base: rf_base,
+                    fields,
+                    cells: normalize_cells(cells),
+                },
+                pack,
+            ))
         }
         // A bounded FINITE FUNCTION whose domain is EXACTLY the consecutive prefix `0..arity-1` and each
         // value's digit CODE `< rf_base`, packed POSITIONALLY like a record: `pack = Σ_d code_d·base^d`,
@@ -2272,6 +2342,7 @@ pub fn value_cell_encode_at(val: &crate::value::Value, rf_base: u64) -> Option<(
         Value::Func(f) => {
             let n = f.domain_len();
             rf_base.checked_pow(u32::try_from(n).ok()?)?; // DERIVED arity bound: pack fits u64
+
             // The domain is the consecutive Int prefix `0,1,…,n-1` (`dom` empty ⇒ byte-identical) OR a set
             // of atom keys (model values / `String`s — `dom`/`dom_kind` per [`func_enum_domain_keys`]); any
             // other domain ⇒ out of fragment. Values pack in the domain's canonical `Value::cmp` order.
@@ -2425,7 +2496,13 @@ pub fn certify_explicit_state_spec_strict_domain(
         // test-thread exhaustion, while the shared term preflight supplies the
         // fail-closed resource bound.
         stacker::grow(crate::cert::STACKER_GROWTH, || {
-            certify_explicit_state_spec_inner(spec_src, config, memory_derived_state_cap(), true, None)
+            certify_explicit_state_spec_inner(
+                spec_src,
+                config,
+                memory_derived_state_cap(),
+                true,
+                None,
+            )
         })
     }
 }
@@ -2513,9 +2590,10 @@ pub fn recognize_spec_fixpoint_irs(spec_src: &str, config: &Config) -> Option<Re
         .units
         .iter()
         .flat_map(|u| match &u.node {
-            Unit::Variable(decls) => {
-                decls.iter().map(|d| Arc::<str>::from(d.node.as_str())).collect::<Vec<_>>()
-            }
+            Unit::Variable(decls) => decls
+                .iter()
+                .map(|d| Arc::<str>::from(d.node.as_str()))
+                .collect::<Vec<_>>(),
             _ => Vec::new(),
         })
         .collect();
@@ -2562,7 +2640,10 @@ pub fn recognize_spec_fixpoint_irs(spec_src: &str, config: &Config) -> Option<Re
     // overrides in force, a SURVIVING `Ident("Nat")` in an inlined obligation body
     // would be read by the recognizer arms with BUILTIN (infinite) semantics —
     // WEAKER than the overridden finite bound (false-safe vector). Decline.
-    if crate::cert_inline::overridden_builtin_survives(config, &[&init_body, &next_body, &safety_body]) {
+    if crate::cert_inline::overridden_builtin_survives(
+        config,
+        &[&init_body, &next_body, &safety_body],
+    ) {
         return None;
     }
 
@@ -2604,7 +2685,12 @@ pub fn recognize_spec_fixpoint_irs(spec_src: &str, config: &Config) -> Option<Re
         &mvsets,
     )?;
 
-    Some(RecognizedSpecIRs { sorts, init_ir, next_ir, safety_ir })
+    Some(RecognizedSpecIRs {
+        sorts,
+        init_ir,
+        next_ir,
+        safety_ir,
+    })
 }
 
 /// The stdlib modules BUILTIN to the evaluator (kept as `EXTENDS` in a merged
@@ -2675,9 +2761,9 @@ pub fn certify_explicit_state_spec_from_dir_deadline(
     state_cap: usize,
     deadline: Option<std::time::Instant>,
 ) -> Option<ExplicitFixpointCert> {
+    use tla_core::ast::Unit;
     use tla_core::ast::{Expr as Expr2, Module};
     use tla_core::ModuleLoader;
-    use tla_core::ast::Unit;
     let main_name = main_file.file_stem()?.to_str()?.to_string();
     let mut loader = ModuleLoader::new(main_file);
     let main_module = loader.load(&main_name).ok()?.module.clone();
@@ -2715,9 +2801,9 @@ pub fn certify_explicit_state_spec_from_dir_deadline(
     {
         use tla_core::ast::Unit;
         let is_identity = |decl: &tla_core::ast::InstanceDecl| {
-            decl.substitutions.iter().all(|sub| {
-                matches!(&sub.to.node, Expr2::Ident(n, _) if *n == sub.from.node)
-            })
+            decl.substitutions
+                .iter()
+                .all(|sub| matches!(&sub.to.node, Expr2::Ident(n, _) if *n == sub.from.node))
         };
         let mut tier_a: Vec<String> = Vec::new();
         let scope_mods: Vec<&Module> = chain.iter().chain(std::iter::once(&main_module)).collect();
@@ -2733,13 +2819,12 @@ pub fn certify_explicit_state_spec_from_dir_deadline(
         tier_a.sort();
         tier_a.dedup();
         for name in tier_a {
-            let Some(loaded) = loader.get(&name) else { continue };
+            let Some(loaded) = loader.get(&name) else {
+                continue;
+            };
             let m = &loaded.module;
             let extends_ok = m.extends.iter().all(|e| is_stdlib_module(&e.node));
-            let no_instances = m
-                .units
-                .iter()
-                .all(|u| !matches!(u.node, Unit::Instance(_)));
+            let no_instances = m.units.iter().all(|u| !matches!(u.node, Unit::Instance(_)));
             if extends_ok && no_instances {
                 chain.push(m.clone());
             }
@@ -2964,7 +3049,10 @@ fn certify_module_inner(
     // overrides in force, a SURVIVING `Ident("Nat")` in an inlined obligation body
     // would be read by the recognizer arms with BUILTIN (infinite) semantics —
     // WEAKER than the overridden finite bound (false-safe vector). Decline.
-    if crate::cert_inline::overridden_builtin_survives(config, &[&init_body, &next_body, &safety_body]) {
+    if crate::cert_inline::overridden_builtin_survives(
+        config,
+        &[&init_body, &next_body, &safety_body],
+    ) {
         return None;
     }
 
@@ -3063,7 +3151,11 @@ fn certify_module_inner(
         if let Some(ub) = unbounded {
             // The state width: relational certs cover exactly two Int variables; nonneg certs cover
             // `pairs.len()`.
-            let n = if ub.relational.is_some() { 2 } else { ub.pairs.len() };
+            let n = if ub.relational.is_some() {
+                2
+            } else {
+                ub.pairs.len()
+            };
             return Some(ExplicitFixpointCert {
                 // NO enumeration: the empty `reachable`/`init_values`/`image` signal an UNBOUNDED cert.
                 reachable: Vec::new(),
@@ -3253,7 +3345,10 @@ fn certify_module_inner(
                                     // its observed cells — stored in the sort so recognition can kind-check
                                     // membership/equality and verify re-derives it. `ec.kind` is `Copy`.
                                     (
-                                        ColSort::Enum { labels: ec.labels.clone(), kind: ec.kind },
+                                        ColSort::Enum {
+                                            labels: ec.labels.clone(),
+                                            kind: ec.kind,
+                                        },
                                         idx as u64,
                                     )
                                 }
@@ -3339,7 +3434,11 @@ fn certify_module_inner(
                     // `pack = Σ_d idx(e_d)·|labels|^d` (base `|labels|`, each digit an enum index). A value
                     // label not yet in the union raises `GrowEnum` ⇒ restart with it grown, exactly like a
                     // scalar enum cell. The label union is the SAME per-column property verify re-derives.
-                    let kind = if is_model { EnumKind::Model } else { EnumKind::Str };
+                    let kind = if is_model {
+                        EnumKind::Model
+                    } else {
+                        EnumKind::Str
+                    };
                     match &enum_labels[i] {
                         Some(ec) if ec.kind == kind => {
                             let base = ec.labels.len() as u64;
@@ -3393,11 +3492,14 @@ fn certify_module_inner(
                     // atom-`SetMask` empty-set handling). A record with a non-leaf field is UNKEYABLE ⇒
                     // fail-closed; a set MIXING records and atoms fails closed (`record_value_key` = `None`).
                     let record_col = recmask_labels[i].is_some();
-                    let has_record =
-                        setv.iter().any(|e| matches!(e, crate::value::Value::Record(_)));
+                    let has_record = setv
+                        .iter()
+                        .any(|e| matches!(e, crate::value::Value::Record(_)));
                     if has_record
                         || (record_col
-                            && setv.iter().all(|e| matches!(e, crate::value::Value::Record(_))))
+                            && setv
+                                .iter()
+                                .all(|e| matches!(e, crate::value::Value::Record(_))))
                     {
                         let dom: Vec<String> = recmask_labels[i].clone().unwrap_or_default();
                         let mut mask: u64 = 0;
@@ -3461,7 +3563,13 @@ fn certify_module_inner(
                                     None => return Err(EnumStop::GrowSetMask(i, kind, a.clone())),
                                 }
                             }
-                            (ColSort::SetMask { dom, dom_kind: kind }, mask)
+                            (
+                                ColSort::SetMask {
+                                    dom,
+                                    dom_kind: kind,
+                                },
+                                mask,
+                            )
                         } else {
                             match value_cell_encode_at(val, bases[i]) {
                                 Some(x) => x,
@@ -3497,8 +3605,10 @@ fn certify_module_inner(
                         .map(|ec| ec.kind)
                         .or(view_e_kind)
                         .unwrap_or(EnumKind::Model);
-                    let dom: Vec<String> =
-                        enum_labels[i].as_ref().map(|ec| ec.labels.clone()).unwrap_or_default();
+                    let dom: Vec<String> = enum_labels[i]
+                        .as_ref()
+                        .map(|ec| ec.labels.clone())
+                        .unwrap_or_default();
                     // `base = 2^|E|`; the pack `base^arity` must fit a `u64` (`|E|·arity ≤ 63`) ⇒ else closed.
                     if dom.len() >= 64 {
                         return Err(EnumStop::Fail);
@@ -3578,12 +3688,16 @@ fn certify_module_inner(
         let ctx = build_ctx(&module).ok_or(EnumStop::Fail)?;
         let branches = extract_init_constraints(&ctx, &init_def.body, &var_names, None)
             .ok_or(EnumStop::Fail)?;
-        let init_states =
-            enumerate_states_from_constraint_branches_probed(Some(&ctx), &var_names, &branches, deadline_probe)
-                .ok()
-                .flatten()
-                .filter(|v| !v.is_empty())
-                .ok_or(EnumStop::Fail)?;
+        let init_states = enumerate_states_from_constraint_branches_probed(
+            Some(&ctx),
+            &var_names,
+            &branches,
+            deadline_probe,
+        )
+        .ok()
+        .flatten()
+        .filter(|v| !v.is_empty())
+        .ok_or(EnumStop::Fail)?;
         let mut init_values: Vec<Vec<u64>> = Vec::new();
         for s in &init_states {
             init_values.push(state_tuple(s)?);
@@ -3683,7 +3797,14 @@ fn certify_module_inner(
     // Per-column QUEUE flag: `true` once column `i` is seen at ≥2 different sequence lengths (a variable-
     // length queue) ⇒ its sequences route to the generalized `Seq`. Grown monotonically across restarts.
     let mut seq_queue: Vec<bool> = vec![false; var_names.len()];
-    let EnumOut { init_values, reachable, image: image_vec, sorts, deadlock_witness, succ_witness } = loop {
+    let EnumOut {
+        init_values,
+        reachable,
+        image: image_vec,
+        sorts,
+        deadlock_witness,
+        succ_witness,
+    } = loop {
         // A latched deadline trip also stops the Widen/Grow* RESTART loop — the
         // next enumerate_at attempt would re-tick and fail, but checking here
         // avoids even starting a doomed restart.
@@ -3710,7 +3831,10 @@ fn certify_module_inner(
             // distinct labels across the finite state set is finite, so the restarts terminate. A kind
             // flip on an already-typed column is malformed (state_tuple already fails closed on the mix).
             Err(EnumStop::GrowEnum(i, kind, label)) => {
-                let ec = enum_labels[i].get_or_insert(EnumCol { kind, labels: Vec::new() });
+                let ec = enum_labels[i].get_or_insert(EnumCol {
+                    kind,
+                    labels: Vec::new(),
+                });
                 if ec.kind != kind {
                     return None;
                 }
@@ -3724,7 +3848,10 @@ fn certify_module_inner(
             // set is finite, so the restarts terminate. CAPPED at 64 (the u64 cell bit width): a universe
             // wider than 64 atoms cannot fit ONE mask cell ⇒ fail-closed (the whole spec declines).
             Err(EnumStop::GrowSetMask(i, kind, atom)) => {
-                let ec = enum_labels[i].get_or_insert(EnumCol { kind, labels: Vec::new() });
+                let ec = enum_labels[i].get_or_insert(EnumCol {
+                    kind,
+                    labels: Vec::new(),
+                });
                 if ec.kind != kind {
                     return None;
                 }
@@ -3758,7 +3885,10 @@ fn certify_module_inner(
                 if positions.len() <= p {
                     positions.resize_with(p + 1, || None);
                 }
-                let ec = positions[p].get_or_insert(EnumCol { kind, labels: Vec::new() });
+                let ec = positions[p].get_or_insert(EnumCol {
+                    kind,
+                    labels: Vec::new(),
+                });
                 if ec.kind != kind {
                     return None;
                 }
@@ -3772,7 +3902,10 @@ fn certify_module_inner(
             // terminate. Capped at [`SEQ_BASE`]-relative pack ceiling in `pack_atom_seq` (a huge alphabet
             // whose `D^max_len` overflows a `u64` fails closed there). A kind flip (or atom↔Bool) declines.
             Err(EnumStop::GrowSeqAtom(i, kind, atom)) => {
-                let cur = seq_elem[i].get_or_insert(CellSort::Enum { labels: Vec::new(), kind });
+                let cur = seq_elem[i].get_or_insert(CellSort::Enum {
+                    labels: Vec::new(),
+                    kind,
+                });
                 match cur {
                     CellSort::Enum { labels, kind: k } if *k == kind => {
                         if !labels.iter().any(|l| *l == atom) {
@@ -3840,7 +3973,13 @@ fn certify_module_inner(
     // re-enumerates the SAME R and reruns this path — recomputes the SAME `col_max` ⇒ the SAME expanded
     // `safety_pred`. A spec with NO state-dependent domain never consults it ⇒ byte-identical certs.
     let col_max: Vec<Option<u64>> = (0..sorts.len())
-        .map(|c| if sorts[c] == ColSort::Int { reachable.iter().map(|t| t[c]).max() } else { None })
+        .map(|c| {
+            if sorts[c] == ColSort::Int {
+                reachable.iter().map(|t| t[c]).max()
+            } else {
+                None
+            }
+        })
         .collect();
     let safety_pred: Option<PredIR> =
         if crate::cleancic::is_conjunctive_nonneg_safety(&safety_body.node, &var_strs, &sorts) {
@@ -3897,25 +4036,29 @@ fn certify_module_inner(
         init_member_terms,
         init_member_reflected,
         closed_member_reflected,
-    ): (Vec<Vec<u8>>, Vec<u8>, Vec<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>) =
-        if use_reflected_membership_lane(reachable.len(), sorts.len()) {
-            let (closed_r, safety, init_r) =
-                crate::cleancic::certify_explicit_fixpoint_set_reflected(
-                    &reachable,
-                    &init_values,
-                    &image_vec,
-                    &sorts,
-                )?;
-            (Vec::new(), safety, Vec::new(), Some(init_r), Some(closed_r))
-        } else {
-            let (closed, safety, init) = crate::cleancic::certify_explicit_fixpoint_set(
-                &reachable,
-                &init_values,
-                &image_vec,
-                &sorts,
-            )?;
-            (closed, safety, init, None, None)
-        };
+    ): (
+        Vec<Vec<u8>>,
+        Vec<u8>,
+        Vec<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+    ) = if use_reflected_membership_lane(reachable.len(), sorts.len()) {
+        let (closed_r, safety, init_r) = crate::cleancic::certify_explicit_fixpoint_set_reflected(
+            &reachable,
+            &init_values,
+            &image_vec,
+            &sorts,
+        )?;
+        (Vec::new(), safety, Vec::new(), Some(init_r), Some(closed_r))
+    } else {
+        let (closed, safety, init) = crate::cleancic::certify_explicit_fixpoint_set(
+            &reachable,
+            &init_values,
+            &image_vec,
+            &sorts,
+        )?;
+        (closed, safety, init, None, None)
+    };
 
     // GENERAL `R⊆Safety` leg: `⋀_{s∈R} ⟦Safety⟧(s)` reduced to `Bool.true`, kernel-gated. The kernel
     // is the arbiter: a reachable state VIOLATING the invariant reduces the conjunction to
@@ -3923,9 +4066,7 @@ fn certify_module_inner(
     // (fail-closed — never a Certified verdict the kernel did not accept).
     let safety_general: Option<Vec<u8>> = match &safety_pred {
         None => None,
-        Some(ir) => Some(crate::cleancic::certify_bool_true_obligation(safety_general_bool(
-            &reachable, ir,
-        ))?),
+        Some(ir) => Some(certify_safety_general(&reachable, ir)?),
     };
 
     // KERNEL-RE-EVALUATED `Next`-completeness (closes the enumerator-trust gap for the affine single-Int
@@ -4017,8 +4158,10 @@ fn certify_module_inner(
         // CONSTRUCTION (every index `< labels.len()`) and the coverage upgrade kernel-PROVES the
         // membership→bound step from the Next disjuncts (see `next_domain_bounds_cov_from_ir`'s Enum arm).
         let all_embeddable = sorts.iter().all(|s| {
-            matches!(s, ColSort::Int | ColSort::Bool | ColSort::Set { .. } | ColSort::Enum { .. })
-                || s.is_compound()
+            matches!(
+                s,
+                ColSort::Int | ColSort::Bool | ColSort::Set { .. } | ColSort::Enum { .. }
+            ) || s.is_compound()
         });
         if all_embeddable {
             let vars: Vec<&str> = var_names.iter().map(|v| v.as_ref()).collect();
@@ -4100,7 +4243,10 @@ fn certify_module_inner(
                                     &reachable, &domain, &ir,
                                 )
                             {
-                                next_pred = Some(ValIRDomain { pred: ir, hi: bounds });
+                                next_pred = Some(ValIRDomain {
+                                    pred: ir,
+                                    hi: bounds,
+                                });
                                 next_general_completeness = Some(bytes);
                             }
                         }
@@ -4168,7 +4314,10 @@ fn certify_module_inner(
                                     &reachable, &domain, &ir,
                                 )
                             {
-                                init_pred = Some(ValIRDomain { pred: ir, hi: bounds });
+                                init_pred = Some(ValIRDomain {
+                                    pred: ir,
+                                    hi: bounds,
+                                });
                                 init_general_completeness = Some(bytes);
                             }
                         }
@@ -4253,8 +4402,10 @@ fn certify_module_inner(
             return None;
         }
         // Witnesses aligned to the FINAL reachable order; every reachable state has one (no deadlock).
-        let witnesses: Vec<Vec<u64>> =
-            reachable.iter().map(|s| succ_witness.get(s).cloned()).collect::<Option<Vec<_>>>()?;
+        let witnesses: Vec<Vec<u64>> = reachable
+            .iter()
+            .map(|s| succ_witness.get(s).cloned())
+            .collect::<Option<Vec<_>>>()?;
         if let Some(dp) = &next_pred {
             return crate::cleancic::certify_deadlock_witness_general(
                 &reachable, &witnesses, &dp.pred,
@@ -4320,8 +4471,10 @@ fn certify_module_inner(
 fn safety_general_bool(reachable: &[Vec<u64>], ir: &PredIR) -> clean_kernel::Expr {
     use clean_kernel::Expr;
     if reachable.len() > REFLECTED_MEMBERSHIP_THRESHOLD {
-        let legs: Vec<Expr> =
-            reachable.iter().map(|s| crate::cleancic::embed_pred_ir(ir, s, s)).collect();
+        let legs: Vec<Expr> = reachable
+            .iter()
+            .map(|s| crate::cleancic::embed_pred_ir(ir, s, s))
+            .collect();
         return crate::cleancic::balanced_bool_and(legs);
     }
     let mut acc: Option<Expr> = None;
@@ -4333,6 +4486,35 @@ fn safety_general_bool(reachable: &[Vec<u64>], ir: &PredIR) -> clean_kernel::Exp
         });
     }
     acc.unwrap_or_else(|| Expr::const_str("Bool.true"))
+}
+
+/// Maximum source states in one fallback `R ⊆ Safety` kernel obligation. The monolith remains the
+/// preferred byte-compatible path; this exact conjunction partition is used only when its structural
+/// term/heartbeat guard rejects. SingleLaneBridge's 3,605-state invariant is the motivating scale.
+const SAFETY_GENERAL_CHUNK_STATES: usize = 128;
+
+fn certify_safety_general(reachable: &[Vec<u64>], ir: &PredIR) -> Option<Vec<u8>> {
+    if let Some(bytes) =
+        crate::cleancic::certify_bool_true_obligation(safety_general_bool(reachable, ir))
+    {
+        return Some(bytes);
+    }
+    let mut token = None;
+    for chunk in reachable.chunks(SAFETY_GENERAL_CHUNK_STATES) {
+        let bytes = crate::cleancic::certify_bool_true_obligation(safety_general_bool(chunk, ir))?;
+        token.get_or_insert(bytes);
+    }
+    token
+}
+
+fn verify_safety_general(reachable: &[Vec<u64>], ir: &PredIR, bytes: &[u8]) -> bool {
+    if crate::cleancic::verify_bool_true_obligation(safety_general_bool(reachable, ir), bytes) {
+        return true;
+    }
+    !reachable.is_empty()
+        && reachable.chunks(SAFETY_GENERAL_CHUNK_STATES).all(|chunk| {
+            crate::cleancic::verify_bool_true_obligation(safety_general_bool(chunk, ir), bytes)
+        })
 }
 
 /// Re-check a [`ExplicitFixpointCert`] by re-running the Clean kernel on every embedded leg, bound to
@@ -4407,7 +4589,11 @@ pub fn verify_explicit_state_cert(cert: &ExplicitFixpointCert) -> bool {
             if init < ub.bound {
                 return false;
             }
-            let shape = crate::cleancic::UnboundedAffineShape { init, delta, bound: ub.bound };
+            let shape = crate::cleancic::UnboundedAffineShape {
+                init,
+                delta,
+                bound: ub.bound,
+            };
             return crate::cleancic::verify_unbounded_invariant(
                 &shape,
                 &ub.initiation,
@@ -4419,7 +4605,9 @@ pub fn verify_explicit_state_cert(cert: &ExplicitFixpointCert) -> bool {
         if ub.bound != 0 {
             return false;
         }
-        let tuple = crate::cleancic::UnboundedAffineTuple { pairs: ub.pairs.clone() };
+        let tuple = crate::cleancic::UnboundedAffineTuple {
+            pairs: ub.pairs.clone(),
+        };
         return crate::cleancic::verify_unbounded_invariant_tuple(
             &tuple,
             &ub.initiation,
@@ -4495,8 +4683,10 @@ pub fn verify_explicit_state_cert(cert: &ExplicitFixpointCert) -> bool {
     // A scalar ENUM column embeds too (its cell is a `Nat` label index, `Nat.beq`/`Bool.or`-fold exact) —
     // mirrors the certify-side `all_embeddable` so the verify path admits the SAME general legs.
     let all_int_bool = cert.sorts.iter().all(|s| {
-        matches!(s, ColSort::Int | ColSort::Bool | ColSort::Set { .. } | ColSort::Enum { .. })
-            || s.is_compound()
+        matches!(
+            s,
+            ColSort::Int | ColSort::Bool | ColSort::Set { .. } | ColSort::Enum { .. }
+        ) || s.is_compound()
     }) && cert.reachable.iter().all(|t| t.len() == n_cols);
 
     // KERNEL-RE-EVALUATED `Next`-completeness leg — present iff the spec was a recognized affine counter.
@@ -4631,10 +4821,7 @@ pub fn verify_explicit_state_cert(cert: &ExplicitFixpointCert) -> bool {
             {
                 return false;
             }
-            if !crate::cleancic::verify_bool_true_obligation(
-                safety_general_bool(&cert.reachable, ir),
-                bytes,
-            ) {
+            if !verify_safety_general(&cert.reachable, ir, bytes) {
                 return false;
             }
         }
@@ -4833,7 +5020,11 @@ mod tests {
         assert!(verify_explicit_state_cert(&cert));
 
         let mut oversized_next = cert.clone();
-        oversized_next.next_shape.as_mut().expect("affine shortcut").bound = u64::MAX;
+        oversized_next
+            .next_shape
+            .as_mut()
+            .expect("affine shortcut")
+            .bound = u64::MAX;
         assert!(
             !verify_explicit_state_cert(&oversized_next),
             "an oversized affine domain must reject without allocation"
@@ -4860,21 +5051,37 @@ mod tests {
                     Safety == x >= 0\n\
                     ====\n";
         let cert = certify_explicit_state_spec(spec, &cfg()).expect("cycling spec must certify");
-        assert!(cert.deadlock_scan.0.is_none(), "no reachable deadlock in a 3-cycle");
+        assert!(
+            cert.deadlock_scan.0.is_none(),
+            "no reachable deadlock in a 3-cycle"
+        );
         let dl = cert
             .deadlock_free
             .as_ref()
             .expect("enumerator-free tier builds the kernel deadlock leg");
-        assert_eq!(dl.witnesses.len(), cert.reachable.len(), "one witness per reachable state");
-        assert!(verify_explicit_state_cert(&cert), "cert (incl. deadlock leg) must re-verify");
+        assert_eq!(
+            dl.witnesses.len(),
+            cert.reachable.len(),
+            "one witness per reachable state"
+        );
+        assert!(
+            verify_explicit_state_cert(&cert),
+            "cert (incl. deadlock leg) must re-verify"
+        );
         let bytes = serde_json::to_vec(&cert).expect("serialize");
         assert!(
             String::from_utf8_lossy(&bytes).contains("deadlock_free"),
             "the deadlock leg must be serialized (digest changes by design)"
         );
         let back: ExplicitFixpointCert = serde_json::from_slice(&bytes).expect("deserialize");
-        assert_eq!(cert, back, "the deadlock-leg cert must serde round-trip identically");
-        assert!(verify_explicit_state_cert(&back), "the round-tripped cert must re-verify");
+        assert_eq!(
+            cert, back,
+            "the deadlock-leg cert must serde round-trip identically"
+        );
+        assert!(
+            verify_explicit_state_cert(&back),
+            "the round-tripped cert must re-verify"
+        );
     }
 
     /// A deadlocking spec (`x < 3 /\ x' = x+1`): state x=3 has NO successor. The mint records the
@@ -4890,8 +5097,15 @@ mod tests {
                     Safety == x >= 0\n\
                     ====\n";
         let cert = certify_explicit_state_spec(spec, &cfg()).expect("safety still certifies");
-        assert_eq!(cert.deadlock_scan.0, Some(vec![3]), "x=3 is the deadlock witness");
-        assert!(cert.deadlock_free.is_none(), "no kernel deadlock leg for a deadlocking spec");
+        assert_eq!(
+            cert.deadlock_scan.0,
+            Some(vec![3]),
+            "x=3 is the deadlock witness"
+        );
+        assert!(
+            cert.deadlock_free.is_none(),
+            "no kernel deadlock leg for a deadlocking spec"
+        );
         assert!(
             verify_explicit_state_cert(&cert),
             "the safety cert is sound (this is the `--no-deadlock` certificate)"
@@ -4911,9 +5125,18 @@ mod tests {
                     Safety == x >= 0\n\
                     ====\n";
         let cert = certify_explicit_state_spec(spec, &cfg()).expect("self-loop spec certifies");
-        assert!(cert.deadlock_scan.0.is_none(), "a self-loop is not a deadlock");
-        let dl = cert.deadlock_free.as_ref().expect("kernel deadlock leg present");
-        assert_eq!(dl.witnesses, cert.reachable, "each state's witness successor is itself");
+        assert!(
+            cert.deadlock_scan.0.is_none(),
+            "a self-loop is not a deadlock"
+        );
+        let dl = cert
+            .deadlock_free
+            .as_ref()
+            .expect("kernel deadlock leg present");
+        assert_eq!(
+            dl.witnesses, cert.reachable,
+            "each state's witness successor is itself"
+        );
         assert!(verify_explicit_state_cert(&cert));
     }
 
@@ -5127,7 +5350,11 @@ mod tests {
         for (bound, expect_reflected) in [(62u64, false), (63, false), (64, true)] {
             let cert = certify_explicit_state_spec(&counter_spec(bound), &cfg())
                 .unwrap_or_else(|| panic!("bound {bound} must certify"));
-            assert_eq!(cert.reachable.len(), bound as usize + 1, "R = {{0..{bound}}}");
+            assert_eq!(
+                cert.reachable.len(),
+                bound as usize + 1,
+                "R = {{0..{bound}}}"
+            );
             if expect_reflected {
                 assert!(
                     cert.init_member_reflected.is_some() && cert.closed_member_reflected.is_some(),
@@ -5153,7 +5380,10 @@ mod tests {
                 expect_reflected,
                 "serde presence must track the threshold (digest back-compat below it)"
             );
-            assert!(verify_explicit_state_cert(&cert), "bound {bound} must re-verify");
+            assert!(
+                verify_explicit_state_cert(&cert),
+                "bound {bound} must re-verify"
+            );
             // Round-trip through serde (the reflected fields deserialize + verify).
             let back: ExplicitFixpointCert =
                 serde_json::from_slice(json.as_bytes()).expect("deserialize");
@@ -5169,38 +5399,59 @@ mod tests {
     fn reflected_membership_tampers_reject() {
         let cert = certify_explicit_state_spec(&counter_spec(64), &cfg())
             .expect("65-state counter certifies");
-        assert!(verify_explicit_state_cert(&cert), "control: genuine cert verifies");
+        assert!(
+            verify_explicit_state_cert(&cert),
+            "control: genuine cert verifies"
+        );
 
         // (a) Mutated reflected bytes: garbage AND a wrong-constant proof both reject.
         let mut t = cert.clone();
         t.closed_member_reflected = Some(b"garbage".to_vec());
-        assert!(!verify_explicit_state_cert(&t), "garbage closed bytes must reject");
+        assert!(
+            !verify_explicit_state_cert(&t),
+            "garbage closed bytes must reject"
+        );
         let mut t = cert.clone();
         t.init_member_reflected = Some(b"garbage".to_vec());
-        assert!(!verify_explicit_state_cert(&t), "garbage init bytes must reject");
+        assert!(
+            !verify_explicit_state_cert(&t),
+            "garbage init bytes must reject"
+        );
 
         // (b) Image superset: an image tuple OUTSIDE R refutes the reflected closed leg (the
         // obligation is REBUILT from the tampered tuples; the kernel reduces Subseq to false).
         let mut t = cert.clone();
         t.image.push(vec![999]);
-        assert!(!verify_explicit_state_cert(&t), "an escaping image tuple must reject");
+        assert!(
+            !verify_explicit_state_cert(&t),
+            "an escaping image tuple must reject"
+        );
 
         // (c) Foreign Init value: Init ⊄ R refutes the reflected init leg.
         let mut t = cert.clone();
         t.init_values.push(vec![999]);
-        assert!(!verify_explicit_state_cert(&t), "a foreign Init value must reject");
+        assert!(
+            !verify_explicit_state_cert(&t),
+            "a foreign Init value must reject"
+        );
 
         // (d) R-SUBSET swap: dropping a reachable state leaves image tuples outside the
         // shrunken R. (65 → 64 states also flips the lane to per-member, where the PRESENT
         // reflected legs are malformed — either rule must reject.)
         let mut t = cert.clone();
         t.reachable.pop();
-        assert!(!verify_explicit_state_cert(&t), "an R-subset swap must reject");
+        assert!(
+            !verify_explicit_state_cert(&t),
+            "an R-subset swap must reject"
+        );
 
         // (e) Missing reflected leg above the threshold: explicit presence rule.
         let mut t = cert.clone();
         t.closed_member_reflected = None;
-        assert!(!verify_explicit_state_cert(&t), "a missing reflected leg must reject");
+        assert!(
+            !verify_explicit_state_cert(&t),
+            "a missing reflected leg must reject"
+        );
 
         // (f) Sub-threshold cert carrying reflected legs: the mixed rule rejects.
         let small = certify_explicit_state_spec(&counter_spec(3), &cfg())
@@ -5252,9 +5503,15 @@ mod tests {
             .as_ref()
             .expect("the cert must carry the parametric inductive invariant");
         assert_eq!((ub.init, ub.delta), (0, 1));
-        assert!(cert.reachable.is_empty(), "an unbounded cert has NO enumerated reachable set");
+        assert!(
+            cert.reachable.is_empty(),
+            "an unbounded cert has NO enumerated reachable set"
+        );
         assert!(cert.init_values.is_empty() && cert.image.is_empty());
-        assert!(cert.next_shape.is_none(), "the unbounded path is NOT the finite affine path");
+        assert!(
+            cert.next_shape.is_none(),
+            "the unbounded path is NOT the finite affine path"
+        );
         // verify_explicit_state_cert + Leg-E re-check pass (the 3 parametric legs kernel-re-check).
         assert!(
             verify_explicit_state_cert(&cert),
@@ -5275,9 +5532,16 @@ mod tests {
                     ====\n";
         let cert = certify_explicit_state_spec(spec, &cfg())
             .expect("an unbounded counter with c=3, δ=5 must certify");
-        let ub = cert.unbounded_invariant.as_ref().expect("parametric invariant present");
+        let ub = cert
+            .unbounded_invariant
+            .as_ref()
+            .expect("parametric invariant present");
         assert_eq!((ub.init, ub.delta), (3, 5));
-        assert_eq!(ub.pairs, vec![(3, 5)], "single-var cert carries pairs=[(c,δ)]");
+        assert_eq!(
+            ub.pairs,
+            vec![(3, 5)],
+            "single-var cert carries pairs=[(c,δ)]"
+        );
         assert!(verify_explicit_state_cert(&cert));
     }
 
@@ -5296,10 +5560,16 @@ mod tests {
                     ====\n";
         let cert = certify_explicit_state_spec(spec, &cfg())
             .expect("x>=N (N=2) must certify via the widened parametric leg");
-        let ub = cert.unbounded_invariant.as_ref().expect("parametric invariant present");
+        let ub = cert
+            .unbounded_invariant
+            .as_ref()
+            .expect("parametric invariant present");
         assert_eq!((ub.init, ub.delta, ub.bound), (5, 1, 2));
         assert!(cert.reachable.is_empty(), "no enumeration");
-        assert!(verify_explicit_state_cert(&cert), "kernel re-check of the Int.le legs");
+        assert!(
+            verify_explicit_state_cert(&cert),
+            "kernel re-check of the Int.le legs"
+        );
         // TAMPER: a cert claiming a WEAKER bound than the spec's must be caught by Leg-E
         // re-recognition (struct equality on the re-derived shape); here, kernel-level:
         // a different bound rebuilds different obligation types → the stored terms fail.
@@ -5328,7 +5598,10 @@ mod tests {
                     Safety == x >= 0\n\
                     ====\n";
         let cert = certify_explicit_state_spec(spec, &cfg()).expect("unbounded certifies");
-        let ub = cert.unbounded_invariant.as_ref().expect("parametric invariant");
+        let ub = cert
+            .unbounded_invariant
+            .as_ref()
+            .expect("parametric invariant");
         assert_eq!(ub.bound, 0);
         let json = serde_json::to_string(ub).expect("serializes");
         assert!(
@@ -5338,7 +5611,10 @@ mod tests {
         // Old-style JSON (no `bound` key) round-trips byte-stably.
         let reparsed: UnboundedInvariantCert = serde_json::from_str(&json).expect("reparses");
         assert_eq!(&reparsed, ub);
-        assert_eq!(serde_json::to_string(&reparsed).expect("re-serializes"), json);
+        assert_eq!(
+            serde_json::to_string(&reparsed).expect("re-serializes"),
+            json
+        );
         // A widened cert DOES carry the field (self-consistent, new-only).
         let spec_ge = "---- MODULE UnbGe ----\n\
                        EXTENDS Integers\n\
@@ -5350,7 +5626,9 @@ mod tests {
         let cert_ge = certify_explicit_state_spec(spec_ge, &cfg()).expect("x>=2 certifies");
         let ub_ge = cert_ge.unbounded_invariant.as_ref().expect("invariant");
         assert_eq!(ub_ge.bound, 2);
-        assert!(serde_json::to_string(ub_ge).expect("serializes").contains("\"bound\":2"));
+        assert!(serde_json::to_string(ub_ge)
+            .expect("serializes")
+            .contains("\"bound\":2"));
     }
 
     /// PHASE-2 WIDENING, general δ: `Init x=10 / Next x'=x+3 / Safety x>=4` exercises the
@@ -5366,7 +5644,10 @@ mod tests {
                     ====\n";
         let cert = certify_explicit_state_spec(spec, &cfg())
             .expect("x>=4 with δ=3 must certify via the widened parametric leg");
-        let ub = cert.unbounded_invariant.as_ref().expect("parametric invariant present");
+        let ub = cert
+            .unbounded_invariant
+            .as_ref()
+            .expect("parametric invariant present");
         assert_eq!((ub.init, ub.delta, ub.bound), (10, 3, 4));
         assert!(verify_explicit_state_cert(&cert));
     }
@@ -5408,15 +5689,30 @@ mod tests {
             .unbounded_invariant
             .as_ref()
             .expect("the cert must carry the conjoined parametric inductive invariant");
-        assert_eq!(ub.pairs, vec![(0, 1), (3, 2)], "per-variable (c_j, δ_j) in declaration order");
-        assert_eq!((ub.init, ub.delta), (0, 1), "the scalar summary is pairs[0]");
+        assert_eq!(
+            ub.pairs,
+            vec![(0, 1), (3, 2)],
+            "per-variable (c_j, δ_j) in declaration order"
+        );
+        assert_eq!(
+            (ub.init, ub.delta),
+            (0, 1),
+            "the scalar summary is pairs[0]"
+        );
         assert!(
             cert.reachable.is_empty(),
             "a multi-var unbounded cert has NO enumerated reachable set"
         );
         assert!(cert.init_values.is_empty() && cert.image.is_empty());
-        assert_eq!(cert.sorts, vec![ColSort::Int, ColSort::Int], "an all-Int product of width n=2");
-        assert!(cert.next_shape.is_none(), "the unbounded path is NOT the finite affine path");
+        assert_eq!(
+            cert.sorts,
+            vec![ColSort::Int, ColSort::Int],
+            "an all-Int product of width n=2"
+        );
+        assert!(
+            cert.next_shape.is_none(),
+            "the unbounded path is NOT the finite affine path"
+        );
         // The kernel re-check of the 3 conjoined legs (And.intro / NonNeg.add / And.left/right) passes.
         assert!(
             verify_explicit_state_cert(&cert),
@@ -5449,9 +5745,19 @@ mod tests {
                     ====\n";
         let cert = certify_explicit_state_spec(spec, &cfg())
             .expect("the relational lock-step counter must be Certified via the parametric Eq-leg");
-        let ub = cert.unbounded_invariant.as_ref().expect("carries the relational invariant");
-        assert_eq!(ub.relational, Some((0, 1)), "the relational (c,δ) is recorded");
-        assert!(ub.pairs.is_empty(), "a relational cert carries no per-variable nonneg vector");
+        let ub = cert
+            .unbounded_invariant
+            .as_ref()
+            .expect("carries the relational invariant");
+        assert_eq!(
+            ub.relational,
+            Some((0, 1)),
+            "the relational (c,δ) is recorded"
+        );
+        assert!(
+            ub.pairs.is_empty(),
+            "a relational cert carries no per-variable nonneg vector"
+        );
         assert!(
             cert.reachable.is_empty(),
             "a relational unbounded cert has NO enumerated reachable set"
@@ -5547,7 +5853,10 @@ mod tests {
             "a GUARDED (finite) counter must NOT take the unbounded path"
         );
         assert_eq!(cert.reachable, vec![vec![0], vec![1], vec![2], vec![3]]);
-        assert_eq!(cert.next_shape, Some(AffineNextShape { delta: 1, bound: 3 }));
+        assert_eq!(
+            cert.next_shape,
+            Some(AffineNextShape { delta: 1, bound: 3 })
+        );
         assert!(verify_explicit_state_cert(&cert));
     }
 
@@ -5587,12 +5896,19 @@ mod tests {
         // The literal `Init == x = 0` is recognized too, so the kernel ALSO re-evaluated Init over the
         // finite domain — `Init ⊆ R` no longer trusts that TY enumerated every init state. With both
         // legs, R is a fully KERNEL-VERIFIED inductive invariant (Init-complete ∧ Next-closed ∧ Safe).
-        assert_eq!(cert.init_shape, Some(vec![0]), "Init x=0 recognized as the literal set {{0}}");
+        assert_eq!(
+            cert.init_shape,
+            Some(vec![0]),
+            "Init x=0 recognized as the literal set {{0}}"
+        );
         assert!(
             cert.init_completeness.is_some(),
             "the kernel re-evaluated Init over the finite domain"
         );
-        assert!(verify_explicit_state_cert(&cert), "kernel re-check incl. BOTH completeness legs");
+        assert!(
+            verify_explicit_state_cert(&cert),
+            "kernel re-check incl. BOTH completeness legs"
+        );
     }
 
     /// LIVE end-to-end MULTI-VARIABLE: a 2-variable stutter spec — the live model checker enumerates
@@ -5609,7 +5925,11 @@ mod tests {
                     ====\n";
         let cert = certify_explicit_state_spec(spec, &cfg())
             .expect("2-variable spec must kernel-certify over tuples");
-        assert_eq!(cert.reachable, vec![vec![0, 2]], "R is the single tuple (0,2)");
+        assert_eq!(
+            cert.reachable,
+            vec![vec![0, 2]],
+            "R is the single tuple (0,2)"
+        );
         assert!(verify_explicit_state_cert(&cert));
     }
 
@@ -5629,8 +5949,16 @@ mod tests {
                     ====\n";
         let cert = certify_explicit_state_spec(spec, &cfg())
             .expect("mixed Int/Bool spec must kernel-certify over tuples");
-        assert_eq!(cert.reachable, vec![vec![0, 1]], "R is the single tuple (x=0, b=true→1)");
-        assert_eq!(cert.sorts, vec![ColSort::Int, ColSort::Bool], "x is Int, b is Bool");
+        assert_eq!(
+            cert.reachable,
+            vec![vec![0, 1]],
+            "R is the single tuple (x=0, b=true→1)"
+        );
+        assert_eq!(
+            cert.sorts,
+            vec![ColSort::Int, ColSort::Bool],
+            "x is Int, b is Bool"
+        );
         assert!(
             verify_explicit_state_cert(&cert),
             "the kernel re-check of the mixed Int/Bool legs must pass"
@@ -5653,18 +5981,31 @@ mod tests {
         let cert = certify_explicit_state_spec(spec, &cfg())
             .expect("non-affine modular Next must certify via the general IR leg");
         // The affine recognizer must NOT have fired (the update is `(x+2)%5`, not `x+δ`).
-        assert!(cert.next_shape.is_none(), "non-affine Next is NOT the affine shape");
-        assert!(cert.next_completeness.is_none(), "no affine completeness leg");
+        assert!(
+            cert.next_shape.is_none(),
+            "non-affine Next is NOT the affine shape"
+        );
+        assert!(
+            cert.next_completeness.is_none(),
+            "no affine completeness leg"
+        );
         // The GENERAL leg IS present: the kernel re-evaluated the ACTUAL predicate over R×D.
         let np = cert.next_pred.as_ref().expect("general Next IR present");
-        assert_eq!(np.hi, vec![8], "RULE 1 reads the per-column bound H=8 off `x' < 9`");
+        assert_eq!(
+            np.hi,
+            vec![8],
+            "RULE 1 reads the per-column bound H=8 off `x' < 9`"
+        );
         assert!(
             cert.next_general_completeness.is_some(),
             "the kernel re-evaluated the real Next predicate over the finite domain"
         );
         // Init `x = 0` is still the literal-disjunction leg (the general Init fallback is not needed).
         assert_eq!(cert.init_shape, Some(vec![0]));
-        assert!(verify_explicit_state_cert(&cert), "kernel re-check incl. the general Next leg");
+        assert!(
+            verify_explicit_state_cert(&cert),
+            "kernel re-check incl. the general Next leg"
+        );
 
         // TAMPER (witness bytes): corrupt the serialized general-completeness term — verify rebuilds the
         // obligation TYPE from (R, D, IR) and re-runs the kernel on the bogus term, which fails to check.
@@ -5704,15 +6045,25 @@ mod tests {
                     ====\n";
         let cert = certify_explicit_state_spec(spec, &cfg())
             .expect("the IF-THEN-ELSE Next (HourClock class) must certify via the general leg");
-        assert_eq!(cert.reachable, (1..=12u64).map(|v| vec![v]).collect::<Vec<_>>());
+        assert_eq!(
+            cert.reachable,
+            (1..=12u64).map(|v| vec![v]).collect::<Vec<_>>()
+        );
         // NOT the affine shortcut — the general IF-desugared leg.
         assert!(cert.next_shape.is_none() && cert.next_completeness.is_none());
-        let np = cert.next_pred.as_ref().expect("general Next IR present (IF desugared to Or)");
+        let np = cert
+            .next_pred
+            .as_ref()
+            .expect("general Next IR present (IF desugared to Or)");
         assert!(
             matches!(np.pred, PredIR::Or(_, _)),
             "the stored Next IR is the desugared Or shape"
         );
-        assert_eq!(np.hi, vec![13], "RULE 4 Or-split: max(then-pin 12+1, else-pin 1) = 13");
+        assert_eq!(
+            np.hi,
+            vec![13],
+            "RULE 4 Or-split: max(then-pin 12+1, else-pin 1) = 13"
+        );
         assert!(
             cert.next_general_completeness.is_some(),
             "the kernel re-evaluated the REAL IF-desugared Next over R×D — enumerator-free closure"
@@ -5723,19 +6074,33 @@ mod tests {
         // single Π-lemma) — nothing Rust-derived remains.
         let cov = domain_coverage_of_cert(&cert);
         assert!(cov.any_completeness_leg && !cov.shortcut_legs);
-        assert_eq!(cov.next_kernel_columns, vec![0], "Next axis KERNEL-PROVEN (or-elim + pins)");
+        assert_eq!(
+            cov.next_kernel_columns,
+            vec![0],
+            "Next axis KERNEL-PROVEN (or-elim + pins)"
+        );
         assert_eq!(cov.init_kernel_columns, vec![0], "Init axis KERNEL-PROVEN");
         assert!(cov.next_rust_columns.is_empty() && cov.init_rust_columns.is_empty());
-        assert!(cov.fully_construction_covered(), "passes --require-domain-complete");
-        assert!(verify_explicit_state_cert(&cert), "kernel re-check incl. the Or-shaped legs");
+        assert!(
+            cov.fully_construction_covered(),
+            "passes --require-domain-complete"
+        );
+        assert!(
+            verify_explicit_state_cert(&cert),
+            "kernel re-check incl. the Or-shaped legs"
+        );
 
         // TAMPER (stored Next IR): mutate the else-arm pin `x'=1` → `x'=0`. Verify rebuilds the
         // obligation from the STORED IR — the serialized witness term no longer checks against
         // the rebuilt type → fail-closed. (Binding the IR to the SPEC is Leg E's re-recognition.)
         let mut bad = cert.clone();
         if let Some(d) = bad.next_pred.as_mut() {
-            let PredIR::Or(_, ref mut else_arm) = d.pred else { panic!("Or shape") };
-            let PredIR::And(_, ref mut pin) = **else_arm else { panic!("And arm") };
+            let PredIR::Or(_, ref mut else_arm) = d.pred else {
+                panic!("Or shape")
+            };
+            let PredIR::And(_, ref mut pin) = **else_arm else {
+                panic!("And arm")
+            };
             **pin = PredIR::Eq(ValIR::Prime(0), ValIR::Lit(0));
         }
         assert!(
@@ -5777,8 +6142,14 @@ mod tests {
         let cert = certify_explicit_state_spec(spec, &c)
             .expect("a spec with TWO configured invariants must certify their conjunction");
         // The conjoined safety predicate rode the general leg (`InvX ∧ InvY`).
-        assert!(cert.safety_pred.is_some(), "conjunction recognized into the general safety leg");
-        assert!(verify_explicit_state_cert(&cert), "verify re-conjoins and re-accepts");
+        assert!(
+            cert.safety_pred.is_some(),
+            "conjunction recognized into the general safety leg"
+        );
+        assert!(
+            verify_explicit_state_cert(&cert),
+            "verify re-conjoins and re-accepts"
+        );
 
         // FAIL-CLOSED: a SECOND invariant violated on a reachable state must decline (the
         // conjunction reduces to false in the kernel on that state). `y` reaches 5, so `y ∈ 0..3`
@@ -5824,7 +6195,10 @@ mod tests {
         // The single-Int affine/literal shortcuts do NOT fire for a 2-var spec; the GENERAL multi-var
         // legs do, with the PER-COLUMN product-domain bounds.
         assert!(cert.next_shape.is_none() && cert.init_shape.is_none());
-        let np = cert.next_pred.as_ref().expect("general multi-var Next IR present");
+        let np = cert
+            .next_pred
+            .as_ref()
+            .expect("general multi-var Next IR present");
         assert_eq!(
             np.hi,
             vec![2, 0],
@@ -5834,8 +6208,15 @@ mod tests {
             cert.next_general_completeness.is_some(),
             "kernel re-evaluated Next over the product domain"
         );
-        let ip = cert.init_pred.as_ref().expect("general multi-var Init IR present");
-        assert_eq!(ip.hi, vec![0, 0], "Init pins x=0,y=0 ⇒ per-column bounds (0,0)");
+        let ip = cert
+            .init_pred
+            .as_ref()
+            .expect("general multi-var Init IR present");
+        assert_eq!(
+            ip.hi,
+            vec![0, 0],
+            "Init pins x=0,y=0 ⇒ per-column bounds (0,0)"
+        );
         assert!(
             cert.init_general_completeness.is_some(),
             "kernel re-evaluated Init over the product domain"
@@ -5937,6 +6318,72 @@ mod tests {
         );
     }
 
+    /// The full three-RM TCommit action includes nested nullary operators whose bodies quantify over
+    /// the same `rm` name as the outer action. Its 34×64 completeness obligation is below the normal
+    /// monolith leg-count cap, but the expanded global guards make that single kernel term structurally
+    /// expensive. The exact per-source fallback must retain the enumerator-free proof and Leg-E must
+    /// re-check it through the same path.
+    #[test]
+    fn live_explicit_fixpoint_tcommit_nested_guards_general() {
+        let spec = "---- MODULE TC ----\n\
+                    VARIABLE rmState\n\
+                    Init == rmState = [rm \\in RM |-> \"working\"]\n\
+                    canCommit == \\A rm \\in RM : rmState[rm] \\in {\"prepared\", \"committed\"}\n\
+                    notCommitted == \\A rm \\in RM : rmState[rm] # \"committed\"\n\
+                    Prepare(rm) == /\\ rmState[rm] = \"working\"\n\
+                                   /\\ rmState' = [rmState EXCEPT ![rm] = \"prepared\"]\n\
+                    Decide(rm) == \\/ /\\ rmState[rm] = \"prepared\"\n\
+                                      /\\ canCommit\n\
+                                      /\\ rmState' = [rmState EXCEPT ![rm] = \"committed\"]\n\
+                                  \\/ /\\ rmState[rm] \\in {\"working\", \"prepared\"}\n\
+                                      /\\ notCommitted\n\
+                                      /\\ rmState' = [rmState EXCEPT ![rm] = \"aborted\"]\n\
+                    Next == \\E rm \\in RM : Prepare(rm) \\/ Decide(rm)\n\
+                    Safety == rmState \\in [RM -> {\"working\", \"prepared\", \"committed\", \"aborted\"}]\n\
+                    ====\n";
+        use crate::config::ConstantValue;
+        let mut config = cfg();
+        config.constants.insert(
+            "RM".to_string(),
+            ConstantValue::ModelValueSet(vec![
+                "r1".to_string(),
+                "r2".to_string(),
+                "r3".to_string(),
+            ]),
+        );
+        let cert = certify_explicit_state_spec(spec, &config)
+            .expect("the full nested-guard TCommit shape must certify");
+        assert_eq!(
+            cert.reachable.len(),
+            34,
+            "the real three-RM model has 34 states"
+        );
+        assert!(
+            cert.next_general_completeness.is_some(),
+            "the exact per-source fallback must preserve enumerator-free Next closure"
+        );
+        assert!(
+            cert.init_general_completeness.is_some(),
+            "the FuncEnum constructor keeps enumerator-free Init completeness"
+        );
+        assert!(
+            verify_explicit_state_cert(&cert),
+            "Leg-E must re-check the per-source completeness fallback"
+        );
+        let mut under = cert.clone();
+        let victim = under
+            .reachable
+            .iter()
+            .find(|s| *s != &under.init_values[0])
+            .cloned()
+            .expect("a non-initial reachable state exists");
+        under.reachable.retain(|s| s != &victim);
+        assert!(
+            !verify_explicit_state_cert(&under),
+            "partitioning must still reject an under-approximated reachable set"
+        );
+    }
+
     /// LIVE PART A — general SUBTRACTION in `Next`: a bounded DOWN-COUNTER `x' = x − 1 ∧ x > 0 ∧ x' < 9`.
     /// The affine recognizer declines (subtraction, three conjuncts), so the GENERAL IR leg fires with the
     /// NARROWLY SOUND `nonneg = a − b` positive-polarity form (`x' = x − 1` ⇒ `Eq(Prime, Sub(Var, Lit))`).
@@ -5953,13 +6400,30 @@ mod tests {
                     ====\n";
         let cert = certify_explicit_state_spec(spec, &cfg())
             .expect("the down-counter (subtraction Next) must certify via the general IR leg");
-        assert_eq!(cert.reachable, vec![vec![0], vec![1], vec![2], vec![3]], "R = {{0,1,2,3}}");
+        assert_eq!(
+            cert.reachable,
+            vec![vec![0], vec![1], vec![2], vec![3]],
+            "R = {{0,1,2,3}}"
+        );
         // The affine recognizer must NOT have fired (the update is `x − 1`, not `x + δ`).
-        assert!(cert.next_shape.is_none(), "subtraction Next is NOT the affine shape");
-        assert!(cert.next_completeness.is_none(), "no affine completeness leg");
+        assert!(
+            cert.next_shape.is_none(),
+            "subtraction Next is NOT the affine shape"
+        );
+        assert!(
+            cert.next_completeness.is_none(),
+            "no affine completeness leg"
+        );
         // The GENERAL leg IS present with the narrow-Sub IR; RULE 1 reads H=8 off `x' < 9`.
-        let np = cert.next_pred.as_ref().expect("general Next IR present (narrow Sub)");
-        assert_eq!(np.hi, vec![8], "RULE 1 reads the per-column bound H=8 off `x' < 9`");
+        let np = cert
+            .next_pred
+            .as_ref()
+            .expect("general Next IR present (narrow Sub)");
+        assert_eq!(
+            np.hi,
+            vec![8],
+            "RULE 1 reads the per-column bound H=8 off `x' < 9`"
+        );
         assert!(
             cert.next_general_completeness.is_some(),
             "the kernel re-evaluated the real subtraction Next over the finite domain"
@@ -6062,10 +6526,20 @@ mod tests {
             "R = {{(0,T),(1,T),(2,T)}} (b stays TRUE→1)"
         );
         assert_eq!(cert.sorts, vec![ColSort::Int, ColSort::Bool]);
-        let np = cert.next_pred.as_ref().expect("general Int+Bool Next IR present");
-        assert_eq!(np.hi, vec![2, 1], "H_x=2 (x'<3), H_b=1 (Bool domain {{0,1}})");
+        let np = cert
+            .next_pred
+            .as_ref()
+            .expect("general Int+Bool Next IR present");
+        assert_eq!(
+            np.hi,
+            vec![2, 1],
+            "H_x=2 (x'<3), H_b=1 (Bool domain {{0,1}})"
+        );
         assert!(cert.next_general_completeness.is_some());
-        assert!(cert.init_general_completeness.is_some(), "Init `b = TRUE` general leg present");
+        assert!(
+            cert.init_general_completeness.is_some(),
+            "Init `b = TRUE` general leg present"
+        );
         // (d) end-to-end Leg-E verifier ACCEPTS the Bool-column general legs.
         assert!(
             verify_explicit_state_cert(&cert),
@@ -6098,13 +6572,22 @@ mod tests {
         let cert = certify_explicit_state_spec(spec, &cfg())
             .expect("the all-Bool toggle spec must kernel-certify");
         assert_eq!(cert.sorts, vec![ColSort::Bool, ColSort::Bool]);
-        assert_eq!(cert.reachable, vec![vec![0, 0], vec![0, 1], vec![1, 0], vec![1, 1]]);
+        assert_eq!(
+            cert.reachable,
+            vec![vec![0, 0], vec![0, 1], vec![1, 0], vec![1, 1]]
+        );
         // The Bool-op successor `x' = ~x` recognizes EXACTLY as `Equiv(Eq(Prime,1), Not(Eq(Var,1)))`.
-        let np = cert.next_pred.as_ref().expect("Bool-op general Next IR present");
+        let np = cert
+            .next_pred
+            .as_ref()
+            .expect("Bool-op general Next IR present");
         let leg = |i: usize| {
             PredIR::Equiv(
                 Box::new(PredIR::Eq(ValIR::Prime(i), ValIR::Lit(1))),
-                Box::new(PredIR::Not(Box::new(PredIR::Eq(ValIR::Var(i), ValIR::Lit(1))))),
+                Box::new(PredIR::Not(Box::new(PredIR::Eq(
+                    ValIR::Var(i),
+                    ValIR::Lit(1),
+                )))),
             )
         };
         assert_eq!(
@@ -6112,8 +6595,15 @@ mod tests {
             PredIR::And(Box::new(leg(0)), Box::new(leg(1))),
             "x'=~x /\\ y'=~y ⇒ And of two `Equiv(Prime=1, ¬(Var=1))` legs"
         );
-        assert_eq!(np.hi, vec![1, 1], "both axes are the Bool universe {{0,1}} (H=1)");
-        assert!(cert.next_general_completeness.is_some(), "kernel re-evaluated Next over R×D");
+        assert_eq!(
+            np.hi,
+            vec![1, 1],
+            "both axes are the Bool universe {{0,1}} (H=1)"
+        );
+        assert!(
+            cert.next_general_completeness.is_some(),
+            "kernel re-evaluated Next over R×D"
+        );
         // CONSTRUCTION-COMPLETE: every completeness-leg axis is its column's full SORT universe.
         let cov = crate::cleancic::next_domain_bounds_cov_from_ir(
             &np.pred,
@@ -6123,10 +6613,14 @@ mod tests {
         )
         .expect("Bool axes bound");
         assert!(
-            cov.iter().all(|(_, c)| *c == crate::cleancic::DomainCoverage::UniverseComplete),
+            cov.iter()
+                .all(|(_, c)| *c == crate::cleancic::DomainCoverage::UniverseComplete),
             "every Bool axis is UniverseComplete (ConstructionComplete): {cov:?}"
         );
-        assert!(verify_explicit_state_cert(&cert), "kernel re-check of the Bool-op general legs");
+        assert!(
+            verify_explicit_state_cert(&cert),
+            "kernel re-check of the Bool-op general legs"
+        );
         // STRICT-DOMAIN mode (declines any Rust-derived axis) ALSO certifies — the enumerator-free
         // claim rests on no trusted-Rust bound rule (all axes universe-complete).
         let strict = certify_explicit_state_spec_strict_domain(spec, &cfg())
@@ -6145,7 +6639,7 @@ mod tests {
     /// closure leg (`verify_explicit_state_cert`) MUST reduce to false. A non-closed R certifying would
     /// be a FALSE SAFE.
     #[test]
-    fn bool_next_non_closed_R_declines() {
+    fn bool_next_non_closed_r_declines() {
         let spec = "---- MODULE A1 ----\n\
                     EXTENDS Naturals\n\
                     VARIABLES x, y\n\
@@ -6161,7 +6655,10 @@ mod tests {
             "R = {{(F,F),(F,T),(T,F)}} — a PROPER subset ((T,T) unreachable)"
         );
         assert!(cert.next_pred.is_some() && cert.next_general_completeness.is_some());
-        assert!(verify_explicit_state_cert(&cert), "the genuinely-closed R re-checks");
+        assert!(
+            verify_explicit_state_cert(&cert),
+            "the genuinely-closed R re-checks"
+        );
         // Drop (0,1) — a real successor of (1,0) under `x'=~x /\ y'=x` — so R is NOT closed.
         let mut under = cert.clone();
         under.reachable.retain(|t| t != &vec![0, 1]);
@@ -6193,7 +6690,10 @@ mod tests {
             cert.next_pred.is_none() && cert.next_general_completeness.is_none(),
             "the out-of-fragment Bool Next declines the enumerator-FREE leg (fail-closed)"
         );
-        assert!(verify_explicit_state_cert(&cert), "the enumerated image leg still re-checks");
+        assert!(
+            verify_explicit_state_cert(&cert),
+            "the enumerated image leg still re-checks"
+        );
     }
 
     /// LIVE end-to-end SET-VALUED column: an Int var `x` (carries the `x≥0` Safety leg) plus a SET var
@@ -6224,11 +6724,20 @@ mod tests {
         );
         assert_eq!(
             cert.sorts,
-            vec![ColSort::Int, ColSort::Set { universe: SET_UNIVERSE_BITS }],
+            vec![
+                ColSort::Int,
+                ColSort::Set {
+                    universe: SET_UNIVERSE_BITS
+                }
+            ],
             "x is Int, chosen is a Set bitmask column"
         );
         // image(R) under Next: every successor sets `chosen'={0}` (mask 1), x stutters at 0.
-        assert_eq!(cert.image, vec![vec![0, 1]], "image = (x=0, chosen={{0}}=1)");
+        assert_eq!(
+            cert.image,
+            vec![vec![0, 1]],
+            "image = (x=0, chosen={{0}}=1)"
+        );
         // CHANGING Set column over the 16-bit universe ⇒ general Next leg declined (universe > cap).
         assert!(
             cert.next_pred.is_none() && cert.next_general_completeness.is_none(),
@@ -6268,11 +6777,21 @@ mod tests {
             .expect("Int + stuttering Set spec must kernel-certify");
         // chosen = {0,1} → bitmask 0b11 = 3; the single reachable tuple (x=0, chosen=3).
         assert_eq!(cert.reachable, vec![vec![0, 3]], "chosen={{0,1}}→bitmask 3");
-        assert_eq!(cert.sorts, vec![ColSort::Int, ColSort::Set { universe: SET_UNIVERSE_BITS }]);
+        assert_eq!(
+            cert.sorts,
+            vec![
+                ColSort::Int,
+                ColSort::Set {
+                    universe: SET_UNIVERSE_BITS
+                }
+            ]
+        );
         // The STUTTER set column gives a sound finite product-domain bound (max R = 3), so the general
         // Next leg fires and is kernel-re-evaluated.
-        let np =
-            cert.next_pred.as_ref().expect("general Next IR present for the stuttering set spec");
+        let np = cert
+            .next_pred
+            .as_ref()
+            .expect("general Next IR present for the stuttering set spec");
         assert_eq!(
             np.hi,
             vec![0, 3],
@@ -6307,7 +6826,11 @@ mod tests {
             "Int + Record-valued spec must kernel-certify the membership legs over the pack",
         );
         // r = [a|->1, b|->2] → pack = 1 + 2*10 = 21 (canonical field order a,b).
-        assert_eq!(cert.reachable, vec![vec![0, 21]], "Record column stored as positional pack 21");
+        assert_eq!(
+            cert.reachable,
+            vec![vec![0, 21]],
+            "Record column stored as positional pack 21"
+        );
         assert_eq!(
             cert.sorts,
             vec![
@@ -6399,7 +6922,14 @@ mod tests {
         );
         assert_eq!(
             cert.sorts,
-            vec![ColSort::Int, ColSort::Seq { base: 9, max_len: 4, elem: CellSort::Int }],
+            vec![
+                ColSort::Int,
+                ColSort::Seq {
+                    base: 9,
+                    max_len: 4,
+                    elem: CellSort::Int
+                }
+            ],
             "x is Int, s is a Sequence pack column (base 9, max_len 4)"
         );
         assert!(
@@ -6462,7 +6992,6 @@ mod tests {
     #[test]
     fn seq_min_radix_boundary_and_byte_compat() {
         use crate::value::{SeqValue, Value};
-        use std::sync::Arc;
         let seq = |xs: &[i64]| {
             Value::Seq(Rp::new(SeqValue::from_vec(
                 xs.iter().map(|&n| Value::SmallInt(n)).collect(),
@@ -6476,14 +7005,32 @@ mod tests {
         );
         assert_eq!(
             value_cell_encode(&seq(&[8])),
-            Some((ColSort::Seq { base: SEQ_BASE, max_len: SEQ_MAX_LEN, elem: CellSort::Int }, 9)),
+            Some((
+                ColSort::Seq {
+                    base: SEQ_BASE,
+                    max_len: SEQ_MAX_LEN,
+                    elem: CellSort::Int
+                },
+                9
+            )),
             "element 8 stays byte-identical: base SEQ_BASE, pack 9"
         );
         // <<9>>: element = SEQ_BASE now admitted at radix 11 (element base 10); pre-widening declined.
-        assert_eq!(compound_min_base(&seq(&[9])), Some(11), "element 9 ⇒ D = max(10, 9+2) = 11");
+        assert_eq!(
+            compound_min_base(&seq(&[9])),
+            Some(11),
+            "element 9 ⇒ D = max(10, 9+2) = 11"
+        );
         assert_eq!(
             value_cell_encode_at(&seq(&[9]), 11),
-            Some((ColSort::Seq { base: 10, max_len: SEQ_MAX_LEN, elem: CellSort::Int }, 10)),
+            Some((
+                ColSort::Seq {
+                    base: 10,
+                    max_len: SEQ_MAX_LEN,
+                    elem: CellSort::Int
+                },
+                10
+            )),
             "element 9 packs at radix 11: base 10, pack = (9+1)·11^0 = 10"
         );
     }
@@ -6574,8 +7121,14 @@ mod tests {
         let cert = certify_explicit_state_spec(spec, &cfg())
             .expect("a record-field Safety conjunct is exact digit extraction — certifiable");
         assert!(cert.safety_pred.is_some(), "rides the GENERAL safety leg");
-        assert!(cert.safety_general.is_some(), "kernel-checked general R⊆Safety leg present");
-        assert!(verify_explicit_state_cert(&cert), "the record-field safety cert re-verifies");
+        assert!(
+            cert.safety_general.is_some(),
+            "kernel-checked general R⊆Safety leg present"
+        );
+        assert!(
+            verify_explicit_state_cert(&cert),
+            "the record-field safety cert re-verifies"
+        );
     }
 
     /// The exactness filter still REJECTS genuinely inexact div/mod: `x % 2 = 0` over an INT
@@ -6610,8 +7163,14 @@ mod tests {
         let cert = certify_explicit_state_spec(spec, &cfg()).expect("record cert");
         let bytes = serde_json::to_vec(&cert).expect("serialize");
         let back: ExplicitFixpointCert = serde_json::from_slice(&bytes).expect("deserialize");
-        assert_eq!(cert, back, "the compound-column cert must serde round-trip identically");
-        assert!(verify_explicit_state_cert(&back), "the re-loaded compound cert must still verify");
+        assert_eq!(
+            cert, back,
+            "the compound-column cert must serde round-trip identically"
+        );
+        assert!(
+            verify_explicit_state_cert(&back),
+            "the re-loaded compound cert must still verify"
+        );
         for sort in [
             ColSort::Record {
                 base: 10,
@@ -6625,7 +7184,11 @@ mod tests {
                 dom: vec![],
                 dom_kind: EnumKind::Model,
             },
-            ColSort::Seq { base: 9, max_len: 4, elem: CellSort::Int },
+            ColSort::Seq {
+                base: 9,
+                max_len: 4,
+                elem: CellSort::Int,
+            },
         ] {
             let s = serde_json::to_vec(&sort).unwrap();
             let d: ColSort = serde_json::from_slice(&s).unwrap();
@@ -6634,7 +7197,10 @@ mod tests {
             // NOR `dom_kind` keys ⇒ byte-identical to a pre-domain-shape cert.
             let text = String::from_utf8(s).unwrap();
             if matches!(sort, ColSort::Func { .. }) {
-                assert!(!text.contains("dom"), "Int-prefix Func must omit dom/dom_kind: {text}");
+                assert!(
+                    !text.contains("dom"),
+                    "Int-prefix Func must omit dom/dom_kind: {text}"
+                );
             }
         }
     }
@@ -6658,12 +7224,23 @@ mod tests {
             vec![
                 ColSort::Int,
                 // `max(RECORD_FUNC_BASE, 99+1) = 100` — the smallest-admitting derived base.
-                ColSort::Record { base: 100, fields: vec!["a".to_string()], cells: vec![] }
+                ColSort::Record {
+                    base: 100,
+                    fields: vec!["a".to_string()],
+                    cells: vec![]
+                }
             ],
             "the widened column's sort carries the DERIVED tight base (99+1), not a fixed 1024"
         );
-        assert_eq!(cert.reachable, vec![vec![0, 99]], "single-field pack = 99·100^0 = 99");
-        assert!(verify_explicit_state_cert(&cert), "the derived-base cert re-verifies");
+        assert_eq!(
+            cert.reachable,
+            vec![vec![0, 99]],
+            "single-field pack = 99·100^0 = 99"
+        );
+        assert!(
+            verify_explicit_state_cert(&cert),
+            "the derived-base cert re-verifies"
+        );
     }
 
     /// FAIL-CLOSED on PACK OVERFLOW: the derived base has no fixed ceiling, but the pack `base^arity` must
@@ -6703,16 +7280,27 @@ mod tests {
         let cert = certify_explicit_state_spec(spec, &cfg())
             .expect("record-field counter must certify with the general completeness leg");
         // R = single-field record packs {0,1,2} paired with x=0.
-        assert_eq!(cert.reachable, vec![vec![0, 0], vec![0, 1], vec![0, 2]], "mod-3 record cycle");
+        assert_eq!(
+            cert.reachable,
+            vec![vec![0, 0], vec![0, 1], vec![0, 2]],
+            "mod-3 record cycle"
+        );
         assert_eq!(
             cert.sorts,
             vec![
                 ColSort::Int,
-                ColSort::Record { base: 10, fields: vec!["a".to_string()], cells: vec![] }
+                ColSort::Record {
+                    base: 10,
+                    fields: vec!["a".to_string()],
+                    cells: vec![]
+                }
             ],
         );
         // The GENERAL Next-completeness leg FIRED (the kernel re-evaluated Next over the pack domain).
-        assert!(cert.next_pred.is_some(), "the compound-op general Next leg must be present");
+        assert!(
+            cert.next_pred.is_some(),
+            "the compound-op general Next leg must be present"
+        );
         assert!(
             cert.next_general_completeness.is_some(),
             "...with its kernel-checked completeness term"
@@ -6887,7 +7475,11 @@ mod tests {
             ],
             "a 3-label MODEL Enum column (val) plus two Int flip columns (rdy, ack)"
         );
-        assert_eq!(cert.reachable.len(), 12, "3 (val) × 2 (rdy) × 2 (ack) reachable states");
+        assert_eq!(
+            cert.reachable.len(),
+            12,
+            "3 (val) × 2 (rdy) × 2 (ack) reachable states"
+        );
         assert!(
             cert.next_general_completeness.is_some(),
             "the kernel RE-EVALUATED Send∨Rcv (incl. the `val'∈Data` enum assignment) over D — enumerator-free closure"
@@ -7026,7 +7618,11 @@ mod tests {
             ],
             "three Int bit columns (sBit, sAck, rBit) plus two 2-label MODEL Enum columns (sent, rcvd)"
         );
-        assert_eq!(cert.reachable.len(), 20, "the alternating-bit reachable set is 20 states");
+        assert_eq!(
+            cert.reachable.len(),
+            20,
+            "the alternating-bit reachable set is 20 states"
+        );
         assert!(
             cert.next_general_completeness.is_some(),
             "the kernel RE-EVALUATED ABCNext (incl. the parameterized `\\E d: CSndNewValue(d)` enum \
@@ -7064,7 +7660,10 @@ mod tests {
         // `Next(s,sp) ∧ sp∉R` ⇒ the closure obligation is FALSE ⇒ verify must REJECT. This is the guard
         // that proves the closure re-check uses the FAITHFUL (beta-inlined) Next relation.
         let escaping = vec![1u64, 0, 0, 0, 0]; // (sBit=1, sAck=0, rBit=0, sent=d1, rcvd=d1): a CSndNewValue successor
-        assert!(cert.reachable.contains(&escaping), "the drop target must be a reachable state");
+        assert!(
+            cert.reachable.contains(&escaping),
+            "the drop target must be a reachable state"
+        );
         let mut under = cert.clone();
         under.reachable.retain(|t| t != &escaping);
         assert_ne!(
@@ -7117,7 +7716,9 @@ mod tests {
             ConstantValue::ModelValueSet(vec!["a1".to_string(), "a2".to_string()]),
         );
         // `blk` is a STANDALONE model value — NOT a member of any model-value SET ⇒ NOT in `mvsets`.
-        config.constants.insert("blk".to_string(), ConstantValue::ModelValue);
+        config
+            .constants
+            .insert("blk".to_string(), ConstantValue::ModelValue);
         config.constants_order.push("Data".to_string());
         config.constants_order.push("blk".to_string());
 
@@ -7157,8 +7758,19 @@ mod tests {
         let cert = certify_explicit_state_spec(spec, &cfg())
             .expect("set-comprehension spec must certify with the general completeness leg");
         // chosen: {1,2,3}=mask 0b1110 → filter out 1 → {2,3}=0b1100 → filter again → {2,3} (fixpoint).
-        assert_eq!(cert.sorts, vec![ColSort::Int, ColSort::Set { universe: SET_UNIVERSE_BITS }]);
-        assert!(cert.next_pred.is_some(), "the comprehension general Next leg must be present");
+        assert_eq!(
+            cert.sorts,
+            vec![
+                ColSort::Int,
+                ColSort::Set {
+                    universe: SET_UNIVERSE_BITS
+                }
+            ]
+        );
+        assert!(
+            cert.next_pred.is_some(),
+            "the comprehension general Next leg must be present"
+        );
         assert!(
             cert.next_general_completeness.is_some(),
             "...with its kernel-checked completeness term"
@@ -7227,8 +7839,19 @@ mod tests {
                     ====\n";
         let cert = certify_explicit_state_spec(spec, &cfg())
             .expect("a bounded-∀-over-a-set guard spec must kernel-certify with the general leg");
-        assert_eq!(cert.sorts, vec![ColSort::Int, ColSort::Set { universe: SET_UNIVERSE_BITS }]);
-        assert!(cert.next_pred.is_some(), "the bounded-∀ general Next leg must be present");
+        assert_eq!(
+            cert.sorts,
+            vec![
+                ColSort::Int,
+                ColSort::Set {
+                    universe: SET_UNIVERSE_BITS
+                }
+            ]
+        );
+        assert!(
+            cert.next_pred.is_some(),
+            "the bounded-∀ general Next leg must be present"
+        );
         assert!(
             cert.next_general_completeness.is_some(),
             "...with its kernel-checked completeness term"
@@ -7253,7 +7876,10 @@ mod tests {
                     ====\n";
         let cert = certify_explicit_state_spec(spec, &cfg())
             .expect("a bounded-∃-over-a-set guard spec must kernel-certify with the general leg");
-        assert!(cert.next_pred.is_some(), "the bounded-∃ general Next leg must be present");
+        assert!(
+            cert.next_pred.is_some(),
+            "the bounded-∃ general Next leg must be present"
+        );
         assert!(
             cert.next_general_completeness.is_some(),
             "...with its kernel-checked completeness term"
@@ -7290,7 +7916,10 @@ mod tests {
         // it does NOT enumerate (the `∀x` consecution leg is the closure proof).
         let cert = certify_explicit_state_spec_bounded(spec, &cfg(), 64)
             .expect("the unbounded counter is Certified by the parametric leg (no enumeration)");
-        assert!(cert.unbounded_invariant.is_some(), "via the parametric inductive-invariant path");
+        assert!(
+            cert.unbounded_invariant.is_some(),
+            "via the parametric inductive-invariant path"
+        );
         assert!(cert.reachable.is_empty(), "NO enumeration was performed");
         assert!(verify_explicit_state_cert(&cert));
     }
@@ -7321,7 +7950,10 @@ mod tests {
             vec![vec![2], vec![3], vec![4], vec![5]],
             "Init x ∈ 2..5 enumerates R through the live constraint branches"
         );
-        let ir = cert.safety_pred.as_ref().expect("the recognized general safety IR is stored");
+        let ir = cert
+            .safety_pred
+            .as_ref()
+            .expect("the recognized general safety IR is stored");
         assert_eq!(
             *ir,
             PredIR::And(
@@ -7330,12 +7962,18 @@ mod tests {
             ),
             "x ∈ 1..12 is recognized EXACTLY as 1≤x ∧ x≤12"
         );
-        assert!(cert.safety_general.is_some(), "the kernel-checked general safety leg is present");
+        assert!(
+            cert.safety_general.is_some(),
+            "the kernel-checked general safety leg is present"
+        );
         assert!(
             !cert.safety_term.is_empty(),
             "the tuple (encoding-level nonneg) leg still rides along — both must pass"
         );
-        assert!(verify_explicit_state_cert(&cert), "kernel re-check incl. the general safety leg");
+        assert!(
+            verify_explicit_state_cert(&cert),
+            "kernel re-check incl. the general safety leg"
+        );
     }
 
     /// FAIL-CLOSED: an invariant VIOLATED on a reachable state must NOT certify — the kernel
@@ -7450,7 +8088,10 @@ mod tests {
         );
         let reparsed: ExplicitFixpointCert = serde_json::from_str(&json).expect("reparses");
         assert_eq!(reparsed, cert);
-        assert_eq!(serde_json::to_string(&reparsed).expect("re-serializes"), json);
+        assert_eq!(
+            serde_json::to_string(&reparsed).expect("re-serializes"),
+            json
+        );
         // A GENERAL-lane cert carries both fields (self-consistent, new-only) and round-trips.
         let general =
             certify_explicit_state_spec(HC_SHAPE, &cfg()).expect("general lane certifies");
@@ -7461,6 +8102,9 @@ mod tests {
         );
         let gback: ExplicitFixpointCert = serde_json::from_str(&gjson).expect("reparses");
         assert_eq!(gback, general);
-        assert!(verify_explicit_state_cert(&gback), "the round-tripped general cert re-checks");
+        assert!(
+            verify_explicit_state_cert(&gback),
+            "the round-tripped general cert re-checks"
+        );
     }
 }

@@ -9,8 +9,8 @@
 //! `record/mod.rs`.
 
 use super::record::RecordValue;
-use crate::rp::Rp;
 use super::Value;
+use crate::rp::Rp;
 use smallvec::SmallVec;
 use std::sync::Arc;
 use tla_core::{intern_name, name_id_str_cmp, resolve_name_id, NameId};

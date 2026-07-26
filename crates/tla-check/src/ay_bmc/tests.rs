@@ -9,6 +9,21 @@ use crate::bind_constants_from_config;
 use crate::test_support::parse_module;
 use tla_ay::BmcValue;
 
+#[test]
+fn parse_step_var_accepts_canonical_adversarial_and_legacy_symbols() {
+    let source = "x__0_step_7_☃";
+    let canonical = BmcTranslator::state_step_symbol(source, 12);
+    assert_eq!(parse_step_var(&canonical), Some((source.to_string(), 12)));
+    assert_eq!(
+        parse_step_var(&BmcTranslator::rigid_const_symbol(source)),
+        None
+    );
+    assert_eq!(
+        parse_step_var("legacy__name__3"),
+        Some(("legacy__name".to_string(), 3))
+    );
+}
+
 fn check_spec(src: &str, max_depth: usize) -> Result<BmcResult, BmcError> {
     let module = parse_module(src);
     let config = crate::Config {
@@ -761,6 +776,420 @@ fn test_certificate_obligation_proofs_accumulator() {
     );
 }
 
+/// Liveness re-derivation must run the same exact cert normalization as safety: structural record
+/// memberships are expanded to field memberships and every EXCEPT `@` is replaced by its old-field
+/// projection. This keeps both the AY translator and the affine kernel leg on one canonical AST.
+#[test]
+fn liveness_rederive_normalizes_record_membership_and_except_at() {
+    let src = "---- MODULE LiveRecordNormalize ----\n\
+               EXTENDS Naturals\n\
+               CONSTANT MaxBeanCount\n\
+               VARIABLE can\n\
+               Can == [black : 0..MaxBeanCount, white : 0..MaxBeanCount]\n\
+               TypeInvariant == can \\in Can\n\
+               Init == can \\in {c \\in Can : c.black + c.white \\in 1..MaxBeanCount}\n\
+               BeanCount == can.black + can.white\n\
+               Termination == BeanCount = 1 /\\ UNCHANGED can\n\
+               Next == \\/ /\\ BeanCount > 1\n\
+               \x20          /\\ can.black >= 2\n\
+               \x20          /\\ can' = [can EXCEPT !.black = @ - 1]\n\
+               \x20       \\/ Termination\n\
+               ====\n";
+    let mut config = crate::Config {
+        init: Some("Init".to_string()),
+        next: Some("Next".to_string()),
+        invariants: vec!["TypeInvariant".to_string()],
+        ..Default::default()
+    };
+    config.add_constant(
+        "MaxBeanCount".to_string(),
+        crate::config::ConstantValue::Value("4".to_string()),
+    );
+
+    let inp = rederive_liveness_inputs(
+        src,
+        &config,
+        "TypeInvariant",
+        "ENABLED Termination",
+        "can.black + can.white",
+    )
+    .expect("record-shaped liveness inputs must rederive");
+    let inline = rederive_liveness_inputs(
+        src,
+        &config,
+        "TypeInvariant",
+        "ENABLED (can.black + can.white = 1 /\\ UNCHANGED can)",
+        "can.black + can.white",
+    )
+    .expect("the equivalent inline action must rederive");
+    let init = tla_core::pretty_expr(&inp.init.node);
+    let next = tla_core::pretty_expr(&inp.next.node);
+    let invariant = tla_core::pretty_expr(&inp.j.node);
+    let target = tla_core::pretty_expr(&inp.p.node);
+
+    assert!(
+        !init.contains("[black :") && !invariant.contains("[black :"),
+        "record-set membership must be structurally expanded: init={init}; J={invariant}"
+    );
+    assert!(
+        init.contains("can.black \\in 0..4")
+            && init.contains("can.white \\in 0..4")
+            && invariant.contains("can.black \\in 0..4")
+            && invariant.contains("can.white \\in 0..4"),
+        "normalization must retain both record-field bounds: init={init}; J={invariant}"
+    );
+    assert!(
+        !next.contains('@'),
+        "EXCEPT @ must not reach liveness inputs: {next}"
+    );
+    assert!(
+        next.contains("!.black = can.black - 1"),
+        "EXCEPT @ must become the exact old-field projection: {next}"
+    );
+    assert_eq!(
+        target, "can.black + can.white = 1",
+        "ENABLED Termination must lower to its exact arithmetic guard"
+    );
+    assert_eq!(
+        tla_core::pretty_expr(&inp.p.node),
+        tla_core::pretty_expr(&inline.p.node),
+        "named and inline ENABLED actions must lower to the identical canonical predicate"
+    );
+}
+
+/// `[a : S]` contains records whose DOMAIN is exactly `{a}`. Merely checking
+/// `r.a \in S` would accept an extra `b` field and can turn a false invariant
+/// into a certificate. Both safety and liveness must decline that mismatch.
+#[test]
+fn cert_record_membership_extra_field_fails_closed() {
+    let src = "---- MODULE RecordDomainMismatch ----\n\
+               EXTENDS Naturals\n\
+               VARIABLE r\n\
+               Init == r = [a |-> 0, b |-> 0]\n\
+               Next == UNCHANGED r\n\
+               Inv == r \\in [a : {0}]\n\
+               ====\n";
+    let config = crate::Config {
+        init: Some("Init".to_string()),
+        next: Some("Next".to_string()),
+        invariants: vec!["Inv".to_string()],
+        ..Default::default()
+    };
+
+    assert!(
+        rederive_obligation_inputs(src, &config, "Inv").is_none(),
+        "safety certification must not erase the mismatched record DOMAIN"
+    );
+    assert!(
+        rederive_liveness_inputs(src, &config, "Inv", "TRUE", "0").is_none(),
+        "liveness certification must not erase the mismatched record DOMAIN"
+    );
+}
+
+/// A candidate invariant may suggest a record's field carriers, but that is the
+/// proposition initiation is meant to prove. Init must independently establish
+/// the same complete field sort. Otherwise a Bool literal encoded through the
+/// candidate's Int carrier becomes constant FALSE and a false invariant can be
+/// certified vacuously.
+#[test]
+fn cert_record_init_field_sort_conflict_fails_closed() {
+    let src = "---- MODULE RecordInitSortConflict ----\n\
+               EXTENDS Integers\n\
+               VARIABLE r\n\
+               Init == r = [a |-> TRUE]\n\
+               Next == UNCHANGED r\n\
+               Inv == r \\in [a : Int]\n\
+               ====\n";
+    let config = crate::Config {
+        init: Some("Init".to_string()),
+        next: Some("Next".to_string()),
+        invariants: vec!["Inv".to_string()],
+        ..Default::default()
+    };
+
+    assert!(
+        rederive_obligation_inputs(src, &config, "Inv").is_none(),
+        "candidate-only Int evidence must not type a Bool-valued Init record"
+    );
+    assert!(
+        certificate_obligation_proofs(src, &config, "Inv").is_none(),
+        "the false record invariant must not receive vacuous obligation proofs"
+    );
+    assert!(
+        rederive_liveness_inputs(src, &config, "Inv", "TRUE", "0").is_none(),
+        "liveness must apply the same Init-independent record-sort gate"
+    );
+}
+
+/// An Init record sort is not a type invariant: TLA+ variables may change
+/// shape. The fixed-sort SMT encoding must therefore decline a `Next` action
+/// that adds a field, rather than translate that assignment to `FALSE` and
+/// prove the one-field invariant by vacuous consecution.
+#[test]
+fn cert_record_next_shape_change_fails_closed() {
+    let src = "---- MODULE RecordNextShapeChange ----\n\
+               EXTENDS Naturals\n\
+               VARIABLE r\n\
+               Init == r = [a |-> 0]\n\
+               Next == r' = [a |-> 0, b |-> 1]\n\
+               Inv == r = [a |-> 0]\n\
+               ====\n";
+    let config = crate::Config {
+        init: Some("Init".to_string()),
+        next: Some("Next".to_string()),
+        invariants: vec!["Inv".to_string()],
+        ..Default::default()
+    };
+
+    assert!(
+        rederive_obligation_inputs(src, &config, "Inv").is_none(),
+        "shape-changing Next must decline safety certification before consecution"
+    );
+    assert!(
+        certificate_obligation_proofs(src, &config, "r = [a |-> 0]").is_none(),
+        "the false one-field invariant must not be proved vacuously"
+    );
+    assert!(
+        rederive_liveness_inputs(src, &config, "Inv", "TRUE", "0").is_none(),
+        "liveness certification must use the same record-shape preservation gate"
+    );
+}
+
+fn assert_record_next_sort_change_declines(src: &str) {
+    let config = crate::Config {
+        init: Some("Init".to_string()),
+        next: Some("Next".to_string()),
+        invariants: vec!["Inv".to_string()],
+        ..Default::default()
+    };
+
+    assert!(
+        rederive_obligation_inputs(src, &config, "Inv").is_none(),
+        "sort-changing Next must decline safety certification before consecution"
+    );
+    assert!(
+        certificate_obligation_proofs(src, &config, "r = [a |-> 0]").is_none(),
+        "the false Int-field invariant must not be proved vacuously"
+    );
+    assert!(
+        rederive_liveness_inputs(src, &config, "Inv", "TRUE", "0").is_none(),
+        "liveness certification must use the same record-sort preservation gate"
+    );
+}
+
+/// Keeping the same field name is insufficient when a record literal changes
+/// that field from Int to Bool: the fixed-sort SMT equality becomes FALSE and
+/// would otherwise erase the real transition.
+#[test]
+fn cert_record_next_literal_field_sort_change_fails_closed() {
+    assert_record_next_sort_change_declines(
+        "---- MODULE RecordNextLiteralSortChange ----\n\
+         VARIABLE r\n\
+         Init == r = [a |-> 0]\n\
+         Next == r' = [a |-> TRUE]\n\
+         Inv == r = [a |-> 0]\n\
+         ====\n",
+    );
+}
+
+/// EXCEPT preserves the record DOMAIN but not necessarily its field sorts. A
+/// Bool replacement for an Init-proven Int field must decline for the same
+/// reason as a mismatched record literal.
+#[test]
+fn cert_record_next_except_field_sort_change_fails_closed() {
+    assert_record_next_sort_change_declines(
+        "---- MODULE RecordNextExceptSortChange ----\n\
+         VARIABLE r\n\
+         Init == r = [a |-> 0]\n\
+         Next == r' = [r EXCEPT !.a = TRUE]\n\
+         Inv == r = [a |-> 0]\n\
+         ====\n",
+    );
+}
+
+/// Exact-shape evidence from Init admits the useful per-field rewrite.
+#[test]
+fn cert_record_membership_exact_domain_expands() {
+    let src = "---- MODULE RecordDomainExact ----\n\
+               EXTENDS Naturals\n\
+               VARIABLE r\n\
+               Init == r = [a |-> 0]\n\
+               Next == UNCHANGED r\n\
+               Inv == r \\in [a : {0}]\n\
+               ====\n";
+    let config = crate::Config {
+        init: Some("Init".to_string()),
+        next: Some("Next".to_string()),
+        invariants: vec!["Inv".to_string()],
+        ..Default::default()
+    };
+    let inputs = rederive_obligation_inputs(src, &config, "Inv")
+        .expect("an Init-proven exact record DOMAIN must remain certifiable");
+    let safety = tla_core::pretty_expr(&inputs.safety.node);
+    assert!(
+        !safety.contains("[a :"),
+        "record set must be eliminated: {safety}"
+    );
+    assert!(
+        safety.contains("r.a \\in {0}"),
+        "field membership must be retained exactly: {safety}"
+    );
+}
+
+fn desugared_test_operator(src: &str, name: &str) -> Spanned<Expr> {
+    let module = parse_module(src);
+    let mut ctx = crate::EvalCtx::new();
+    ctx.load_module(&module);
+    let body = crate::ay_shared::get_operator_body(&ctx, name).expect("test operator exists");
+    desugar_except_at(&body)
+}
+
+/// Multiple EXCEPT specs are nested left-to-right. When two specs update the same path, the
+/// second `@` must therefore project from the result of the first update. Projecting both from the
+/// original base changes `0 -> 2` into `0 -> 1` and can turn a violated invariant into a proof.
+#[test]
+fn except_at_desugaring_uses_prior_duplicate_path_update() {
+    let normalized = desugared_test_operator(
+        "---- MODULE ExceptAtDuplicate ----\n\
+         EXTENDS Naturals\n\
+         VARIABLE r\n\
+         Update == [r EXCEPT !.a = @ + 1, !.a = @ + 1]\n\
+         ====\n",
+        "Update",
+    );
+    let Expr::Except(_, specs) = &normalized.node else {
+        panic!(
+            "expected EXCEPT, got {}",
+            tla_core::pretty_expr(&normalized.node)
+        );
+    };
+    assert_eq!(specs.len(), 2);
+    let Expr::Add(second_old, _) = &specs[1].value.node else {
+        panic!("second replacement must add to @");
+    };
+    let Expr::RecordAccess(prior, field) = &second_old.node else {
+        panic!("second @ must be an old-field projection");
+    };
+    assert_eq!(field.name.node, "a");
+    let Expr::Except(prior_base, prior_specs) = &prior.node else {
+        panic!("second @ must project from the prior EXCEPT result");
+    };
+    assert!(matches!(&prior_base.node, Expr::Ident(name, _) if name == "r"));
+    assert_eq!(
+        prior_specs.len(),
+        1,
+        "only the first update precedes the second"
+    );
+    assert!(
+        !tla_core::pretty_expr(&normalized.node).contains('@'),
+        "all EXCEPT @ references must be eliminated"
+    );
+}
+
+/// A later nested-path update must also observe an earlier update of its parent path. Here the
+/// second `@` denotes the `x` field of the newly installed `a` record, not `r.a.x` from the
+/// original base.
+#[test]
+fn except_at_desugaring_uses_prior_parent_update_for_nested_path() {
+    let normalized = desugared_test_operator(
+        "---- MODULE ExceptAtNestedOverlap ----\n\
+         EXTENDS Naturals\n\
+         VARIABLE r\n\
+         Update == [r EXCEPT !.a = [x |-> 5], !.a.x = @ + 1]\n\
+         ====\n",
+        "Update",
+    );
+    let Expr::Except(_, specs) = &normalized.node else {
+        panic!(
+            "expected EXCEPT, got {}",
+            tla_core::pretty_expr(&normalized.node)
+        );
+    };
+    assert_eq!(specs.len(), 2);
+    let Expr::Add(second_old, _) = &specs[1].value.node else {
+        panic!("second replacement must add to @");
+    };
+    let Expr::RecordAccess(parent_access, x_field) = &second_old.node else {
+        panic!("second @ must end in an x-field projection");
+    };
+    assert_eq!(x_field.name.node, "x");
+    let Expr::RecordAccess(prior, a_field) = &parent_access.node else {
+        panic!("second @ must project through the a field");
+    };
+    assert_eq!(a_field.name.node, "a");
+    let Expr::Except(_, prior_specs) = &prior.node else {
+        panic!("nested @ must start from the prior EXCEPT result");
+    };
+    assert_eq!(prior_specs.len(), 1);
+    assert!(
+        matches!(&prior_specs[0].value.node, Expr::Record(fields) if fields.len() == 1),
+        "the prior result must include the parent-record replacement"
+    );
+    assert!(
+        !tla_core::pretty_expr(&normalized.node).contains('@'),
+        "all EXCEPT @ references must be eliminated"
+    );
+}
+
+/// `ENABLED A` lowering is admitted only when `A` decomposes into guards plus a total assignment.
+/// A relational primed predicate with no assignment witness must make liveness re-derivation
+/// decline, never be approximated by a weaker state predicate.
+#[test]
+fn liveness_enabled_lowering_fails_closed_on_opaque_action() {
+    let src = "---- MODULE LiveEnabledOpaque ----\n\
+               EXTENDS Integers\n\
+               VARIABLE x\n\
+               Init == x = 0\n\
+               Next == x' = x\n\
+               Inv == x >= 0\n\
+               ====\n";
+    let config = crate::Config {
+        init: Some("Init".to_string()),
+        next: Some("Next".to_string()),
+        invariants: vec!["Inv".to_string()],
+        ..Default::default()
+    };
+    assert!(
+        rederive_liveness_inputs(src, &config, "Inv", "ENABLED (x' > x)", "x").is_none(),
+        "an opaque ENABLED action must fail closed"
+    );
+}
+
+#[test]
+fn liveness_enabled_lowering_fails_closed_on_unknown_or_recursive_action() {
+    let base = "---- MODULE LiveEnabledNamedDecline ----\n\
+                EXTENDS Integers\n\
+                VARIABLE x\n\
+                Init == x = 0\n\
+                Next == x' = x\n\
+                Inv == x >= 0\n\
+                ====\n";
+    let config = crate::Config {
+        init: Some("Init".to_string()),
+        next: Some("Next".to_string()),
+        invariants: vec!["Inv".to_string()],
+        ..Default::default()
+    };
+    assert!(
+        rederive_liveness_inputs(base, &config, "Inv", "ENABLED MissingAction", "x").is_none(),
+        "an unresolved named action must fail closed"
+    );
+
+    let recursive = "---- MODULE LiveEnabledRecursiveDecline ----\n\
+                     EXTENDS Integers\n\
+                     VARIABLE x\n\
+                     RECURSIVE Loop(_)\n\
+                     Loop(n) == IF n = 0 THEN x' = x ELSE Loop(n - 1)\n\
+                     Init == x = 0\n\
+                     Next == x' = x\n\
+                     Inv == x >= 0\n\
+                     ====\n";
+    assert!(
+        rederive_liveness_inputs(recursive, &config, "Inv", "ENABLED Loop(1)", "x").is_none(),
+        "a recursively unresolved named action must fail closed"
+    );
+}
+
 #[test]
 fn strict_safety_certificate_state_verifies_an_inductive_spec() {
     use crate::shared_verdict::CertificateVerification;
@@ -1210,7 +1639,6 @@ fn test_enabled_recursive_let_declines() {
     );
 }
 
-
 // ===========================================================================
 // Function-state all-N: symbolic-domain FunctionSym + pointwise-∀ discipline.
 // Fast unit tests (NO solver): sort recognition, obligation-transform shape,
@@ -1291,9 +1719,10 @@ fn funcstate_affine_upper_bound_recognized() {
                 TypeOK == /\\ c \\in [ Node -> 0 .. M-1 ]\n\
                 ====\n";
     let mut config = fs_config();
-    config
-        .constants
-        .insert("M".to_string(), crate::config::ConstantValue::Value("6".to_string()));
+    config.constants.insert(
+        "M".to_string(),
+        crate::config::ConstantValue::Value("6".to_string()),
+    );
     let inputs = fs_inputs(spec, &config);
     let c_sort = inputs
         .var_sorts
@@ -1332,7 +1761,9 @@ fn funcstate_consecution_transform_skolemizes_and_instantiates() {
         pt.skolem_consts
     );
     assert!(
-        pt.skolem_consts.iter().any(|c| c.starts_with("__ty_skolem_")),
+        pt.skolem_consts
+            .iter()
+            .any(|c| c.starts_with("__ty_skolem_")),
         "Next selector skolem must be minted, got {:?}",
         pt.skolem_consts
     );
@@ -1384,8 +1815,7 @@ fn funcstate_set_codomain_not_functionsym() {
                 Next == UNCHANGED f\n\
                 TypeOK == /\\ f \\in [1..N -> SUBSET (1..3)]\n\
                 ====\n";
-    let inputs =
-        rederive_obligation_inputs(spec, &fs_config(), "TRUE").expect("must rederive");
+    let inputs = rederive_obligation_inputs(spec, &fs_config(), "TRUE").expect("must rederive");
     let f_sort = inputs
         .var_sorts
         .iter()

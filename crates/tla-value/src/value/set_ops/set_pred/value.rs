@@ -10,11 +10,11 @@
 //! hashing, fingerprinting) lives in `identity.rs`.
 
 use super::super::super::*;
-use std::sync::Arc;
 use super::super::cached_bound_names::CachedBoundNames;
 use super::super::span_normalize::{bound_var_identity_hash, expr_identity_hash};
 use super::captures::SetPredCaptures;
 use crate::CapturedChain;
+use std::sync::Arc;
 use std::sync::OnceLock;
 use tla_core::name_intern::NameId;
 

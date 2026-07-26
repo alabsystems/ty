@@ -302,11 +302,12 @@ pub(crate) fn build_safety_conjunction(
 
 thread_local! {
     /// The set of unbound (symbolic) `CONSTANT` names in scope for the CURRENT
-    /// sort-inference call. Read ONLY by the `FuncSet` arm of
-    /// [`infer_sort_from_set_expr`] to recognise a symbolic contiguous domain
-    /// `lo..(N+offset)` as a [`TlaSort::FunctionSym`]. Defaults to empty (so
-    /// every ordinary caller of [`infer_var_sorts`] is unaffected); populated
-    /// only for the duration of an [`infer_var_sorts_with_symbolic`] call.
+    /// sort-inference call. Read by symbolic function-domain recognition and by
+    /// closed-record field inference: all-N rigid constants are declared as
+    /// scalar Ints by the obligation translator, so an Init equality such as
+    /// `r.limit = N` establishes an Int field. Defaults to empty (so every
+    /// ordinary caller of [`infer_var_sorts`] is unaffected); populated only for
+    /// the duration of an [`infer_var_sorts_with_symbolic`] call.
     static SYMBOLIC_CONSTANTS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
 }
 
@@ -337,7 +338,10 @@ pub(crate) fn infer_var_sorts_with_symbolic(
 /// where the bound denotes `constant_name + offset`. Recognises `N` (offset 0),
 /// `N - k` (offset `-k`), and `N + k` (offset `+k`) for a symbolic `N`. Returns
 /// `None` for any other shape or a non-symbolic base.
-fn parse_symbolic_upper_bound(hi: &Spanned<Expr>, symbolic: &HashSet<String>) -> Option<(String, i64)> {
+fn parse_symbolic_upper_bound(
+    hi: &Spanned<Expr>,
+    symbolic: &HashSet<String>,
+) -> Option<(String, i64)> {
     let ident_if_symbolic = |e: &Spanned<Expr>| -> Option<String> {
         match &e.node {
             Expr::Ident(name, _) | Expr::StateVar(name, ..) if symbolic.contains(name) => {
@@ -418,7 +422,9 @@ fn recognize_symbolic_func_domain(
 /// Inference strategy:
 /// 1. Look for TypeOK in invariants and check for `x \in BOOLEAN` or `x \in Int`
 /// 2. Fall back to Init constraints of the form `x = TRUE/FALSE` (Bool) or `x = n` (Int)
-/// 3. Default to Int if ambiguous (most TLA+ specs use integers)
+/// 3. Infer a closed record from direct field equalities only when Init also
+///    contains an exact record-shape witness (`r = [a |-> r.a, ...]`)
+/// 4. Default to Int if ambiguous (most TLA+ specs use integers)
 pub(crate) fn infer_var_sorts(
     vars: &[Arc<str>],
     init_expr: &Spanned<Expr>,
@@ -459,7 +465,380 @@ fn infer_single_var_sort(
         return sort;
     }
 
+    if let Some(sort) = infer_closed_record_sort_from_init(var, init_expr) {
+        return sort;
+    }
+
     TlaSort::Int
+}
+
+/// Infer a value sort using only syntax that fixes the TLA+ value kind without
+/// relying on a candidate invariant. This is intentionally narrower than the
+/// general heuristic sort inference above: callers use it to justify a fixed
+/// record carrier before translating `Init`, so an ambiguous expression must
+/// decline rather than inherit a potentially circular candidate sort.
+fn infer_exact_init_value_sort(expr: &Spanned<Expr>) -> Option<TlaSort> {
+    fn same(left: TlaSort, right: TlaSort) -> Option<TlaSort> {
+        let left = left.canonicalized();
+        (left == right.canonicalized()).then_some(left)
+    }
+
+    match &expr.node {
+        Expr::Label(label) => infer_exact_init_value_sort(&label.body),
+        Expr::Bool(_) => Some(TlaSort::Bool),
+        Expr::Int(_) => Some(TlaSort::Int),
+        Expr::String(_) => Some(TlaSort::String),
+        Expr::Ident(name, _)
+            if SYMBOLIC_CONSTANTS.with(|symbolic| symbolic.borrow().contains(name)) =>
+        {
+            Some(TlaSort::Int)
+        }
+        Expr::Record(fields) => {
+            let mut field_sorts = Vec::with_capacity(fields.len());
+            for (field, value) in fields {
+                if field_sorts
+                    .iter()
+                    .any(|(existing, _)| existing == &field.node)
+                {
+                    return None;
+                }
+                field_sorts.push((field.node.clone(), infer_exact_init_value_sort(value)?));
+            }
+            Some((TlaSort::Record { field_sorts }).canonicalized())
+        }
+        Expr::RecordAccess(base, field) => {
+            let TlaSort::Record { field_sorts } =
+                infer_exact_init_value_sort(base)?.canonicalized()
+            else {
+                return None;
+            };
+            field_sorts
+                .into_iter()
+                .find(|(name, _)| name == &field.name.node)
+                .map(|(_, sort)| sort)
+        }
+        Expr::Tuple(elements) => Some(TlaSort::Tuple {
+            element_sorts: elements
+                .iter()
+                .map(infer_exact_init_value_sort)
+                .collect::<Option<Vec<_>>>()?,
+        }),
+        Expr::SetEnum(elements) => {
+            let (first, rest) = elements.split_first()?;
+            let element_sort = infer_exact_init_value_sort(first)?.canonicalized();
+            for element in rest {
+                if infer_exact_init_value_sort(element)?.canonicalized() != element_sort {
+                    return None;
+                }
+            }
+            Some(TlaSort::Set {
+                element_sort: Box::new(element_sort),
+            })
+        }
+        Expr::Range(low, high) => {
+            let low = infer_exact_init_value_sort(low)?.canonicalized();
+            let high = infer_exact_init_value_sort(high)?.canonicalized();
+            (low == TlaSort::Int && high == TlaSort::Int).then_some(TlaSort::Set {
+                element_sort: Box::new(TlaSort::Int),
+            })
+        }
+        Expr::If(condition, then_expr, else_expr) => {
+            if infer_exact_init_value_sort(condition)?.canonicalized() != TlaSort::Bool {
+                return None;
+            }
+            same(
+                infer_exact_init_value_sort(then_expr)?,
+                infer_exact_init_value_sort(else_expr)?,
+            )
+        }
+        Expr::Neg(value) => (infer_exact_init_value_sort(value)?.canonicalized() == TlaSort::Int)
+            .then_some(TlaSort::Int),
+        Expr::Add(left, right)
+        | Expr::Sub(left, right)
+        | Expr::Mul(left, right)
+        | Expr::Div(left, right)
+        | Expr::IntDiv(left, right)
+        | Expr::Mod(left, right)
+        | Expr::Pow(left, right) => {
+            let left = infer_exact_init_value_sort(left)?.canonicalized();
+            let right = infer_exact_init_value_sort(right)?.canonicalized();
+            (left == TlaSort::Int && right == TlaSort::Int).then_some(TlaSort::Int)
+        }
+        Expr::Not(value) => (infer_exact_init_value_sort(value)?.canonicalized() == TlaSort::Bool)
+            .then_some(TlaSort::Bool),
+        Expr::And(left, right)
+        | Expr::Or(left, right)
+        | Expr::Implies(left, right)
+        | Expr::Equiv(left, right) => {
+            let left = infer_exact_init_value_sort(left)?.canonicalized();
+            let right = infer_exact_init_value_sort(right)?.canonicalized();
+            (left == TlaSort::Bool && right == TlaSort::Bool).then_some(TlaSort::Bool)
+        }
+        // Equality and disequality are Boolean even when their operands have
+        // different value kinds. Their eventual term translation still checks
+        // that the operands themselves are in the supported fragment.
+        Expr::Eq(..) | Expr::Neq(..) => Some(TlaSort::Bool),
+        Expr::Lt(left, right)
+        | Expr::Leq(left, right)
+        | Expr::Gt(left, right)
+        | Expr::Geq(left, right) => {
+            let left = infer_exact_init_value_sort(left)?.canonicalized();
+            let right = infer_exact_init_value_sort(right)?.canonicalized();
+            (left == TlaSort::Int && right == TlaSort::Int).then_some(TlaSort::Bool)
+        }
+        // In particular, do not inherit the base sort of an EXCEPT without
+        // validating every replacement. The fixed record lane currently needs
+        // only literal/scalar Init evidence, so unsupported compound updates
+        // fail closed here.
+        _ => None,
+    }
+}
+
+/// Infer a CLOSED record sort from Init's direct field equalities.
+///
+/// Field accesses alone only prove that the named keys exist: `r.a = 0 /\
+/// r.b = N` does NOT exclude a hidden `r.c`, so treating those equalities as a
+/// closed two-field record would be unsound. This fallback therefore also
+/// requires an exact record-literal equality such as
+/// `r = [a |-> r.a, b |-> r.b]`. The equality proves the complete DOMAIN while
+/// the direct field equalities determine each field's sort.
+///
+/// The recognizer deliberately accepts only conjunctions (plus LET/label
+/// wrappers), requires every witnessed field to have exactly one consistent
+/// inferred sort, and requires the witnessed and inferred field-name sets to
+/// match exactly. Any disjunction, unknown value sort, duplicate shape field,
+/// or conflicting field sort fails closed.
+fn infer_closed_record_sort_from_init(var: &str, expr: &Spanned<Expr>) -> Option<TlaSort> {
+    #[derive(Default)]
+    struct Evidence {
+        field_sorts: Vec<(String, TlaSort)>,
+        exact_fields: Option<Vec<String>>,
+    }
+
+    fn is_var(var: &str, expr: &Spanned<Expr>) -> bool {
+        matches!(
+            &expr.node,
+            Expr::Ident(name, _) | Expr::StateVar(name, _, _) if name == var
+        )
+    }
+
+    fn field_of_var<'a>(var: &str, expr: &'a Spanned<Expr>) -> Option<&'a str> {
+        let Expr::RecordAccess(base, field) = &expr.node else {
+            return None;
+        };
+        is_var(var, base).then_some(field.name.node.as_str())
+    }
+
+    fn record_shape_witness(
+        var: &str,
+        lhs: &Spanned<Expr>,
+        rhs: &Spanned<Expr>,
+    ) -> Option<Result<Vec<String>, ()>> {
+        let record = if is_var(var, lhs) {
+            match &rhs.node {
+                Expr::Record(fields) => fields,
+                _ => return None,
+            }
+        } else if is_var(var, rhs) {
+            match &lhs.node {
+                Expr::Record(fields) => fields,
+                _ => return None,
+            }
+        } else {
+            return None;
+        };
+
+        let mut names = Vec::with_capacity(record.len());
+        for (field, value) in record {
+            let name = field.node.clone();
+            if field_of_var(var, value) != Some(name.as_str())
+                || names.iter().any(|existing| existing == &name)
+            {
+                return Some(Err(()));
+            }
+            names.push(name);
+        }
+        names.sort();
+        Some(Ok(names))
+    }
+
+    fn merge_field_sort(
+        field_sorts: &mut Vec<(String, TlaSort)>,
+        field: &str,
+        sort: TlaSort,
+    ) -> Result<(), ()> {
+        if let Some((_, existing)) = field_sorts.iter().find(|(name, _)| name == field) {
+            return (existing == &sort).then_some(()).ok_or(());
+        }
+        field_sorts.push((field.to_string(), sort));
+        Ok(())
+    }
+
+    fn collect(var: &str, expr: &Spanned<Expr>, evidence: &mut Evidence) -> Result<(), ()> {
+        match &expr.node {
+            Expr::And(left, right) => {
+                collect(var, left, evidence)?;
+                collect(var, right, evidence)
+            }
+            Expr::Let(_, body) => collect(var, body, evidence),
+            Expr::Label(label) => collect(var, &label.body, evidence),
+            // A field equality in only one disjunct does not constrain every
+            // Init state. Keep this fallback intentionally conjunction-only.
+            Expr::Or(_, _) => Err(()),
+            Expr::Eq(lhs, rhs) => {
+                if let Some(shape) = record_shape_witness(var, lhs, rhs) {
+                    let shape = shape?;
+                    match &evidence.exact_fields {
+                        Some(existing) if existing != &shape => return Err(()),
+                        Some(_) => {}
+                        None => evidence.exact_fields = Some(shape),
+                    }
+                }
+
+                let lhs_field = field_of_var(var, lhs);
+                let rhs_field = field_of_var(var, rhs);
+                match (lhs_field, rhs_field) {
+                    (Some(_), Some(_)) => Err(()),
+                    (Some(field), None) => {
+                        let sort = infer_exact_init_value_sort(rhs).ok_or(())?;
+                        merge_field_sort(&mut evidence.field_sorts, field, sort)
+                    }
+                    (None, Some(field)) => {
+                        let sort = infer_exact_init_value_sort(lhs).ok_or(())?;
+                        merge_field_sort(&mut evidence.field_sorts, field, sort)
+                    }
+                    (None, None) => Ok(()),
+                }
+            }
+            _ => Ok(()),
+        }
+    }
+
+    let mut evidence = Evidence::default();
+    collect(var, expr, &mut evidence).ok()?;
+    let exact_fields = evidence.exact_fields?;
+    if exact_fields.is_empty() || evidence.field_sorts.len() != exact_fields.len() {
+        return None;
+    }
+    evidence
+        .field_sorts
+        .sort_by(|(left, _), (right, _)| left.cmp(right));
+    if !evidence
+        .field_sorts
+        .iter()
+        .map(|(name, _)| name)
+        .eq(exact_fields.iter())
+    {
+        return None;
+    }
+    Some(
+        (TlaSort::Record {
+            field_sorts: evidence.field_sorts,
+        })
+        .canonicalized(),
+    )
+}
+
+/// Prove the exact canonical sort of record state variable `var` using `Init`
+/// alone. Candidate invariants are deliberately absent from this proof: using a
+/// candidate record-set membership to choose field carriers can turn a
+/// conflicting Init literal into SMT `FALSE` and make initiation vacuous.
+///
+/// Accepted evidence is an exact record literal equality, membership in a
+/// record set (possibly through a filter), or the closed-record
+/// self-reconstruction plus direct-field-equality pattern recognized above.
+/// Conjunction may contribute evidence from either side; every disjunct must
+/// establish the same sort. Anything ambiguous fails closed.
+pub(crate) fn infer_exact_record_sort_from_init(
+    var: &str,
+    expr: &Spanned<Expr>,
+    symbolic_constants: &HashSet<String>,
+) -> Option<TlaSort> {
+    struct RestoreSymbolicConstants(HashSet<String>);
+    impl Drop for RestoreSymbolicConstants {
+        fn drop(&mut self) {
+            let previous = std::mem::take(&mut self.0);
+            SYMBOLIC_CONSTANTS.with(|symbolic| *symbolic.borrow_mut() = previous);
+        }
+    }
+
+    let previous = SYMBOLIC_CONSTANTS.with(|symbolic| {
+        std::mem::replace(&mut *symbolic.borrow_mut(), symbolic_constants.clone())
+    });
+    let _restore = RestoreSymbolicConstants(previous);
+
+    fn is_var(var: &str, expr: &Spanned<Expr>) -> bool {
+        matches!(
+            &expr.node,
+            Expr::Ident(name, _) | Expr::StateVar(name, _, _) if name == var
+        )
+    }
+
+    fn record_set_sort(set: &Spanned<Expr>) -> Option<TlaSort> {
+        match &set.node {
+            Expr::Label(label) => record_set_sort(&label.body),
+            Expr::SetFilter(bound, _) => bound.domain.as_deref().and_then(record_set_sort),
+            Expr::RecordSet(fields) => {
+                let mut field_sorts = Vec::with_capacity(fields.len());
+                for (field, domain) in fields {
+                    if field_sorts
+                        .iter()
+                        .any(|(existing, _)| existing == &field.node)
+                    {
+                        return None;
+                    }
+                    field_sorts.push((field.node.clone(), infer_sort_from_set_expr(domain)?));
+                }
+                Some((TlaSort::Record { field_sorts }).canonicalized())
+            }
+            _ => None,
+        }
+    }
+
+    fn exact(var: &str, expr: &Spanned<Expr>) -> Option<TlaSort> {
+        fn same(left: Option<TlaSort>, right: Option<TlaSort>) -> Option<TlaSort> {
+            match (left, right) {
+                (Some(left), Some(right))
+                    if left.clone().canonicalized() == right.clone().canonicalized() =>
+                {
+                    Some(left.canonicalized())
+                }
+                _ => None,
+            }
+        }
+
+        match &expr.node {
+            Expr::And(left, right) => {
+                let left = exact(var, left);
+                let right = exact(var, right);
+                match (left, right) {
+                    (Some(left), Some(right))
+                        if left.clone().canonicalized() == right.clone().canonicalized() =>
+                    {
+                        Some(left.canonicalized())
+                    }
+                    (Some(sort), None) | (None, Some(sort)) => Some(sort.canonicalized()),
+                    _ => None,
+                }
+            }
+            Expr::Or(left, right) => same(exact(var, left), exact(var, right)),
+            Expr::Let(_, body) => exact(var, body),
+            Expr::Label(label) => exact(var, &label.body),
+            Expr::Eq(left, right) if is_var(var, left) => match &right.node {
+                Expr::Record(_) => infer_exact_init_value_sort(right),
+                _ => None,
+            },
+            Expr::Eq(left, right) if is_var(var, right) => match &left.node {
+                Expr::Record(_) => infer_exact_init_value_sort(left),
+                _ => None,
+            },
+            Expr::In(elem, set) if is_var(var, elem) => record_set_sort(set),
+            _ => None,
+        }
+    }
+
+    let sort = exact(var, expr).or_else(|| infer_closed_record_sort_from_init(var, expr))?;
+    matches!(sort, TlaSort::Record { .. }).then(|| sort.canonicalized())
 }
 
 /// Check if expression contains `var \in S` constraint that reveals the variable sort.
@@ -513,6 +892,14 @@ fn infer_sort_from_value_expr(expr: &Spanned<Expr>) -> Option<TlaSort> {
         Expr::Bool(_) => Some(TlaSort::Bool),
         Expr::Int(_) => Some(TlaSort::Int),
         Expr::String(_) => Some(TlaSort::String),
+        // The all-N lane declares every name in SYMBOLIC_CONSTANTS as a rigid
+        // Int in every obligation translator. Keep this recognition scoped to
+        // that lane: ordinary unbound identifiers remain unknown.
+        Expr::Ident(name, _)
+            if SYMBOLIC_CONSTANTS.with(|symbolic| symbolic.borrow().contains(name)) =>
+        {
+            Some(TlaSort::Int)
+        }
         // Part of #3749: set literal as a value — infer Set sort from elements.
         Expr::SetEnum(elements) => {
             let element_sort = infer_sort_from_set_enum(elements)?;
@@ -594,7 +981,7 @@ fn infer_sort_from_value_expr(expr: &Spanned<Expr>) -> Option<TlaSort> {
     }
 }
 
-fn infer_sort_from_set_expr(expr: &Spanned<Expr>) -> Option<TlaSort> {
+pub(crate) fn infer_sort_from_set_expr(expr: &Spanned<Expr>) -> Option<TlaSort> {
     match &expr.node {
         Expr::Label(label) => infer_sort_from_set_expr(&label.body),
         Expr::Ident(name, _) if name == "BOOLEAN" => Some(TlaSort::Bool),
@@ -607,9 +994,7 @@ fn infer_sort_from_set_expr(expr: &Spanned<Expr>) -> Option<TlaSort> {
         // CoffeeCan's `Init == can \in {c \in Can : c.black + c.white \in 1..M}`)
         // still be typed as the record — without it `v` falls back to `Int` and a
         // `v.field` access is untranslatable.
-        Expr::SetFilter(bv, _pred) => {
-            bv.domain.as_ref().and_then(|d| infer_sort_from_set_expr(d))
-        }
+        Expr::SetFilter(bv, _pred) => bv.domain.as_ref().and_then(|d| infer_sort_from_set_expr(d)),
         Expr::RecordSet(fields) => {
             let mut field_sorts = Vec::with_capacity(fields.len());
             for (field_name, domain) in fields {
@@ -638,7 +1023,6 @@ fn infer_sort_from_set_expr(expr: &Spanned<Expr>) -> Option<TlaSort> {
                 .canonicalized(),
             )
         }
-        Expr::SetFilter(bound, _) => infer_sort_from_set_expr(bound.domain.as_ref()?),
         // FuncSet-as-sequence builder: `{FunAsSeq(p, n, m) : p \in [1..n -> R]}`
         // (the Permutation idiom). A `FunAsSeq` over a function with a
         // contiguous `1..n` domain is a length-n sequence whose elements come
@@ -1952,6 +2336,106 @@ mod tests {
     use tla_mc_core::{
         validate_shared_engine_adoption_evidence_row, PreparedPropertyKind, PreparedTransitionKind,
     };
+
+    fn test_ident(name: &str) -> Spanned<Expr> {
+        Spanned::dummy(Expr::Ident(name.to_string(), tla_core::NameId::INVALID))
+    }
+
+    fn test_field(var: &str, field: &str) -> Spanned<Expr> {
+        Spanned::dummy(Expr::RecordAccess(
+            Box::new(test_ident(var)),
+            Spanned::dummy(field.to_string()).into(),
+        ))
+    }
+
+    fn test_eq(lhs: Spanned<Expr>, rhs: Spanned<Expr>) -> Spanned<Expr> {
+        Spanned::dummy(Expr::Eq(Box::new(lhs), Box::new(rhs)))
+    }
+
+    fn test_conjunction(mut conjuncts: Vec<Spanned<Expr>>) -> Spanned<Expr> {
+        let first = conjuncts.remove(0);
+        conjuncts.into_iter().fold(first, |left, right| {
+            Spanned::dummy(Expr::And(Box::new(left), Box::new(right)))
+        })
+    }
+
+    fn exact_record_shape(var: &str, fields: &[&str]) -> Spanned<Expr> {
+        let record = fields
+            .iter()
+            .map(|field| (Spanned::dummy((*field).to_string()), test_field(var, field)))
+            .collect();
+        test_eq(test_ident(var), Spanned::dummy(Expr::Record(record)))
+    }
+
+    fn with_test_symbolic_constants<T>(names: &[&str], f: impl FnOnce() -> T) -> T {
+        struct ResetSymbolicConstants;
+        impl Drop for ResetSymbolicConstants {
+            fn drop(&mut self) {
+                SYMBOLIC_CONSTANTS.with(|symbolic| symbolic.borrow_mut().clear());
+            }
+        }
+
+        SYMBOLIC_CONSTANTS.with(|symbolic| {
+            *symbolic.borrow_mut() = names.iter().map(|name| (*name).to_string()).collect();
+        });
+        let _reset = ResetSymbolicConstants;
+        f()
+    }
+
+    #[test]
+    fn closed_record_init_infers_direct_field_sorts_with_symbolic_int() {
+        let init = test_conjunction(vec![
+            exact_record_shape("r", &["a", "b"]),
+            test_eq(test_field("r", "a"), Spanned::dummy(Expr::Int(0.into()))),
+            test_eq(test_field("r", "b"), test_ident("N")),
+        ]);
+
+        let inferred =
+            with_test_symbolic_constants(&["N"], || infer_closed_record_sort_from_init("r", &init));
+        assert_eq!(
+            inferred,
+            Some(TlaSort::Record {
+                field_sorts: vec![
+                    ("a".to_string(), TlaSort::Int),
+                    ("b".to_string(), TlaSort::Int),
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn direct_field_equalities_without_exact_record_shape_fail_closed() {
+        let init = test_conjunction(vec![
+            test_eq(test_field("r", "a"), Spanned::dummy(Expr::Int(0.into()))),
+            test_eq(test_field("r", "b"), test_ident("N")),
+        ]);
+
+        assert_eq!(
+            with_test_symbolic_constants(&["N"], || {
+                infer_closed_record_sort_from_init("r", &init)
+            }),
+            None,
+            "field access proves key presence, not an exact closed record domain"
+        );
+    }
+
+    #[test]
+    fn conflicting_direct_field_sorts_fail_closed() {
+        let init = test_conjunction(vec![
+            exact_record_shape("r", &["a", "b"]),
+            test_eq(test_field("r", "a"), Spanned::dummy(Expr::Int(0.into()))),
+            test_eq(test_field("r", "a"), Spanned::dummy(Expr::Bool(false))),
+            test_eq(test_field("r", "b"), test_ident("N")),
+        ]);
+
+        assert_eq!(
+            with_test_symbolic_constants(&["N"], || {
+                infer_closed_record_sort_from_init("r", &init)
+            }),
+            None,
+            "one field cannot be inferred as both Int and Bool"
+        );
+    }
 
     // SOUNDNESS GATE (symmetric dual of reconcile_masked_violation): a symbolic
     // safety proof (PDR / k-induction) may resolve the cooperative verdict — and so

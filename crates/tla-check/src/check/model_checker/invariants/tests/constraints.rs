@@ -107,10 +107,7 @@ IsTrue == x = TRUE
     let registry = mc.ctx.var_registry().clone();
     let make_state = |x: Value, irrelevant: i64| {
         ArrayState::from_state(
-            &State::from_pairs([
-                ("x", x),
-                ("irrelevant", Value::int(irrelevant)),
-            ]),
+            &State::from_pairs([("x", x), ("irrelevant", Value::int(irrelevant))]),
             &registry,
         )
     };
@@ -136,16 +133,10 @@ IsTrue == x = TRUE
     assert_eq!(mc.state_constraint_verdict_cache.test_hit_count(), 2);
 
     assert!(!mc
-        .check_state_constraints_array(&make_state(
-            Value::seq([Value::int(1), Value::int(2)]),
-            0,
-        ))
+        .check_state_constraints_array(&make_state(Value::seq([Value::int(1), Value::int(2)]), 0,))
         .unwrap());
     assert!(!mc
-        .check_state_constraints_array(&make_state(
-            Value::seq([Value::int(1), Value::int(2)]),
-            99,
-        ))
+        .check_state_constraints_array(&make_state(Value::seq([Value::int(1), Value::int(2)]), 99,))
         .unwrap());
     assert_eq!(mc.state_constraint_verdict_cache.test_entry_count(), 3);
     assert_eq!(
@@ -249,7 +240,10 @@ Second == IF y = 0 THEN FALSE ELSE y
 
     assert!(!mc.check_state_constraints_array(&false_state).unwrap());
     assert_eq!(mc.state_constraint_verdict_cache.test_entry_count(), 1);
-    assert_eq!(mc.state_constraint_verdict_cache.test_inline_entry_count(), 0);
+    assert_eq!(
+        mc.state_constraint_verdict_cache.test_inline_entry_count(),
+        0
+    );
     let hits_before = mc.state_constraint_verdict_cache.test_hit_count();
     assert!(!mc.check_state_constraints_array(&false_state).unwrap());
     assert_eq!(mc.state_constraint_verdict_cache.test_entry_count(), 1);
@@ -396,13 +390,13 @@ Contextual == TLCGet("level") >= 0
     let mut verified = ModelChecker::new(&contextual_module, &config);
     verified.tir_parity = None;
     let registry = verified.ctx.var_registry().clone();
-    let state = ArrayState::from_state(
-        &State::from_pairs([("x", Value::int(0))]),
-        &registry,
+    let state = ArrayState::from_state(&State::from_pairs([("x", Value::int(0))]), &registry);
+    assert!(verified.check_state_constraints_array(&state).unwrap());
+    assert!(verified.check_state_constraints_array(&state).unwrap());
+    assert_eq!(
+        verified.state_constraint_verdict_cache.test_entry_count(),
+        0
     );
-    assert!(verified.check_state_constraints_array(&state).unwrap());
-    assert!(verified.check_state_constraints_array(&state).unwrap());
-    assert_eq!(verified.state_constraint_verdict_cache.test_entry_count(), 0);
     assert_eq!(verified.state_constraint_verdict_cache.test_hit_count(), 0);
 
     let config = Config {
@@ -421,10 +415,7 @@ Contextual == TLCGet("level") >= 0
         ),
     );
     let registry = tir.ctx.var_registry().clone();
-    let state = ArrayState::from_state(
-        &State::from_pairs([("x", Value::int(0))]),
-        &registry,
-    );
+    let state = ArrayState::from_state(&State::from_pairs([("x", Value::int(0))]), &registry);
     assert!(tir.check_state_constraints_array(&state).unwrap());
     assert!(tir.check_state_constraints_array(&state).unwrap());
     assert_eq!(tir.state_constraint_verdict_cache.test_entry_count(), 0);
@@ -464,13 +455,9 @@ NonNegative == x >= 0
     }
     assert!(mc.state_constraint_verdict_cache.test_is_enabled());
 
-    let retiring_false = ArrayState::from_state(
-        &State::from_pairs([("x", Value::int(-1))]),
-        &registry,
-    );
-    assert!(!mc
-        .check_state_constraints_array(&retiring_false)
-        .unwrap());
+    let retiring_false =
+        ArrayState::from_state(&State::from_pairs([("x", Value::int(-1))]), &registry);
+    assert!(!mc.check_state_constraints_array(&retiring_false).unwrap());
     assert!(!mc.state_constraint_verdict_cache.test_is_enabled());
     assert_eq!(mc.state_constraint_verdict_cache.test_entry_count(), 0);
 }

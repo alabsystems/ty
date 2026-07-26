@@ -3,9 +3,9 @@
 // Licensed under the Apache License, Version 2.0
 
 use proptest::prelude::*;
-use std::sync::Arc;
 use tla_check::State;
 use tla_check::Value;
+use tla_value::Rp;
 
 use super::helpers::{func_from_pairs, sorted_set_from_values};
 
@@ -139,7 +139,7 @@ proptest! {
         let mut rec_builder = RecordBuilder::new();
         rec_builder.insert_arc(&key_arc, Value::int(val));
 
-        let s1 = State::from_pairs([("x", Value::Func(Arc::new(func)))]);
+        let s1 = State::from_pairs([("x", Value::Func(Rp::new(func)))]);
         let s2 = State::from_pairs([("x", Value::Record(rec_builder.build()))]);
 
         // Records are functions with string domains - same fingerprint
@@ -154,8 +154,8 @@ proptest! {
         // Same interval should always produce the same fingerprint
         let iv1 = tla_check::IntervalValue::new(lo.into(), hi.into());
         let iv2 = tla_check::IntervalValue::new(lo.into(), hi.into());
-        let s1 = State::from_pairs([("x", Value::Interval(Arc::new(iv1)))]);
-        let s2 = State::from_pairs([("x", Value::Interval(Arc::new(iv2)))]);
+        let s1 = State::from_pairs([("x", Value::Interval(Rp::new(iv1)))]);
+        let s2 = State::from_pairs([("x", Value::Interval(Rp::new(iv2)))]);
         prop_assert_eq!(s1.fingerprint(), s2.fingerprint());
     }
 
@@ -166,7 +166,7 @@ proptest! {
         // (extensional equivalence)
         let iv = tla_check::IntervalValue::new(lo.into(), hi.into());
         let set = sorted_set_from_values((lo..=hi).map(Value::int));
-        let s1 = State::from_pairs([("x", Value::Interval(Arc::new(iv)))]);
+        let s1 = State::from_pairs([("x", Value::Interval(Rp::new(iv)))]);
         let s2 = State::from_pairs([("x", Value::Set(set.into()))]);
         prop_assert_eq!(s1.fingerprint(), s2.fingerprint());
     }

@@ -7,10 +7,10 @@
 //! Verifies that Tuple, Seq, and IntFunc(min=1) with the same elements
 //! produce identical state dedup fingerprints.
 
+use super::state_value_fingerprint_unwrap;
+use crate::rp::Rp;
 use crate::{IntIntervalFunc, Value};
 use std::sync::Arc;
-use crate::rp::Rp;
-use super::state_value_fingerprint_unwrap;
 
 // ---------------------------------------------------------------------------
 // Tuple/Seq fingerprint equivalence tests (Part of #3193)
@@ -85,9 +85,8 @@ fn test_tuple_seq_intfunc_three_way_equivalence() {
     let tuple_fp = state_value_fingerprint_unwrap(&Value::Tuple(Rp::from(elems.as_slice())));
     let seq_fp =
         state_value_fingerprint_unwrap(&Value::Seq(Rp::new(SeqValue::from(elems.clone()))));
-    let intfunc_fp = state_value_fingerprint_unwrap(&Value::IntFunc(Rp::new(
-        IntIntervalFunc::new(1, 2, elems),
-    )));
+    let intfunc_fp =
+        state_value_fingerprint_unwrap(&Value::IntFunc(Rp::new(IntIntervalFunc::new(1, 2, elems))));
 
     assert_eq!(tuple_fp, seq_fp, "Tuple and Seq must match");
     assert_eq!(seq_fp, intfunc_fp, "Seq and IntFunc(min=1) must match");

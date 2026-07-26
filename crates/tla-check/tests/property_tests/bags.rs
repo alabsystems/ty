@@ -46,26 +46,23 @@ fn eval_bags_str(src: &str) -> Result<Value, String> {
 #[test]
 fn test_empty_bag() {
     let result = eval_bags_str("EmptyBag").unwrap();
-    if let Value::Func(ref f) = result {
-        assert!(f.domain_is_empty());
-        assert!(f.domain_is_empty());
-    } else {
-        panic!("Expected Func value");
-    }
+    let bag = result
+        .as_bag()
+        .unwrap_or_else(|| panic!("Expected compact Bag value, got {result:?}"));
+    assert!(bag.is_empty());
+    assert_eq!(bag.cardinality(), Some(0));
 }
 
 #[cfg_attr(test, ntest::timeout(10000))]
 #[test]
 fn test_set_to_bag() {
     let result = eval_bags_str("SetToBag({1, 2, 3})").unwrap();
-    if let Value::Func(ref f) = result {
-        assert_eq!(f.domain_len(), 3);
-        // Each element should have count 1
-        for v in f.mapping_values() {
-            assert_eq!(v, &Value::int(1));
-        }
-    } else {
-        panic!("Expected Func value, got {:?}", result);
+    let bag = result
+        .as_bag()
+        .unwrap_or_else(|| panic!("Expected compact Bag value, got {result:?}"));
+    assert_eq!(bag.len(), 3);
+    for value in [1, 2, 3] {
+        assert_eq!(bag.count_of(&Value::int(value)), 1);
     }
 }
 
@@ -128,13 +125,12 @@ fn test_bag_in() {
 #[test]
 fn test_bag_union() {
     let result = eval_bags_str("BagUnion({SetToBag({1, 2}), SetToBag({2, 3})})").unwrap();
-    if let Value::Func(ref f) = result {
-        assert_eq!(f.mapping_get(&Value::int(1)), Some(&Value::int(1)));
-        assert_eq!(f.mapping_get(&Value::int(2)), Some(&Value::int(2)));
-        assert_eq!(f.mapping_get(&Value::int(3)), Some(&Value::int(1)));
-    } else {
-        panic!("Expected Func value, got {:?}", result);
-    }
+    let bag = result
+        .as_bag()
+        .unwrap_or_else(|| panic!("Expected compact Bag value, got {result:?}"));
+    assert_eq!(bag.count_of(&Value::int(1)), 1);
+    assert_eq!(bag.count_of(&Value::int(2)), 2);
+    assert_eq!(bag.count_of(&Value::int(3)), 1);
 }
 
 #[cfg_attr(test, ntest::timeout(10000))]
@@ -151,12 +147,11 @@ fn test_bag_of_all_merges_counts() {
     let result =
         eval_bags_str("BagOfAll(LAMBDA x : 0, [e \\in {1, 2} |-> IF e = 1 THEN 2 ELSE 1])")
             .unwrap();
-    if let Value::Func(ref f) = result {
-        assert_eq!(f.domain_len(), 1);
-        assert_eq!(f.mapping_get(&Value::int(0)), Some(&Value::int(3)));
-    } else {
-        panic!("Expected Func value, got {:?}", result);
-    }
+    let bag = result
+        .as_bag()
+        .unwrap_or_else(|| panic!("Expected compact Bag value, got {result:?}"));
+    assert_eq!(bag.len(), 1);
+    assert_eq!(bag.count_of(&Value::int(0)), 3);
 }
 
 #[cfg_attr(test, ntest::timeout(10000))]

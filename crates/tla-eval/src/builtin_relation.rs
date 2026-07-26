@@ -7,9 +7,8 @@ use super::{
     create_closure_from_arg, eval, eval_iter_set, values_equal, EvalCtx, EvalError, EvalResult,
     Expr, FuncValue, Span, Spanned, Value,
 };
-use std::sync::Arc;
-use tla_value::Rp;
 use tla_value::ClosureValue;
+use tla_value::Rp;
 
 enum BinaryRelationArg {
     Eq,

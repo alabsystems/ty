@@ -3,9 +3,28 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::super::Value;
+use crate::rp::Rp as Arc;
 use num_traits::ToPrimitive;
 use std::cmp::Ordering;
-use crate::rp::Rp as Arc;
+
+/// Cached-fingerprint inequality fast-reject (value-canon).
+///
+/// The additive dedup fingerprint is a deterministic function of value
+/// CONTENT (representation-converging), so two values with DIFFERENT cached
+/// fingerprints cannot be equal. Equal fingerprints prove nothing
+/// (collisions) — callers must still deep-compare. This helper only READS
+/// caches (never computes), so it can only make eq cheaper, and it returns
+/// `true` ("definitely different") only when both caches are populated and
+/// disagree. Killed by `TY_NO_VALUE_FP_CACHE=1` alongside the other
+/// value-canon fast paths.
+#[inline(always)]
+fn cached_fp_differs(a: Option<u64>, b: Option<u64>) -> bool {
+    if crate::value::permute_memo::value_canon_disabled() {
+        return false;
+    }
+    matches!((a, b), (Some(fa), Some(fb)) if fa != fb)
+}
+
 /// Same-type equality for values within the same type_order group.
 /// Caller guarantees type_order(lhs) == type_order(rhs) and that cross-type
 /// cases have already been handled.
@@ -24,18 +43,23 @@ pub(in crate::value) fn eq_same_type(lhs: &Value, rhs: &Value) -> bool {
                 || (a.len() == b.len() && a.iter().zip(b.iter()).all(|(av, bv)| av == bv))
         }
         (Value::Seq(a), Value::Seq(b)) => {
-            a.ptr_eq(b) || (a.len() == b.len() && a.iter().zip(b.iter()).all(|(av, bv)| av == bv))
+            a.ptr_eq(b)
+                || (!cached_fp_differs(a.get_additive_fp(), b.get_additive_fp())
+                    && a.len() == b.len()
+                    && a.iter().zip(b.iter()).all(|(av, bv)| av == bv))
         }
         (Value::Record(a), Value::Record(b)) => {
             a.ptr_eq(b)
-                || (a.len() == b.len()
+                || (!cached_fp_differs(a.get_additive_fp(), b.get_additive_fp())
+                    && a.len() == b.len()
                     && a.iter()
                         .zip(b.iter())
                         .all(|((ak, av), (bk, bv))| ak == bk && av == bv))
         }
         (Value::Func(a), Value::Func(b)) => {
             a.ptr_eq(b)
-                || (a.domain_len() == b.domain_len()
+                || (!cached_fp_differs(a.get_additive_fp(), b.get_additive_fp())
+                    && a.domain_len() == b.domain_len()
                     && a.mapping_iter()
                         .zip(b.mapping_iter())
                         .all(|((ak, av), (bk, bv))| ak == bk && av == bv))
@@ -59,7 +83,10 @@ pub(in crate::value) fn eq_same_type(lhs: &Value, rhs: &Value) -> bool {
         // Set types: Arc pointer equality fast path before full extensional
         // comparison. For UNCHANGED evaluation, sets that weren't modified share
         // the same Arc allocation. Part of #3805.
-        (Value::Set(a), Value::Set(b)) => a.ptr_eq(b) || *a == *b,
+        (Value::Set(a), Value::Set(b)) => {
+            a.ptr_eq(b)
+                || (!cached_fp_differs(a.get_additive_fp(), b.get_additive_fp()) && *a == *b)
+        }
         // Other set types: delegate to cmp()-based comparison since set equality
         // requires extensional/structural comparison that cmp() already handles.
         _ => lhs.cmp(rhs) == Ordering::Equal,

@@ -234,6 +234,9 @@ impl ModelChecker<'_> {
         fp: Fingerprint,
         array: &ArrayState,
     ) {
+        if self.liveness_cache.regenerate_on_the_fly {
+            return;
+        }
         if self.liveness_cache.fp_only_replay_cache.is_some() {
             return;
         }

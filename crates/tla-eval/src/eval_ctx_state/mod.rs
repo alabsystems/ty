@@ -37,7 +37,9 @@ impl EvalCtx {
             if let Some(idx) = self.shared.var_registry.get(name) {
                 debug_assert!(idx.as_usize() < state_env.env_len());
                 // SAFETY: `idx` comes from this context's VarRegistry and is bounded above.
-                tla_value::churn_stats::churn_count(tla_value::churn_stats::ChurnSite::StateVarReadCtxLookup);
+                tla_value::churn_stats::churn_count(
+                    tla_value::churn_stats::ChurnSite::StateVarReadCtxLookup,
+                );
                 return Some(unsafe { state_env.get_value(idx.as_usize()) });
             }
         }
@@ -79,7 +81,9 @@ impl EvalCtx {
                     debug_assert!(idx.as_usize() < state_env.env_len());
                     // SAFETY: `idx` originates from this model's VarRegistry, which
                     // defines the layout for the bound `state_env` array.
-                    tla_value::churn_stats::churn_count(tla_value::churn_stats::ChurnSite::StateVarReadCtxLookup);
+                    tla_value::churn_stats::churn_count(
+                        tla_value::churn_stats::ChurnSite::StateVarReadCtxLookup,
+                    );
                     let value = unsafe { state_env.get_value(idx.as_usize()) };
                     pairs.push((Arc::clone(name), value));
                 } else if let Some(value) = self.env.get(name.as_ref()) {
@@ -186,7 +190,9 @@ impl EvalCtx {
                     debug_assert!(idx < len);
                     // SAFETY: loop bounds guarantee `idx < len`, and env_ref
                     // points to a valid values slice for this call.
-                    tla_value::churn_stats::churn_count(tla_value::churn_stats::ChurnSite::StateVarReadCtxLookup);
+                    tla_value::churn_stats::churn_count(
+                        tla_value::churn_stats::ChurnSite::StateVarReadCtxLookup,
+                    );
                     values.push(unsafe { env_ref.get_value(idx) });
                 }
                 Arc::from(values.into_boxed_slice())

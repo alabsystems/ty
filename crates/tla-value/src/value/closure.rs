@@ -11,8 +11,8 @@
 
 use super::lazy_func::{deterministic_id_from_span, CapturedChain};
 use super::Value;
-use std::sync::{OnceLock};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use tla_core::ast::Expr;
 use tla_core::kani_types::HashMap;
 use tla_core::Spanned;

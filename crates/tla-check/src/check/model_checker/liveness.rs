@@ -205,26 +205,26 @@ impl ModelChecker<'_> {
         self.track_liveness_init_states() && self.config.liveness_execution.uses_on_the_fly()
     }
 
-    /// Whether the post-BFS liveness pass should REGENERATE system successors on
-    /// demand instead of reading the BFS-cached graph.
+    /// Whether the post-BFS liveness pass should use the on-the-fly checker.
     ///
     /// True when either (a) the user requested `--liveness-mode on-the-fly`, or
     /// (b) the mid-BFS memory guard tripped
     /// ([`maybe_trip_liveness_regen_budget`]) because the cached liveness
-    /// structures exceeded `TY_LIVENESS_REGEN_BUDGET_MB`. Both routes run the
-    /// identical on-the-fly checker, which produces the same verdict and (for a
-    /// violation) the same counterexample trace as the cached path.
+    /// structures exceeded `TY_LIVENESS_REGEN_BUDGET_MB`. The automatic route
+    /// may replay an exactly resolvable source from retained disk adjacency;
+    /// unresolved sources evaluate Next normally. Both routes use the same
+    /// checker and produce the same verdict and counterexample trace.
     pub(super) fn should_run_on_the_fly_liveness(&self) -> bool {
         self.use_on_the_fly_liveness()
             || (self.liveness_cache.regenerate_on_the_fly && self.track_liveness_init_states())
     }
 
-    /// Estimate the resident bytes held by the BFS-time liveness caches: the
-    /// system successor graph, the inline state/action bitmasks, the fp-only
-    /// replay seed, and the symmetry witnesses. This is the working set the
-    /// large-liveness regeneration trip trades away; it is deliberately a
-    /// load-INDEPENDENT structure estimate (entry counts × per-entry size), so
-    /// the trip decision is reproducible regardless of machine memory pressure.
+    /// Estimate selected structural heap allocations used by the hybrid-trip
+    /// decision; this is not RSS. The in-memory graph counts its table and Vec
+    /// capacities, while the disk graph counts only an O(states) offset-index
+    /// heuristic and excludes its direct cache and mapped pages. Inline masks,
+    /// replay seeds, and symmetry witnesses use entry-count heuristics. The
+    /// load-independent estimate keeps the decision reproducible across hosts.
     pub(super) fn liveness_cache_estimated_bytes(&self) -> usize {
         // Per-entry estimates. The bitmask maps key on a fingerprint (state) or
         // an ordered fingerprint pair (transition) plus a small bitmask value,
@@ -280,16 +280,16 @@ impl ModelChecker<'_> {
     /// graph for the fast post-BFS liveness path (`cache_for_liveness`), this
     /// checks the estimated size of those caches against the configured byte
     /// budget. When the budget is exceeded (or `TY_LIVENESS_REGEN_FORCE=1`), it:
-    ///   1. drops every BFS-time liveness cache to free memory immediately, and
-    ///   2. flips the run onto the on-demand REGENERATION path
-    ///      (`regenerate_on_the_fly`), so BFS stops caching and the post-BFS
-    ///      liveness pass rebuilds successors on the fly.
+    ///   1. moves ordered successor records to disk while retaining an O(states)
+    ///      offset index and fixed-slot direct cache in memory,
+    ///   2. drops inline masks, property plans, replay seeds, and witnesses, and
+    ///   3. flips the run onto the on-the-fly checker while continuing adjacency
+    ///      capture for the rest of BFS.
     ///
-    /// The dropped caches are exactly the ones the on-the-fly path does not read
-    /// (it re-explores from the cached init states via the Next relation), so the
-    /// liveness verdict and any counterexample trace are unchanged — only the
-    /// memory/time tradeoff shifts to match TLC. No-op when the budget is
-    /// explicitly disabled (`0`) or the trip already fired.
+    /// A retained source is used only when every successor payload resolves
+    /// exactly; missing or unsupported sources fall back as a whole to Next.
+    /// Thus the liveness verdict and counterexample remain unchanged. No-op when
+    /// the budget is explicitly disabled (`0`) or the trip already fired.
     pub(in crate::check::model_checker) fn maybe_trip_liveness_regen_budget(&mut self) {
         if self.liveness_cache.regenerate_on_the_fly || !self.liveness_cache.cache_for_liveness {
             return;
@@ -321,28 +321,53 @@ impl ModelChecker<'_> {
         }
     }
 
-    /// Execute the regeneration trip: drop the BFS-time liveness caches, stop
-    /// caching for the rest of BFS, and route the post-BFS pass to on-the-fly.
+    /// Execute the regeneration trip: put edge lists in the disk-backed graph
+    /// representation, drop heavyweight inline caches, and route the post-BFS
+    /// pass to on-the-fly checking. The representation retains an O(states)
+    /// offset index and fixed-slot cache in memory. Retained adjacency is only
+    /// an optimization: if the file cannot be created, historical full
+    /// regeneration remains the sound fallback.
     fn trip_liveness_regen(&mut self, estimated_bytes: usize) {
         let states = self.states_count();
         eprintln!(
-            "Note: liveness cache reached {} MB at {} states — switching to \
-             on-demand successor regeneration for the post-BFS liveness pass \
-             (bounds peak memory, like TLC). Disable with \
-             TY_LIVENESS_REGEN_BUDGET_MB=0.",
+            "Note: liveness cache reached {} MB at {} states — moving ordered \
+             successor lists to disk and dropping inline liveness caches. An \
+             O(states) offset index and fixed-slot read cache remain resident; \
+             exactly resolvable sources replay adjacency and others evaluate \
+             Next. Disable with TY_LIVENESS_REGEN_BUDGET_MB=0.",
             estimated_bytes / (1024 * 1024),
             states,
         );
-        // Stop caching for the remainder of BFS (per-level gates read this).
-        self.liveness_cache.cache_for_liveness = false;
         self.liveness_cache.regenerate_on_the_fly = true;
-        // Drop the accumulated caches to free memory now. The on-the-fly pass
-        // re-explores from init and never reads these, so discarding them is
-        // sound (init_states and Init/Next names are retained separately).
+        // Keep ordered adjacency in the disk-backed representation through the
+        // rest of BFS. Edge records live in the temp file; the parent-offset
+        // index remains O(states), and a fixed number of cache slots retain
+        // recently inserted/read successor Vecs (payload bytes remain
+        // fanout-dependent). A retained source is used only when every payload
+        // resolves exactly; otherwise that whole source evaluates Next.
+        const REGEN_DISK_CACHE_SLOTS: usize = 1024;
+        match self
+            .liveness_cache
+            .successors
+            .migrate_to_disk_with_cache_slots(REGEN_DISK_CACHE_SLOTS)
+        {
+            Ok(_) => {
+                self.liveness_cache.cache_for_liveness = true;
+            }
+            Err(error) => {
+                eprintln!(
+                    "Note: could not retain liveness adjacency on disk ({error}); \
+                     falling back to full successor regeneration."
+                );
+                self.liveness_cache.cache_for_liveness = false;
+                self.liveness_cache.successors = Default::default();
+            }
+        }
+        // Drop the accumulated inline caches to free memory now. The on-the-fly
+        // pass rebuilds their exact facts from retained adjacency or Next.
         // Replace capacity-owning containers instead of clearing them: HashMap
         // and disk hot-tier `clear()` implementations retain their allocation,
         // defeating the purpose of the memory trip.
-        self.liveness_cache.successors = Default::default();
         self.liveness_cache.inline_state_bitmasks = Default::default();
         self.liveness_cache.inline_action_bitmasks = Default::default();
         // Property plans own additional per-state/per-edge maps. The on-demand

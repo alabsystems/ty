@@ -452,6 +452,34 @@ impl ValueActionVmDispatch {
         }
     }
 
+    /// Engine-provenance summary for this run's value-action VM engagement,
+    /// or `None` when the VM never armed and never evaluated an entry.
+    ///
+    /// `mode` distinguishes the production-AUTO certified configuration from
+    /// the historical explicit `TY_VALUE_ACTION_VM=1` legacy request — the
+    /// two select different plans and must not be conflated in benchmark rows.
+    pub(super) fn provenance_json(&self) -> Option<serde_json::Value> {
+        if !self.requested && !self.auto_selected && self.stats.entry_evals == 0 {
+            return None;
+        }
+        let mode = if self.auto_selected || self.auto_activated {
+            "auto-certified"
+        } else if self.requested {
+            "explicit-legacy"
+        } else {
+            "off"
+        };
+        Some(serde_json::json!({
+            "mode": mode,
+            "armed": self.is_armed(),
+            "entry_evals": self.stats.entry_evals,
+            "authoritative_parents": self.stats.authoritative_parents,
+            "shadow_mismatches": self.stats.shadow_mismatches,
+            "runtime_fallbacks": self.stats.runtime_fallbacks,
+            "quarantined_entries": self.stats.quarantined_entries,
+        }))
+    }
+
     pub(super) fn report_summary(&self) {
         if !self.requested && !self.auto_activated {
             return;
@@ -513,8 +541,7 @@ impl ValueActionVmDispatch {
             eprintln!(
                 "[value-action-vm-first-guard] certified_entries={certified_entries}, \
                  uniform_slot_indexed={uniform_slot_indexed}, checks={}, skips={}",
-                self.stats.first_guard_checks,
-                self.stats.first_guard_skips,
+                self.stats.first_guard_checks, self.stats.first_guard_skips,
             );
         }
         if let Some(reason) = &self.admission_rejection {
@@ -524,6 +551,7 @@ impl ValueActionVmDispatch {
 }
 
 impl ValueActionVmPlan {
+    #[cfg(test)]
     pub(super) fn build(
         metadata: &[ActionInstanceMeta],
         bytecode: &CompiledBytecode,
@@ -1739,6 +1767,7 @@ fn execute_value_action_vm_plan_once<'a>(
         return (
             Ok(SuccessorResult {
                 had_raw_successors: false,
+                raw_successor_count: 0,
                 successors: Vec::new(),
             }),
             stats,
@@ -1761,9 +1790,13 @@ fn execute_value_action_vm_plan_once<'a>(
         selection.finish_uniform_guards(&mut stats, &mut logical_guard_cursor);
     }
     (
-        result.map(|successors| SuccessorResult {
-            had_raw_successors: !successors.is_empty(),
-            successors,
+        result.map(|successors| {
+            let raw_successor_count = successors.len();
+            SuccessorResult {
+                had_raw_successors: raw_successor_count > 0,
+                raw_successor_count,
+                successors,
+            }
         }),
         stats,
     )
@@ -1952,9 +1985,11 @@ fn execute_value_action_vm_mixed_bound(
 
     selection.finish_uniform_guards(&mut stats, &mut logical_guard_cursor);
 
+    let raw_successor_count = successors.len();
     (
         Ok(SuccessorResult {
-            had_raw_successors: !successors.is_empty(),
+            had_raw_successors: raw_successor_count > 0,
+            raw_successor_count,
             successors,
         }),
         stats,
@@ -2120,6 +2155,7 @@ pub(super) fn ordered_value_action_vm_shadow_match(
     interpreter: &SuccessorResult<Vec<DiffSuccessor>>,
 ) -> bool {
     candidate.had_raw_successors == interpreter.had_raw_successors
+        && candidate.raw_successor_count == interpreter.raw_successor_count
         && candidate.successors.len() == interpreter.successors.len()
         && candidate
             .successors

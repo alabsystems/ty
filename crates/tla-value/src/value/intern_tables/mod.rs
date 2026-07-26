@@ -45,11 +45,12 @@ pub(super) use sets::set_intern_table_len;
 pub struct InterningSkipGuard {
     prev_sets: bool,
     prev_int_funcs: bool,
+    prev_records: bool,
 }
 
 impl InterningSkipGuard {
-    /// Disable set and int-function interning on the current thread, returning
-    /// a guard that restores the previous flags when dropped.
+    /// Disable set, int-function, and record interning on the current thread,
+    /// returning a guard that restores the previous flags when dropped.
     ///
     /// Construct one around a block that builds many throwaway values (e.g.
     /// symmetry canonicalization) to avoid polluting the intern tables.
@@ -58,6 +59,7 @@ impl InterningSkipGuard {
         InterningSkipGuard {
             prev_sets: sets::replace_skip_set_interning(true),
             prev_int_funcs: int_funcs::replace_skip_int_func_interning(true),
+            prev_records: super::record::intern::replace_skip_record_interning(true),
         }
     }
 }
@@ -72,5 +74,6 @@ impl Drop for InterningSkipGuard {
     fn drop(&mut self) {
         sets::replace_skip_set_interning(self.prev_sets);
         int_funcs::replace_skip_int_func_interning(self.prev_int_funcs);
+        super::record::intern::replace_skip_record_interning(self.prev_records);
     }
 }

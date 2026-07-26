@@ -32,7 +32,10 @@ fn test_empty_queue_returns_complete() {
 #[test]
 fn test_portfolio_early_exit_does_not_claim_frontier_exhaustion() {
     let mut transport = ConfigurableMock::basic(4097);
-    let config = BfsWorkerConfig { max_depth: None, deadline: None };
+    let config = BfsWorkerConfig {
+        max_depth: None,
+        deadline: None,
+    };
     let verdict = crate::shared_verdict::SharedVerdict::new();
     assert!(verdict.publish(crate::shared_verdict::Verdict::Satisfied));
 

@@ -486,6 +486,38 @@ pub enum Opcode {
         parent: Register,
     },
 
+    /// Exact VM-only fusion for the SetFilter comprehension
+    ///
+    /// `{ c \in domain : <<first, c>> \in E }`  where  `E == arg[projection_index]`.
+    ///
+    /// Computed by range-scanning the sorted edge set `E` for the `<<first, *>>`
+    /// prefix (binary search on the first tuple component) and binding `c` to
+    /// each matching edge's second component, instead of iterating the whole
+    /// `domain` and probing `<<first, c>> \in E` per element. `first` is an
+    /// already-bound outer register; `domain` holds the comprehension domain;
+    /// `arg` holds the record/tuple that the concrete edge set projects out of
+    /// (`E == arg[projection_index]`). The projection is deferred into the
+    /// opcode so `E` is never evaluated for an empty `domain`, exactly matching
+    /// the historical `SetFilterBegin` preheader skip.
+    ///
+    /// The result set is semantically identical to the naive comprehension:
+    /// `SortedSet::edge_children` carries the range-scan/domain-filter proof and
+    /// fails closed to the naive membership scan for any representation it cannot
+    /// place. Native lowering deliberately rejects this opcode; it may be emitted
+    /// only by an explicitly gated bytecode-VM compiler.
+    EdgeFilter {
+        /// Destination register receiving the filtered child set.
+        rd: Register,
+        /// Register holding the fixed first tuple component.
+        first: Register,
+        /// Register holding the record/tuple `E` projects out of.
+        arg: Register,
+        /// Register holding the comprehension domain.
+        domain: Register,
+        /// 1-based projection index `k` such that `E == arg[k]`.
+        projection_index: i64,
+    },
+
     /// rd = SUBSET(rs) (powerset).
     Powerset {
         /// Destination register the powerset value is written to.

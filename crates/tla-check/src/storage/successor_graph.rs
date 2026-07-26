@@ -22,8 +22,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 ///
 /// When the entry count reaches the configured limit, the
 /// `SuccessorGraph` auto-migrates all entries to a disk-backed store
-/// instead of returning a hard error. This prevents BFS failures
-/// while keeping memory bounded.
+/// instead of returning a hard error. This prevents BFS failures while moving
+/// successor payloads out of RAM; the disk backend still keeps an O(states)
+/// parent-offset index in memory.
 ///
 /// Tier-1 #4: the migration gate is byte-aware. The `entry_limit` is derived
 /// from the smaller of the historical entry-count limit
@@ -82,8 +83,8 @@ impl InMemorySuccessorGraph {
 pub(crate) enum SuccessorGraph {
     /// In-memory HashMap (default, fast, but O(states × avg_succs × 8) bytes).
     InMemory(InMemorySuccessorGraph),
-    /// Disk-backed store with in-memory index + direct-mapped cache.
-    /// Memory cost: O(states × 16) bytes (index only).
+    /// Append-only O(states + edges) file with a resident O(states) hash index
+    /// and fixed-slot direct cache. Cached Vec bytes depend on fanout.
     Disk(DiskSuccessorGraph),
 }
 
@@ -106,13 +107,46 @@ impl SuccessorGraph {
         Ok(SuccessorGraph::Disk(DiskSuccessorGraph::new()?))
     }
 
+    /// Move an in-memory graph to disk immediately and set its direct-cache size.
+    ///
+    /// Unlike the insertion-time entry-limit gate, this is an explicit phase
+    /// transition used when the liveness memory guard wants to retain only
+    /// adjacency. Creating the backing file and writer clone happens before the
+    /// in-memory map is drained, so those recoverable creation errors leave the
+    /// original graph untouched. Record-write failures retain the disk backend's
+    /// existing fatal-error contract.
+    ///
+    /// Returns `Ok(true)` when migration occurred and `Ok(false)` when the graph
+    /// was already disk-backed. A new disk graph uses exactly `cache_slots`; an
+    /// existing disk graph is shrunk to at most that many slots and never grown.
+    /// The O(states) parent-offset index is retained.
+    pub(crate) fn migrate_to_disk_with_cache_slots(
+        &mut self,
+        cache_slots: usize,
+    ) -> std::io::Result<bool> {
+        if let SuccessorGraph::Disk(disk) = self {
+            disk.shrink_cache_to(cache_slots);
+            return Ok(false);
+        }
+
+        let mut disk = DiskSuccessorGraph::with_cache_slots(cache_slots)?;
+        let SuccessorGraph::InMemory(graph) = self else {
+            unreachable!("disk successor graph handled above");
+        };
+        for (fp, successors) in graph.map.drain() {
+            disk.insert(fp, successors);
+        }
+        *self = SuccessorGraph::Disk(disk);
+        Ok(true)
+    }
+
     /// Insert a parent fingerprint and its successor list.
     ///
     /// Part of #4080: When the in-memory backend reaches its entry limit
     /// (`TY_LIVENESS_INMEMORY_SUCCESSOR_LIMIT`, default 5M), all
     /// entries are automatically migrated to a disk-backed store. This
-    /// converts a previously hard BFS failure into graceful degradation —
-    /// exploration continues with bounded memory instead of crashing.
+    /// converts a previously hard BFS failure into graceful degradation by
+    /// removing edge-list heap growth. Resident metadata remains O(states).
     pub(crate) fn insert(
         &mut self,
         parent_fp: Fingerprint,
@@ -134,7 +168,8 @@ impl SuccessorGraph {
                     eprintln!(
                         "Note: liveness successor cache auto-migrating to disk \
                          ({entry_count} entries at configured limit). \
-                         Memory-bounded disk backend will be used for remaining BFS."
+                         Edge lists will be stored on disk; an O(states) offset \
+                         index and fixed-slot read cache remain in memory."
                     );
 
                     // Drain in-memory map into disk.
@@ -171,6 +206,14 @@ impl SuccessorGraph {
         match self {
             SuccessorGraph::InMemory(graph) => graph.map.get(fp).cloned(),
             SuccessorGraph::Disk(disk) => disk.get(fp),
+        }
+    }
+
+    /// Whether a parent entry exists, without cloning or reading its payload.
+    pub(crate) fn contains_parent(&self, fp: &Fingerprint) -> bool {
+        match self {
+            SuccessorGraph::InMemory(graph) => graph.map.contains_key(fp),
+            SuccessorGraph::Disk(disk) => disk.contains_parent(fp),
         }
     }
 
@@ -255,11 +298,13 @@ impl SuccessorGraph {
         matches!(self, SuccessorGraph::Disk(_))
     }
 
-    /// Estimate the memory consumed by the in-memory successor graph.
+    /// Selected structural heap estimate for the successor graph.
     ///
     /// Part of #4080: OOM safety — liveness cache memory accounting.
     /// For the in-memory backend: HashMap overhead + per-entry Vec allocations.
-    /// For the disk backend: only the in-memory index is counted.
+    /// For the disk backend, only a 20-byte-per-parent offset-index heuristic is
+    /// counted. Direct-cache Vecs, mapped/page-cache residency, and allocator
+    /// overhead are intentionally excluded.
     pub(crate) fn estimate_memory_bytes(&self) -> usize {
         match self {
             SuccessorGraph::InMemory(graph) => {
@@ -330,6 +375,30 @@ mod tests {
         assert_eq!(owned, borrowed);
     }
 
+    fn assert_contains_parent_tracks_sources(mut graph: SuccessorGraph) {
+        let parent_with_child = Fingerprint(1);
+        let empty_parent = Fingerprint(2);
+        let destination_only = Fingerprint(3);
+        graph
+            .insert(parent_with_child, vec![destination_only])
+            .unwrap();
+        graph.insert(empty_parent, Vec::new()).unwrap();
+
+        assert!(graph.contains_parent(&parent_with_child));
+        assert!(graph.contains_parent(&empty_parent));
+        assert!(!graph.contains_parent(&destination_only));
+    }
+
+    #[test]
+    fn test_contains_parent_for_inmemory_sources_including_empty() {
+        assert_contains_parent_tracks_sources(SuccessorGraph::in_memory());
+    }
+
+    #[test]
+    fn test_contains_parent_for_disk_sources_including_empty() {
+        assert_contains_parent_tracks_sources(SuccessorGraph::disk().unwrap());
+    }
+
     #[test]
     fn test_auto_migration_to_disk_on_limit() {
         // Create in-memory graph with a tiny limit for testing.
@@ -374,6 +443,60 @@ mod tests {
             .expect("post-migration insert should succeed");
         assert_eq!(graph.len(), 12);
         assert_eq!(graph.get(&Fingerprint(99)), Some(vec![Fingerprint(199)]));
+    }
+
+    #[test]
+    fn test_explicit_migration_to_disk_preserves_order_duplicates_and_empty_entries() {
+        let mut graph = SuccessorGraph::in_memory();
+        graph
+            .insert(
+                Fingerprint(1),
+                vec![Fingerprint(3), Fingerprint(2), Fingerprint(3)],
+            )
+            .unwrap();
+        graph.insert(Fingerprint(2), Vec::new()).unwrap();
+
+        assert_eq!(graph.migrate_to_disk_with_cache_slots(1).unwrap(), true);
+        assert!(graph.is_disk());
+        assert_eq!(graph.len(), 2);
+        assert_eq!(graph.total_successors(), 3);
+        assert_eq!(
+            graph.get(&Fingerprint(1)),
+            Some(vec![Fingerprint(3), Fingerprint(2), Fingerprint(3)])
+        );
+        assert_eq!(graph.get(&Fingerprint(2)), Some(Vec::new()));
+        assert_eq!(graph.get(&Fingerprint(99)), None);
+
+        assert_eq!(graph.migrate_to_disk_with_cache_slots(2).unwrap(), false);
+        let SuccessorGraph::Disk(disk) = &graph else {
+            panic!("graph must remain disk-backed");
+        };
+        assert_eq!(
+            disk.cache_slots(),
+            1,
+            "an existing smaller cache must not grow"
+        );
+        assert_eq!(
+            graph.get(&Fingerprint(1)),
+            Some(vec![Fingerprint(3), Fingerprint(2), Fingerprint(3)])
+        );
+    }
+
+    #[test]
+    fn test_explicit_migration_shrinks_an_existing_disk_cache() {
+        let mut graph = SuccessorGraph::disk().unwrap();
+        graph.insert(Fingerprint(1), vec![Fingerprint(2)]).unwrap();
+        let SuccessorGraph::Disk(disk) = &graph else {
+            panic!("graph must start disk-backed");
+        };
+        assert!(disk.cache_slots() > 1);
+
+        assert_eq!(graph.migrate_to_disk_with_cache_slots(1).unwrap(), false);
+        let SuccessorGraph::Disk(disk) = &graph else {
+            panic!("graph must remain disk-backed");
+        };
+        assert_eq!(disk.cache_slots(), 1);
+        assert_eq!(graph.get(&Fingerprint(1)), Some(vec![Fingerprint(2)]));
     }
 
     #[test]

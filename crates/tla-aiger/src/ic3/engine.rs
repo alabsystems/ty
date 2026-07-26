@@ -71,6 +71,10 @@ pub struct Ic3Engine {
     pub(super) inf_solver: Box<dyn SatSolver>,
     /// Configuration for portfolio diversity.
     pub(super) config: Ic3Config,
+    /// Whether to independently verify every generated lemma before admitting
+    /// it to a frame. Snapshot once at construction so a run is unaffected by
+    /// later process-environment changes.
+    pub(super) verify_lemmas: bool,
     /// Counter for solve_with_temporary_clause calls across all frame solvers.
     /// Used to trigger periodic solver rebuilds to clear accumulated internal
     /// state (learned clause bloat, dead variable metadata).
@@ -477,6 +481,7 @@ impl Ic3Engine {
             }
         }
 
+        let verify_lemmas = std::env::var_os("IC3_VERIFY_LEMMAS").is_some();
         let mut engine = Ic3Engine {
             ts,
             solvers: Vec::new(),
@@ -495,6 +500,7 @@ impl Ic3Engine {
             inf_lemmas: Vec::new(),
             inf_solver: Box::new(SimpleSolver::new()), // placeholder
             config,
+            verify_lemmas,
             solve_count: 0,
             domain_computer,
             domain_stats: DomainStats::new(),

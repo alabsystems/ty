@@ -115,7 +115,9 @@ pub(crate) fn dd_spec_to_ordered_mdd_net(
     // when set. SOUND either way — the order changes only MDD size/feasibility,
     // never verdicts (isomorphic relabeling; `inv` = identity here). Default
     // (unset) is byte-identical to the always-on FORCE order.
-    if std::env::var("TY_MCC_DISABLE_MDD_FORCE_ORDER").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")) {
+    if std::env::var("TY_MCC_DISABLE_MDD_FORCE_ORDER")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    {
         let n = spec.bounds.len();
         return (dd_spec_to_mdd_net(spec), (0..n).collect());
     }

@@ -7,10 +7,9 @@
 //! Extracted from `sorted_set.rs` per #3326.
 
 use super::{SortedSet, Value};
+use crate::rp::Rp;
 use num_traits::ToPrimitive;
 use smallvec::SmallVec;
-use crate::rp::Rp as Arc;
-use crate::rp::Rp;
 // ============================================================================
 // Value Pooling (Part of #346 - Performance Optimization Phase 3)
 // ============================================================================

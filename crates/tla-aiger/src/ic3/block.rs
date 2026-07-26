@@ -496,11 +496,12 @@ impl Ic3Engine {
 
                 // Per-lemma consecution verification (#4121 diagnostics).
                 //
-                // When IC3_VERIFY_LEMMAS is set, independently verify EVERY lemma
-                // before adding it to the frame sequence. This catches ay-sat false
-                // UNSAT at the earliest possible point, before unsound lemmas
-                // propagate. Expensive (doubles SAT calls), but invaluable for
-                // diagnosing which benchmarks trigger ay-sat bugs.
+                // When IC3_VERIFY_LEMMAS was set at engine construction,
+                // independently verify EVERY lemma before adding it to the frame
+                // sequence. This catches ay-sat false UNSAT at the earliest possible
+                // point, before unsound lemmas propagate. Expensive (doubles SAT
+                // calls), but invaluable for diagnosing which benchmarks trigger
+                // ay-sat bugs.
                 //
                 // The lemma is verified AT ITS PLACEMENT, `target_frame` (#4560).
                 // Adding at delta index t claims ¬lemma holds in F_1..F_t, and
@@ -519,7 +520,7 @@ impl Ic3Engine {
                 //
                 // When not set, this code is a no-op and the existing cross-check
                 // + validate_invariant_budgeted provide the soundness net.
-                if target_frame >= 1 && std::env::var("IC3_VERIFY_LEMMAS").is_ok() {
+                if target_frame >= 1 && self.verify_lemmas {
                     match self.verify_lemma_consecution(target_frame, &pushed_cube) {
                         LemmaVerdict::Verified => {
                             self.consecution_stats.lemmas_verified += 1;

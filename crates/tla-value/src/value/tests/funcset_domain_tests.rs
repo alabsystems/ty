@@ -8,10 +8,9 @@
 //! pushed that file past the size limit.
 
 use super::super::*;
+use crate::rp::Rp;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use crate::rp::Rp as Arc;
-use crate::rp::Rp;
 #[cfg_attr(test, ntest::timeout(10000))]
 #[test]
 fn test_manual_func_domain_eq_sorted_set_matches_expected_domain() {

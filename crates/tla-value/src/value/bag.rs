@@ -30,9 +30,9 @@ use super::{FuncValue, SortedSet, Value};
 use crate::dedup_fingerprint::{
     additive_entry_hash_from_fps, splitmix64, state_value_fingerprint, ADDITIVE_FUNC_SEED,
 };
-use std::sync::{OnceLock};
 use crate::rp::Rp as Arc;
 use crate::rp::Rp;
+use std::sync::OnceLock;
 
 /// Kill switch: `TY_COMPACT_BAG=0|off|false` forces the general Func
 /// representation (constructors return `None`/`Err`). Read once per process.

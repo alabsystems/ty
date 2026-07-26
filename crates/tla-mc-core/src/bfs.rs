@@ -660,12 +660,7 @@ where
     }
 
     if let Some(limit) = options.max_states {
-        if admitted
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                (count < limit).then_some(count + 1)
-            })
-            .is_err()
-        {
+        if !try_reserve_state_slot(admitted, limit) {
             state_limit_reached.store(true, Ordering::Release);
             stop.store(true, Ordering::Release);
             return Ok(());
@@ -688,6 +683,28 @@ where
         injector.push((state, depth));
     }
     Ok(())
+}
+
+/// Atomically reserve one state-admission slot without exceeding `limit`.
+///
+/// This is the stable-toolchain equivalent of `AtomicUsize::try_update`: the
+/// acquire failure ordering refreshes `count` after contention, while the
+/// successful read-modify-write publishes the reservation with `AcqRel`.
+#[inline]
+fn try_reserve_state_slot(admitted: &AtomicUsize, limit: usize) -> bool {
+    let mut count = admitted.load(Ordering::Acquire);
+    loop {
+        if count >= limit {
+            return false;
+        }
+        let Some(next) = count.checked_add(1) else {
+            return false;
+        };
+        match admitted.compare_exchange_weak(count, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(observed) => count = observed,
+        }
+    }
 }
 
 /// Batch size for in_flight counter updates.
@@ -1157,6 +1174,20 @@ mod tests {
         assert!(outcome.state_limit_reached);
         assert_eq!(outcome.states_discovered, 2);
         assert_eq!(observer.states, 2);
+    }
+
+    #[test]
+    fn state_slot_reservation_stops_exactly_at_limit() {
+        let admitted = AtomicUsize::new(0);
+
+        assert!(try_reserve_state_slot(&admitted, 2));
+        assert!(try_reserve_state_slot(&admitted, 2));
+        assert!(!try_reserve_state_slot(&admitted, 2));
+        assert_eq!(admitted.load(Ordering::Acquire), 2);
+
+        let zero_limit = AtomicUsize::new(0);
+        assert!(!try_reserve_state_slot(&zero_limit, 0));
+        assert_eq!(zero_limit.load(Ordering::Acquire), 0);
     }
 
     #[test]

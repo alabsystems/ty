@@ -212,6 +212,7 @@ fn scan_opcode(
         | Opcode::SetDiff { .. }
         | Opcode::Subseteq { .. }
         | Opcode::RoundStepEq { .. }
+        | Opcode::EdgeFilter { .. }
         | Opcode::Powerset { .. }
         | Opcode::BigUnion { .. }
         | Opcode::KSubset { .. }

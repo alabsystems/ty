@@ -22,6 +22,8 @@ const TRUNCATED_FALLBACK_REASON: &str =
 pub(super) struct ParsedRunCounts {
     pub(super) states_found: Option<u64>,
     pub(super) distinct_states: Option<u64>,
+    pub(super) raw_initial_states_generated: Option<u64>,
+    pub(super) raw_successors_generated: Option<u64>,
     pub(super) states_generated: Option<u64>,
     pub(super) states_left: Option<u64>,
     pub(super) transitions: Option<u64>,
@@ -91,20 +93,28 @@ pub(super) struct TrustCgTelemetry {
 
 pub(super) fn parse_tlc_final_counts(stdout: &str, stderr: &str) -> ParsedRunCounts {
     let combined = format!("{stdout}\n{stderr}");
-    let initial_summary = Regex::new(
-        r"(?m)^\s*Finished computing initial states:\s+([0-9][0-9,]*)\s+distinct states generated\b",
+    // TLC_INIT_GENERATED1 is used when every generated initial state is
+    // distinct. TLC_INIT_GENERATED2 reports both the raw and distinct counts.
+    let initial_distinct_summary = Regex::new(
+        r"(?m)^\s*Finished computing initial states:\s+([0-9][0-9,]*)\s+distinct states? generated\b",
+    )
+    .unwrap();
+    let initial_raw_summary = Regex::new(
+        r"(?m)^\s*Finished computing initial states:\s+([0-9][0-9,]*)\s+states? generated,\s+with\s+([0-9][0-9,]*)\s+of them distinct\b",
     )
     .unwrap();
     let final_summary = Regex::new(concat!(
-        r"(?m)^\s*([0-9][0-9,]*)\s+states generated,\s+",
-        r"([0-9][0-9,]*)\s+distinct states found,\s+",
-        r"([0-9][0-9,]*)\s+states left(?:\s+on queue\.)?\s*$",
+        r"(?m)^\s*([0-9][0-9,]*)\s+states? generated,\s+",
+        r"([0-9][0-9,]*)\s+distinct states? found,\s+",
+        r"([0-9][0-9,]*)\s+states? left(?:\s+on queue\.)?\s*$",
     ))
     .unwrap();
     let mut counts = ParsedRunCounts::default();
-    let mut initial_states = None;
-    for captures in initial_summary.captures_iter(&combined) {
-        initial_states = parse_count(&captures[1]);
+    for captures in initial_distinct_summary.captures_iter(&combined) {
+        counts.raw_initial_states_generated = parse_count(&captures[1]);
+    }
+    for captures in initial_raw_summary.captures_iter(&combined) {
+        counts.raw_initial_states_generated = parse_count(&captures[1]);
     }
     for captures in final_summary.captures_iter(&combined) {
         let generated = parse_count(&captures[1]);
@@ -114,8 +124,11 @@ pub(super) fn parse_tlc_final_counts(stdout: &str, stderr: &str) -> ParsedRunCou
         counts.distinct_states = distinct;
         counts.states_left = parse_count(&captures[3]);
     }
-    if let (Some(generated), Some(initial)) = (counts.states_generated, initial_states) {
-        counts.transitions = generated.checked_sub(initial);
+    if let (Some(generated), Some(initial)) =
+        (counts.states_generated, counts.raw_initial_states_generated)
+    {
+        counts.raw_successors_generated = generated.checked_sub(initial);
+        counts.transitions = counts.raw_successors_generated;
     }
     counts
 }
@@ -126,6 +139,9 @@ pub(super) fn parse_ty_final_counts(stdout: &str, stderr: &str) -> ParsedRunCoun
         r"(?m)^\s*(?:States found:\s+([0-9][0-9,]*)|([0-9][0-9,]*)\s+states?\s+found\.?)\s*$",
     )
     .unwrap();
+    let states_generated = Regex::new(r"(?m)^\s*States generated:\s+([0-9][0-9,]*)\s*$").unwrap();
+    let raw_initial_states_generated =
+        Regex::new(r"(?m)^\s*Initial states generated:\s+([0-9][0-9,]*)\s*$").unwrap();
     let transitions = Regex::new(r"(?m)^\s*Transitions:\s+([0-9][0-9,]*)\s*$").unwrap();
     let mut counts = ParsedRunCounts::default();
     for captures in states_found.captures_iter(&combined) {
@@ -136,8 +152,19 @@ pub(super) fn parse_ty_final_counts(stdout: &str, stderr: &str) -> ParsedRunCoun
         counts.states_found = states;
         counts.distinct_states = states;
     }
+    for captures in states_generated.captures_iter(&combined) {
+        counts.states_generated = parse_count(&captures[1]);
+    }
+    for captures in raw_initial_states_generated.captures_iter(&combined) {
+        counts.raw_initial_states_generated = parse_count(&captures[1]);
+    }
     for captures in transitions.captures_iter(&combined) {
         counts.transitions = parse_count(&captures[1]);
+    }
+    if let (Some(generated), Some(initial)) =
+        (counts.states_generated, counts.raw_initial_states_generated)
+    {
+        counts.raw_successors_generated = generated.checked_sub(initial);
     }
     counts
 }
@@ -1145,6 +1172,8 @@ mod tests {
         let counts = parse_tlc_final_counts(stdout, "");
 
         assert_eq!(counts.states_generated, Some(1_499_503));
+        assert_eq!(counts.raw_initial_states_generated, Some(1_001));
+        assert_eq!(counts.raw_successors_generated, Some(1_498_502));
         assert_eq!(counts.states_found, Some(501_500));
         assert_eq!(counts.distinct_states, Some(501_500));
         assert_eq!(counts.states_left, Some(0));
@@ -1152,10 +1181,58 @@ mod tests {
     }
 
     #[test]
+    fn parses_tlc_singular_one_initial_state() {
+        // TLC's one-init-state summary uses the SINGULAR "state" —
+        // e.g. DiningPhilosophers. The derived transition count must survive.
+        let stdout = "\
+            Finished computing initial states: 1 distinct state generated at 2026-07-23 07:34:16.\n\
+            336 states generated, 67 distinct states found, 0 states left on queue.\n";
+
+        let counts = parse_tlc_final_counts(stdout, "");
+
+        assert_eq!(counts.states_generated, Some(336));
+        assert_eq!(counts.raw_initial_states_generated, Some(1));
+        assert_eq!(counts.raw_successors_generated, Some(335));
+        assert_eq!(counts.states_found, Some(67));
+        assert_eq!(counts.transitions, Some(335));
+    }
+
+    #[test]
+    fn parses_tlc_raw_and_distinct_initial_state_summary() {
+        let stdout = "\
+            Finished computing initial states: 5 states generated, with 2 of them distinct at 2026-07-23 07:34:16.\n\
+            17 states generated, 9 distinct states found, 0 states left on queue.\n";
+
+        let counts = parse_tlc_final_counts(stdout, "");
+
+        assert_eq!(counts.raw_initial_states_generated, Some(5));
+        assert_eq!(counts.raw_successors_generated, Some(12));
+        assert_eq!(counts.states_generated, Some(17));
+        assert_eq!(counts.transitions, Some(12));
+    }
+
+    #[test]
+    fn parses_tlc_singular_final_summary() {
+        let stdout = "\
+            Finished computing initial states: 1 distinct state generated at 2026-07-23 07:34:16.\n\
+            1 state generated, 1 distinct state found, 0 states left on queue.\n";
+
+        let counts = parse_tlc_final_counts(stdout, "");
+
+        assert_eq!(counts.states_found, Some(1));
+        assert_eq!(counts.raw_initial_states_generated, Some(1));
+        assert_eq!(counts.raw_successors_generated, Some(0));
+        assert_eq!(counts.states_generated, Some(1));
+        assert_eq!(counts.transitions, Some(0));
+    }
+
+    #[test]
     fn parses_ty_final_states_and_transitions() {
         let stdout = "\
             Model checking complete.\n\
             States found: 501,500\n\
+            Initial states generated: 1,001\n\
+            States generated: 1,499,503\n\
             Transitions: 1,498,502\n";
 
         let counts = parse_ty_final_counts(stdout, "");
@@ -1163,7 +1240,9 @@ mod tests {
         assert_eq!(counts.states_found, Some(501_500));
         assert_eq!(counts.distinct_states, Some(501_500));
         assert_eq!(counts.transitions, Some(1_498_502));
-        assert_eq!(counts.states_generated, None);
+        assert_eq!(counts.raw_initial_states_generated, Some(1_001));
+        assert_eq!(counts.raw_successors_generated, Some(1_498_502));
+        assert_eq!(counts.states_generated, Some(1_499_503));
     }
 
     #[test]

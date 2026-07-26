@@ -247,7 +247,16 @@ fn allocation_limit_from_info(
             (total / CUDA_FREE_RESERVE_DIVISOR)
                 .max(CUDA_MIN_FREE_RESERVE_BYTES)
                 .min(total),
-            shared_host_available.map_or(cuda_free, |host| cuda_free.min(host)),
+            // On a unified-memory part GPU memory IS host memory, and
+            // `cuMemGetInfo` reports a GPU-context "free" figure (a few GiB on
+            // GB10) that does NOT reflect the real allocatable pool — trusting
+            // it caps the budget below the reserve and drives the whole engine
+            // to a 0-byte budget. The kernel's MemAvailable is the true
+            // constraint here, so use it directly; only fall back to the CUDA
+            // figure when host availability is unknown (never on this path in
+            // practice — `safe_allocation_limit` always supplies it for
+            // integrated devices).
+            shared_host_available.unwrap_or(cuda_free),
         )
     } else {
         // Device-local VRAM cannot invoke the host OOM killer. Retain a small
@@ -372,6 +381,21 @@ fn memory_info(api: &CudaApi) -> Result<(usize, usize), GpuError> {
     Ok((free, total))
 }
 
+/// Public advisory headroom: remaining bytes this process may allocate under
+/// the aggregate CUDA budget (process cap and free-memory reserve combined).
+/// Advisory only — [`DeviceBuffer`] repeats the check atomically at
+/// allocation time; callers use this to decline doomed configurations before
+/// asking the driver for them.
+///
+/// Ensures the device primary context is current first: `cuMemGetInfo`
+/// requires an active context, so a caller that has not yet entered
+/// [`run_bfs`](crate::run_bfs) would otherwise see `invalid device context`.
+pub fn allocation_headroom_bytes() -> Result<u64, GpuError> {
+    let api = cuda_api()?;
+    crate::bfs_driver::activate_device_context(api)?;
+    Ok(device_allocation_headroom(api)? as u64)
+}
+
 /// Remaining bytes this process may reserve under the aggregate CUDA budget.
 /// The result is advisory for adaptive planners; [`DeviceBuffer`] repeats the
 /// check atomically at allocation time.
@@ -476,6 +500,26 @@ mod tests {
             allocation_limit_from_info(120 * GIB, 128 * GIB, Some(16 * GIB), 0, true),
             0
         );
+    }
+
+    #[test]
+    fn unified_memory_budget_survives_a_small_cuda_free_report() {
+        // Regression: real GB10 `cuMemGetInfo` reports free≈3.8 GiB against a
+        // 130 GiB total even with ~117 GiB host-available, because on a
+        // unified part the CUDA "free" figure is a GPU-context artifact, not
+        // the allocatable pool. The budget must follow host availability
+        // (→ the 1/8 process cap), not collapse to 0 as it did when the
+        // misleading small cuda_free capped effective_free below the reserve.
+        let mb = |n: usize| n * (1 << 20);
+        let limit = allocation_limit_from_info(
+            mb(3800),        // cuda_free as GB10 actually reports it
+            130 * GIB,       // total
+            Some(117 * GIB), // host MemAvailable
+            0,
+            true,
+        );
+        assert_eq!(limit, 130 * GIB / CUDA_PROCESS_BUDGET_DIVISOR);
+        assert!(limit >= 16 * GIB, "budget collapsed to {limit}");
     }
 
     #[test]

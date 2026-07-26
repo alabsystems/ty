@@ -10,9 +10,8 @@
 
 use super::{FuncValue, Value};
 use crate::error::{EvalError, EvalResult};
-use std::cmp::Ordering;
 use crate::rp::Rp as Arc;
-use crate::rp::Rp;
+use std::cmp::Ordering;
 pub(crate) enum TlcFuncOrder<'a> {
     Stored,
     Permuted(&'a [usize]),
@@ -286,9 +285,7 @@ impl Value {
                     Vec::with_capacity(f.domain_len());
                 for (k, vv) in f.mapping_iter() {
                     match k {
-                        Value::String(s) => {
-                            entries.push((std::sync::Arc::from(&**s), vv.clone()))
-                        }
+                        Value::String(s) => entries.push((std::sync::Arc::from(&**s), vv.clone())),
                         _ => return Ok(None),
                     }
                 }

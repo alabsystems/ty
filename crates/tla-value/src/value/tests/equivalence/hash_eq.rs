@@ -5,7 +5,6 @@
 //! Cross-type hash/equality equivalence tests.
 
 use super::super::super::*;
-use crate::rp::Rp as Arc;
 use crate::rp::Rp;
 #[cfg_attr(test, ntest::timeout(10000))]
 #[test]
@@ -56,8 +55,14 @@ fn test_recordset_funcset_hash_equivalence() {
 
     // RecordSet [a : {1,2}, b : {1,2}]
     let rsv = RecordSetValue::new([
-        (std::sync::Arc::from("a"), Value::set([Value::int(1), Value::int(2)])),
-        (std::sync::Arc::from("b"), Value::set([Value::int(1), Value::int(2)])),
+        (
+            std::sync::Arc::from("a"),
+            Value::set([Value::int(1), Value::int(2)]),
+        ),
+        (
+            std::sync::Arc::from("b"),
+            Value::set([Value::int(1), Value::int(2)]),
+        ),
     ]);
     let record_set = Value::RecordSet(rsv.clone().into());
 

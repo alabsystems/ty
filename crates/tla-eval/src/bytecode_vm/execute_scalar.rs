@@ -8,10 +8,10 @@
 //! control flow, and special opcodes. Extracted from `execute.rs` per #3611.
 
 use num_bigint::BigInt;
-use tla_value::Rp;
 use num_traits::Signed;
 use tla_tir::bytecode::{ConstantPool, Opcode};
 use tla_value::error::EvalError;
+use tla_value::Rp;
 use tla_value::Value;
 
 use super::execute::{BytecodeVm, VmError};

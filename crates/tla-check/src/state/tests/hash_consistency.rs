@@ -12,12 +12,12 @@
 //! same value produces the same result.
 
 use super::helpers::fnv_hash;
-use tla_value::Rp;
 use super::*;
 use crate::fingerprint::FP64_INIT;
 use crate::state::value_hash::value_fingerprint;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use tla_value::Rp;
 
 fn std_hash(v: &Value) -> u64 {
     let mut hasher = DefaultHasher::new();

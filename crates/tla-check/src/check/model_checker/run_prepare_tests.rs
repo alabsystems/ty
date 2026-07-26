@@ -12,7 +12,6 @@ use super::super::bfs::compiled_step_trait::{
     BfsStepError, CompiledBfsLevel, CompiledBfsStep, FlatBfsStepOutput,
 };
 use super::super::bfs::flat_frontier::FlatBfsFrontier;
-use tla_value::Rp;
 use super::super::bfs::storage_modes::NoTraceQueueEntry;
 use super::super::frontier::BfsFrontier;
 use super::super::mc_struct::ActionInstanceMeta;
@@ -35,6 +34,7 @@ use tla_core::ast::{Expr, OperatorDef};
 use tla_core::name_intern::intern_name;
 use tla_core::span::Spanned;
 use tla_tir::bytecode::CompileError;
+use tla_value::Rp;
 
 fn make_op(name: &str, body: Expr) -> OperatorDef {
     OperatorDef {
@@ -269,11 +269,7 @@ fn observed_network_value() -> Value {
     ]));
     let nonempty = Value::Seq(Rp::new(SeqValue::from_vec(vec![msg])));
     let empty = || Value::Seq(Rp::new(SeqValue::from_vec(vec![])));
-    let row1 = Value::IntFunc(Rp::new(IntIntervalFunc::new(
-        1,
-        2,
-        vec![empty(), nonempty],
-    )));
+    let row1 = Value::IntFunc(Rp::new(IntIntervalFunc::new(1, 2, vec![empty(), nonempty])));
     let row2 = Value::IntFunc(Rp::new(IntIntervalFunc::new(1, 2, vec![empty(), empty()])));
     Value::IntFunc(Rp::new(IntIntervalFunc::new(1, 2, vec![row1, row2])))
 }
@@ -668,110 +664,6 @@ fn assert_fixed_int_sequence_layout(
         }
         other => panic!("{message}: expected recursive sequence layout, got {other:?}"),
     }
-}
-
-fn assert_fixed_nested_int_sequence_layout(
-    layout: &crate::state::StateLayout,
-    outer_len: usize,
-    row_len: usize,
-    message: &str,
-) {
-    let VarLayoutKind::Recursive { layout: req } = &layout.var_layout(0).unwrap().kind else {
-        panic!("{message}: expected recursive nested sequence layout");
-    };
-    let FlatValueLayout::Sequence {
-        bound: outer_bound,
-        max_len: actual_outer_len,
-        element_layout: row_layout,
-    } = req
-    else {
-        panic!("{message}: expected outer sequence layout, got {req:?}");
-    };
-    assert_eq!(
-        *outer_bound,
-        SequenceBoundEvidence::FixedDomainTypeLayout {
-            invariant: Arc::from("TypeOK")
-        },
-        "{message}: outer fixed-domain bound"
-    );
-    assert_eq!(
-        *actual_outer_len, outer_len,
-        "{message}: outer fixed-domain length"
-    );
-    let FlatValueLayout::Sequence {
-        bound: row_bound,
-        max_len: actual_row_len,
-        element_layout: cell_layout,
-    } = row_layout.as_ref()
-    else {
-        panic!("{message}: expected row sequence layout, got {row_layout:?}");
-    };
-    assert_eq!(
-        *row_bound,
-        SequenceBoundEvidence::FixedDomainTypeLayout {
-            invariant: Arc::from("TypeOK")
-        },
-        "{message}: row fixed-domain bound"
-    );
-    assert_eq!(
-        *actual_row_len, row_len,
-        "{message}: row fixed-domain length"
-    );
-    assert_eq!(
-        cell_layout.as_ref(),
-        &FlatValueLayout::Scalar(SlotType::Int),
-        "{message}: row cell layout"
-    );
-}
-
-fn assert_sequence_network_type_layout_not_proven(
-    layout: &crate::state::StateLayout,
-    message: &str,
-) {
-    assert!(
-        !layout.supports_flat_primary(),
-        "{message}: invalid type alias must not make network primary-safe"
-    );
-    let VarLayoutKind::Recursive {
-        layout:
-            FlatValueLayout::Sequence {
-                bound: network_bound,
-                element_layout: row_layout,
-                ..
-            },
-    } = &layout.var_layout(0).unwrap().kind
-    else {
-        panic!("{message}: expected outer sequence network layout");
-    };
-    assert_eq!(
-        *network_bound,
-        SequenceBoundEvidence::Observed,
-        "{message}: invalid alias must not prove outer network domain"
-    );
-    let FlatValueLayout::Sequence {
-        bound: row_bound,
-        element_layout: channel_layout,
-        ..
-    } = row_layout.as_ref()
-    else {
-        panic!("{message}: expected network row sequence layout, got {row_layout:?}");
-    };
-    assert_eq!(
-        *row_bound,
-        SequenceBoundEvidence::Observed,
-        "{message}: invalid alias must not prove row domain"
-    );
-    let FlatValueLayout::Sequence { bound, max_len, .. } = channel_layout.as_ref() else {
-        panic!("{message}: expected channel sequence layout, got {channel_layout:?}");
-    };
-    assert_eq!(
-        *bound,
-        SequenceBoundEvidence::ProvenInvariant {
-            invariant: Arc::from("BoundedNetwork")
-        },
-        "{message}: channel should retain capacity-only evidence"
-    );
-    assert_eq!(*max_len, 3, "{message}: channel capacity");
 }
 
 #[test]
@@ -1338,14 +1230,18 @@ VARIABLE temp
 }
 
 #[test]
-fn test_native_install_gate_summary_mapping_tracks_exact_pins_and_clean_ancestry() {
-    const REQUESTED_AY_REV: &str = "0adeaab4d66b1414a95ab5cee4ec64078c9dbd97";
-    const REQUESTED_CLEAN_REV: &str = "659a6eeb15b29f7d739ecca852a77483fcfd88ea";
-    const STANDALONE_CLEAN_FALLBACK_REV: &str =
-        "659a6eeb15b29f7d739ecca852a77483fcfd88ea";
-    const REQUESTED_TRUST_IR_REV: &str = "9de13453d69f84f24556bd75636bf020206f33c9";
-    const REQUESTED_TRUST_CG_REV: &str = "7005df3c00a3e1b4042cc49a6608feb1aaa1bfec";
-    const AUDITED_CLEAN_AY_PATH_PACKAGES: &[&str] = &[
+fn test_native_install_gate_summary_mapping_tracks_exact_committed_pins() {
+    const REQUESTED_AY_REV: &str = "035e84f25ffe983f4c1a0d8f2cb1d5f945d3bdee";
+    const REQUESTED_CLEAN_REV: &str = "ed8c87702e1bb429d6f2df4333130eac0d577ff7";
+    const STANDALONE_CLEAN_FALLBACK_REV: &str = "ed8c87702e1bb429d6f2df4333130eac0d577ff7";
+    const REQUESTED_TRUST_IR_REV: &str = "3fafb62434db0a5b2bd4027a988a7fed74bd8679";
+    const REQUESTED_TRUST_CG_REV: &str = "98e3ffb6ae59b803a93a3f09f72dd497810ac5b4";
+    // Clean 1.2.0 intentionally consumes AY 0.2.0 while TY consumes AY 0.3.0.
+    // Keep the complete older-source roster explicit so a new mixed revision,
+    // package, or source-less fallback cannot silently enter the lock.
+    const AUDITED_CLEAN_AY_REV: &str = "2d89a99ed3d152c5dda93d44b5001e1083c89ffc";
+    const AUDITED_CLEAN_AY_VERSION: &str = "0.2.0";
+    const AUDITED_CLEAN_AY_PACKAGES: &[&str] = &[
         "ay",
         "ay-allsat",
         "ay-arrays",
@@ -1535,8 +1431,10 @@ fn test_native_install_gate_summary_mapping_tracks_exact_pins_and_clean_ancestry
         ("trust-ir", REQUESTED_TRUST_IR_REV),
         ("trust-cg", REQUESTED_TRUST_CG_REV),
     ] {
-        let expected_source = format!(
-            "git+https://github.com/alabsystems/{repo}.git?rev={rev}#{rev}"
+        let expected_source =
+            format!("git+https://github.com/alabsystems/{repo}.git?rev={rev}#{rev}");
+        let audited_clean_ay_source = format!(
+            "git+https://github.com/alabsystems/ay.git?rev={AUDITED_CLEAN_AY_REV}#{AUDITED_CLEAN_AY_REV}"
         );
         let is_repo_package = |name: &str| match repo {
             "ay" => name == "ay" || name.starts_with("ay-"),
@@ -1559,7 +1457,7 @@ fn test_native_install_gate_summary_mapping_tracks_exact_pins_and_clean_ancestry
             "Cargo.lock must contain packages from the exact `{repo}` source identity"
         );
         let mut exact_source_count = 0;
-        let mut path_ay_packages = Vec::new();
+        let mut clean_ay_packages = Vec::new();
         for package in observed_packages {
             let package_name = package
                 .get("name")
@@ -1570,13 +1468,13 @@ fn test_native_install_gate_summary_mapping_tracks_exact_pins_and_clean_ancestry
                 exact_source_count += 1;
                 continue;
             }
-            if repo == "ay" && source.is_none() {
+            if repo == "ay" && source == Some(audited_clean_ay_source.as_str()) {
                 assert_eq!(
                     package.get("version").and_then(toml::Value::as_str),
-                    Some("0.1.0"),
-                    "audited Clean cycle-boundary AY package `{package_name}` must retain version 0.1.0"
+                    Some(AUDITED_CLEAN_AY_VERSION),
+                    "audited Clean AY package `{package_name}` must retain version {AUDITED_CLEAN_AY_VERSION}"
                 );
-                path_ay_packages.push(package_name);
+                clean_ay_packages.push(package_name);
                 continue;
             }
             assert_eq!(
@@ -1590,10 +1488,10 @@ fn test_native_install_gate_summary_mapping_tracks_exact_pins_and_clean_ancestry
             "Cargo.lock must retain at least one package from the exact `{repo}` Git source"
         );
         if repo == "ay" {
-            path_ay_packages.sort_unstable();
+            clean_ay_packages.sort_unstable();
             assert_eq!(
-                path_ay_packages, AUDITED_CLEAN_AY_PATH_PACKAGES,
-                "TY-root source-less AY packages must exactly equal the audited Clean cycle boundary"
+                clean_ay_packages, AUDITED_CLEAN_AY_PACKAGES,
+                "TY-root AY 0.2 packages must exactly equal the audited Clean dependency boundary"
             );
         }
     }
@@ -1651,16 +1549,20 @@ fn test_native_install_gate_summary_mapping_tracks_exact_pins_and_clean_ancestry
             "early lock preflight must classify the complete `{family_pattern}` package family"
         );
     }
-    let audited_path_assignment = format!(
-        "audited_clean_ay_path_packages='{}'",
-        AUDITED_CLEAN_AY_PATH_PACKAGES.join(",")
+    let audited_packages_assignment = format!(
+        "audited_clean_ay_packages='{}'",
+        AUDITED_CLEAN_AY_PACKAGES.join(",")
     );
     assert!(
-        lock_preflight.contains(&audited_path_assignment),
+        lock_preflight.contains(&audited_packages_assignment),
         "Rust and shell guards must carry the same exact Clean-to-AY cycle-boundary allowlist"
     );
     assert!(
-        lock_preflight.contains("    '0.1.0'"),
+        lock_preflight.contains(&format!("audited_clean_ay_rev='{AUDITED_CLEAN_AY_REV}'")),
+        "Rust and shell guards must carry the same exact Clean-to-AY revision"
+    );
+    assert!(
+        lock_preflight.contains(&format!("    '{AUDITED_CLEAN_AY_VERSION}'")),
         "early lock preflight must enforce the audited AY cycle-boundary version"
     );
 
@@ -1671,77 +1573,11 @@ fn test_native_install_gate_summary_mapping_tracks_exact_pins_and_clean_ancestry
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
         "audited Clean revision must be lowercase 40-hex"
     );
-    let clean_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../clean")
-        .canonicalize()
-        .expect("effective sibling Clean checkout must exist");
-    let git_clean = |args: &[&str]| -> String {
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&clean_root)
-            .args(args)
-            .output()
-            .unwrap_or_else(|error| {
-                panic!(
-                    "failed to inspect effective Clean checkout {}: {error}",
-                    clean_root.display()
-                )
-            });
-        assert!(
-            output.status.success(),
-            "git -C {} {} failed: {}",
-            clean_root.display(),
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout)
-            .expect("Clean git metadata must be UTF-8")
-            .trim()
-            .to_string()
-    };
-    let clean_head = git_clean(&["rev-parse", "HEAD"]);
-    // The standalone MCC image and package graph retain the immutable Clean
-    // cycle-cut above, while an umbrella checkout follows the current public
-    // Clean main and records that exact descendant in its own gitlink. Requiring
-    // the frozen content pin to remain public main made this test inevitably
-    // stale as soon as Clean advanced. Preserve both authorities explicitly:
-    // current sibling/public-main identity below, and frozen ancestry here.
-    git_clean(&[
-        "merge-base",
-        "--is-ancestor",
-        REQUESTED_CLEAN_REV,
-        clean_head.as_str(),
-    ]);
-    let clean_status = git_clean(&["status", "--porcelain=v1", "--untracked-files=normal"]);
-    assert!(
-        clean_status.is_empty(),
-        "effective sibling Clean worktree must be clean, observed:\n{clean_status}"
-    );
-    let clean_origin = git_clean(&["remote", "get-url", "origin"]);
-    let clean_git_root = std::path::PathBuf::from(git_clean(&["rev-parse", "--show-toplevel"]))
-        .canonicalize()
-        .expect("Clean git toplevel must resolve");
-    assert_eq!(
-        clean_git_root, clean_root,
-        "effective sibling Clean path must be the root of its own checkout"
-    );
-    assert!(
-        matches!(
-            clean_origin.trim_end_matches('/'),
-            "https://github.com/alabsystems/clean"
-                | "https://github.com/alabsystems/clean.git"
-                | "ssh://git@github.com/alabsystems/clean"
-                | "ssh://git@github.com/alabsystems/clean.git"
-                | "git@github.com:alabsystems/clean"
-                | "git@github.com:alabsystems/clean.git"
-        ),
-        "effective sibling Clean origin must be a secure canonical alabsystems/clean URL, observed `{clean_origin}`"
-    );
-    let clean_remote_main = git_clean(&["rev-parse", "refs/remotes/origin/main"]);
-    assert_eq!(
-        clean_head, clean_remote_main,
-        "effective sibling Clean checkout must be bidirectionally aligned with fetched origin/main; the standalone content pin is validated separately as an ancestor"
-    );
+    // This unit test validates repository-controlled authority only. The state
+    // (HEAD, dirtiness, fetched refs) of a developer's unrelated sibling Clean
+    // checkout is ambient and cannot make committed TY inputs valid or invalid.
+    // Exact Clean authority is already fixed above by Cargo.toml, Cargo.lock,
+    // the Docker build arguments, and the dependency-free lock preflight.
 
     struct AdmissionRowMapping {
         row_code: &'static str,
@@ -2107,7 +1943,8 @@ TypeOK == TRUE
         temp_proof.source().starts_with("action-producer:"),
         "proof should be tied to action-local producer evidence"
     );
-    let jit_layout = crate::state::check_layout_to_jit_layout(layout);
+    let jit_layout = crate::state::try_check_layout_to_jit_layout(layout)
+        .expect("promoted layout should have a faithful native ABI carrier");
     match jit_layout.var_layout(temp_idx) {
         Some(tla_jit_abi::VarLayout::Compound(tla_jit_abi::CompoundLayout::Function {
             value_layout,
@@ -2546,11 +2383,7 @@ fn string_temp_tagged_range_candidate() -> super::ActionTaggedRangeCandidate {
     super::ActionTaggedRangeCandidate {
         var_idx: 0,
         domain: Arc::from(
-            vec![
-                Value::String(Rp::from("p1")),
-                Value::String(Rp::from("p2")),
-            ]
-            .into_boxed_slice(),
+            vec![Value::String(Rp::from("p1")), Value::String(Rp::from("p2"))].into_boxed_slice(),
         ),
         scalar_type: SlotType::String,
         set_universe: vec![

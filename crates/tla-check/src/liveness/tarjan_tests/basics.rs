@@ -198,7 +198,7 @@ fn test_edge_filter_excludes_back_edge_from_scc() {
         .add_successor(n1, &s0, 0)
         .expect("filtered edge should attach to an existing source node");
 
-    let result = find_sccs_with_edge_filter(&graph, &|_from_info, _succ_idx, to| {
+    let result = find_sccs_with_edge_filter(&graph, &|_from_info, _succ_idx, to, _to_info| {
         // Exclude the back-edge n1->n0 (the only edge targeting n0)
         *to != n0
     });
@@ -210,6 +210,71 @@ fn test_edge_filter_excludes_back_edge_from_scc() {
         0,
         "trivial SCCs after edge filter should be filtered out"
     );
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_packed_tarjan_matches_raw_with_duplicate_filtered_edges() {
+    let mut graph = BehaviorGraph::new();
+    let states: Vec<State> = (0..3).map(make_state).collect();
+    graph.add_init_node(&states[0], 0);
+    let nodes: Vec<BehaviorGraphNode> = states
+        .iter()
+        .map(|state| BehaviorGraphNode::from_state(state, 0))
+        .collect();
+
+    // The second row starts at a non-zero global CSR offset and contains two
+    // identical edges. The filter admits only local edge index 1, so passing a
+    // global index or deduplicating the row would incorrectly destroy the SCC.
+    graph.add_successor(nodes[0], &states[0], 0).unwrap();
+    graph.add_successor(nodes[0], &states[1], 0).unwrap();
+    graph.add_successor(nodes[1], &states[2], 0).unwrap();
+    graph.add_successor(nodes[1], &states[2], 0).unwrap();
+    graph.add_successor(nodes[2], &states[1], 0).unwrap();
+
+    let filter = |_from_info: &NodeInfo,
+                  successor_idx: usize,
+                  to: &BehaviorGraphNode,
+                  _to_info: &NodeInfo| { *to != nodes[2] || successor_idx == 1 };
+
+    let raw_unfiltered = find_sccs(&graph);
+    let raw_filtered = find_sccs_with_edge_filter(&graph, &filter);
+    assert!(raw_unfiltered.errors.is_empty());
+    assert!(raw_filtered.errors.is_empty());
+
+    graph.pack_inmemory_successors().unwrap();
+    let packed_unfiltered = find_sccs(&graph);
+    let packed_filtered = find_sccs_with_edge_filter(&graph, &filter);
+    assert!(packed_unfiltered.errors.is_empty());
+    assert!(packed_filtered.errors.is_empty());
+
+    assert_eq!(
+        canonicalize_sccs(raw_unfiltered.sccs, &nodes),
+        canonicalize_sccs(packed_unfiltered.sccs, &nodes)
+    );
+    let raw_filtered = canonicalize_sccs(raw_filtered.sccs, &nodes);
+    assert_eq!(raw_filtered, vec![vec![0], vec![1, 2]]);
+    assert_eq!(
+        raw_filtered,
+        canonicalize_sccs(packed_filtered.sccs, &nodes)
+    );
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_allowed_edge_bitmap_word_and_tail_boundaries() {
+    let mut bitmap = AllowedEdgeBitmap::try_new(130).unwrap();
+    for edge in [0, 63, 64, 65, 129] {
+        bitmap.set(edge);
+    }
+
+    assert_eq!(bitmap.next_set(0, 130), Some(0));
+    assert_eq!(bitmap.next_set(1, 130), Some(63));
+    assert_eq!(bitmap.next_set(64, 130), Some(64));
+    assert_eq!(bitmap.next_set(65, 130), Some(65));
+    assert_eq!(bitmap.next_set(66, 129), None);
+    assert_eq!(bitmap.next_set(66, 130), Some(129));
+    assert_eq!(bitmap.next_set(130, 130), None);
 }
 
 #[cfg_attr(test, ntest::timeout(10000))]

@@ -414,9 +414,7 @@ fn parse_cargo_toml_ay_rev(path: &Path) -> Result<(String, Vec<String>), PinVali
     ))
 }
 
-fn parse_cargo_lock_ay_rev(
-    path: &Path,
-) -> Result<(String, Vec<String>), PinValidationError> {
+fn parse_cargo_lock_ay_rev(path: &Path) -> Result<(String, Vec<String>), PinValidationError> {
     let text = fs::read_to_string(path).map_err(|source| PinValidationError::Io {
         path: path.to_path_buf(),
         source,
@@ -638,9 +636,7 @@ mod tests {
     }
 
     fn path_package_stanza(name: &str, version: &str) -> String {
-        format!(
-            "\n[[package]]\nname = \"{name}\"\nversion = \"{version}\"\n"
-        )
+        format!("\n[[package]]\nname = \"{name}\"\nversion = \"{version}\"\n")
     }
 
     fn write_workspace(dir: &Path, rev: &str) -> (PathBuf, PathBuf, PathBuf) {
@@ -689,16 +685,15 @@ mod tests {
     fn validate_rejects_incomplete_clean_cycle_boundary() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (df, ct, cl) = write_workspace(dir.path(), FORTY_A);
-        let text = fs::read_to_string(&cl)
-            .unwrap()
-            .replace(
-                &path_package_stanza("ay-count", AUDITED_CLEAN_AY_VERSION),
-                "",
-            );
+        let text = fs::read_to_string(&cl).unwrap().replace(
+            &path_package_stanza("ay-count", AUDITED_CLEAN_AY_VERSION),
+            "",
+        );
         fs::write(&cl, text).unwrap();
         let err = validate_ay_pin_paths(&df, &ct, &cl).expect_err("must fail");
         assert!(
-            err.to_string().contains("cycle-boundary ay package set mismatch"),
+            err.to_string()
+                .contains("cycle-boundary ay package set mismatch"),
             "got: {err}"
         );
     }
@@ -708,11 +703,15 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let (df, ct, cl) = write_workspace(dir.path(), FORTY_A);
         let mut text = fs::read_to_string(&cl).unwrap();
-        text.push_str(&path_package_stanza("ay-unexpected", AUDITED_CLEAN_AY_VERSION));
+        text.push_str(&path_package_stanza(
+            "ay-unexpected",
+            AUDITED_CLEAN_AY_VERSION,
+        ));
         fs::write(&cl, text).unwrap();
         let err = validate_ay_pin_paths(&df, &ct, &cl).expect_err("must fail");
         assert!(
-            err.to_string().contains("cycle-boundary ay package set mismatch"),
+            err.to_string()
+                .contains("cycle-boundary ay package set mismatch"),
             "got: {err}"
         );
     }
@@ -726,7 +725,8 @@ mod tests {
         fs::write(&cl, text).unwrap();
         let err = validate_ay_pin_paths(&df, &ct, &cl).expect_err("must fail");
         assert!(
-            err.to_string().contains("cycle-boundary ay package set mismatch"),
+            err.to_string()
+                .contains("cycle-boundary ay package set mismatch"),
             "got: {err}"
         );
     }
@@ -735,12 +735,10 @@ mod tests {
     fn validate_rejects_wrong_clean_cycle_boundary_version() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (df, ct, cl) = write_workspace(dir.path(), FORTY_A);
-        let text = fs::read_to_string(&cl)
-            .unwrap()
-            .replace(
-                &path_package_stanza("ay-count", AUDITED_CLEAN_AY_VERSION),
-                &path_package_stanza("ay-count", "0.12.0"),
-            );
+        let text = fs::read_to_string(&cl).unwrap().replace(
+            &path_package_stanza("ay-count", AUDITED_CLEAN_AY_VERSION),
+            &path_package_stanza("ay-count", "0.12.0"),
+        );
         fs::write(&cl, text).unwrap();
         let err = validate_ay_pin_paths(&df, &ct, &cl).expect_err("must fail");
         assert!(
@@ -756,12 +754,10 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let (_, _, lock) = write_workspace(dir.path(), FORTY_A);
-        let mut exact_lock = fs::read_to_string(&lock)
-            .unwrap()
-            .replace(
-                "git+https://github.com/alabsystems/ay?rev=",
-                "git+https://github.com/alabsystems/ay.git?rev=",
-            );
+        let mut exact_lock = fs::read_to_string(&lock).unwrap().replace(
+            "git+https://github.com/alabsystems/ay?rev=",
+            "git+https://github.com/alabsystems/ay.git?rev=",
+        );
         exact_lock.push_str(&format!(
             "\n[[package]]\nname = \"trust-ir\"\nversion = \"0.2.0\"\nsource = \"git+https://github.com/alabsystems/trust-ir.git?rev={FORTY_A}#{FORTY_A}\"\n\n\
              [[package]]\nname = \"trust-cg-ir\"\nversion = \"0.1.0\"\nsource = \"git+https://github.com/alabsystems/trust-cg.git?rev={FORTY_A}#{FORTY_A}\"\n\n\
@@ -813,7 +809,8 @@ mod tests {
         .unwrap();
         let output = run(&wrong_version);
         assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("expected 0.11.0"));
+        assert!(String::from_utf8_lossy(&output.stderr)
+            .contains(&format!("expected {AUDITED_CLEAN_AY_VERSION}")));
 
         let duplicate = dir.path().join("duplicate.lock");
         fs::write(
@@ -867,30 +864,23 @@ mod tests {
     fn workspace_rev_cannot_mix_with_branch_selector() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (df, ct, cl) = write_workspace(dir.path(), FORTY_A);
-        let text = fs::read_to_string(&ct)
-            .unwrap()
-            .replace(
-                &format!("rev = \"{FORTY_A}\""),
-                &format!("rev = \"{FORTY_A}\", branch = \"main\""),
-            );
+        let text = fs::read_to_string(&ct).unwrap().replace(
+            &format!("rev = \"{FORTY_A}\""),
+            &format!("rev = \"{FORTY_A}\", branch = \"main\""),
+        );
         fs::write(&ct, text).unwrap();
         let err = validate_ay_pin_paths(&df, &ct, &cl).expect_err("must fail");
-        assert!(
-            err.to_string().contains("mixes exact rev"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("mixes exact rev"), "got: {err}");
     }
 
     #[test]
     fn workspace_git_rev_cannot_mix_with_path_selector() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (df, ct, cl) = write_workspace(dir.path(), FORTY_A);
-        let text = fs::read_to_string(&ct)
-            .unwrap()
-            .replace(
-                &format!("rev = \"{FORTY_A}\""),
-                &format!("rev = \"{FORTY_A}\", path = \"../ay\""),
-            );
+        let text = fs::read_to_string(&ct).unwrap().replace(
+            &format!("rev = \"{FORTY_A}\""),
+            &format!("rev = \"{FORTY_A}\", path = \"../ay\""),
+        );
         fs::write(&ct, text).unwrap();
         let err = validate_ay_pin_paths(&df, &ct, &cl).expect_err("must fail");
         assert!(
@@ -934,12 +924,10 @@ mod tests {
     fn unsupported_lock_git_url_fails() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (df, ct, cl) = write_workspace(dir.path(), FORTY_A);
-        let text = fs::read_to_string(&cl)
-            .unwrap()
-            .replace(
-                "https://github.com/alabsystems/ay",
-                "https://github.com/elsewhere/ay",
-            );
+        let text = fs::read_to_string(&cl).unwrap().replace(
+            "https://github.com/alabsystems/ay",
+            "https://github.com/elsewhere/ay",
+        );
         fs::write(&cl, text).unwrap();
         let err = validate_ay_pin_paths(&df, &ct, &cl).expect_err("must fail");
         assert!(
@@ -967,12 +955,10 @@ mod tests {
     fn lock_source_with_extra_query_key_fails() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (df, ct, cl) = write_workspace(dir.path(), FORTY_A);
-        let text = fs::read_to_string(&cl)
-            .unwrap()
-            .replace(
-                &format!("?rev={FORTY_A}"),
-                &format!("?rev={FORTY_A}&subdir=elsewhere"),
-            );
+        let text = fs::read_to_string(&cl).unwrap().replace(
+            &format!("?rev={FORTY_A}"),
+            &format!("?rev={FORTY_A}&subdir=elsewhere"),
+        );
         fs::write(&cl, text).unwrap();
         let err = validate_ay_pin_paths(&df, &ct, &cl).expect_err("must fail");
         assert!(
@@ -985,7 +971,9 @@ mod tests {
     fn lock_source_without_git_prefix_fails() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (df, ct, cl) = write_workspace(dir.path(), FORTY_A);
-        let text = fs::read_to_string(&cl).unwrap().replace("git+https://", "https://");
+        let text = fs::read_to_string(&cl)
+            .unwrap()
+            .replace("git+https://", "https://");
         fs::write(&cl, text).unwrap();
         let err = validate_ay_pin_paths(&df, &ct, &cl).expect_err("must fail");
         assert!(

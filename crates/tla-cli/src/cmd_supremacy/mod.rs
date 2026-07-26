@@ -20,8 +20,10 @@ use serde_json::json;
 use crate::cli_schema::{
     SupremacyAntiOverfitArgs, SupremacyArgs, SupremacyBenchmarkArgs, SupremacyCommand,
     SupremacyCommonArgs, SupremacyCompareArgs, SupremacyGateArgs, SupremacyGateMode,
-    SupremacyMatrixArgs, SupremacyMatrixFullSuiteArgs, SupremacyMatrixRuntimeScope, SupremacyMode,
-    SupremacyOutputFormat, SupremacyReproduceArgs, SupremacySmokeArgs, SupremacySoundnessSweepArgs,
+    SupremacyMatrixArgs, SupremacyMatrixCampaignPlanArgs, SupremacyMatrixFullSuiteArgs,
+    SupremacyMatrixMergeArgs, SupremacyMatrixRuntimeScope, SupremacyMatrixSegmentArgs,
+    SupremacyMode, SupremacyOutputFormat, SupremacyReproduceArgs, SupremacySmokeArgs,
+    SupremacySoundnessSweepArgs,
 };
 
 mod anti_overfit;
@@ -39,6 +41,7 @@ mod smoke;
 mod soundness_sweep;
 mod summary;
 mod verdict;
+mod work_equivalence;
 
 use policy::{PlannedGate, SupremacyPolicy};
 
@@ -58,6 +61,55 @@ const TLC_JAVA_SINGLE_THREAD_ARGS: &[&str] = &[
 
 fn tlc_java_single_thread_args() -> &'static [&'static str] {
     TLC_JAVA_SINGLE_THREAD_ARGS
+}
+
+/// `os.path.expanduser` behavior. Pure: the home dir is passed in so this is
+/// unit-testable without mutating the process environment.
+fn expand_home_with(path: &Path, home: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if s == "~" {
+        return home.to_path_buf();
+    }
+    if let Some(rest) = s.strip_prefix("~/") {
+        return home.join(rest);
+    }
+    path.to_path_buf()
+}
+
+fn home_dir() -> PathBuf {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Resolve the corpus `specifications/` dir for baseline-driven commands.
+/// Priority mirrors the documented corpus contract (`cmd_corpus::resolve_dest`):
+/// 1. `$TLAPLUS_EXAMPLES` (accepted pointing either AT `specifications/` or at
+///    its parent; normalized to the `specifications/` dir),
+/// 2. the baseline's `inputs.examples_dir` with `~` expanded (committed
+///    baselines pin the author's home-relative path),
+/// 3. `$HOME/tlaplus-examples/specifications`.
+fn resolve_examples_dir_with(
+    env_examples: Option<&str>,
+    baseline_examples_dir: Option<&Path>,
+    home: &Path,
+) -> PathBuf {
+    if let Some(env) = env_examples.filter(|v| !v.is_empty()) {
+        let p = expand_home_with(Path::new(env), home);
+        if p.file_name().and_then(|s| s.to_str()) == Some("specifications") {
+            return p;
+        }
+        return p.join("specifications");
+    }
+    if let Some(dir) = baseline_examples_dir {
+        return expand_home_with(dir, home);
+    }
+    home.join("tlaplus-examples").join("specifications")
+}
+
+fn resolve_examples_dir(baseline_examples_dir: Option<&Path>) -> PathBuf {
+    let env_examples = env::var("TLAPLUS_EXAMPLES").ok();
+    resolve_examples_dir_with(env_examples.as_deref(), baseline_examples_dir, &home_dir())
 }
 
 fn tlc_java_single_thread_base_argv() -> Vec<String> {
@@ -80,6 +132,10 @@ pub(crate) fn cmd_supremacy(args: SupremacyArgs) -> Result<()> {
         SupremacyCommand::AntiOverfit(args) => cmd_anti_overfit(args),
         SupremacyCommand::Matrix(args) => cmd_matrix(args),
         SupremacyCommand::MatrixFullSuite(args) => cmd_matrix_full_suite(args),
+        SupremacyCommand::MatrixCampaignPlan(args) => cmd_matrix_campaign_plan(args),
+        SupremacyCommand::MatrixSegment(args) => cmd_matrix_segment(args),
+        SupremacyCommand::MatrixMergeInventory(args) => cmd_matrix_merge_inventory(args),
+        SupremacyCommand::MatrixMerge(args) => cmd_matrix_merge(args),
         SupremacyCommand::SoundnessSweep(args) => cmd_soundness_sweep(args),
     }
 }
@@ -278,6 +334,7 @@ fn cmd_matrix_full_suite(args: SupremacyMatrixFullSuiteArgs) -> Result<()> {
         runtime_limit: None,
         runtime_specs: Vec::new(),
         runtime_timeout: args.runtime_timeout,
+        runtime_runs: args.runtime_runs,
         production_runtime: args.production_runtime,
         runtime_ty_bin: args.runtime_ty_bin,
         allow_debug_runtime: args.allow_debug_runtime,
@@ -285,6 +342,33 @@ fn cmd_matrix_full_suite(args: SupremacyMatrixFullSuiteArgs) -> Result<()> {
         runtime_community_modules: args.runtime_community_modules,
         runtime_tla_library: args.runtime_tla_library,
     })
+}
+
+fn cmd_matrix_campaign_plan(args: SupremacyMatrixCampaignPlanArgs) -> Result<()> {
+    matrix::write_campaign_plan(&args)
+}
+
+fn cmd_matrix_segment(args: SupremacyMatrixSegmentArgs) -> Result<()> {
+    let collection = matrix::collect_campaign_segment(&args)?;
+    matrix::print_campaign_segment_summary(&collection, args.format)
+}
+
+fn cmd_matrix_merge(args: SupremacyMatrixMergeArgs) -> Result<()> {
+    let summary = matrix::merge_campaign_segments(&args)?;
+    matrix::print_summary(&summary, args.format)?;
+    let blockers = summary.enforce_blocker_count();
+    if args.mode == SupremacyMode::Enforce && blockers > 0 {
+        bail!(
+            "merged all-runnable supremacy matrix has {blockers} non-passing rows out of {}",
+            summary.total_rows()
+        );
+    }
+    Ok(())
+}
+
+fn cmd_matrix_merge_inventory(args: SupremacyMatrixMergeArgs) -> Result<()> {
+    let summary = matrix::merge_campaign_inventory(&args)?;
+    matrix::print_summary(&summary, args.format)
 }
 
 #[derive(Debug)]
@@ -582,6 +666,61 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::{Mutex, OnceLock};
 
+    #[test]
+    fn expand_home_handles_tilde_prefix() {
+        let home = Path::new("/home/test");
+        assert_eq!(
+            expand_home_with(Path::new("~"), home),
+            PathBuf::from("/home/test")
+        );
+        assert_eq!(
+            expand_home_with(Path::new("~/tlaplus-examples/specifications"), home),
+            PathBuf::from("/home/test/tlaplus-examples/specifications")
+        );
+        // Non-tilde paths pass through unchanged.
+        assert_eq!(
+            expand_home_with(Path::new("/abs/path"), home),
+            PathBuf::from("/abs/path")
+        );
+    }
+
+    #[test]
+    fn examples_dir_resolution_priority() {
+        let home = Path::new("/home/test");
+        // 1. Env wins, normalized to the specifications dir in either form.
+        assert_eq!(
+            resolve_examples_dir_with(Some("/corpus"), Some(Path::new("~/x")), home),
+            PathBuf::from("/corpus/specifications")
+        );
+        assert_eq!(
+            resolve_examples_dir_with(Some("/corpus/specifications"), None, home),
+            PathBuf::from("/corpus/specifications")
+        );
+        assert_eq!(
+            resolve_examples_dir_with(Some("~/corpus"), None, home),
+            PathBuf::from("/home/test/corpus/specifications")
+        );
+        // Empty env is ignored.
+        assert_eq!(
+            resolve_examples_dir_with(Some(""), Some(Path::new("/pinned")), home),
+            PathBuf::from("/pinned")
+        );
+        // 2. Baseline value is home-expanded (committed baselines pin `~/...`).
+        assert_eq!(
+            resolve_examples_dir_with(
+                None,
+                Some(Path::new("~/tlaplus-examples/specifications")),
+                home
+            ),
+            PathBuf::from("/home/test/tlaplus-examples/specifications")
+        );
+        // 3. Default.
+        assert_eq!(
+            resolve_examples_dir_with(None, None, home),
+            PathBuf::from("/home/test/tlaplus-examples/specifications")
+        );
+    }
+
     fn repo_policy_path() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
@@ -801,7 +940,7 @@ mod tests {
         let mut common = common_for_test(None);
         common
             .trust_cg_env
-            .push("TY_TRUST_CG_NATIVE_CALLOUT_COMPILE_JOBS=1".to_string());
+            .push("TY_TRUST_CG_NATIVE_CALLOUT_COMPILE_JOBS=27".to_string());
         let prepared = PreparedSupremacy::prepare(
             "gate",
             &common,
@@ -814,7 +953,7 @@ mod tests {
         let error = prepared.validate_enforce_env_overrides().unwrap_err();
         assert!(error
             .to_string()
-            .contains("requires TY_TRUST_CG_NATIVE_CALLOUT_COMPILE_JOBS=27"));
+            .contains("requires TY_TRUST_CG_NATIVE_CALLOUT_COMPILE_JOBS=1"));
     }
 
     #[test]

@@ -15,7 +15,6 @@ use super::{
 use crate::error::EvalResult;
 use crate::liveness::debug::liveness_profile;
 use rustc_hash::FxHashSet;
-use std::cell::RefCell;
 use std::time::Instant;
 
 /// Outcome of the authoritative AE re-verification of a candidate witness cycle.
@@ -109,6 +108,14 @@ impl LivenessChecker {
         ) {
             return LivenessResult::EvalFailure { error: e };
         }
+        // The topology is complete once masks have been populated. Compact
+        // in-memory successor rows to dense-id CSR before Tarjan reaches peak
+        // RSS. This operation is idempotent because authoritative witness
+        // retry may repopulate masks and re-enter this method on the same
+        // graph; disk-backed graphs deliberately remain record-local.
+        if let Err(e) = self.graph.pack_inmemory_successors() {
+            return LivenessResult::EvalFailure { error: e };
+        }
         let profile = liveness_profile();
         if profile {
             eprintln!(
@@ -147,32 +154,16 @@ impl LivenessChecker {
             // 2. Run Tarjan once for this EA signature.
             // Edge filter now reads bitmasks inline via EaEdgeCheck (#2704).
             let tarjan_start = Instant::now();
-            let graph_ref = &self.graph;
-            let edge_filter_error = RefCell::new(None);
             let scc_result = if let Some(ref ec) = ea_check {
                 crate::liveness::tarjan::find_sccs_with_edge_filter(
                     &self.graph,
-                    &|from_info, succ_idx, to| match graph_ref.try_get_node_info(to) {
-                        Ok(Some(to_info)) => ec.allows_edge(from_info, succ_idx, &to_info),
-                        Ok(None) => false,
-                        Err(error) => {
-                            if edge_filter_error.borrow().is_none() {
-                                edge_filter_error.replace(Some(error.to_string()));
-                            }
-                            false
-                        }
+                    &|from_info, succ_idx, _to, to_info| {
+                        ec.allows_edge(from_info, succ_idx, to_info)
                     },
                 )
             } else {
                 self.find_sccs()
             };
-            if let Some(error) = edge_filter_error.into_inner() {
-                return LivenessResult::RuntimeFailure {
-                    reason: format!(
-                        "error reading graph nodes during Tarjan edge filtering: {error}"
-                    ),
-                };
-            }
             if profile {
                 eprintln!(
                     "  check_liveness_grouped: tarjan: {:.3}s (sccs={})",
@@ -237,15 +228,6 @@ impl LivenessChecker {
                 continue;
             }
 
-            // Precompute SCC node sets once per SCC (#2714).
-            // Previously, scc_ae_action_satisfied called scc.build_node_set() on
-            // every PEM×SCC call. For P PEMs and S SCCs, that was P×S HashSet
-            // allocations instead of S.
-            let scc_node_sets: Vec<FxHashSet<BehaviorGraphNode>> = candidate_sccs
-                .iter()
-                .map(|scc| scc.build_node_set())
-                .collect();
-
             // Precompute per-SCC aggregate bitmasks for O(1) AE constraint checks.
             // The aggregate state mask is the union of all nodes' state_check_mask.
             // The aggregate action mask is the union of all intra-SCC edges'
@@ -254,7 +236,6 @@ impl LivenessChecker {
             // allowing early skip without per-node iteration.
             let scc_aggregates: Vec<SccAggregateMasks> = match Self::try_build_scc_aggregates(
                 &candidate_sccs,
-                &scc_node_sets,
                 ea_check.as_ref(),
                 &self.graph,
             ) {
@@ -471,10 +452,7 @@ impl LivenessChecker {
         };
 
         if self.graph.has_owned_state_cache()
-            || self
-                .graph
-                .get_state_by_fp(first_node.state_fp)
-                .is_some()
+            || self.graph.get_state_by_fp(first_node.state_fp).is_some()
         {
             let (prefix, cycle) = match self.build_counterexample(cycle_nodes) {
                 Ok(value) => value,
@@ -491,9 +469,7 @@ impl LivenessChecker {
             Ok(value) => value,
             Err(error) => {
                 return LivenessResult::RuntimeFailure {
-                    reason: format!(
-                        "error constructing fingerprint-only counterexample: {error}"
-                    ),
+                    reason: format!("error constructing fingerprint-only counterexample: {error}"),
                 };
             }
         };
@@ -645,15 +621,12 @@ impl LivenessChecker {
         for (from_i, to_i) in edges {
             let from = cycle_nodes[from_i];
             let to = cycle_nodes[to_i];
-            let from_info = self
-                .graph
-                .try_get_node_info(&from)?
-                .ok_or_else(|| {
-                    Self::behavior_graph_invariant_error(format!(
-                        "authoritative cycle source node {from} is missing from the behavior graph"
-                    ))
-                })?;
-            if !from_info.successors.contains(&to) {
+            let from_info = self.graph.try_get_node_info(&from)?.ok_or_else(|| {
+                Self::behavior_graph_invariant_error(format!(
+                    "authoritative cycle source node {from} is missing from the behavior graph"
+                ))
+            })?;
+            if !from_info.successors().contains(&to) {
                 return Err(Self::behavior_graph_invariant_error(format!(
                     "authoritative cycle pair {from} -> {to} is not a behavior-graph edge"
                 )));
@@ -751,7 +724,7 @@ impl LivenessChecker {
                         "gate reseed source node {bg_node} from node_keys is missing"
                     ))
                 })?;
-                for succ in &info.successors {
+                for succ in info.successors() {
                     if succ_seen.insert(succ.state_fp) {
                         if let Some(st) = self.graph.get_state_by_fp(succ.state_fp) {
                             succ_states.push(st.clone());

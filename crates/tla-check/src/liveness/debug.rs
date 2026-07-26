@@ -72,8 +72,8 @@ pub(crate) fn liveness_auto_disk_threshold() -> usize {
 
 /// Estimated bytes for a single in-memory behavior-graph node (`NodeInfo`).
 ///
-/// `NodeInfo` carries a successors `Vec`, parent pointer, BFS depth, and
-/// precomputed check bitmasks. The matching count default
+/// `NodeInfo` carries a successors `Vec`, a compact optional disk-trace parent,
+/// and precomputed check bitmasks. The matching count default
 /// (`liveness_inmemory_node_limit`, 5M nodes) is documented as ~1 GB, i.e.
 /// ~200 bytes/node — used here so a byte budget maps back to an equivalent
 /// node count. This is an estimate hook; refine alongside the deeper
@@ -102,8 +102,7 @@ pub(crate) fn liveness_disk_budget_mb() -> usize {
     crate::debug_env::env_usize_or(&LIMIT, "TY_LIVENESS_DISK_BUDGET_MB", 0)
 }
 
-/// Estimated-memory budget (in MiB) for the mid-BFS liveness-cache regeneration
-/// trip (the "large-liveness on-the-fly" auto-gate).
+/// Structural-heap budget (in MiB) for the mid-BFS hybrid liveness trip.
 ///
 /// The sequential checker normally CACHES the full system successor graph plus
 /// the per-state / per-transition inline liveness structures (`bfs_seeded_states`,
@@ -113,12 +112,15 @@ pub(crate) fn liveness_disk_budget_mb() -> usize {
 /// caches dominate peak RSS (7.2 GB — nine times TLC).
 ///
 /// When the estimated size of those caches crosses this budget MID-BFS, the
-/// checker DROPS them, stops caching for the remainder of BFS, and switches the
-/// post-BFS liveness pass to on-demand successor REGENERATION (the same
-/// `--liveness-mode on-the-fly` path), trading time for a bounded memory
-/// footprint — exactly TLC's tradeoff. Below the budget the fast cached path is
-/// used unchanged, so small/medium liveness specs (and the native-fused
-/// parallel path) are untouched.
+/// checker moves ordered successor payloads to an append-only temporary file,
+/// drops the heavyweight inline maps, and switches the post-BFS liveness pass
+/// to the on-the-fly checker. Exactly resolvable sources replay the disk-backed
+/// adjacency; all other sources regenerate through Next. This removes O(edges)
+/// graph-owned heap payloads, but is not constant-memory: the disk graph keeps
+/// an O(states) parent-offset index and a fixed-slot direct cache whose payload
+/// bytes depend on fanout; mapped-page residency is OS-dependent. Below the
+/// budget the fast cached path is unchanged, so small/medium liveness specs
+/// (and the native-fused parallel path) are untouched.
 ///
 /// This budget is measured against a load-INDEPENDENT structural estimate of
 /// the caches (entry counts × per-entry size), which under-counts true resident
@@ -159,10 +161,10 @@ pub(crate) fn liveness_regen_should_trip(
     budget_bytes.is_some_and(|budget| force || estimated_bytes >= budget)
 }
 
-// Force the mid-BFS liveness-cache regeneration trip to fire as soon as ANY
-// liveness cache entry exists, regardless of the byte budget. Test/probe hook
-// used to exercise the regeneration path (and its counterexample-trace
-// reconstruction) on small specs where the budget would never be reached.
+// Force the mid-BFS hybrid liveness trip at the next eligible monitoring poll,
+// regardless of the structural estimate (including zero). Test/probe hook used
+// to exercise retained-or-regenerated checking and trace reconstruction on
+// small specs where the budget would never be reached.
 // Enable with `TY_LIVENESS_REGEN_FORCE=1`.
 feature_flag!(pub(crate) liveness_regen_force, "TY_LIVENESS_REGEN_FORCE");
 
@@ -170,10 +172,10 @@ fn liveness_otf_compact_cache_disabled_value(value: Option<&str>) -> bool {
     value == Some("1")
 }
 
-/// Whether regenerated liveness exploration should retain checker-owned
-/// compact state payloads. Only the exact value `1` disables the default-on
-/// cache; other values are treated as unset so a stray `0` cannot silently
-/// turn the optimization off.
+/// Whether on-the-fly (retained-or-regenerated) liveness exploration should
+/// retain checker-owned compact state payloads. Only the exact value `1`
+/// disables the default-on cache; other values are treated as unset so a stray
+/// `0` cannot silently turn the optimization off.
 pub(crate) fn liveness_otf_compact_cache_enabled() -> bool {
     !liveness_otf_compact_cache_disabled_value(
         std::env::var("TY_NO_LIVENESS_OTF_COMPACT_CACHE")
@@ -461,7 +463,7 @@ pub(crate) fn liveness_inmemory_node_limit() -> Option<usize> {
 
     /// Default in-memory node limit: 5 million nodes.
     ///
-    /// At ~200 bytes per `NodeInfo` (successors Vec, parent, depth, check masks),
+    /// At ~200 bytes per `NodeInfo` (successors Vec, trace slot, check masks),
     /// 5M nodes consumes ~1 GB. Beyond this, disk-backed mode should be used.
     /// Override with `TY_LIVENESS_INMEMORY_NODE_LIMIT` env var.
     /// Set to `0` to disable the limit entirely (not recommended).

@@ -754,7 +754,6 @@ fn body_mentions_any(body: &Expr, names: &[String]) -> bool {
     tla_core::walk_expr(&mut Hit(names), body).0
 }
 
-
 /// Parse a brace set of QUOTED strings — `{"a", "b", "c"}` — into its element list
 /// (cfg order, deterministic). `None` for anything else: unquoted elements (a
 /// MODEL-VALUE set, which must stay on the mvsets path), an empty/odd shape, or a
@@ -784,10 +783,7 @@ fn parse_brace_quoted_string_set(v: &str) -> Option<Vec<String>> {
 /// `x ∈ Nat` recognized as `0 ≤ x` while the override means `0 ≤ x ≤ MaxNat`).
 /// Returns `true` (⇒ caller declines fail-closed) iff the config overrides any
 /// zero-arg builtin AND one of the (already-inlined) bodies still mentions it free.
-pub(crate) fn overridden_builtin_survives(
-    config: &Config,
-    bodies: &[&Spanned<Expr>],
-) -> bool {
+pub(crate) fn overridden_builtin_survives(config: &Config, bodies: &[&Spanned<Expr>]) -> bool {
     const ZERO_ARG_BUILTINS: [&str; 5] = ["Nat", "Int", "Real", "BOOLEAN", "Infinity"];
     let overridden: Vec<&str> = ZERO_ARG_BUILTINS
         .iter()
@@ -875,7 +871,10 @@ pub(crate) fn elide_module_solo_field_records(module: &mut Module) {
                 _ => {}
             }
             let span = e.span;
-            Spanned { node: self.fold_expr_inner(e.node), span }
+            Spanned {
+                node: self.fold_expr_inner(e.node),
+                span,
+            }
         }
     }
     let mut c = Collect::default();

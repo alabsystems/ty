@@ -28,7 +28,7 @@
 //!
 //! # Usage
 //!
-//! ```rust,ignore
+//! ```text
 //! use tla_check::intern::ValueInterner; // crate-internal path
 //! use tla_check::Value;
 //!

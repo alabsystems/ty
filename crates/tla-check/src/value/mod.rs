@@ -15,8 +15,8 @@
 // These are implementation details for state management and should not
 // be part of the crate's public semver surface.
 pub(crate) use tla_value::{
-    clear_int_func_intern_table, clear_model_value_registry, clear_set_intern_table,
-    clear_string_intern_table, intern_string,
+    clear_int_func_intern_table, clear_model_value_registry, clear_record_intern_table,
+    clear_set_intern_table, clear_string_intern_table, intern_string,
 };
 
 // Test-only interning helpers (no production callers).

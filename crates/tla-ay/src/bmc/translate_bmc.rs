@@ -8,12 +8,13 @@
 //! `extract_trace`, and internal translation helpers (div/mod linearization,
 //! UNCHANGED, membership) from the parent module.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ay_dpll::api::{Model, ModelValue, SolveResult, Sort, Term};
 use num_bigint::BigInt;
 use tla_core::ast::{BoundVar, Expr};
 use tla_core::name_intern::NameId;
+use tla_core::visit::ExprVisitor;
 use tla_core::{
     dispatch_translate_bool, dispatch_translate_int, ExprFold, SpanPolicy, Spanned, SubstituteExpr,
 };
@@ -119,41 +120,24 @@ impl BmcTranslator {
             let mut assignments = HashMap::new();
 
             for (name, info) in &self.vars {
-                let step_name = format!("{name}__{step}");
+                let step_name = if self.rigid_const_names.contains(name) {
+                    Self::rigid_const_symbol(name)
+                } else {
+                    Self::state_step_symbol(name, step)
+                };
                 match &info.sort {
-                    TlaSort::Bool => {
-                        if let Some(val) = model.bool_val(&step_name) {
-                            assignments.insert(name.clone(), BmcValue::Bool(val));
+                    TlaSort::Bool | TlaSort::Int | TlaSort::String | TlaSort::Set { .. } => {
+                        if let Some(value) =
+                            self.extract_named_value_for_sort(model, &step_name, &info.sort)
+                        {
+                            assignments.insert(name.clone(), value);
                         } else {
                             eprintln!(
-                                "Warning: BMC extract_trace: Bool variable '{name}' \
-                                 not found in model at step {step}"
+                                "Warning: BMC extract_trace: variable '{name}' with sort {} \
+                                 could not be extracted at step {step}",
+                                info.sort
                             );
                         }
-                    }
-                    TlaSort::Int | TlaSort::String => {
-                        if let Some(val) = model.int_val(&step_name) {
-                            use std::convert::TryFrom;
-                            if let Ok(v) = i64::try_from(val) {
-                                assignments.insert(name.clone(), BmcValue::Int(v));
-                            } else {
-                                // Part of #3888: preserve big integers instead of dropping them
-                                assignments.insert(name.clone(), BmcValue::BigInt(val.clone()));
-                            }
-                        } else {
-                            eprintln!(
-                                "Warning: BMC extract_trace: Int variable '{name}' \
-                                 not found in model at step {step}"
-                            );
-                        }
-                    }
-                    TlaSort::Set { .. } => {
-                        // Sets are encoded as (Array Int Bool). Extract domain keys
-                        // where membership is true.
-                        let domain_keys = Self::extract_array_domain_keys(model, &step_name);
-                        let members: Vec<BmcValue> =
-                            domain_keys.into_iter().map(BmcValue::Int).collect();
-                        assignments.insert(name.clone(), BmcValue::Set(members));
                     }
                     TlaSort::Sequence { .. } => {
                         // Sequences are delegated to seq_vars; handled below.
@@ -178,88 +162,147 @@ impl BmcTranslator {
             // Extract function variable values from func_vars.
             // Part of #3786: Function encoding in BMC translator.
             for (name, info) in &self.func_vars {
-                let dom_name = format!("{name}__dom__{step}");
-                let map_name = format!("{name}__map__{step}");
+                let string_keys = matches!(info.key_sort, TlaSort::String);
+                let map_name = if info.symbolic_domain.is_some() {
+                    Self::symbolic_function_mapping_symbol(name, step)
+                } else {
+                    Self::function_mapping_symbol(name, string_keys, step)
+                };
+                let extracted = if string_keys {
+                    let dom_name = Self::function_domain_symbol(name, true, step);
+                    Self::extract_string_domain_keys(model, &dom_name).and_then(|keys| {
+                        let mut entries = Vec::with_capacity(keys.len());
+                        for key in keys {
+                            let key_value = ModelValue::String(key.clone());
+                            let value = self.extract_array_value_for_sort(
+                                model,
+                                &map_name,
+                                &key_value,
+                                &info.range_sort,
+                            )?;
+                            entries.push((key, value));
+                        }
+                        Some(BmcValue::StringFunction(entries))
+                    })
+                } else {
+                    let keys = if let Some((lo, hi_const, hi_offset)) = &info.symbolic_domain {
+                        self.extract_symbolic_domain_keys(model, *lo, hi_const, *hi_offset)
+                    } else {
+                        let dom_name = Self::function_domain_symbol(name, false, step);
+                        Self::extract_int_domain_keys(model, &dom_name).and_then(|keys| {
+                            keys.into_iter()
+                                .map(|key| i64::try_from(key).ok())
+                                .collect()
+                        })
+                    };
+                    keys.and_then(|keys| {
+                        let mut entries = Vec::with_capacity(keys.len());
+                        for key in keys {
+                            let key_value = ModelValue::Int(BigInt::from(key));
+                            let value = self.extract_array_value_for_sort(
+                                model,
+                                &map_name,
+                                &key_value,
+                                &info.range_sort,
+                            )?;
+                            entries.push((key, value));
+                        }
+                        Some(BmcValue::Function(entries))
+                    })
+                };
 
-                let domain_keys = Self::extract_array_domain_keys(model, &dom_name);
-
-                if domain_keys.is_empty() {
-                    let _ = &info.range_sort;
+                if let Some(value) = extracted {
+                    assignments.insert(name.clone(), value);
+                } else {
                     eprintln!(
                         "Warning: BMC extract_trace: function variable '{name}' \
-                         domain could not be extracted from model at step {step}"
+                         could not be extracted without changing its declared key/range sorts \
+                         at step {step}"
                     );
-                } else {
-                    let mut entries = Vec::new();
-                    for key in &domain_keys {
-                        let val = Self::extract_array_int_at(model, &map_name, *key);
-                        let bmc_val = match val {
-                            Some(n) => {
-                                use std::convert::TryFrom;
-                                if let Ok(v) = i64::try_from(&n) {
-                                    BmcValue::Int(v)
-                                } else {
-                                    BmcValue::BigInt(n)
-                                }
-                            }
-                            None => BmcValue::Int(0),
-                        };
-                        entries.push((*key, bmc_val));
-                    }
-                    entries.sort_by_key(|(k, _)| *k);
-                    assignments.insert(name.clone(), BmcValue::Function(entries));
                 }
             }
 
             // Extract sequence variable values from seq_vars.
             for (name, info) in &self.seq_vars {
-                let arr_name = format!("{name}__arr__{step}");
-                let len_name = format!("{name}__len__{step}");
+                let arr_name = Self::sequence_array_symbol(name, step);
+                let len_name = Self::sequence_length_symbol(name, step);
 
-                let len = model.int_val_i64(&len_name).unwrap_or(0);
-                let mut elements = Vec::with_capacity(len.max(0) as usize);
-                for i in 1..=len {
-                    let val = Self::extract_array_int_at(model, &arr_name, i);
-                    let bmc_val = match val {
-                        Some(n) => {
-                            use std::convert::TryFrom;
-                            if let Ok(v) = i64::try_from(&n) {
-                                BmcValue::Int(v)
-                            } else {
-                                BmcValue::BigInt(n)
-                            }
-                        }
-                        None => BmcValue::Int(0),
-                    };
-                    elements.push(bmc_val);
+                let extracted = model.int_val_i64(&len_name).and_then(|len| {
+                    let len = usize::try_from(len).ok()?;
+                    if len > info.max_len {
+                        return None;
+                    }
+                    let mut elements = Vec::with_capacity(len);
+                    for index in 1..=len {
+                        let key = ModelValue::Int(BigInt::from(index));
+                        elements.push(self.extract_array_value_for_sort(
+                            model,
+                            &arr_name,
+                            &key,
+                            &info.element_sort,
+                        )?);
+                    }
+                    Some(BmcValue::Sequence(elements))
+                });
+                if let Some(value) = extracted {
+                    assignments.insert(name.clone(), value);
+                } else {
+                    eprintln!(
+                        "Warning: BMC extract_trace: sequence variable '{name}' \
+                         could not be extracted without changing its element sort at step {step}"
+                    );
                 }
-                let _ = &info.element_sort;
-                assignments.insert(name.clone(), BmcValue::Sequence(elements));
             }
 
             // Extract record variable values from record_vars.
             // Part of #3787: Record encoding — per-field SMT variables.
             for (name, info) in &self.record_vars {
                 let mut fields = Vec::with_capacity(info.field_sorts.len());
-                for (field_name, _sort) in &info.field_sorts {
-                    let field_var_name = format!("{name}__f_{field_name}__{step}");
-                    let bmc_val = Self::extract_scalar_from_model(model, &field_var_name);
-                    fields.push((field_name.clone(), bmc_val));
+                let mut complete = true;
+                for (field_name, sort) in &info.field_sorts {
+                    let field_var_name = Self::record_field_symbol(name, field_name, step);
+                    let Some(value) =
+                        self.extract_named_value_for_sort(model, &field_var_name, sort)
+                    else {
+                        complete = false;
+                        break;
+                    };
+                    fields.push((field_name.clone(), value));
                 }
-                fields.sort_by(|(a, _), (b, _)| a.cmp(b));
-                assignments.insert(name.clone(), BmcValue::Record(fields));
+                if complete {
+                    fields.sort_by(|(a, _), (b, _)| a.cmp(b));
+                    assignments.insert(name.clone(), BmcValue::Record(fields));
+                } else {
+                    eprintln!(
+                        "Warning: BMC extract_trace: record variable '{name}' \
+                         could not be extracted without changing a field sort at step {step}"
+                    );
+                }
             }
 
             // Extract tuple variable values from tuple_vars.
             // Part of #3787: Tuple encoding — per-element SMT variables.
             for (name, info) in &self.tuple_vars {
                 let mut elements = Vec::with_capacity(info.element_sorts.len());
-                for (i, _sort) in info.element_sorts.iter().enumerate() {
-                    let elem_var_name = format!("{name}__e_{}__{step}", i + 1);
-                    let bmc_val = Self::extract_scalar_from_model(model, &elem_var_name);
-                    elements.push(bmc_val);
+                let mut complete = true;
+                for (i, sort) in info.element_sorts.iter().enumerate() {
+                    let elem_var_name = Self::tuple_element_symbol(name, i + 1, step);
+                    let Some(value) =
+                        self.extract_named_value_for_sort(model, &elem_var_name, sort)
+                    else {
+                        complete = false;
+                        break;
+                    };
+                    elements.push(value);
                 }
-                assignments.insert(name.clone(), BmcValue::Tuple(elements));
+                if complete {
+                    assignments.insert(name.clone(), BmcValue::Tuple(elements));
+                } else {
+                    eprintln!(
+                        "Warning: BMC extract_trace: tuple variable '{name}' \
+                         could not be extracted without changing an element sort at step {step}"
+                    );
+                }
             }
 
             trace.push(BmcState { step, assignments });
@@ -270,8 +313,10 @@ impl BmcTranslator {
         // (see `bmc_intern_string`); the model assigns those raw ids. Replaying
         // a CEX through the interpreter requires the genuine string value, so we
         // map every `Int(id)` matching a known interned id back to its string.
-        // Sound: interned ids are far-negative and disjoint from ordinary
-        // integer data, so no real integer value is ever misdecoded.
+        // Scalar-kind gates keep String and Int terms semantically disjoint
+        // even though the raw numeric ids can coincide. Only values belonging
+        // to String-sorted declarations/compound fields should reach this
+        // recursive decoder; typed extraction is responsible for that routing.
         if !self.string_intern.is_empty() {
             let reverse: HashMap<i64, &str> = self
                 .string_intern
@@ -279,8 +324,57 @@ impl BmcTranslator {
                 .map(|(s, &id)| (id, s.as_str()))
                 .collect();
             for state in &mut trace {
-                for value in state.assignments.values_mut() {
-                    Self::decode_interned_strings(value, &reverse);
+                for (name, value) in &mut state.assignments {
+                    if let Some(info) = self.vars.get(name) {
+                        Self::decode_interned_strings_for_sort(value, &info.sort, &reverse);
+                    } else if let Some(info) = self.func_vars.get(name) {
+                        match value {
+                            BmcValue::Function(entries) => {
+                                for (_, range_value) in entries {
+                                    Self::decode_interned_strings_for_sort(
+                                        range_value,
+                                        &info.range_sort,
+                                        &reverse,
+                                    );
+                                }
+                            }
+                            BmcValue::StringFunction(entries) => {
+                                for (_, range_value) in entries {
+                                    Self::decode_interned_strings_for_sort(
+                                        range_value,
+                                        &info.range_sort,
+                                        &reverse,
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                    } else if let Some(info) = self.seq_vars.get(name) {
+                        Self::decode_interned_strings_for_sort(
+                            value,
+                            &TlaSort::Sequence {
+                                element_sort: Box::new(info.element_sort.clone()),
+                                max_len: info.max_len,
+                            },
+                            &reverse,
+                        );
+                    } else if let Some(info) = self.record_vars.get(name) {
+                        Self::decode_interned_strings_for_sort(
+                            value,
+                            &TlaSort::Record {
+                                field_sorts: info.field_sorts.clone(),
+                            },
+                            &reverse,
+                        );
+                    } else if let Some(info) = self.tuple_vars.get(name) {
+                        Self::decode_interned_strings_for_sort(
+                            value,
+                            &TlaSort::Tuple {
+                                element_sorts: info.element_sorts.clone(),
+                            },
+                            &reverse,
+                        );
+                    }
                 }
             }
         }
@@ -288,120 +382,215 @@ impl BmcTranslator {
         trace
     }
 
-    /// Recursively rewrite `BmcValue::Int(id)` into `BmcValue::String(s)` for
-    /// every interned-string id present in `reverse`.
-    fn decode_interned_strings(value: &mut BmcValue, reverse: &HashMap<i64, &str>) {
-        match value {
-            BmcValue::Int(n) => {
-                if let Some(s) = reverse.get(n) {
-                    *value = BmcValue::String((*s).to_string());
+    /// Decode intern ids only where declaration metadata proves a String value.
+    /// Raw Int values may numerically equal an intern id and must stay Int.
+    fn decode_interned_strings_for_sort(
+        value: &mut BmcValue,
+        sort: &TlaSort,
+        reverse: &HashMap<i64, &str>,
+    ) {
+        match (value, sort) {
+            (slot @ BmcValue::Int(_), TlaSort::String) => {
+                let id = match slot {
+                    BmcValue::Int(id) => *id,
+                    _ => unreachable!("pattern matched Int"),
+                };
+                if let Some(s) = reverse.get(&id) {
+                    *slot = BmcValue::String((*s).to_string());
                 }
             }
-            BmcValue::Set(elems) | BmcValue::Sequence(elems) | BmcValue::Tuple(elems) => {
-                for e in elems {
-                    Self::decode_interned_strings(e, reverse);
+            (BmcValue::Set(elements), TlaSort::Set { element_sort })
+            | (BmcValue::Sequence(elements), TlaSort::Sequence { element_sort, .. }) => {
+                for element in elements {
+                    Self::decode_interned_strings_for_sort(element, element_sort, reverse);
                 }
             }
-            BmcValue::Record(fields) => {
-                for (_, v) in fields {
-                    Self::decode_interned_strings(v, reverse);
+            (BmcValue::Tuple(elements), TlaSort::Tuple { element_sorts }) => {
+                for (element, element_sort) in elements.iter_mut().zip(element_sorts) {
+                    Self::decode_interned_strings_for_sort(element, element_sort, reverse);
                 }
             }
-            BmcValue::Function(entries) => {
-                for (_, v) in entries {
-                    Self::decode_interned_strings(v, reverse);
-                }
-            }
-            BmcValue::Bool(_) | BmcValue::BigInt(_) | BmcValue::String(_) => {}
-        }
-    }
-
-    /// Extract a scalar BmcValue from the model by variable name.
-    ///
-    /// Checks int first, then bool. Returns `BmcValue::Int(0)` as default.
-    fn extract_scalar_from_model(model: &Model, name: &str) -> BmcValue {
-        if let Some(val) = model.int_val(name) {
-            use std::convert::TryFrom;
-            if let Ok(v) = i64::try_from(val) {
-                BmcValue::Int(v)
-            } else {
-                BmcValue::BigInt(val.clone())
-            }
-        } else if let Some(b) = model.bool_val(name) {
-            BmcValue::Bool(b)
-        } else {
-            BmcValue::Int(0)
-        }
-    }
-
-    /// Extract domain keys from an `(Array Int Bool)` model value.
-    ///
-    /// Reads the structured `ModelValue::Array { default, stores }` from the
-    /// solver model. For a set encoded as `(store ... (const false) k1 true ...)`,
-    /// the stores with `true` values are the domain keys.
-    ///
-    /// Part of #3786.
-    fn extract_array_domain_keys(model: &Model, name: &str) -> Vec<i64> {
-        let Some(array_val) = model.array_val(name) else {
-            return Vec::new();
-        };
-        match array_val {
-            ModelValue::Array { default: _, stores } => {
-                let mut keys = Vec::new();
-                for (index, value) in stores {
-                    // Only include keys where the value is `true` (set membership)
-                    let is_member = match value {
-                        ModelValue::Bool(true) => true,
-                        ModelValue::Int(n) => *n != BigInt::from(0),
-                        _ => false,
-                    };
-                    if is_member {
-                        if let ModelValue::Int(k) = index {
-                            use num_traits::ToPrimitive;
-                            if let Some(key) = k.to_i64() {
-                                keys.push(key);
-                            }
-                        }
+            (BmcValue::Record(fields), TlaSort::Record { field_sorts }) => {
+                for (field_name, field_value) in fields {
+                    if let Some((_, field_sort)) =
+                        field_sorts.iter().find(|(name, _)| name == field_name)
+                    {
+                        Self::decode_interned_strings_for_sort(field_value, field_sort, reverse);
                     }
                 }
-                keys.sort();
-                keys
             }
-            _ => Vec::new(),
+            _ => {}
         }
     }
 
-    /// Extract an integer value at a specific index from an `(Array Int Int)` model.
-    ///
-    /// Reads the structured `ModelValue::Array { default, stores }` and looks
-    /// for a store at the given key index. If no explicit store exists, returns
-    /// the default value.
-    ///
-    /// Part of #3786.
-    fn extract_array_int_at(model: &Model, name: &str, key: i64) -> Option<num_bigint::BigInt> {
-        let array_val = model.array_val(name)?;
-        match array_val {
-            ModelValue::Array { default, stores } => {
-                // Check for an explicit store at the key
-                let key_bi = BigInt::from(key);
-                for (index, value) in stores {
-                    if let ModelValue::Int(idx) = index {
-                        if *idx == key_bi {
-                            if let ModelValue::Int(v) = value {
-                                return Some(v.clone());
-                            }
-                        }
+    /// Extract a named carrier according to its declared TLA+ sort. Missing or
+    /// differently sorted model values are left unassigned rather than filled
+    /// with a fabricated `Int(0)`.
+    fn extract_named_value_for_sort(
+        &self,
+        model: &Model,
+        name: &str,
+        sort: &TlaSort,
+    ) -> Option<BmcValue> {
+        match sort {
+            TlaSort::Bool => model.bool_val(name).map(BmcValue::Bool),
+            TlaSort::Int => model.int_val(name).map(Self::bmc_value_from_integer),
+            TlaSort::String => model
+                .int_val(name)
+                .and_then(|value| self.bmc_string_from_integer(value)),
+            TlaSort::Set { element_sort } => {
+                let keys = Self::extract_int_domain_keys(model, name)?;
+                let members = match element_sort.as_ref() {
+                    TlaSort::Int => keys
+                        .into_iter()
+                        .map(|key| Self::bmc_value_from_integer(&key))
+                        .collect(),
+                    TlaSort::String => {
+                        let mut strings = keys
+                            .into_iter()
+                            .map(|key| match self.bmc_string_from_integer(&key)? {
+                                BmcValue::String(value) => Some(value),
+                                _ => None,
+                            })
+                            .collect::<Option<Vec<_>>>()?;
+                        strings.sort();
+                        strings.into_iter().map(BmcValue::String).collect()
                     }
-                }
-                // Fall back to default value
-                if let ModelValue::Int(d) = default.as_ref() {
-                    Some(d.clone())
-                } else {
-                    None
-                }
+                    _ => return None,
+                };
+                Some(BmcValue::Set(members))
             }
             _ => None,
         }
+    }
+
+    fn bmc_value_from_integer(value: &BigInt) -> BmcValue {
+        match i64::try_from(value) {
+            Ok(value) => BmcValue::Int(value),
+            Err(_) => BmcValue::BigInt(value.clone()),
+        }
+    }
+
+    fn bmc_string_from_integer(&self, value: &BigInt) -> Option<BmcValue> {
+        let id = i64::try_from(value).ok()?;
+        self.bmc_string_from_i64(id)
+    }
+
+    fn bmc_string_from_i64(&self, id: i64) -> Option<BmcValue> {
+        self.string_intern
+            .iter()
+            .find_map(|(string, candidate)| (*candidate == id).then(|| string.clone()))
+            .map(BmcValue::String)
+    }
+
+    /// Extract the finite true keys of an `(Array Int Bool)`. A true default
+    /// denotes an unbounded/co-finite domain and cannot be represented by
+    /// `BmcValue`, so it is rejected. Later stores correctly override earlier
+    /// stores at the same key.
+    fn extract_int_domain_keys(model: &Model, name: &str) -> Option<Vec<BigInt>> {
+        let ModelValue::Array { default, stores } = model.array_val(name)? else {
+            return None;
+        };
+        if !matches!(default.as_ref(), ModelValue::Bool(false)) {
+            return None;
+        }
+        let mut keys = std::collections::BTreeSet::new();
+        for (index, value) in stores {
+            let ModelValue::Int(index) = index else {
+                return None;
+            };
+            match value {
+                ModelValue::Bool(true) => {
+                    keys.insert(index.clone());
+                }
+                ModelValue::Bool(false) => {
+                    keys.remove(index);
+                }
+                _ => return None,
+            }
+        }
+        Some(keys.into_iter().collect())
+    }
+
+    /// String-key counterpart of [`Self::extract_int_domain_keys`]. Native SMT
+    /// String indices remain TLA+ strings; they never pass through the integer
+    /// literal interning table.
+    fn extract_string_domain_keys(model: &Model, name: &str) -> Option<Vec<String>> {
+        let ModelValue::Array { default, stores } = model.array_val(name)? else {
+            return None;
+        };
+        if !matches!(default.as_ref(), ModelValue::Bool(false)) {
+            return None;
+        }
+        let mut keys = std::collections::BTreeSet::new();
+        for (index, value) in stores {
+            let ModelValue::String(key) = index else {
+                return None;
+            };
+            match value {
+                ModelValue::Bool(true) => {
+                    keys.insert(key.clone());
+                }
+                ModelValue::Bool(false) => {
+                    keys.remove(key);
+                }
+                _ => return None,
+            }
+        }
+        Some(keys.into_iter().collect())
+    }
+
+    /// Look up an array element with SMT store-chain semantics (the last store
+    /// wins), then decode it only as the declared scalar TLA+ sort.
+    fn extract_array_value_for_sort(
+        &self,
+        model: &Model,
+        name: &str,
+        key: &ModelValue,
+        sort: &TlaSort,
+    ) -> Option<BmcValue> {
+        let ModelValue::Array { default, stores } = model.array_val(name)? else {
+            return None;
+        };
+        let value = stores
+            .iter()
+            .rev()
+            .find_map(|(stored_key, value)| (stored_key == key).then_some(value))
+            .unwrap_or(default.as_ref());
+        match (sort, value) {
+            (TlaSort::Bool, ModelValue::Bool(value)) => Some(BmcValue::Bool(*value)),
+            (TlaSort::Int, ModelValue::Int(value)) => Some(Self::bmc_value_from_integer(value)),
+            (TlaSort::String, ModelValue::Int(value)) => self.bmc_string_from_integer(value),
+            _ => None,
+        }
+    }
+
+    /// Materialize a map-only symbolic function's concrete domain from its
+    /// rigid upper-bound constant. Refuse domains too large to safely allocate
+    /// during trace extraction.
+    fn extract_symbolic_domain_keys(
+        &self,
+        model: &Model,
+        lo: i64,
+        hi_const: &str,
+        hi_offset: i64,
+    ) -> Option<Vec<i64>> {
+        const MAX_EXTRACTED_SYMBOLIC_DOMAIN: i128 = 100_000;
+
+        if !self.rigid_const_names.contains(hi_const) {
+            return None;
+        }
+        let symbol = Self::rigid_const_symbol(hi_const);
+        let hi_base = i64::try_from(model.int_val(&symbol)?).ok()?;
+        let hi = hi_base.checked_add(hi_offset)?;
+        if hi < lo {
+            return Some(Vec::new());
+        }
+        let cardinality = i128::from(hi) - i128::from(lo) + 1;
+        if cardinality > MAX_EXTRACTED_SYMBOLIC_DOMAIN {
+            return None;
+        }
+        Some((lo..=hi).collect())
     }
 
     // === Translation methods ===
@@ -566,33 +755,9 @@ impl BmcTranslator {
         match &set.node {
             // x \in SUBSET S -> x \subseteq S
             // For set-typed element x and base set S, membership in SUBSET S
-            // means x is a subset of S. We extract the universe from S,
-            // translate both x and S as set expressions, then assert the
-            // pointwise subset constraint.
-            Expr::Powerset(base) => {
-                let universe = self.extract_universe_from_exprs(&[elem, base])?;
-                let elem_set = self.translate_set_expr(elem, &universe)?;
-                let base_set = self.translate_set_expr(base, &universe)?;
-
-                if universe.is_empty() {
-                    return Ok(self.solver.bool_const(true));
-                }
-
-                // x \subseteq S: \A u \in universe : (select x u) => (select S u)
-                let mut conjuncts = Vec::with_capacity(universe.len());
-                for &u in &universe {
-                    let in_x = self.solver.try_select(elem_set, u)?;
-                    let in_s = self.solver.try_select(base_set, u)?;
-                    let implication = self.solver.try_implies(in_x, in_s)?;
-                    conjuncts.push(implication);
-                }
-
-                let mut result = conjuncts[0];
-                for &c in &conjuncts[1..] {
-                    result = self.solver.try_and(result, c)?;
-                }
-                Ok(result)
-            }
+            // is exactly x \subseteq S. Route through the guarded subset
+            // encoder so symbolic out-of-support members cannot disappear.
+            Expr::Powerset(base) => self.translate_subseteq_bmc(elem, base),
 
             // x \in {a, b, c} -> x = a \/ x = b \/ x = c
             Expr::SetEnum(elements) => {
@@ -672,6 +837,31 @@ impl BmcTranslator {
                     .get(name)
                     .map_or(false, |info| matches!(info.sort, TlaSort::Set { .. })) =>
             {
+                let element_sort = match &self.vars.get(name).expect("guarded above").sort {
+                    TlaSort::Set { element_sort } => (**element_sort).clone().canonicalized(),
+                    _ => unreachable!("guarded as a set"),
+                };
+                match &element_sort {
+                    TlaSort::Int | TlaSort::String => {}
+                    TlaSort::Bool => {
+                        return Err(AYError::UnsupportedOp(format!(
+                            "BMC membership in {name} does not support Set(Bool): no Bool-index encoding is defined"
+                        )))
+                    }
+                    sort => {
+                        return Err(AYError::UnsupportedOp(format!(
+                            "BMC membership in {name} does not support set element sort {sort}"
+                        )))
+                    }
+                }
+                let actual_sort = self.scalar_expr_sort(elem).ok_or_else(|| {
+                    AYError::UnsupportedOp(format!(
+                        "BMC cannot determine element sort for membership in {name}"
+                    ))
+                })?;
+                if actual_sort.canonicalized() != element_sort {
+                    return Ok(self.solver.bool_const(false));
+                }
                 let set_term = self.get_var_at_step(name, self.current_step)?;
                 let elem_term = self.translate_int(elem)?;
                 Ok(self.solver.try_select(set_term, elem_term)?)
@@ -684,11 +874,19 @@ impl BmcTranslator {
                 if let Some((lo, hi_const, hi_offset)) =
                     Self::func_expr_base_name(func).and_then(|n| self.func_symbolic_domain(&n))
                 {
-                    let elem_term = self.translate_int(elem)?;
+                    let elem_term = self.translate_function_key_term(&TlaSort::Int, elem)?;
                     return self.symbolic_func_domain_bound(lo, &hi_const, hi_offset, elem_term);
                 }
+                let func_name = Self::func_expr_base_name(func).ok_or_else(|| {
+                    AYError::UntranslatableExpr(
+                        "BMC DOMAIN membership requires a function variable".to_string(),
+                    )
+                })?;
+                let key_sort = self
+                    .func_key_sort(&func_name)
+                    .ok_or_else(|| AYError::UnknownVariable(format!("function {func_name}")))?;
                 let dom_term = self.translate_func_domain_bmc(func)?;
-                let elem_term = self.translate_int(elem)?;
+                let elem_term = self.translate_function_key_term(&key_sort, elem)?;
                 Ok(self.solver.try_select(dom_term, elem_term)?)
             }
 
@@ -700,6 +898,31 @@ impl BmcTranslator {
                         .get(name)
                         .map_or(false, |info| matches!(info.sort, TlaSort::Set { .. })) =>
                 {
+                    let element_sort = match &self.vars.get(name).expect("guarded above").sort {
+                        TlaSort::Set { element_sort } => (**element_sort).clone().canonicalized(),
+                        _ => unreachable!("guarded as a set"),
+                    };
+                    match &element_sort {
+                        TlaSort::Int | TlaSort::String => {}
+                        TlaSort::Bool => {
+                            return Err(AYError::UnsupportedOp(format!(
+                                "BMC membership in primed {name} does not support Set(Bool): no Bool-index encoding is defined"
+                            )))
+                        }
+                        sort => {
+                            return Err(AYError::UnsupportedOp(format!(
+                                "BMC membership in primed {name} does not support set element sort {sort}"
+                            )))
+                        }
+                    }
+                    let actual_sort = self.scalar_expr_sort(elem).ok_or_else(|| {
+                        AYError::UnsupportedOp(format!(
+                            "BMC cannot determine element sort for membership in primed {name}"
+                        ))
+                    })?;
+                    if actual_sort.canonicalized() != element_sort {
+                        return Ok(self.solver.bool_const(false));
+                    }
                     let set_term = self.get_var_at_step(name, self.current_step + 1)?;
                     let elem_term = self.translate_int(elem)?;
                     Ok(self.solver.try_select(set_term, elem_term)?)
@@ -771,7 +994,7 @@ impl BmcTranslator {
             // Reuses the FuncSet quantifier enumeration so direct function-set
             // membership (without an enclosing SetBuilder) is also handled.
             Expr::FuncSet(_, _) => {
-                let fresh = self.fresh_funcset_member_name();
+                let fresh = self.fresh_funcset_member_name(&[elem, set])?;
                 let bound = BoundVar {
                     name: Spanned::new(fresh.clone(), set.span),
                     domain: Some(Box::new(set.clone())),
@@ -795,11 +1018,45 @@ impl BmcTranslator {
         }
     }
 
-    /// Fresh name for a function-set membership witness variable.
-    fn fresh_funcset_member_name(&mut self) -> String {
-        let id = self.aux_var_counter;
-        self.aux_var_counter += 1;
-        format!("__fs_member_{id}")
+    /// Fresh hygienic name for a function-set membership witness variable.
+    /// The subsequent concrete-table folder substitutes by spelling, so a name
+    /// that occurs in the original element expression would capture that source
+    /// reference and could turn `x = witness` into `witness = witness`.
+    fn fresh_funcset_member_name(&mut self, exprs: &[&Spanned<Expr>]) -> AYResult<String> {
+        struct IdentifierNames;
+        impl ExprVisitor for IdentifierNames {
+            type Output = HashSet<String>;
+
+            fn visit_node(&mut self, expr: &Expr) -> Option<Self::Output> {
+                match expr {
+                    Expr::Ident(name, _) | Expr::StateVar(name, ..) => {
+                        Some(HashSet::from([name.clone()]))
+                    }
+                    _ => None,
+                }
+            }
+        }
+
+        let mut used = HashSet::new();
+        for expr in exprs {
+            used.extend(IdentifierNames.walk_expr(&expr.node));
+        }
+        used.extend(self.vars.keys().cloned());
+        used.extend(self.func_vars.keys().cloned());
+        used.extend(self.seq_vars.keys().cloned());
+        used.extend(self.record_vars.keys().cloned());
+        used.extend(self.tuple_vars.keys().cloned());
+
+        loop {
+            let id = self.aux_var_counter;
+            self.aux_var_counter = self.aux_var_counter.checked_add(1).ok_or_else(|| {
+                AYError::UnsupportedOp("BMC auxiliary name counter overflow".to_string())
+            })?;
+            let candidate = format!("__fs_member_{id}");
+            if !used.contains(&candidate) {
+                return Ok(candidate);
+            }
+        }
     }
 
     // === Set operations (Part of #3778) ===
@@ -818,6 +1075,7 @@ impl BmcTranslator {
         expr: &Spanned<Expr>,
         universe: &[Term],
     ) -> AYResult<Term> {
+        self.ensure_set_expr_array_exact(expr, "set expression")?;
         match &expr.node {
             Expr::SetEnum(elements) => {
                 // Build: (store (store (const false) e1 true) ... en true)
@@ -879,6 +1137,8 @@ impl BmcTranslator {
 
             Expr::Range(lo, hi) => self.translate_range_set_term(lo, hi),
 
+            Expr::Label(label) => self.translate_set_expr(&label.body, universe),
+
             _ => Err(AYError::UntranslatableExpr(format!(
                 "BMC cannot translate set expression: {:?}",
                 std::mem::discriminant(&expr.node)
@@ -893,95 +1153,93 @@ impl BmcTranslator {
         &mut self,
         left: &Spanned<Expr>,
         right: &Spanned<Expr>,
-        universe: &[Term],
     ) -> AYResult<Term> {
-        let set_s = self.translate_set_expr(left, universe)?;
-        let set_t = self.translate_set_expr(right, universe)?;
+        self.ensure_subseteq_exact(left, right, "subset comparison")?;
+        let left_has_support = self.set_has_complete_finite_support(left);
+        let universe = self.extract_universe_from_exprs(&[left, right])?;
+        let set_s = self.translate_set_expr(left, &universe)?;
+        let set_t = self.translate_set_expr(right, &universe)?;
 
-        if universe.is_empty() {
-            return Ok(self.solver.bool_const(true));
-        }
-
-        let mut conjuncts = Vec::with_capacity(universe.len());
-        for &u in universe {
+        let mut conjuncts = Vec::with_capacity(universe.len() + usize::from(!left_has_support));
+        for &u in &universe {
             let in_s = self.solver.try_select(set_s, u)?;
             let in_t = self.solver.try_select(set_t, u)?;
             let implication = self.solver.try_implies(in_s, in_t)?;
             conjuncts.push(implication);
         }
 
-        let mut result = conjuncts[0];
-        for &c in &conjuncts[1..] {
-            result = self.solver.try_and(result, c)?;
+        if !left_has_support {
+            // The right operand's finite support is the only bound. Prove the
+            // symbolic left array has no members outside it by comparing it to
+            // an exact false-default restriction over that support.
+            let false_val = self.solver.bool_const(false);
+            let mut restricted_left = self.solver.try_const_array(Sort::Int, false_val)?;
+            for &u in &universe {
+                let in_s = self.solver.try_select(set_s, u)?;
+                restricted_left = self.solver.try_store(restricted_left, u, in_s)?;
+            }
+            conjuncts.push(self.solver.try_eq(set_s, restricted_left)?);
         }
-        Ok(result)
+
+        self.combine_bool_terms(&conjuncts, true)
     }
 
-    /// Encode set union as a fresh array with pointwise OR constraints.
+    /// Encode an exact finite-support set union as a false-default array.
     pub(super) fn encode_union(
         &mut self,
         set_s: Term,
         set_t: Term,
         universe: &[Term],
     ) -> AYResult<Term> {
-        let result = self.declare_fresh_set("bmc_union")?;
+        let false_val = self.solver.bool_const(false);
+        let mut result = self.solver.try_const_array(Sort::Int, false_val)?;
 
         for &u in universe {
             let in_s = self.solver.try_select(set_s, u)?;
             let in_t = self.solver.try_select(set_t, u)?;
-            let in_result = self.solver.try_select(result, u)?;
             let s_or_t = self.solver.try_or(in_s, in_t)?;
-            let eq = self.solver.try_eq(in_result, s_or_t)?;
-            self.solver
-                .try_assert_term(eq)
-                .expect("invariant: eq is Bool-sorted");
+            result = self.solver.try_store(result, u, s_or_t)?;
         }
 
         Ok(result)
     }
 
-    /// Encode set intersection as a fresh array with pointwise AND constraints.
+    /// Encode an exact finite-support set intersection as a false-default array.
     pub(super) fn encode_intersect(
         &mut self,
         set_s: Term,
         set_t: Term,
         universe: &[Term],
     ) -> AYResult<Term> {
-        let result = self.declare_fresh_set("bmc_intersect")?;
+        let false_val = self.solver.bool_const(false);
+        let mut result = self.solver.try_const_array(Sort::Int, false_val)?;
 
         for &u in universe {
             let in_s = self.solver.try_select(set_s, u)?;
             let in_t = self.solver.try_select(set_t, u)?;
-            let in_result = self.solver.try_select(result, u)?;
             let s_and_t = self.solver.try_and(in_s, in_t)?;
-            let eq = self.solver.try_eq(in_result, s_and_t)?;
-            self.solver
-                .try_assert_term(eq)
-                .expect("invariant: eq is Bool-sorted");
+            result = self.solver.try_store(result, u, s_and_t)?;
         }
 
         Ok(result)
     }
 
-    /// Encode set difference as a fresh array with pointwise AND-NOT constraints.
+    /// Encode an exact finite-support set difference as a false-default array.
     pub(super) fn encode_set_minus(
         &mut self,
         set_s: Term,
         set_t: Term,
         universe: &[Term],
     ) -> AYResult<Term> {
-        let result = self.declare_fresh_set("bmc_setminus")?;
+        let false_val = self.solver.bool_const(false);
+        let mut result = self.solver.try_const_array(Sort::Int, false_val)?;
 
         for &u in universe {
             let in_s = self.solver.try_select(set_s, u)?;
             let in_t = self.solver.try_select(set_t, u)?;
             let not_in_t = self.solver.try_not(in_t)?;
-            let in_result = self.solver.try_select(result, u)?;
             let s_and_not_t = self.solver.try_and(in_s, not_in_t)?;
-            let eq = self.solver.try_eq(in_result, s_and_not_t)?;
-            self.solver
-                .try_assert_term(eq)
-                .expect("invariant: eq is Bool-sorted");
+            result = self.solver.try_store(result, u, s_and_not_t)?;
         }
 
         Ok(result)
@@ -989,11 +1247,9 @@ impl BmcTranslator {
 
     /// Declare a fresh set variable (Array Int Bool) with a unique name.
     pub(crate) fn declare_fresh_set(&mut self, prefix: &str) -> AYResult<Term> {
-        let id = self.aux_var_counter;
-        self.aux_var_counter += 1;
-        let name = format!("__{prefix}_{id}");
         let set_sort = Sort::array(Sort::Int, Sort::Bool);
-        Ok(self.solver.declare_const(&name, set_sort))
+        let (_, term) = self.declare_internal_const(prefix, set_sort);
+        Ok(term)
     }
 
     // === Function operations (Part of #3786) ===
@@ -1013,14 +1269,20 @@ impl BmcTranslator {
             Expr::Ident(name, _) | Expr::StateVar(name, ..) => {
                 // Direct function variable: f[x] -> (select f__map x)
                 let mapping = self.get_func_mapping_at_step(name, self.current_step)?;
-                let arg_term = self.translate_int(arg)?;
+                let key_sort = self
+                    .func_key_sort(name)
+                    .ok_or_else(|| AYError::UnknownVariable(format!("function {name}")))?;
+                let arg_term = self.translate_function_key_term(&key_sort, arg)?;
                 Ok(self.solver.try_select(mapping, arg_term)?)
             }
             Expr::Prime(inner) => match &inner.node {
                 Expr::Ident(name, _) | Expr::StateVar(name, ..) => {
                     // f'[x] -> (select f__map__{step+1} x)
                     let mapping = self.get_func_mapping_at_step(name, self.current_step + 1)?;
-                    let arg_term = self.translate_int(arg)?;
+                    let key_sort = self
+                        .func_key_sort(name)
+                        .ok_or_else(|| AYError::UnknownVariable(format!("function {name}")))?;
+                    let arg_term = self.translate_function_key_term(&key_sort, arg)?;
                     Ok(self.solver.try_select(mapping, arg_term)?)
                 }
                 _ => Err(AYError::UntranslatableExpr(
@@ -1030,6 +1292,50 @@ impl BmcTranslator {
             _ => Err(AYError::UntranslatableExpr(format!(
                 "BMC function apply requires variable, got: {:?}",
                 std::mem::discriminant(&func.node)
+            ))),
+        }
+    }
+
+    /// Translate a function-domain key only after proving that its TLA+ scalar
+    /// kind matches the declared key kind. String-keyed functions use native
+    /// SMT String indices, while scalar String state elsewhere is interned as
+    /// Int; keeping this boundary explicit prevents `"x"` from addressing the
+    /// Int-keyed cell -1_000_000_007.
+    fn translate_function_key_term(
+        &mut self,
+        expected: &TlaSort,
+        arg: &Spanned<Expr>,
+    ) -> AYResult<Term> {
+        let expected = expected.clone().canonicalized();
+        let actual = self.scalar_expr_sort(arg).ok_or_else(|| {
+            AYError::UnsupportedOp("BMC cannot determine function application key sort".to_string())
+        })?;
+        let actual = actual.canonicalized();
+        if actual != expected {
+            return Err(AYError::UnsupportedOp(format!(
+                "BMC function key sort mismatch: expected {expected}, got {actual}"
+            )));
+        }
+
+        match (&expected, &arg.node) {
+            (TlaSort::Int, _) => self.translate_int(arg),
+            (TlaSort::String, Expr::String(value)) => Ok(self.solver.string_const(value)),
+            (TlaSort::String, Expr::Ident(name, _) | Expr::StateVar(name, ..)) => {
+                self.get_var_at_step(name, self.current_step)
+            }
+            (TlaSort::String, Expr::Prime(inner)) => match &inner.node {
+                Expr::Ident(name, _) | Expr::StateVar(name, ..) => {
+                    self.get_var_at_step(name, self.current_step + 1)
+                }
+                _ => Err(AYError::UnsupportedOp(
+                    "BMC native-String function key must be a literal or variable".to_string(),
+                )),
+            },
+            (TlaSort::String, _) => Err(AYError::UnsupportedOp(
+                "BMC native-String function key must be a literal or variable".to_string(),
+            )),
+            _ => Err(AYError::UnsupportedOp(format!(
+                "BMC function key sort {expected} is unsupported"
             ))),
         }
     }
@@ -1103,7 +1409,7 @@ impl BmcTranslator {
     /// Produces a new mapping term via SMT `store` operations:
     /// - Single: `[f EXCEPT ![a] = b]` -> `(store f_map a b)`
     /// - Multi:  `[f EXCEPT ![a] = b, ![c] = d]` -> `(store (store f_map a b) c d)`
-    /// - Nested: `[f EXCEPT ![a][b] = c]` -> `(store f_map a (store (select f_map a) b c))`
+    /// Nested paths fail closed because BMC function ranges are scalar.
     ///
     /// Returns the resulting mapping term. The domain is unchanged (EXCEPT
     /// does not alter the domain of a function in TLA+).
@@ -1119,6 +1425,43 @@ impl BmcTranslator {
             return self.resolve_func_mapping(func);
         }
 
+        let func_name = Self::func_expr_root_name(func).ok_or_else(|| {
+            AYError::UntranslatableExpr(
+                "BMC EXCEPT requires a function variable as its root".to_string(),
+            )
+        })?;
+        let key_sort = self
+            .func_key_sort(&func_name)
+            .ok_or_else(|| AYError::UnknownVariable(format!("function {func_name}")))?;
+        let range_sort = self
+            .func_vars
+            .get(&func_name)
+            .ok_or_else(|| AYError::UnknownVariable(format!("function {func_name}")))?
+            .range_sort
+            .clone();
+
+        // Scalar-range BMC functions cannot represent nested function-valued
+        // EXCEPT paths. Reject every path/value kind before resolving or storing
+        // into a carrier so an error cannot leave a partially translated update.
+        for spec in specs {
+            if spec.path.len() != 1 {
+                return Err(AYError::UnsupportedOp(format!(
+                    "BMC nested EXCEPT path depth {} requires a compound function range",
+                    spec.path.len()
+                )));
+            }
+            let value_sort = self.scalar_expr_sort(&spec.value).ok_or_else(|| {
+                AYError::UnsupportedOp(
+                    "BMC cannot determine function EXCEPT value kind".to_string(),
+                )
+            })?;
+            if value_sort.clone().canonicalized() != range_sort.clone().canonicalized() {
+                return Err(AYError::UnsupportedOp(format!(
+                    "BMC function EXCEPT value kind mismatch: expected {range_sort}, got {value_sort}"
+                )));
+            }
+        }
+
         let mut mapping = self.resolve_func_mapping(func)?;
 
         // Apply each spec sequentially (left to right, as in TLA+ semantics)
@@ -1128,7 +1471,8 @@ impl BmcTranslator {
                     "BMC EXCEPT with empty path".to_string(),
                 ));
             }
-            mapping = self.apply_except_spec(mapping, &spec.path, &spec.value)?;
+            mapping =
+                self.apply_except_spec(mapping, &spec.path, &spec.value, &key_sort, &range_sort)?;
         }
 
         Ok(mapping)
@@ -1167,6 +1511,8 @@ impl BmcTranslator {
         mapping: Term,
         path: &[tla_core::ast::ExceptPathElement],
         value: &Spanned<Expr>,
+        key_sort: &TlaSort,
+        range_sort: &TlaSort,
     ) -> AYResult<Term> {
         match path.len() {
             0 => Err(AYError::UnsupportedOp(
@@ -1174,22 +1520,24 @@ impl BmcTranslator {
             )),
             1 => {
                 // Single-level: (store mapping key val)
-                let key = self.translate_except_path_key(&path[0])?;
-                let val_term = self.translate_int(value)?;
+                let key = self.translate_except_path_key(&path[0], key_sort)?;
+                let val_term =
+                    self.translate_scalar_as_sort(range_sort, value, "function EXCEPT value")?;
                 Ok(self.solver.try_store(mapping, key, val_term)?)
             }
             _ => {
                 // Nested: [f EXCEPT ![a][b]...[z] = val]
                 // Encode as: (store mapping a (store (select mapping a) b ... val))
                 // Requires the range sort to be an array (i.e., function of functions).
-                let key = self.translate_except_path_key(&path[0])?;
+                let key = self.translate_except_path_key(&path[0], key_sort)?;
                 let inner = self.solver.try_select(mapping, key).map_err(|_| {
                     AYError::UnsupportedOp(format!(
                         "BMC nested EXCEPT path depth {} requires array-of-array function sort",
                         path.len()
                     ))
                 })?;
-                let updated_inner = self.apply_except_spec(inner, &path[1..], value)?;
+                let updated_inner =
+                    self.apply_except_spec(inner, &path[1..], value, key_sort, range_sort)?;
                 self.solver
                     .try_store(mapping, key, updated_inner)
                     .map_err(|_| {
@@ -1206,15 +1554,25 @@ impl BmcTranslator {
     fn translate_except_path_key(
         &mut self,
         elem: &tla_core::ast::ExceptPathElement,
+        key_sort: &TlaSort,
     ) -> AYResult<Term> {
         match elem {
-            tla_core::ast::ExceptPathElement::Index(idx) => self.translate_int(idx),
+            tla_core::ast::ExceptPathElement::Index(idx) => {
+                self.translate_function_key_term(key_sort, idx)
+            }
             tla_core::ast::ExceptPathElement::Field(field_name) => {
                 Err(AYError::UnsupportedOp(format!(
                     "BMC EXCEPT on record field '.{}' not supported (use record encoding)",
                     field_name.name.node
                 )))
             }
+        }
+    }
+
+    fn func_expr_root_name(func: &Spanned<Expr>) -> Option<String> {
+        match &func.node {
+            Expr::Except(base, _) => Self::func_expr_root_name(base),
+            _ => Self::func_expr_base_name(func),
         }
     }
 
@@ -1241,7 +1599,7 @@ impl BmcTranslator {
     ///
     /// Builds a (domain, mapping) pair:
     /// - domain: translate S as a set expression (Array Int Bool)
-    /// - mapping: a fresh `(Array Int RangeSort)` with constraints from the body
+    /// - mapping: a fresh `(Array KeySort RangeSort)` with constraints from the body
     ///
     /// For finite set domains `{e1, ..., en}`, adds per-element constraints:
     /// `(select mapping ei) = body_with_x_replaced_by_ei` for each `ei`.
@@ -1266,12 +1624,50 @@ impl BmcTranslator {
         } else {
             Sort::Int
         };
-        let id = self.aux_var_counter;
-        self.aux_var_counter += 1;
-        let map_name = format!("__func_map_{id}");
-        let map_sort = Sort::array(key_index_sort, Sort::Int);
-        let mapping = self.solver.declare_const(&map_name, map_sort);
-        let domain_arr = self.translate_func_construct_bmc_into(bound_vars, body, mapping)?;
+        let key_tla_sort = if Self::func_construct_keys_are_strings(bound_vars) {
+            TlaSort::String
+        } else {
+            TlaSort::Int
+        };
+        // Infer the body under the function binder's lexical scope.  Looking
+        // at the live outer `vars` map directly is wrong when the binder
+        // shadows an outer scalar of another kind (`x: Bool` outside,
+        // `[x \in {1} |-> x]` inside).  A metadata-only temporary binding is
+        // sufficient here: scalar sort inference never reads carrier terms.
+        let range_sort = if let Some(bound) = bound_vars.first() {
+            let bound_name = bound.name.node.clone();
+            let previous = self.vars.remove(&bound_name);
+            self.vars.insert(
+                bound_name.clone(),
+                super::BmcVarInfo {
+                    sort: key_tla_sort.clone(),
+                    terms: Vec::new(),
+                },
+            );
+            let inferred = self.scalar_expr_sort(body);
+            self.vars.remove(&bound_name);
+            if let Some(previous) = previous {
+                self.vars.insert(bound_name, previous);
+            }
+            inferred
+        } else {
+            self.scalar_expr_sort(body)
+        }
+        .ok_or_else(|| {
+            AYError::UnsupportedOp(
+                "BMC cannot infer scalar range kind for standalone function construction"
+                    .to_string(),
+            )
+        })?;
+        if !range_sort.is_scalar() {
+            return Err(AYError::UnsupportedOp(format!(
+                "BMC function construction range must be scalar, got {range_sort}"
+            )));
+        }
+        let map_sort = Sort::array(key_index_sort, range_sort.to_ay()?);
+        let (_, mapping) = self.declare_internal_const("function construction map", map_sort);
+        let domain_arr =
+            self.translate_func_construct_bmc_into(bound_vars, body, mapping, &range_sort)?;
         Ok((domain_arr, mapping))
     }
 
@@ -1295,6 +1691,7 @@ impl BmcTranslator {
         bound_vars: &[tla_core::ast::BoundVar],
         body: &Spanned<Expr>,
         target_mapping: Term,
+        range_sort: &TlaSort,
     ) -> AYResult<Term> {
         // Only support single bound variable for now
         if bound_vars.len() != 1 {
@@ -1404,11 +1801,7 @@ impl BmcTranslator {
         // term gives the string const-array its own identity. Semantically
         // identical to `false`, so the domain still defaults to "absent".
         let false_default = if keys_are_strings {
-            let d = self.solver.declare_const(
-                &format!("__strdom_false_{}", self.aux_var_counter),
-                Sort::Bool,
-            );
-            self.aux_var_counter += 1;
+            let (_, d) = self.declare_internal_const("string function domain false", Sort::Bool);
             let shared_false = self.solver.bool_const(false);
             let d_is_false = self.solver.try_eq(d, shared_false)?;
             self.solver
@@ -1432,35 +1825,20 @@ impl BmcTranslator {
         for elem in &domain_elements {
             let elem_term = key_term(self, elem)?;
 
-            // Translate body with a temporary variable binding.
-            // We temporarily add a scalar variable for the bound var, pointing
-            // to elem_term, then translate the body, then remove it. The bound
-            // variable carries the domain key sort so a body that reads `x`
-            // (e.g. as a string) resolves to the correctly-sorted term.
-            let _bv_step_name = format!("{var_name}__{}", self.current_step);
-            let existed_before = self.vars.contains_key(var_name);
-
-            // Temporarily inject bound variable as a scalar
-            if !existed_before {
-                self.vars.insert(
-                    var_name.clone(),
-                    super::BmcVarInfo {
-                        sort: key_tla_sort.clone(),
-                        terms: vec![elem_term; self.bound_k + 1],
-                    },
-                );
-            } else {
-                // Save old value and replace with elem_term for current step
-                let info = self.vars.get_mut(var_name).expect("checked above");
-                info.terms[self.current_step] = elem_term;
-            }
-
-            let body_term = self.translate_int(body)?;
-
-            // Clean up: remove temporary binding if we added it
-            if !existed_before {
-                self.vars.remove(var_name);
-            }
+            // Lexical binding must replace the complete outer scalar binding,
+            // including its sort and every step term.  A partial in-place
+            // overwrite corrupts the state carrier after translation and also
+            // makes a bound Int fail to shadow (for example) an outer Bool.
+            // The scoped helper restores the exact prior binding on both the
+            // success and error paths.
+            let body_term = self.with_temporary_scalar_binding(
+                var_name,
+                key_tla_sort.clone(),
+                elem_term,
+                |this| {
+                    this.translate_scalar_as_sort(range_sort, body, "function construction range")
+                },
+            )?;
 
             let selected = self.solver.try_select(mapping, elem_term)?;
             let eq = self.solver.try_eq(selected, body_term)?;
@@ -1477,11 +1855,9 @@ impl BmcTranslator {
     /// Part of #3786.
     #[allow(dead_code)]
     fn declare_fresh_mapping(&mut self, prefix: &str, range_sort: Sort) -> AYResult<Term> {
-        let id = self.aux_var_counter;
-        self.aux_var_counter += 1;
-        let name = format!("__{prefix}_{id}");
         let arr_sort = Sort::array(Sort::Int, range_sort);
-        Ok(self.solver.declare_const(&name, arr_sort))
+        let (_, term) = self.declare_internal_const(prefix, arr_sort);
+        Ok(term)
     }
 
     // === Incremental BMC methods (Part of #3724) ===
@@ -1589,6 +1965,34 @@ impl BmcTranslator {
 
     // === Sequence operations (Part of #3793) ===
 
+    /// Compare two bounded-array sequence encodings as TLA+ sequence values.
+    ///
+    /// The array is only a representation: cells above `lhs_len` are ghosts
+    /// and cannot affect sequence equality.  `lhs_len` belongs to a declared
+    /// sequence and is therefore constrained to `0..=lhs_max_len`; equality of
+    /// the lengths plus the guarded cells below consequently covers the entire
+    /// logical domain of both operands.
+    pub(super) fn translate_seq_logical_eq(
+        &mut self,
+        lhs_arr: Term,
+        lhs_len: Term,
+        lhs_max_len: usize,
+        rhs_arr: Term,
+        rhs_len: Term,
+    ) -> AYResult<Term> {
+        let mut result = self.solver.try_eq(lhs_len, rhs_len)?;
+        for i in 1..=lhs_max_len {
+            let index = self.solver.int_const(i as i64);
+            let is_live = self.solver.try_le(index, lhs_len)?;
+            let lhs_value = self.solver.try_select(lhs_arr, index)?;
+            let rhs_value = self.solver.try_select(rhs_arr, index)?;
+            let values_eq = self.solver.try_eq(lhs_value, rhs_value)?;
+            let live_values_eq = self.solver.try_implies(is_live, values_eq)?;
+            result = self.solver.try_and(result, live_values_eq)?;
+        }
+        Ok(result)
+    }
+
     /// Translate `Len(s)` — returns the length term for a sequence variable.
     ///
     /// Part of #3793.
@@ -1622,6 +2026,12 @@ impl BmcTranslator {
         let arr = self.get_seq_array_at_step(&name, step)?;
         let len = self.get_seq_length_at_step(&name, step)?;
         let max_len = self.get_seq_max_len(&name)?;
+        let element_sort = self
+            .seq_vars
+            .get(&name)
+            .ok_or_else(|| AYError::UnknownVariable(format!("sequence {name}")))?
+            .element_sort
+            .clone();
 
         // Build the tail as an explicit STORE CHAIN over a fresh base array
         // rather than a fresh FREE array pinned by sparse guarded select-
@@ -1635,7 +2045,7 @@ impl BmcTranslator {
         // seq[i+1] there unconditionally is semantics-preserving for the
         // length-bounded encoding (and keeps the UNSAT cases UNSAT: in-bounds
         // contradictions are still forced exactly).
-        let mut result_arr = self.declare_fresh_seq_array("bmc_seq_tail")?;
+        let mut result_arr = self.declare_fresh_seq_array("bmc_seq_tail", &element_sort)?;
         for i in 1..max_len {
             let i_term = self.solver.int_const(i as i64);
             let i_plus_1 = self.solver.int_const((i + 1) as i64);
@@ -1671,7 +2081,21 @@ impl BmcTranslator {
         let arr = self.get_seq_array_at_step(&name, step)?;
         let len = self.get_seq_length_at_step(&name, step)?;
 
-        let elem_term = self.translate_int(elem_expr)?;
+        let element_sort = self
+            .seq_vars
+            .get(&name)
+            .ok_or_else(|| AYError::UnknownVariable(format!("sequence {name}")))?
+            .element_sort
+            .clone();
+        let elem_term = match element_sort {
+            TlaSort::Bool => dispatch_translate_bool(self, elem_expr)?,
+            TlaSort::Int | TlaSort::String => dispatch_translate_int(self, elem_expr)?,
+            compound => {
+                return Err(AYError::UnsupportedOp(format!(
+                    "BMC Append has unsupported element sort {compound}"
+                )))
+            }
+        };
 
         let one = self.solver.int_const(1);
         let new_len = self.solver.try_add(len, one)?;
@@ -1696,6 +2120,12 @@ impl BmcTranslator {
         let (name, step) = self.resolve_seq_var(seq_expr)?;
         let arr = self.get_seq_array_at_step(&name, step)?;
         let max_len = self.get_seq_max_len(&name)?;
+        let element_sort = self
+            .seq_vars
+            .get(&name)
+            .ok_or_else(|| AYError::UnknownVariable(format!("sequence {name}")))?
+            .element_sort
+            .clone();
 
         let m_term = self.translate_int(m_expr)?;
         let n_term = self.translate_int(n_expr)?;
@@ -1721,7 +2151,7 @@ impl BmcTranslator {
             }
             _ => max_len,
         };
-        let mut result_arr = self.declare_fresh_seq_array("bmc_seq_subseq")?;
+        let mut result_arr = self.declare_fresh_seq_array("bmc_seq_subseq", &element_sort)?;
         for i in 1..=copy_len {
             let i_term = self.solver.int_const(i as i64);
             let one = self.solver.int_const(1);
@@ -1743,67 +2173,10 @@ impl BmcTranslator {
         Ok((result_arr, new_len))
     }
 
-    /// Translate `s \o t` (concatenation) — concatenate two sequences.
-    ///
-    /// Returns `(array_term, length_term)`. The result array combines both
-    /// sequences: `result[i] = s[i]` for `1 <= i <= len_s`, and
-    /// `result[len_s + j] = t[j]` for `1 <= j <= len_t`.
-    /// The result length is `len_s + len_t`.
-    ///
-    /// Part of #3793.
-    pub(super) fn translate_seq_concat_bmc(
-        &mut self,
-        s_expr: &Spanned<Expr>,
-        t_expr: &Spanned<Expr>,
-    ) -> AYResult<(Term, Term)> {
-        let (s_name, s_step) = self.resolve_seq_var(s_expr)?;
-        let s_arr = self.get_seq_array_at_step(&s_name, s_step)?;
-        let s_len = self.get_seq_length_at_step(&s_name, s_step)?;
-        let s_max = self.get_seq_max_len(&s_name)?;
-
-        let (t_name, t_step) = self.resolve_seq_var(t_expr)?;
-        let t_arr = self.get_seq_array_at_step(&t_name, t_step)?;
-        let t_len = self.get_seq_length_at_step(&t_name, t_step)?;
-        let t_max = self.get_seq_max_len(&t_name)?;
-
-        let result_arr = self.declare_fresh_seq_array("bmc_seq_concat")?;
-
-        // Copy s elements: for i in 1..=s_max, result[i] = s[i] when i <= len_s
-        for i in 1..=s_max {
-            let i_term = self.solver.int_const(i as i64);
-            let in_bounds = self.solver.try_le(i_term, s_len)?;
-            let src_val = self.solver.try_select(s_arr, i_term)?;
-            let dst_val = self.solver.try_select(result_arr, i_term)?;
-            let vals_eq = self.solver.try_eq(dst_val, src_val)?;
-            let guarded = self.solver.try_implies(in_bounds, vals_eq)?;
-            self.solver
-                .try_assert_term(guarded)
-                .expect("invariant: implies is Bool-sorted");
-        }
-
-        // Copy t elements: for j in 1..=t_max, result[len_s + j] = t[j] when j <= len_t
-        for j in 1..=t_max {
-            let j_term = self.solver.int_const(j as i64);
-            let in_bounds = self.solver.try_le(j_term, t_len)?;
-            let dst_idx = self.solver.try_add(s_len, j_term)?;
-            let src_val = self.solver.try_select(t_arr, j_term)?;
-            let dst_val = self.solver.try_select(result_arr, dst_idx)?;
-            let vals_eq = self.solver.try_eq(dst_val, src_val)?;
-            let guarded = self.solver.try_implies(in_bounds, vals_eq)?;
-            self.solver
-                .try_assert_term(guarded)
-                .expect("invariant: implies is Bool-sorted");
-        }
-
-        // len' = len_s + len_t
-        let new_len = self.solver.try_add(s_len, t_len)?;
-
-        Ok((result_arr, new_len))
-    }
-
     /// Translate `UNCHANGED seq` for a sequence variable.
     ///
-    /// Asserts: `arr' = arr /\ len' = len`.
+    /// Equality covers the length and logical cells only; representation-only
+    /// array ghosts may differ between steps.
     ///
     /// Part of #3793.
     fn translate_unchanged_seq(&mut self, name: &str) -> AYResult<Term> {
@@ -1811,26 +2184,21 @@ impl BmcTranslator {
         let next_arr = self.get_seq_array_at_step(name, self.current_step + 1)?;
         let curr_len = self.get_seq_length_at_step(name, self.current_step)?;
         let next_len = self.get_seq_length_at_step(name, self.current_step + 1)?;
+        let max_len = self.get_seq_max_len(name)?;
 
-        let arr_eq = self.solver.try_eq(next_arr, curr_arr)?;
-        let len_eq = self.solver.try_eq(next_len, curr_len)?;
-        Ok(self.solver.try_and(arr_eq, len_eq)?)
+        self.translate_seq_logical_eq(next_arr, next_len, max_len, curr_arr, curr_len)
     }
 
     /// Translate UNCHANGED for a function variable.
     ///
-    /// Asserts: `dom' = dom /\ map' = map`.
+    /// Compares mapping values only at the exact finite DOMAIN keys. Array cells
+    /// outside DOMAIN are representation ghosts and may change freely.
     ///
     /// Part of #3786.
     fn translate_unchanged_func(&mut self, name: &str) -> AYResult<Term> {
-        let curr_dom = self.get_func_domain_at_step(name, self.current_step)?;
-        let next_dom = self.get_func_domain_at_step(name, self.current_step + 1)?;
         let curr_map = self.get_func_mapping_at_step(name, self.current_step)?;
         let next_map = self.get_func_mapping_at_step(name, self.current_step + 1)?;
-
-        let dom_eq = self.solver.try_eq(next_dom, curr_dom)?;
-        let map_eq = self.solver.try_eq(next_map, curr_map)?;
-        Ok(self.solver.try_and(dom_eq, map_eq)?)
+        self.translate_func_logical_mapping_eq(name, next_map, name, curr_map)
     }
 
     /// Check whether an expression refers to a declared sequence variable.
@@ -1877,15 +2245,18 @@ impl BmcTranslator {
         }
     }
 
-    /// Declare a fresh sequence array `(Array Int Int)` with a unique name.
+    /// Declare a fresh sequence array with the source's exact element carrier.
     ///
     /// Part of #3793.
-    fn declare_fresh_seq_array(&mut self, prefix: &str) -> AYResult<Term> {
-        let id = self.aux_var_counter;
-        self.aux_var_counter += 1;
-        let name = format!("__{prefix}_{id}");
-        let arr_sort = Sort::array(Sort::Int, Sort::Int);
-        Ok(self.solver.declare_const(&name, arr_sort))
+    fn declare_fresh_seq_array(&mut self, prefix: &str, element_sort: &TlaSort) -> AYResult<Term> {
+        if !element_sort.is_scalar() {
+            return Err(AYError::UnsupportedOp(format!(
+                "BMC fresh sequence array has unsupported element sort {element_sort}"
+            )));
+        }
+        let arr_sort = Sort::array(Sort::Int, element_sort.to_ay()?);
+        let (_, term) = self.declare_internal_const(prefix, arr_sort);
+        Ok(term)
     }
 
     // === Quantifier translation ===
@@ -2081,42 +2452,27 @@ impl BmcTranslator {
         let var_name = &bound.name.node;
 
         // Enumerate all concrete subset terms
-        let subsets = self.enumerate_powerset_subsets(base)?;
+        let (element_sort, subsets) = self.enumerate_powerset_subsets_typed(base)?;
 
         if subsets.is_empty() {
             return Ok(self.solver.bool_const(is_forall));
         }
 
         let mut results = Vec::with_capacity(subsets.len());
-        let existed_before = self.vars.contains_key(var_name);
 
         for subset_term in &subsets {
-            // Temporarily inject the bound variable as a set-typed variable
-            // pointing to this specific subset term at all steps.
-            if !existed_before {
-                self.vars.insert(
-                    var_name.clone(),
-                    super::BmcVarInfo {
-                        sort: TlaSort::Set {
-                            element_sort: Box::new(TlaSort::Int),
-                        },
-                        terms: vec![*subset_term; self.bound_k + 1],
-                    },
-                );
-            } else {
-                let info = self.vars.get_mut(var_name).expect("checked above");
-                for t in info.terms.iter_mut() {
-                    *t = *subset_term;
-                }
-            }
-
-            let body_term = self.translate_bool(body)?;
+            // Replace and restore the entire binding transactionally.  In
+            // particular, an outer scalar named `T` must not retain its old
+            // sort while `T` denotes a set in the quantified body.
+            let body_term = self.with_temporary_scalar_binding(
+                var_name,
+                TlaSort::Set {
+                    element_sort: Box::new(element_sort.clone()),
+                },
+                *subset_term,
+                |this| this.translate_bool(body),
+            )?;
             results.push(body_term);
-        }
-
-        // Clean up: remove temporary binding if we added it
-        if !existed_before {
-            self.vars.remove(var_name);
         }
 
         self.combine_bool_terms(&results, is_forall)
@@ -2166,6 +2522,13 @@ impl BmcTranslator {
         // Step 3: Compute base elements
         let base_elements = if let Some(k) = cardinality_k {
             // Filtered: only k-element subsets of inner universe
+            let count = crate::translate::nested_powerset::binomial(inner_universe.len(), k);
+            if count > crate::translate::nested_powerset::MAX_NESTED_POWERSET_BASE {
+                return Err(AYError::UnsupportedOp(format!(
+                    "nested SUBSET Cardinality({k}) filter produces {count} base elements, exceeding the maximum of {}",
+                    crate::translate::nested_powerset::MAX_NESTED_POWERSET_BASE
+                )));
+            }
             crate::translate::nested_powerset::k_subsets(&inner_universe, k)
         } else if inner_universe.len() <= Self::MAX_NESTED_INNER_UNFILTERED {
             // Small enough for all subsets (2^n base elements)
@@ -2211,77 +2574,11 @@ impl BmcTranslator {
 
     /// Extract the inner universe as concrete i64 integers.
     ///
-    /// Similar to `extract_universe_from_exprs` but returns raw i64 values
-    /// instead of solver terms.
+    /// Unlike support collection, this evaluates intersection/difference to
+    /// the actual closed value so nested powerset enumeration cannot invent
+    /// absent base elements.
     fn extract_universe_ints(&self, expr: &Spanned<Expr>) -> AYResult<Vec<i64>> {
-        let mut values = std::collections::BTreeSet::new();
-        Self::collect_universe_ints_static(expr, &mut values)?;
-        Ok(values.into_iter().collect())
-    }
-
-    /// Recursively collect integer values from a set expression (static).
-    fn collect_universe_ints_static(
-        expr: &Spanned<Expr>,
-        values: &mut std::collections::BTreeSet<i64>,
-    ) -> AYResult<()> {
-        match &expr.node {
-            Expr::SetEnum(elements) => {
-                for e in elements {
-                    if let Expr::Int(n) = &e.node {
-                        let v: i64 = n.try_into().map_err(|_| {
-                            AYError::IntegerOverflow("set element too large for i64".to_string())
-                        })?;
-                        values.insert(v);
-                    }
-                }
-            }
-            Expr::Range(lo, hi) => {
-                let lo_val = Self::extract_int_literal(lo)?;
-                let hi_val = Self::extract_int_literal(hi)?;
-                for v in lo_val..=hi_val {
-                    values.insert(v);
-                }
-            }
-            Expr::Powerset(base) => {
-                Self::collect_universe_ints_static(base, values)?;
-            }
-            Expr::Union(left, right)
-            | Expr::Intersect(left, right)
-            | Expr::SetMinus(left, right) => {
-                Self::collect_universe_ints_static(left, values)?;
-                Self::collect_universe_ints_static(right, values)?;
-            }
-            // Ident: may reference a constant set, but we cannot resolve
-            // without runtime context. Try to handle common patterns.
-            Expr::Ident(name, _) | Expr::StateVar(name, ..) => {
-                // If we had a way to look up constant definitions, we would
-                // do so here. For now, this is unresolvable at BMC time.
-                return Err(AYError::UnsupportedOp(format!(
-                    "cannot extract universe from identifier '{}' in nested \
-                     powerset context",
-                    name
-                )));
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    /// Extract an integer literal from an expression.
-    fn extract_int_literal(expr: &Spanned<Expr>) -> AYResult<i64> {
-        match &expr.node {
-            Expr::Int(n) => n.try_into().map_err(|_| {
-                AYError::IntegerOverflow("integer literal too large for i64".to_string())
-            }),
-            Expr::Neg(inner) => {
-                let v = Self::extract_int_literal(inner)?;
-                Ok(-v)
-            }
-            _ => Err(AYError::UnsupportedOp(format!(
-                "expected integer literal, got {:?}",
-                std::mem::discriminant(&expr.node)
-            ))),
-        }
+        self.concrete_int_set_values(expr, "nested SUBSET")
     }
 
     /// Detect a cardinality filter pattern in the body of a nested powerset
@@ -2571,8 +2868,8 @@ impl BmcTranslator {
         let var_name = &bound.name.node;
 
         // Create fresh Skolem constant
-        let sk_name = self.fresh_bmc_name(&format!("sk_{var_name}"));
-        let sk_term = self.solver.declare_const(&sk_name, Sort::Int);
+        let (sk_name, sk_term) =
+            self.declare_internal_const(&format!("exists witness {var_name}"), Sort::Int);
 
         // Assert membership: sk = e1 \/ sk = e2 \/ ...
         // Uses balanced tree for large membership disjunctions.
@@ -2615,8 +2912,8 @@ impl BmcTranslator {
     ) -> AYResult<Term> {
         let var_name = &bound.name.node;
 
-        let sk_name = self.fresh_bmc_name(&format!("sk_{var_name}"));
-        let sk_term = self.solver.declare_const(&sk_name, Sort::Int);
+        let (sk_name, sk_term) =
+            self.declare_internal_const(&format!("exists range witness {var_name}"), Sort::Int);
 
         // Assert: lo <= sk /\ sk <= hi
         let lo_i64 = i64::try_from(lo)
@@ -2739,8 +3036,8 @@ impl BmcTranslator {
     ///
     /// Creates a fresh Int constant constrained to {0, 1} (Bool-as-Int encoding).
     fn skolemize_choose_boolean(&mut self, var_name: &str, body: &Spanned<Expr>) -> AYResult<Term> {
-        let sk_name = self.fresh_bmc_name(&format!("choose_{var_name}"));
-        let sk_term = self.solver.declare_const(&sk_name, Sort::Int);
+        let (sk_name, sk_term) =
+            self.declare_internal_const(&format!("boolean CHOOSE {var_name}"), Sort::Int);
 
         // Assert: sk = 0 \/ sk = 1
         let zero = self.solver.int_const(0);
@@ -2785,8 +3082,8 @@ impl BmcTranslator {
             ));
         }
 
-        let sk_name = self.fresh_bmc_name(&format!("choose_{var_name}"));
-        let sk_term = self.solver.declare_const(&sk_name, Sort::Int);
+        let (sk_name, sk_term) =
+            self.declare_internal_const(&format!("set CHOOSE {var_name}"), Sort::Int);
 
         // Assert membership: sk = e1 \/ sk = e2 \/ ...
         // Uses balanced tree for large membership disjunctions.
@@ -2829,8 +3126,8 @@ impl BmcTranslator {
         hi: &BigInt,
         body: &Spanned<Expr>,
     ) -> AYResult<Term> {
-        let sk_name = self.fresh_bmc_name(&format!("choose_{var_name}"));
-        let sk_term = self.solver.declare_const(&sk_name, Sort::Int);
+        let (sk_name, sk_term) =
+            self.declare_internal_const(&format!("range CHOOSE {var_name}"), Sort::Int);
 
         // Assert: lo <= sk /\ sk <= hi
         let lo_i64 = i64::try_from(lo).map_err(|_| {
@@ -2867,11 +3164,61 @@ impl BmcTranslator {
 
     // --- Shared helpers ---
 
-    /// Generate a fresh variable name for BMC Skolem constants.
-    fn fresh_bmc_name(&mut self, prefix: &str) -> String {
-        let id = self.aux_var_counter;
-        self.aux_var_counter += 1;
-        format!("__bmc_{prefix}_{id}")
+    /// Evaluate `f` with `name` lexically bound to one scalar/set term at every
+    /// BMC step, then restore the exact previous scalar binding.
+    ///
+    /// Compound carriers live in separate maps and expression dispatch probes
+    /// those maps independently.  Inserting a scalar binding alongside a
+    /// function/sequence/record/tuple of the same name would therefore be
+    /// ambiguous.  Until compound lexical shadowing has a first-class carrier,
+    /// reject that case rather than silently routing the body to the wrong one.
+    fn with_temporary_scalar_binding<R, F>(
+        &mut self,
+        name: &str,
+        sort: TlaSort,
+        term: Term,
+        f: F,
+    ) -> AYResult<R>
+    where
+        F: FnOnce(&mut Self) -> AYResult<R>,
+    {
+        let mut compound_carriers = Vec::with_capacity(4);
+        if self.func_vars.contains_key(name) {
+            compound_carriers.push("function");
+        }
+        if self.seq_vars.contains_key(name) {
+            compound_carriers.push("sequence");
+        }
+        if self.record_vars.contains_key(name) {
+            compound_carriers.push("record");
+        }
+        if self.tuple_vars.contains_key(name) {
+            compound_carriers.push("tuple");
+        }
+        if !compound_carriers.is_empty() {
+            return Err(AYError::UnsupportedOp(format!(
+                "BMC bound variable {name} cannot shadow {} carrier: temporary scalar dispatch would be ambiguous",
+                compound_carriers.join(" + ")
+            )));
+        }
+
+        let previous = self.vars.remove(name);
+        self.vars.insert(
+            name.to_string(),
+            super::BmcVarInfo {
+                sort,
+                terms: vec![term; self.bound_k + 1],
+            },
+        );
+
+        // Do not use `?` until the old binding is restored: translation errors
+        // must not leak the temporary term or sort into subsequent obligations.
+        let result = f(self);
+        self.vars.remove(name);
+        if let Some(previous) = previous {
+            self.vars.insert(name.to_string(), previous);
+        }
+        result
     }
 
     /// Substitute a value for a bound variable and translate to Bool.
@@ -2941,7 +3288,12 @@ fn enumerate_concrete_int_set(expr: &Spanned<Expr>) -> Option<Vec<i64>> {
             Expr::Range(lo, hi) => {
                 let lo = lit_i64(lo)?;
                 let hi = lit_i64(hi)?;
-                if hi >= lo && (hi - lo) as usize >= MAX_ENUM_INT_SET {
+                let size = if hi >= lo {
+                    i128::from(hi) - i128::from(lo) + 1
+                } else {
+                    0
+                };
+                if size > MAX_ENUM_INT_SET as i128 {
                     return None;
                 }
                 for v in lo..=hi {
@@ -2984,11 +3336,15 @@ fn enumerate_concrete_int_set(expr: &Spanned<Expr>) -> Option<Vec<i64>> {
     }
 
     fn lit_i64(expr: &Spanned<Expr>) -> Option<i64> {
-        match &expr.node {
-            Expr::Int(n) => i64::try_from(n).ok(),
-            Expr::Neg(a) => lit_i64(a)?.checked_neg(),
-            _ => None,
+        fn lit_big_int(expr: &Spanned<Expr>) -> Option<num_bigint::BigInt> {
+            match &expr.node {
+                Expr::Int(value) => Some(value.clone()),
+                Expr::Neg(inner) => Some(-lit_big_int(inner)?),
+                _ => None,
+            }
         }
+
+        i64::try_from(lit_big_int(expr)?).ok()
     }
 
     let mut set = BTreeSet::new();

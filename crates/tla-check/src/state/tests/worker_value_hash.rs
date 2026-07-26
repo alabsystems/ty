@@ -7,7 +7,6 @@
 //! Part of #3337: Verifies fingerprint parity between the shared
 //! (`value_hash::value_fingerprint`) and worker-local (`WorkerFpMemo`) paths.
 
-use std::sync::Arc;
 use tla_value::Rp;
 
 use crate::state::value_hash::value_fingerprint as shared_value_fingerprint;

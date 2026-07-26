@@ -210,6 +210,7 @@ impl<T: BfsWorkItem> ParallelTransport<T> {
             work_remaining: &self.work_remaining,
             max_depth_atomic: &self.max_depth_atomic,
             total_transitions: &self.total_transitions,
+            total_raw_successors_generated: &self.total_raw_successors_generated,
             successors_cache: &self.successors_cache,
             successor_witnesses_cache: &self.successor_witnesses_cache,
             mvperms: &self.mvperms,
@@ -241,6 +242,7 @@ impl<T: BfsWorkItem> ParallelTransport<T> {
 
         if let Some((diffs, base_array, rebuilt_base_fp_cache)) = diff_result {
             wctx.stats.base_fp_cache_rebuilds += usize::from(rebuilt_base_fp_cache);
+            wctx.record_raw_successors_generated(diffs.len());
             let terminated =
                 wctx.process_diffs(&base_array, fp, succ_depth, succ_level, diffs, enqueue);
             enqueue_route.finish();

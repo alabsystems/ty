@@ -4,8 +4,8 @@
 
 //! Membership and cardinality logic for FuncSetValue ([S -> T]).
 
-use num_bigint::BigInt;
 use crate::rp::Rp;
+use num_bigint::BigInt;
 use num_traits::{ToPrimitive, Zero};
 
 use super::super::super::*;

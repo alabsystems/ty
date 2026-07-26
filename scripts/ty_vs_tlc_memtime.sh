@@ -210,6 +210,11 @@ process() {
         fi
     fi
 
+    # A non-empty TY_CHECK_EXTRA splice changes the TY invocation; record it
+    # verbatim so no row can silently claim fairness it didn't have.
+    if [ -n "${TY_CHECK_EXTRA:-}" ]; then
+        note="${note:+$note; }ty_check_extra=${TY_CHECK_EXTRA}"
+    fi
     echo "$name,$cfg,$ty_states,$tlc_states,$states_match,$ty_verdict,$tlc_verdict,$verdict_match,$ty_t,$tlc_t,$time_ratio,$time_win,$ty_rss,$tlc_rss,$mem_ratio,$mem_win,$status,$note" >> "$OUT_CSV"
     printf '%-34s ty=%-7s tlc=%-7s t %-7s/%-7s (%s) mem %-10s/%-10s (%s) [%s]\n' \
         "$name" "$ty_states" "$tlc_states" "$ty_t" "$tlc_t" "$time_win" "$ty_rss" "$tlc_rss" "$mem_win" "$status"
@@ -242,7 +247,6 @@ awk -F, 'NR>1{
         if($12=="true"&&$16=="true")bw++;
         if($12!="true"||$16!="true"){loss++; losers=losers"\n  "$1" (cfg "$2"): time_win="$12" mem_win="$16" ratios t="$11" m="$15}
     }
-    if($17=="PARITY_FAIL")pf++;
     if($17=="VERDICT_FAIL")vf++;
     if($17=="TY_TIMEOUT"||$17=="TLC_TIMEOUT")to++;
     if($17=="TY_ERROR")te++;
@@ -253,7 +257,7 @@ END{
     printf "total=%d comparable(OK+parity+verdict ok)=%d\n", total, comp;
     printf "  time wins=%d  mem wins=%d  BOTH wins=%d\n", tw, mw, bw;
     printf "  TY LOSES on >=1 metric: %d%s\n", loss, (loss?losers:"");
-    printf "non-comparable: parity_fail=%d verdict_fail=%d timeouts=%d ty_error=%d rss_missing=%d\n", pf, vf, to, te, rm;
+    printf "non-comparable: verdict_fail=%d timeouts=%d ty_error=%d rss_missing=%d\n", vf, to, te, rm;
 }' "$OUT_CSV" >&2
 
 echo "Wrote $OUT_CSV" >&2

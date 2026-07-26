@@ -50,7 +50,9 @@ fn rp_value_opt_in() -> bool {
         0 => false,
         1 => true,
         _ => {
-            let on = std::env::var("TY_RP_VALUE").map(|v| v == "1").unwrap_or(false);
+            let on = std::env::var("TY_RP_VALUE")
+                .map(|v| v == "1")
+                .unwrap_or(false);
             CACHE.store(on as u8, Ordering::Relaxed);
             on
         }
@@ -369,12 +371,7 @@ mod tests {
             unimplemented!("release-policy probe never dequeues")
         }
 
-        fn return_current(
-            &mut self,
-            _fp: Fingerprint,
-            _state: ArrayState,
-            _mc: &mut ModelChecker,
-        ) {
+        fn return_current(&mut self, _fp: Fingerprint, _state: ArrayState, _mc: &mut ModelChecker) {
             unimplemented!("release-policy probe never returns a state")
         }
 

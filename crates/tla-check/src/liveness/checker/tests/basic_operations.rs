@@ -13,6 +13,7 @@ use crate::liveness::test_helpers::{
 };
 use crate::liveness::LiveExpr;
 use crate::Value;
+use std::cell::Cell;
 
 #[cfg_attr(test, ntest::timeout(10000))]
 #[test]
@@ -21,6 +22,110 @@ fn test_liveness_checker_new() {
     let checker = make_checker(LiveExpr::always(LiveExpr::Bool(true)));
     assert_eq!(checker.stats().graph_nodes, 0);
     assert_eq!(checker.stats().states_explored, 0);
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_exact_raw_successor_csr_preserves_order_duplicates_and_empty_rows() {
+    let a = Fingerprint(0x11);
+    let b = Fingerprint(0x22);
+    let c = Fingerprint(0x33);
+    let d = Fingerprint(0x44);
+    let expected_b = [c, a, c, b, b];
+    let expected_d = [b, a, b];
+
+    let mut rows = StateSuccessorFingerprints::default();
+    rows.insert(a, Arc::new(Vec::new()));
+    rows.insert(b, Arc::new(expected_b.to_vec()));
+    rows.insert(c, Arc::new(vec![c, c]));
+
+    assert!(rows.freeze());
+    assert!(rows.is_frozen());
+    assert_eq!(rows.get(&a).expect("empty source row").as_slice(), &[]);
+    assert_eq!(
+        rows.get(&b).expect("ordered duplicate row").as_slice(),
+        expected_b
+    );
+    let owned_c = rows.get_owned(&c).expect("owned frozen row");
+    assert_eq!(
+        &*owned_c,
+        &[c, c],
+        "explicit and appended stuttering duplicates must remain distinct"
+    );
+
+    rows.insert(d, Arc::new(expected_d.to_vec()));
+    assert!(
+        !rows.is_frozen(),
+        "a missing cross-group source should open a sparse extension"
+    );
+    assert_eq!(&*owned_c, &[c, c], "the old owned row must remain valid");
+    assert!(rows.freeze(), "the sparse extension must refreeze");
+    assert!(rows.is_frozen());
+    assert_eq!(
+        rows.get(&b).expect("row after repeated freeze").as_slice(),
+        expected_b
+    );
+    assert_eq!(
+        rows.get(&d)
+            .expect("appended row after refreeze")
+            .as_slice(),
+        expected_d
+    );
+    assert_eq!(
+        &*owned_c,
+        &[c, c],
+        "copy-on-write refreeze must preserve outstanding owned rows"
+    );
+    assert!(rows.freeze(), "repeated frozen freeze must be idempotent");
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_exact_raw_csr_count_limits_are_checked_without_truncation() {
+    assert!(StateSuccessorFingerprints::csr_counts_fit(3, 7));
+    #[cfg(target_pointer_width = "64")]
+    {
+        let over_u32 = u32::MAX as usize + 1;
+        assert!(!StateSuccessorFingerprints::csr_counts_fit(over_u32, 0));
+        assert!(!StateSuccessorFingerprints::csr_counts_fit(1, over_u32));
+    }
+    assert!(!StateSuccessorFingerprints::csr_counts_fit(usize::MAX, 0));
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_exact_raw_csr_freeze_requires_closed_payload_and_source_sets() {
+    let s0 = State::from_pairs([("x", Value::int(0))]);
+    let s1 = State::from_pairs([("x", Value::int(1))]);
+    let s0_fp = s0.fingerprint();
+    let s1_fp = s1.fingerprint();
+    let mut checker = make_checker_with_vars(LiveExpr::Bool(true), &["x"]);
+    checker.enable_owned_behavior_graph_state_cache();
+    checker.graph.cache_owned_state(s0_fp, &s0);
+    checker.graph.cache_owned_state(s1_fp, &s1);
+    checker
+        .state_successor_fps
+        .insert(s0_fp, Arc::new(vec![s1_fp]));
+
+    assert!(!checker.freeze_complete_exact_raw_adjacency());
+    assert!(
+        !checker.state_successor_fps.is_frozen(),
+        "a partial cache must remain mutable"
+    );
+    checker
+        .state_successor_fps
+        .insert(s1_fp, Arc::new(Vec::new()));
+    assert!(checker.freeze_complete_exact_raw_adjacency());
+    assert!(checker.state_successor_fps.is_frozen());
+
+    let mut missing_endpoint = make_checker_with_vars(LiveExpr::Bool(true), &["x"]);
+    missing_endpoint.enable_owned_behavior_graph_state_cache();
+    missing_endpoint.graph.cache_owned_state(s0_fp, &s0);
+    missing_endpoint
+        .state_successor_fps
+        .insert(s0_fp, Arc::new(vec![Fingerprint(0xdead_beef)]));
+    assert!(!missing_endpoint.freeze_complete_exact_raw_adjacency());
+    assert!(!missing_endpoint.state_successor_fps.is_frozen());
 }
 
 #[cfg_attr(test, ntest::timeout(10000))]
@@ -117,12 +222,12 @@ fn test_add_successors() {
         .get_node_info(&added0[0])
         .expect("initial node should have info");
     assert!(
-        !init_info.successors.is_empty(),
+        !init_info.successors().is_empty(),
         "initial node should have at least one successor"
     );
     for succ_node in &added1 {
         assert!(
-            init_info.successors.contains(succ_node),
+            init_info.successors().contains(succ_node),
             "initial node's adjacency list should contain successor {:?}",
             succ_node
         );
@@ -174,6 +279,358 @@ fn test_direct_compact_explore_records_ordered_successor_fingerprints() {
         Some(s1),
         "successor payload must remain resolvable after its temporary State is dropped"
     );
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_exact_raw_cache_transfer_reuses_direct_successors() {
+    let s0 = State::from_pairs([("x", Value::int(0))]);
+    let s1 = State::from_pairs([("x", Value::int(1))]);
+    let s2 = State::from_pairs([("x", Value::int(2))]);
+    let expected = vec![s2.fingerprint(), s1.fingerprint(), s2.fingerprint()];
+
+    let producer_calls = Cell::new(0usize);
+    let mut producer_successors = |state: &State| {
+        producer_calls.set(producer_calls.get() + 1);
+        if state == &s0 {
+            Ok(vec![s2.clone(), s1.clone(), s2.clone()])
+        } else {
+            Ok(Vec::new())
+        }
+    };
+    let mut raw_fp = |state: &State| Ok(state.fingerprint());
+    let mut producer = make_checker_with_vars(LiveExpr::Bool(true), &["x"]);
+    producer.enable_owned_behavior_graph_state_cache();
+    producer
+        .explore_state_graph_direct_with_state_fp(
+            std::slice::from_ref(&s0),
+            &mut producer_successors,
+            &mut raw_fp,
+        )
+        .unwrap();
+    assert_eq!(producer_calls.get(), 3);
+    assert!(producer.freeze_complete_exact_raw_adjacency());
+    assert!(producer.state_successor_fps.is_frozen());
+    let expected_nodes = producer.stats.graph_nodes;
+    let expected_edges = producer.stats.graph_edges;
+    let cache = producer
+        .take_exact_raw_state_graph_cache()
+        .expect("producer exact raw cache");
+
+    let consumer_calls = Cell::new(0usize);
+    let mut consumer_successors = |_state: &State| {
+        consumer_calls.set(consumer_calls.get() + 1);
+        Ok(Vec::new())
+    };
+    let mut consumer = make_checker_with_vars(LiveExpr::Bool(true), &["x"]);
+    consumer.install_exact_raw_state_graph_cache(cache);
+    consumer
+        .explore_state_graph_direct_with_state_fp(
+            std::slice::from_ref(&s0),
+            &mut consumer_successors,
+            &mut raw_fp,
+        )
+        .unwrap();
+
+    assert_eq!(
+        consumer_calls.get(),
+        0,
+        "warm direct exploration reran Next"
+    );
+    assert_eq!(consumer.stats.graph_nodes, expected_nodes);
+    assert_eq!(consumer.stats.graph_edges, expected_edges);
+    assert_eq!(
+        consumer
+            .state_successor_fps
+            .get(&s0.fingerprint())
+            .expect("transferred ordered adjacency")
+            .as_slice(),
+        expected.as_slice(),
+        "transfer must preserve successor order and duplicates"
+    );
+    assert_eq!(consumer.graph.get_state_by_fp(s1.fingerprint()), Some(s1));
+    assert_eq!(consumer.graph.get_state_by_fp(s2.fingerprint()), Some(s2));
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_exact_raw_cache_transfer_reuses_successors_in_new_tableau() {
+    let state = State::from_pairs([("x", Value::int(0))]);
+    let state_fp = state.fingerprint();
+
+    let mut producer = make_checker_with_vars(LiveExpr::Bool(true), &["x"]);
+    producer.enable_owned_behavior_graph_state_cache();
+    let mut producer_successors = |current: &State| Ok(vec![current.clone(), current.clone()]);
+    let mut raw_fp = |current: &State| Ok(current.fingerprint());
+    producer
+        .explore_state_graph_direct_with_state_fp(
+            std::slice::from_ref(&state),
+            &mut producer_successors,
+            &mut raw_fp,
+        )
+        .unwrap();
+    let cache = producer
+        .take_exact_raw_state_graph_cache()
+        .expect("producer exact raw cache");
+
+    let formula = LiveExpr::eventually(LiveExpr::Bool(true));
+    let warm_calls = Cell::new(0usize);
+    let mut warm_successors = |_current: &State| {
+        warm_calls.set(warm_calls.get() + 1);
+        Ok(Vec::new())
+    };
+    let mut warm = make_checker_with_vars(formula.clone(), &["x"]);
+    warm.install_exact_raw_state_graph_cache(cache);
+    let warm_nodes = warm
+        .explore_bfs(std::slice::from_ref(&state), &mut warm_successors, None)
+        .unwrap();
+
+    let cold_calls = Cell::new(0usize);
+    let mut cold_successors = |current: &State| {
+        cold_calls.set(cold_calls.get() + 1);
+        Ok(vec![current.clone(), current.clone()])
+    };
+    let mut cold = make_checker_with_vars(formula, &["x"]);
+    cold.enable_owned_behavior_graph_state_cache();
+    let cold_nodes = cold
+        .explore_bfs(std::slice::from_ref(&state), &mut cold_successors, None)
+        .unwrap();
+
+    assert_eq!(warm_calls.get(), 0, "warm tableau exploration reran Next");
+    assert_eq!(cold_calls.get(), 1);
+    assert_eq!(warm_nodes, cold_nodes);
+    assert_eq!(warm.stats.graph_edges, cold.stats.graph_edges);
+    assert_eq!(warm.stats.consistency_checks, cold.stats.consistency_checks);
+    assert_eq!(
+        warm.state_successor_fps
+            .get(&state_fp)
+            .expect("transferred self-loop adjacency")
+            .as_slice(),
+        &[state_fp, state_fp]
+    );
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_exact_raw_cache_transfer_falls_back_for_uncached_sources() {
+    let s0 = State::from_pairs([("x", Value::int(0))]);
+    let s1 = State::from_pairs([("x", Value::int(1))]);
+    let s0_fp = s0.fingerprint();
+    let s1_fp = s1.fingerprint();
+
+    let mut producer = make_checker_with_vars(LiveExpr::Bool(true), &["x"]);
+    producer.enable_owned_behavior_graph_state_cache();
+    let mut empty = empty_successors;
+    producer
+        .explore_state_graph_direct(std::slice::from_ref(&s0), &mut empty)
+        .unwrap();
+    assert!(producer.freeze_complete_exact_raw_adjacency());
+    assert!(producer.state_successor_fps.is_frozen());
+    let cache = producer
+        .take_exact_raw_state_graph_cache()
+        .expect("group-complete exact raw cache");
+
+    let calls = Cell::new(0usize);
+    let fallback_successor = s0.clone();
+    let mut get_successors = |_state: &State| {
+        calls.set(calls.get() + 1);
+        Ok(vec![fallback_successor.clone()])
+    };
+    let mut consumer = make_checker_with_vars(LiveExpr::Bool(true), &["x"]);
+    consumer.install_exact_raw_state_graph_cache(cache);
+    consumer
+        .explore_state_graph_direct(&[s0.clone(), s1.clone()], &mut get_successors)
+        .unwrap();
+
+    assert_eq!(
+        calls.get(),
+        1,
+        "only the previously unseen source should regenerate successors"
+    );
+    assert!(consumer.state_successor_fps.contains_key(&s0_fp));
+    assert!(consumer.state_successor_fps.contains_key(&s1_fp));
+    assert_eq!(consumer.graph.get_state_by_fp(s0_fp), Some(s0));
+    assert_eq!(consumer.graph.get_state_by_fp(s1_fp), Some(s1));
+    assert!(consumer.freeze_complete_exact_raw_adjacency());
+    assert!(consumer.state_successor_fps.is_frozen());
+    assert_eq!(
+        consumer
+            .state_successor_fps
+            .get(&s1_fp)
+            .expect("new source row after refreeze")
+            .as_slice(),
+        &[s0_fp]
+    );
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_exact_raw_cache_transfer_missing_payload_fails_closed() {
+    let s0 = State::from_pairs([("x", Value::int(0))]);
+    let s1 = State::from_pairs([("x", Value::int(1))]);
+    let s1_fp = s1.fingerprint();
+
+    let mut producer = make_checker_with_vars(LiveExpr::Bool(true), &["x"]);
+    producer.enable_owned_behavior_graph_state_cache();
+    let mut producer_successors = |state: &State| {
+        if state == &s0 {
+            Ok(vec![s1.clone()])
+        } else {
+            Ok(Vec::new())
+        }
+    };
+    producer
+        .explore_state_graph_direct(std::slice::from_ref(&s0), &mut producer_successors)
+        .unwrap();
+    let mut cache = producer
+        .take_exact_raw_state_graph_cache()
+        .expect("producer exact raw cache");
+    assert!(cache.state_payloads.remove(&s1_fp).is_some());
+
+    let calls = Cell::new(0usize);
+    let mut should_not_regenerate = |_state: &State| {
+        calls.set(calls.get() + 1);
+        Ok(Vec::new())
+    };
+    let mut consumer = make_checker_with_vars(LiveExpr::Bool(true), &["x"]);
+    consumer.install_exact_raw_state_graph_cache(cache);
+    let error = consumer
+        .explore_state_graph_direct(std::slice::from_ref(&s0), &mut should_not_regenerate)
+        .expect_err("transferred adjacency with a missing payload must fail closed");
+
+    assert_eq!(calls.get(), 0);
+    assert!(
+        error.to_string().contains("missing successor payload"),
+        "unexpected invariant error: {error}"
+    );
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_owned_tableau_explore_reuses_complete_successors_per_state() {
+    let mut checker = make_checker_with_vars(LiveExpr::eventually(LiveExpr::Bool(true)), &["x"]);
+    checker.enable_owned_behavior_graph_state_cache();
+
+    let state = State::from_pairs([("x", Value::int(0))]);
+    let state_fp = state.fingerprint();
+    let successor_calls = Cell::new(0usize);
+    let mut get_successors = |current: &State| {
+        successor_calls.set(successor_calls.get() + 1);
+        Ok(vec![current.clone(), current.clone()])
+    };
+
+    let nodes = checker
+        .explore_bfs(std::slice::from_ref(&state), &mut get_successors, None)
+        .unwrap();
+
+    assert!(
+        nodes > 1,
+        "the tableau must contain multiple product nodes for the same state"
+    );
+    assert_eq!(
+        successor_calls.get(),
+        1,
+        "Next should run once for a concrete state shared by tableau nodes"
+    );
+    assert!(
+        checker.state_successors.is_empty(),
+        "owned compact exploration must not retain concrete successor vectors"
+    );
+    assert_eq!(
+        checker
+            .state_successor_fps
+            .get(&state_fp)
+            .expect("complete successor fingerprints")
+            .as_slice(),
+        &[state_fp, state_fp],
+        "reused adjacency must preserve generation order and duplicates"
+    );
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_direct_raw_array_roots_ignore_foreign_cached_fingerprint() {
+    let registry = crate::var_index::VarRegistry::from_names(["x"]);
+    let state = State::from_pairs([("x", Value::int(7))]);
+    let raw_fp = state.fingerprint();
+    let foreign_fp = Fingerprint(raw_fp.0 ^ 0xd6e8_feb8_6659_fd93);
+    let mut init_array = crate::ArrayState::from_state_with_fp(&state, &registry);
+    init_array
+        .fp_cache
+        .as_mut()
+        .expect("from_state_with_fp cache")
+        .fingerprint = foreign_fp;
+
+    let mut checker = make_checker_with_vars(LiveExpr::Bool(true), &["x"]);
+    checker.enable_owned_behavior_graph_state_cache();
+    let mut get_successors = empty_successors;
+    checker
+        .explore_state_graph_direct_with_raw_array_init_states(
+            std::iter::once(&init_array),
+            &registry,
+            &mut get_successors,
+        )
+        .unwrap();
+
+    assert_eq!(checker.graph.get_state_by_fp(raw_fp), Some(state));
+    assert_eq!(
+        checker.graph.get_state_by_fp(foreign_fp),
+        None,
+        "the raw graph must ignore a foreign cached fingerprint"
+    );
+    assert!(
+        checker
+            .graph
+            .get_array_state_by_fp(raw_fp)
+            .expect("raw compact root")
+            .fp_cache
+            .is_none(),
+        "the adopted payload must not retain the foreign cache"
+    );
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_tableau_raw_array_roots_match_legacy_state_seeding() {
+    let registry = crate::var_index::VarRegistry::from_names(["x"]);
+    let states = vec![
+        State::from_pairs([("x", Value::int(0))]),
+        State::from_pairs([("x", Value::int(1))]),
+    ];
+    let arrays: Vec<_> = states
+        .iter()
+        .map(|state| crate::ArrayState::from_state_with_fp(state, &registry))
+        .collect();
+
+    let formula = LiveExpr::always(LiveExpr::Bool(true));
+    let mut compact = make_checker_with_vars(formula.clone(), &["x"]);
+    compact.enable_owned_behavior_graph_state_cache();
+    let mut compact_successors = empty_successors;
+    let compact_nodes = compact
+        .explore_bfs_with_raw_array_init_states(
+            arrays.iter(),
+            &registry,
+            &mut compact_successors,
+            None,
+        )
+        .unwrap();
+
+    let mut legacy = make_checker_with_vars(formula, &["x"]);
+    let mut legacy_successors = empty_successors;
+    let legacy_nodes = legacy
+        .explore_bfs(&states, &mut legacy_successors, None)
+        .unwrap();
+
+    assert_eq!(compact_nodes, legacy_nodes);
+    assert_eq!(compact.stats.graph_edges, legacy.stats.graph_edges);
+    assert_eq!(compact.stats.states_explored, legacy.stats.states_explored);
+    for state in states {
+        assert_eq!(
+            compact.graph.get_state_by_fp(state.fingerprint()),
+            Some(state),
+            "every compact root must remain reconstructible"
+        );
+    }
 }
 
 #[cfg_attr(test, ntest::timeout(10000))]

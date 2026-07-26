@@ -20,6 +20,13 @@ use crate::cache::{bump_hoist_state_generation_ctx, StateLookupModeGuard};
 use crate::value::intern_string;
 use tla_core::name_intern::intern_name;
 
+// A/B kill switch for the narrow shadow check below. When set, any local
+// binding restores the historical direct-slot-path rejection.
+feature_flag!(
+    no_unchanged_unrelated_bindings,
+    "TY_NO_UNCHANGED_UNRELATED_BINDINGS"
+);
+
 /// Direct slot comparison for UNCHANGED on a single state variable.
 ///
 /// Part of #3073: When both state_env and next_state_env are array-backed and no
@@ -38,8 +45,12 @@ fn try_unchanged_statevar_fast(
     let state_env = ctx.state_env?;
     let next_state_env = ctx.next_state_env?;
 
-    // Same guard conditions as try_borrow_plain_state_var_slot: no overlays.
-    if !ctx.bindings.is_empty()
+    // Substitution overlays can redirect a syntactic state-variable reference.
+    // Ordinary local bindings only matter when they shadow the particular
+    // variable being compared; that narrower check is performed per element
+    // below. This keeps parameterized actions such as `Action(self)` on the
+    // direct-slot path for `UNCHANGED <<x, y>>` when only `self` is bound.
+    if (no_unchanged_unrelated_bindings() && !ctx.bindings.is_empty())
         || ctx.instance_substitutions().is_some()
         || ctx.eager_subst_bindings.is_some()
         || ctx.call_by_name_subs().is_some()
@@ -49,6 +60,9 @@ fn try_unchanged_statevar_fast(
 
     match &inner.node {
         Expr::StateVar(name, idx, name_id) => {
+            if ctx.has_local_binding(name) {
+                return None;
+            }
             let resolved_idx = ctx.resolve_state_var_slot(name, *idx, *name_id);
             let idx = resolved_idx.as_usize();
             if !crate::is_dep_tracking_active(ctx) {
@@ -58,9 +72,13 @@ fn try_unchanged_statevar_fast(
                 return Some(Ok(Value::Bool(eq)));
             }
             // SAFETY: resolved_idx is validated against the current VarRegistry.
-            tla_value::churn_stats::churn_count(tla_value::churn_stats::ChurnSite::StateVarReadUnchanged);
+            tla_value::churn_stats::churn_count(
+                tla_value::churn_stats::ChurnSite::StateVarReadUnchanged,
+            );
             let cur = unsafe { state_env.get_value(idx) };
-            tla_value::churn_stats::churn_count(tla_value::churn_stats::ChurnSite::StateVarReadUnchanged);
+            tla_value::churn_stats::churn_count(
+                tla_value::churn_stats::ChurnSite::StateVarReadUnchanged,
+            );
             let next = unsafe { next_state_env.get_value(idx) };
             // Record deps for zero-arg operator cache correctness.
             record_state_read(ctx, resolved_idx, &cur);
@@ -78,6 +96,9 @@ fn try_unchanged_statevar_fast(
                 let Expr::StateVar(name, idx, name_id) = &elem.node else {
                     return None;
                 };
+                if ctx.has_local_binding(name) {
+                    return None;
+                }
                 let resolved_idx = ctx.resolve_state_var_slot(name, *idx, *name_id);
                 let idx = resolved_idx.as_usize();
                 if !crate::is_dep_tracking_active(ctx) {
@@ -87,9 +108,13 @@ fn try_unchanged_statevar_fast(
                     }
                     continue;
                 }
-                tla_value::churn_stats::churn_count(tla_value::churn_stats::ChurnSite::StateVarReadUnchanged);
+                tla_value::churn_stats::churn_count(
+                    tla_value::churn_stats::ChurnSite::StateVarReadUnchanged,
+                );
                 let cur = unsafe { state_env.get_value(idx) };
-                tla_value::churn_stats::churn_count(tla_value::churn_stats::ChurnSite::StateVarReadUnchanged);
+                tla_value::churn_stats::churn_count(
+                    tla_value::churn_stats::ChurnSite::StateVarReadUnchanged,
+                );
                 let next = unsafe { next_state_env.get_value(idx) };
                 record_state_read(ctx, resolved_idx, &cur);
                 record_next_read(ctx, resolved_idx, &next);
@@ -212,4 +237,42 @@ pub(super) fn eval_unchanged(
         eq
     );
     Ok(Value::Bool(eq))
+}
+
+#[cfg(test)]
+mod fast_path_tests {
+    use super::*;
+
+    fn state_var(name: &str) -> Spanned<Expr> {
+        Spanned::dummy(Expr::StateVar(name.to_string(), 0, intern_name(name)))
+    }
+
+    #[test]
+    fn unrelated_local_binding_keeps_direct_slot_path() {
+        let mut ctx = EvalCtx::new();
+        ctx.register_var("x");
+        let current = [Value::int(1)];
+        ctx.bind_state_array(&current);
+        let mut ctx = ctx.into_bind_local("self", Value::int(7));
+        let next = [Value::int(2)];
+        let _guard = ctx.bind_next_state_array_guard(&next);
+
+        let result = try_unchanged_statevar_fast(&ctx, &state_var("x"), None)
+            .expect("unrelated local must not disable the direct-slot path")
+            .expect("direct-slot comparison must evaluate");
+        assert_eq!(result, Value::Bool(false));
+    }
+
+    #[test]
+    fn same_name_local_binding_disables_direct_slot_path() {
+        let mut ctx = EvalCtx::new();
+        ctx.register_var("x");
+        let current = [Value::int(1)];
+        ctx.bind_state_array(&current);
+        let mut ctx = ctx.into_bind_local("x", Value::int(7));
+        let next = [Value::int(2)];
+        let _guard = ctx.bind_next_state_array_guard(&next);
+
+        assert!(try_unchanged_statevar_fast(&ctx, &state_var("x"), None).is_none());
+    }
 }

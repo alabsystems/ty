@@ -115,7 +115,14 @@ pub(crate) const CATALOG: &[Group] = &[
         title: "Toolchain",
         blurb: "Full command catalog, companion installs, caches, shell integration.",
         tier: Tier::Visible,
-        members: &["commands", "completions", "corpus", "install-tlc", "install-apalache", "cache"],
+        members: &[
+            "commands",
+            "completions",
+            "corpus",
+            "install-tlc",
+            "install-apalache",
+            "cache",
+        ],
     },
     Group {
         title: "Certificates & trust",

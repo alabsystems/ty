@@ -317,4 +317,33 @@ mod tests {
             "a well-formed self-contained spec must pass"
         );
     }
+
+    /// Flattening a corpus-style wrapper must retain the base module's standard-library scope.
+    /// SingleLaneBridge has this exact shape (`MC EXTENDS SingleLaneBridge, TLC`) and uses the
+    /// FiniteSets/Sequences operators below; resolving the flattened text against the originating
+    /// wrapper path must therefore agree with `ty check` rather than report those operators undefined.
+    #[test]
+    fn flattened_wrapper_retains_transitive_stdlib_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "Base.tla",
+            "---- MODULE Base ----\n\n\\* Documentation before EXTENDS is legal TLA+.\n\
+             (* A block comment here must not end the header either. *)\n\
+             EXTENDS Naturals, FiniteSets, Sequences\nVARIABLE x, q\n\
+             Marker == \"(* comment delimiters inside strings are inert *)\"\n\
+             Init == /\\ x = Cardinality({1}) /\\ q = <<1>>\n\
+             Next == /\\ x' = Len(Append(q, Head(q))) /\\ q' = Tail(q)\n====\n",
+        );
+        let main = write(
+            dir.path(),
+            "MC.tla",
+            "---- MODULE MC ----\nEXTENDS Base, TLC\n====\n",
+        );
+        let flat = crate::flatten::flatten_extends_closure(&main).expect("flatten wrapper");
+        assert!(
+            certify_wellformedness_gate(&flat.source, &init_next_cfg(), &main).is_ok(),
+            "standard-library operators inherited through the inlined base must resolve"
+        );
+    }
 }

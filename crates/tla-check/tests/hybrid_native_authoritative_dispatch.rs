@@ -287,7 +287,10 @@ fn authoritative_gate_is_default_off() {
     );
     assert_eq!(out.sampled_checks, 0);
     assert_eq!(out.authoritative_actions, 0);
-    assert_eq!(out.burn_in_pending, 0, "the burn-in machine must stay inert");
+    assert_eq!(
+        out.burn_in_pending, 0,
+        "the burn-in machine must stay inert"
+    );
     assert!(
         out.native_dispatched > 0,
         "the validated shadow itself must still dispatch natively"

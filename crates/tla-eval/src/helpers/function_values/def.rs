@@ -12,16 +12,15 @@ use super::super::{
     push_bound_var_mut_preinterned, PreInternedBound,
 };
 use crate::core::EvalCtx;
-use tla_value::Rp;
 use crate::helpers::eval;
 use crate::value::{
     cartesian_product, ComponentDomain, FuncValue, IntIntervalFunc, LazyDomain, SortedSet, Value,
 };
 use num_traits::ToPrimitive;
-use std::sync::Arc;
 use tla_core::ast::{BoundPattern, BoundVar, Expr};
 use tla_core::{Span, Spanned};
 use tla_value::error::{EvalError, EvalResult};
+use tla_value::Rp;
 
 fn eval_eager_single_var_function<'a>(
     ctx: &EvalCtx,

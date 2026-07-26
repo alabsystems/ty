@@ -86,9 +86,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use tla_core::ast::{
     BoundVar, CaseArm, ExceptPathElement, ExceptSpec, Expr, ModuleTarget, OperatorDef,
 };
-use tla_core::{single_bound_var_names, FileId, Spanned};
+use tla_core::{single_bound_var_names, Spanned};
 
-use crate::eval::{has_complete_builtin_override, should_prefer_builtin_override, EvalCtx};
+use crate::eval::{should_prefer_builtin_override, EvalCtx};
 use crate::var_index::VarIndex;
 
 use super::dependencies::ActionDependencies;
@@ -116,6 +116,42 @@ pub(crate) fn extract_dependencies_ast_expr(
     deps: &mut ActionDependencies,
 ) {
     DepExtractor::new(ctx, ResolutionPolicy::from_env()).walk(expr, deps);
+}
+
+/// Whether an expanded action expression is safe to evaluate through a
+/// per-action replay route.
+///
+/// This is deliberately separate from the production POR policy. Replay
+/// safety needs only to reject executable residue whose result/effects can
+/// depend on evaluation order or live checker context; it does not use the
+/// extracted footprint to prune transitions or admit native code. Walking
+/// pure recursive operator bodies is therefore both necessary (ordinary TLA+
+/// recursion is deterministic) and safe here, even though that precision is
+/// default-off for POR/native admission after its independent miscompile
+/// evidence. Call-graph cycles are cut by `DepExtractor::resolving`, while
+/// unknown, higher-order, config-substituted, random, I/O, time, and TLC
+/// context residue still marks the expression opaque and fails closed.
+pub(crate) fn replay_expr_is_context_free(ctx: &EvalCtx, expr: &Expr) -> bool {
+    replay_expr_context_rejection(ctx, expr).is_none()
+}
+
+/// First fail-closed reason preventing an expression from being replayed.
+///
+/// Kept separate from the Boolean admission predicate so the normal path does
+/// not format or print diagnostics.  The adaptive router calls this only when
+/// its explicit diagnostic flag is enabled.
+pub(crate) fn replay_expr_context_rejection(ctx: &EvalCtx, expr: &Expr) -> Option<String> {
+    let mut deps = ActionDependencies::new();
+    let mut extractor = DepExtractor::new(
+        ctx,
+        ResolutionPolicy {
+            operator_bodies: true,
+            except_at: true,
+        },
+    );
+    extractor.reject_unknown_runtime_calls = true;
+    extractor.walk(expr, &mut deps);
+    deps.opaque_reason
 }
 
 /// Extract dependencies under an EXPLICIT [`ResolutionPolicy`] instead of the
@@ -261,10 +297,39 @@ fn gate_enabled_default_on(name: &str) -> bool {
 /// genuinely state-independent.
 const BUILTIN_CONSTANT_SETS: [&str; 6] = ["Nat", "Int", "Real", "Infinity", "BOOLEAN", "STRING"];
 
+/// Whether evaluating a builtin constant can do so without assigning a
+/// globally observable first-seen token. The mathematical infinite sets are
+/// represented as model values by the interpreter; BOOLEAN/STRING do not use
+/// either token registry.
+fn replay_stable_builtin_constant(name: &str) -> bool {
+    !matches!(name, "Nat" | "Int" | "Real" | "Infinity")
+        || (tla_value::lookup_tlc_string_token(name).is_some()
+            && tla_value::lookup_model_value_index_str(name).is_some())
+}
+
+/// Whether one residual application is a deterministic, context-free runtime
+/// builtin under evidence carried by this exact AST node.
+///
+/// Most accepted builtins are name/arity-dispatched and live in the shared
+/// positive list. `\\o` needs a stricter rule: it is overloaded for strings,
+/// and string concatenation eagerly interns the result, making global TLC
+/// string-token order observable. A literal tuple on the LEFT proves the
+/// evaluator cannot take that string branch. The tuple's elements and the
+/// right operand are still walked normally, so any effectful/contextual
+/// residue inside them fails closed.
+fn replay_stable_application(name: &str, args: &[Spanned<Expr>]) -> bool {
+    crate::enumerate::is_replay_stable_named_builtin(name, args.len())
+        || (name == "\\o"
+            && args.len() == 2
+            && args
+                .first()
+                .is_some_and(|left| matches!(&left.node, Expr::Tuple(_))))
+}
+
 /// Name-dispatched builtins that are impure or context-dependent: their value
 /// is not a pure function of their (walked) arguments, so an application must
 /// mark the action opaque. Pure builtins (`Append`, `Len`, `Cardinality`,
-/// `SubSeq`, folds, ...) read state only through arguments and stay benign.
+/// numeric folds, ...) read state only through arguments and stay benign.
 fn is_impure_or_context_dependent_builtin(name: &str) -> bool {
     name.starts_with("IO")
         || name.starts_with("Random")
@@ -362,6 +427,12 @@ struct DepExtractor<'a> {
     /// Which precision analyses this extraction may use (WP-25: both are
     /// DEFAULT-OFF opt-in gates).
     policy: ResolutionPolicy,
+    /// Replay changes evaluation order, so an unresolved applied name cannot
+    /// be treated like POR's "evaluation will fail loudly" residue. Future
+    /// runtime builtins could be context-dependent or effectful; the replay
+    /// certificate therefore accepts only a resolved operator or a recognized
+    /// complete builtin override.
+    reject_unknown_runtime_calls: bool,
 }
 
 impl<'a> DepExtractor<'a> {
@@ -375,6 +446,7 @@ impl<'a> DepExtractor<'a> {
             resolved: FxHashSet::default(),
             resolve_budget: MAX_OPERATOR_RESOLVE_BODIES,
             policy,
+            reject_unknown_runtime_calls: false,
         }
     }
 
@@ -389,6 +461,26 @@ impl<'a> DepExtractor<'a> {
             } else {
                 *count -= 1;
             }
+        }
+    }
+
+    /// Require a syntactic runtime name to have a fixed TLC string token
+    /// before replay can change evaluation order. Quantifier variables,
+    /// function/LAMBDA bounds, and operator formals are eagerly interned by the
+    /// evaluator and share the same first-seen table as semantic strings.
+    fn require_replay_name_token(
+        &self,
+        name: &str,
+        kind: &str,
+        deps: &mut ActionDependencies,
+    ) -> bool {
+        if self.reject_unknown_runtime_calls && tla_value::lookup_tlc_string_token(name).is_none() {
+            deps.mark_opaque(format!(
+                "{kind} `{name}` has no pre-existing TLC string token"
+            ));
+            false
+        } else {
+            true
         }
     }
 
@@ -464,6 +556,15 @@ impl<'a> DepExtractor<'a> {
         if def
             .params
             .iter()
+            .any(|param| !self.require_replay_name_token(&param.name.node, "operator formal", deps))
+        {
+            // The exact reason is already recorded. Return true so the caller
+            // does not replace it with a generic un-inlined-call diagnostic.
+            return true;
+        }
+        if def
+            .params
+            .iter()
             .any(|p| self.ctx.var_registry().get(&p.name.node).is_some())
         {
             // A formal shadowing a state-variable name would be resolved as
@@ -497,14 +598,15 @@ impl<'a> DepExtractor<'a> {
     }
 
     /// Classify a zero-arg operator folded by
-    /// `precompute_constant_operators`. `Some(true)` is concrete data;
-    /// `Some(false)` is a deferred expression value (Closure/LazyFunc/SetPred)
-    /// that may consult live state or runtime context when consumed later.
-    fn precomputed_constant_is_concrete(&self, name: &str) -> Option<bool> {
+    /// `precompute_constant_operators`. `Some(true)` is concrete data whose
+    /// TLC ordering tokens are already fixed; `Some(false)` is either deferred
+    /// executable data (Closure/LazyFunc/SetPred) or concrete data whose later
+    /// comparison could still assign a first-seen string/model/record token.
+    fn precomputed_constant_is_replay_safe_data(&self, name: &str) -> Option<bool> {
         use tla_core::name_intern::lookup_name_id;
         lookup_name_id(name)
             .and_then(|id| self.ctx.precomputed_constants().get(&id))
-            .map(|value| value.is_concrete_data())
+            .map(|value| value.is_concrete_data() && value.has_preassigned_tlc_order_tokens())
     }
 
     /// Whether a residual `@` is bound by an enclosing EXCEPT replacement
@@ -555,6 +657,12 @@ impl<'a> DepExtractor<'a> {
         if self.bound.contains_key(name) || self.covered.contains_key(name) {
             return; // binder-scoped variable / LET-covered operator
         }
+        if self.ctx.name_in_local_scope(name) {
+            deps.mark_opaque(format!(
+                "ambient local binding or operator `{name}` may shadow runtime lookup"
+            ));
+            return;
+        }
         if let Some(var) = self.ctx.var_registry().get(name) {
             // State variable that was not rewritten to Expr::StateVar —
             // record the read instead of losing it.
@@ -579,26 +687,26 @@ impl<'a> DepExtractor<'a> {
             let is_concrete = self
                 .ctx
                 .lookup(name)
-                .map(|value| value.is_concrete_data())
+                .map(|value| value.is_concrete_data() && value.has_preassigned_tlc_order_tokens())
                 // Normal setup promotes env constants before rebuilding this
                 // analysis, and the ident-hint fast path may then bypass env
                 // lookup. Inspect the authoritative promoted value as well.
-                .or_else(|| self.precomputed_constant_is_concrete(name))
+                .or_else(|| self.precomputed_constant_is_replay_safe_data(name))
                 .unwrap_or(false);
             if is_concrete {
                 return;
             }
             deps.mark_opaque(format!(
-                "non-concrete config constant `{name}` may contain executable state-dependent data"
+                "config constant `{name}` is executable or has unassigned TLC ordering tokens"
             ));
             return;
         }
-        if let Some(is_concrete) = self.precomputed_constant_is_concrete(name) {
+        if let Some(is_concrete) = self.precomputed_constant_is_replay_safe_data(name) {
             if is_concrete {
                 return;
             }
             deps.mark_opaque(format!(
-                "non-concrete precomputed operator `{name}` may execute against live state"
+                "precomputed operator `{name}` is executable or has unassigned TLC ordering tokens"
             ));
             return;
         }
@@ -615,15 +723,28 @@ impl<'a> DepExtractor<'a> {
             // exact definition is replaced by the builtin. In particular, do
             // not absolve a state-dependent user `Nat == FuncDef(...)` merely
             // because its spelling is also a builtin constant set.
-            if BUILTIN_CONSTANT_SETS.contains(&name)
-                && should_prefer_builtin_override(name, &def, 0, self.ctx)
-            {
+            if should_prefer_builtin_override(name, &def, 0, self.ctx) {
+                if is_impure_or_context_dependent_builtin(name)
+                    || (!BUILTIN_CONSTANT_SETS.contains(&name)
+                        && !crate::enumerate::is_replay_stable_named_builtin(name, 0))
+                    || !replay_stable_builtin_constant(name)
+                {
+                    deps.mark_opaque(format!(
+                        "runtime-sensitive or unknown nullary builtin `{name}`"
+                    ));
+                }
                 return;
             }
             if def.params.is_empty() && self.resolve_operator_body(name, &def, 0, deps) {
                 return;
             }
         } else if BUILTIN_CONSTANT_SETS.contains(&name) {
+            if replay_stable_builtin_constant(name) {
+                return;
+            }
+            deps.mark_opaque(format!(
+                "builtin constant `{name}` has no pre-existing TLC model/string token"
+            ));
             return;
         }
         deps.mark_opaque(format!("un-inlined operator/unknown identifier `{name}`"));
@@ -640,6 +761,12 @@ impl<'a> DepExtractor<'a> {
             return;
         }
         if self.bound.contains_key(name) || self.covered.contains_key(name) {
+            return;
+        }
+        if self.ctx.name_in_local_scope(name) {
+            deps.mark_opaque(format!(
+                "ambient local operator reference `{name}` may shadow runtime lookup"
+            ));
             return;
         }
         if self.ctx.op_replacements().contains_key(name) {
@@ -686,10 +813,24 @@ impl<'a> DepExtractor<'a> {
                     // LET-defined operator: its body's deps were extracted at
                     // the Let arm (params scoped), so the application adds
                     // only the argument deps walked below.
+                    if self.reject_unknown_runtime_calls
+                        && is_impure_or_context_dependent_builtin(name)
+                    {
+                        deps.mark_opaque(format!(
+                            "runtime-sensitive builtin spelling `{name}` in covered scope"
+                        ));
+                    }
                 } else if self.bound.contains_key(name) {
                     // Higher-order operator PARAMETER applied — behavior
                     // unknowable at this site.
                     deps.mark_opaque(format!("application of bound operator parameter `{name}`"));
+                } else if self.ctx.name_in_local_scope(name) {
+                    // eval_apply consults a binding-chain Closure before
+                    // replacements, global definitions, and builtins. The
+                    // static spelling therefore cannot certify this call.
+                    deps.mark_opaque(format!(
+                        "application of ambient local binding or operator `{name}`"
+                    ));
                 } else if self.ctx.op_replacements().contains_key(name) {
                     // Runtime resolves the target before dispatch. Classifying
                     // only the source spelling can miss a context-dependent
@@ -706,23 +847,35 @@ impl<'a> DepExtractor<'a> {
                     // the call (capture-unsafe, recursion re-entry, builtin
                     // override kept the token). Benign when the runtime
                     // provably dispatches a complete pure Rust builtin instead
-                    // of the definition body (module-scoped overrides are
-                    // shadowed by same-named MAIN-module definitions, so
-                    // require the def to come from a library module) —
-                    // otherwise walk the definition body itself, and fail
-                    // closed only if that cannot be done exactly.
-                    let builtin_replaces_def = {
-                        let resolved = self.ctx.resolve_op_name(name);
-                        has_complete_builtin_override(resolved, args.len(), self.ctx)
-                            && def.name.span.file != FileId(0)
-                    };
-                    if !builtin_replaces_def
-                        && !self.resolve_operator_body(name, &def, args.len(), deps)
-                    {
+                    // of the definition body. `should_prefer_builtin_override`
+                    // is the evaluator's authoritative predicate and protects
+                    // same-named MAIN-module shadows. Context-dependent or
+                    // effectful builtin targets remain opaque; otherwise walk
+                    // the definition body and fail closed if it cannot be done
+                    // exactly.
+                    let resolved = self.ctx.resolve_op_name(name);
+                    let builtin_replaces_def =
+                        should_prefer_builtin_override(resolved, &def, args.len(), self.ctx);
+                    if builtin_replaces_def {
+                        if is_impure_or_context_dependent_builtin(resolved)
+                            || !crate::enumerate::is_replay_stable_named_builtin(
+                                resolved,
+                                args.len(),
+                            )
+                        {
+                            deps.mark_opaque(format!(
+                                "runtime-sensitive or unknown builtin `{resolved}`"
+                            ));
+                        }
+                    } else if !self.resolve_operator_body(name, &def, args.len(), deps) {
                         deps.mark_opaque(format!("un-inlined operator application `{name}`"));
                     }
                 } else if is_impure_or_context_dependent_builtin(name) {
                     deps.mark_opaque(format!("impure/context-dependent builtin `{name}`"));
+                } else if self.reject_unknown_runtime_calls
+                    && !replay_stable_application(name, args)
+                {
+                    deps.mark_opaque(format!("unknown runtime operator `{name}`"));
                 }
                 // else: name-dispatched PURE builtin (Append, Len,
                 // Cardinality, ...) — reads state only through the walked
@@ -751,6 +904,7 @@ impl<'a> DepExtractor<'a> {
                 self.walk(&domain.node, deps);
             }
             for name in single_bound_var_names(bound) {
+                self.require_replay_name_token(&name, "bound variable", deps);
                 Self::push_name(&mut self.bound, &name);
                 pushed.push(name);
             }
@@ -766,9 +920,15 @@ impl<'a> DepExtractor<'a> {
     /// is opaque (fail closed — e.g. `f[i]' = e` partially writes `f`).
     fn walk_prime(&mut self, inner: &Spanned<Expr>, deps: &mut ActionDependencies) {
         match &inner.node {
-            Expr::StateVar(_, idx, _) => deps.add_write(VarIndex(*idx)),
+            Expr::StateVar(name, idx, _) => {
+                // Partial-next-state fallback exposes the variable name as a
+                // runtime string before looking in the current state.
+                self.require_replay_name_token(name, "primed state variable", deps);
+                deps.add_write(VarIndex(*idx));
+            }
             Expr::Ident(name, _) => {
                 if let Some(var) = self.ctx.var_registry().get(name) {
+                    self.require_replay_name_token(name, "primed state variable", deps);
                     deps.add_write(var);
                 } else {
                     deps.mark_opaque(format!("primed non-variable expression `{name}'`"));
@@ -796,13 +956,15 @@ impl<'a> DepExtractor<'a> {
     /// unknowable (fail closed).
     fn walk_unchanged(&mut self, expr: &Expr, deps: &mut ActionDependencies) {
         match expr {
-            Expr::StateVar(_, idx, _) => {
+            Expr::StateVar(name, idx, _) => {
                 // Only record as identity write. Do NOT add_read — the "read"
                 // in UNCHANGED x is vacuous for commutativity purposes.
+                self.require_replay_name_token(name, "UNCHANGED state variable", deps);
                 deps.add_unchanged(VarIndex(*idx));
             }
             Expr::Ident(name, _) => {
                 if let Some(var) = self.ctx.var_registry().get(name) {
+                    self.require_replay_name_token(name, "UNCHANGED state variable", deps);
                     deps.add_unchanged(var);
                 } else {
                     deps.mark_opaque(format!("UNCHANGED over unresolved identifier `{name}`"));
@@ -866,7 +1028,20 @@ impl<'a> DepExtractor<'a> {
 
     fn walk(&mut self, expr: &Expr, deps: &mut ActionDependencies) {
         match expr {
-            Expr::Bool(_) | Expr::Int(_) | Expr::String(_) => {}
+            Expr::Bool(_) | Expr::Int(_) => {}
+            Expr::String(value) => {
+                // String construction assigns TLC's global first-seen token.
+                // A replay route may only read a token fixed by the canonical
+                // prefix; otherwise action regrouping could change CHOOSE or
+                // normalized-set order even when the string text is equal.
+                if self.reject_unknown_runtime_calls
+                    && tla_value::lookup_tlc_string_token(value).is_none()
+                {
+                    deps.mark_opaque(format!(
+                        "string literal `{value}` has no pre-existing TLC token"
+                    ));
+                }
+            }
             Expr::Ident(name, _) => self.classify_bare_ident(name, deps),
             Expr::StateVar(_, idx, _) => {
                 deps.add_read(VarIndex(*idx));
@@ -916,6 +1091,7 @@ impl<'a> DepExtractor<'a> {
             }
             Expr::Lambda(params, body) => {
                 for p in params {
+                    self.require_replay_name_token(&p.node, "lambda formal", deps);
                     Self::push_name(&mut self.bound, &p.node);
                 }
                 self.walk(&body.node, deps);
@@ -974,6 +1150,13 @@ impl<'a> DepExtractor<'a> {
                 self.walk(&arg.node, deps);
             }
             Expr::Domain(inner) => {
+                if self.reject_unknown_runtime_calls {
+                    // DOMAIN(record) manufactures string values from record
+                    // field names and can assign first-seen TLC tokens. The
+                    // result is therefore not a structural function of the
+                    // walked record value under replay.
+                    deps.mark_opaque("DOMAIN may create TLC string tokens".to_string());
+                }
                 self.walk(&inner.node, deps);
             }
             Expr::Except(base, specs) => {
@@ -999,7 +1182,29 @@ impl<'a> DepExtractor<'a> {
                 self.walk(&range.node, deps);
             }
 
-            Expr::Record(fields) | Expr::RecordSet(fields) => {
+            Expr::Record(fields) => {
+                for (field, value) in fields {
+                    if self.reject_unknown_runtime_calls
+                        && tla_value::lookup_tlc_string_token(&field.node).is_none()
+                    {
+                        // A record keeps NameId keys without creating string
+                        // values. Later comparison against a general function
+                        // materializes those keys as strings, so replay may
+                        // only admit fields whose TLC order is already fixed.
+                        deps.mark_opaque(format!(
+                            "record field `{}` has no pre-existing TLC token",
+                            field.node
+                        ));
+                    }
+                    self.walk(&value.node, deps);
+                }
+            }
+            Expr::RecordSet(fields) => {
+                if self.reject_unknown_runtime_calls {
+                    // Record-set construction converts field names to runtime
+                    // strings, assigning TLC ordering tokens on first use.
+                    deps.mark_opaque("record-set construction may create TLC string tokens");
+                }
                 for (_, value) in fields {
                     self.walk(&value.node, deps);
                 }
@@ -1055,12 +1260,31 @@ impl<'a> DepExtractor<'a> {
                 // actually referenced).
                 let names: Vec<&str> = defs.iter().map(|d| d.name.node.as_str()).collect();
                 for name in &names {
+                    self.require_replay_name_token(name, "LET operator", deps);
                     Self::push_name(&mut self.covered, name);
                 }
                 for def in defs {
+                    if self.reject_unknown_runtime_calls
+                        && should_prefer_builtin_override(
+                            self.ctx.resolve_op_name(&def.name.node),
+                            def,
+                            def.params.len(),
+                            self.ctx,
+                        )
+                        && !crate::enumerate::is_replay_stable_named_builtin(
+                            self.ctx.resolve_op_name(&def.name.node),
+                            def.params.len(),
+                        )
+                    {
+                        deps.mark_opaque(format!(
+                            "runtime-sensitive or unknown LET builtin `{}`",
+                            def.name.node
+                        ));
+                    }
                     let params: Vec<&str> =
                         def.params.iter().map(|p| p.name.node.as_str()).collect();
                     for p in &params {
+                        self.require_replay_name_token(p, "LET operator formal", deps);
                         Self::push_name(&mut self.bound, p);
                     }
                     self.walk(&def.body.node, deps);
@@ -1083,19 +1307,41 @@ impl<'a> DepExtractor<'a> {
                 // `UNCHANGED x`. Part of #3993.
                 if let Some(identity_var) = detect_identity_assignment(left, right) {
                     deps.add_unchanged(identity_var);
+                    if self.reject_unknown_runtime_calls {
+                        // Footprint shortcuts must not become replay-safety
+                        // shortcuts. Prime fallback names and token-producing
+                        // operands still need the full context/effect walk.
+                        self.walk(&left.node, deps);
+                        self.walk(&right.node, deps);
+                    }
                 }
                 // Part of #3993 Phase 11: detect identity through IF/THEN/ELSE and CASE.
                 // `x' = IF cond THEN x ELSE x` is equivalent to UNCHANGED x.
                 else if let Some(identity_var) = detect_identity_through_if(left, right) {
-                    // The condition expression may read state variables — track those reads.
-                    self.walk_condition_reads_from_branching(right, deps);
                     deps.add_unchanged(identity_var);
+                    if self.reject_unknown_runtime_calls {
+                        // The identity proof skips equal-valued branches and
+                        // LET structure for POR. Replay must still inspect all
+                        // of it for eagerly interned names and effects.
+                        self.walk(&left.node, deps);
+                        self.walk(&right.node, deps);
+                    } else {
+                        // The condition expression may read state variables — track those reads.
+                        self.walk_condition_reads_from_branching(right, deps);
+                    }
                 }
                 // Part of #3993 Phase 11: detect EXCEPT identity pattern.
                 // `f' = [f EXCEPT ![k] = f[k]]` means the action reads f[k] and
                 // writes back the same value — a no-op on f. Treat as identity.
                 else if let Some(identity_var) = detect_except_identity(left, right) {
                     deps.add_unchanged(identity_var);
+                    if self.reject_unknown_runtime_calls {
+                        // EXCEPT paths/replacements can contain string and
+                        // record constructors even when the update is an
+                        // extensional identity.
+                        self.walk(&left.node, deps);
+                        self.walk(&right.node, deps);
+                    }
                 }
                 // Part of #3993 Phase 11: constant write detection.
                 // `x' = 0` (state-independent RHS) means the action writes x but
@@ -1103,6 +1349,13 @@ impl<'a> DepExtractor<'a> {
                 else if let Some(write_var) = detect_constant_write(left, right) {
                     deps.add_write(write_var);
                     // Do NOT add a read for the written variable — the value is constant.
+                    if self.reject_unknown_runtime_calls {
+                        // Constant for dependency purposes does not mean
+                        // effect-free: strings, records, record sets, and
+                        // future builtin residue can assign global tokens.
+                        self.walk(&left.node, deps);
+                        self.walk(&right.node, deps);
+                    }
                 } else {
                     self.walk(&left.node, deps);
                     self.walk(&right.node, deps);

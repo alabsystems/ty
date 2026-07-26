@@ -76,7 +76,6 @@
 
 use std::collections::HashMap;
 use tla_value::Rp;
-use std::sync::Arc;
 
 use num_traits::ToPrimitive;
 use tla_value::value::SortedSet;

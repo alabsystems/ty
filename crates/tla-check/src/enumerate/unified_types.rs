@@ -339,4 +339,11 @@ pub(super) struct EnumMut<'a> {
     /// The current outer conjunction owns a complete-action certificate.
     /// This authorizes exact evaluator-compatible INSTANCE call preparation.
     pub certified_complete_action: bool,
+    /// Whether TLC proof-path DFS emits directly to the caller's sink.
+    ///
+    /// False for the hidden-prime validation path, whose provisional successors
+    /// are first materialized in an uncapped local Vec. Expanding proof paths
+    /// there could allocate an unbounded intermediate before the real sink can
+    /// signal Break or enforce its cap.
+    pub allow_tlc_proof_dfs: bool,
 }

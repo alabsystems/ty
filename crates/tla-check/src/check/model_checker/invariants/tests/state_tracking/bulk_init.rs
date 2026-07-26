@@ -46,6 +46,40 @@ Next == x' = x
 
 #[cfg_attr(test, ntest::timeout(10000))]
 #[test]
+fn test_vec_init_solver_preserves_raw_duplicate_multiplicity() {
+    let module = parse_module(
+        r#"
+---- MODULE InitVecRawMultiplicity ----
+VARIABLE x
+Init == x \in {0, 1} \/ x = 0
+Next == FALSE
+====
+"#,
+    );
+    let config = Config {
+        init: Some("Init".to_string()),
+        next: Some("Next".to_string()),
+        ..Default::default()
+    };
+    let mut mc = ModelChecker::new(&module, &config);
+
+    let (states, raw_initial_states_generated) = mc
+        .solve_predicate_for_states_with_raw_count("Init")
+        .expect("Vec Init solve should succeed");
+
+    assert_eq!(
+        states.len(),
+        2,
+        "Vec result remains semantically deduplicated"
+    );
+    assert_eq!(
+        raw_initial_states_generated, 3,
+        "raw count must retain the duplicate x = 0 branch"
+    );
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
 fn test_solve_predicate_for_states_to_bulk_fallback_candidate_filtering() {
     let module = parse_module(
         r#"
@@ -245,9 +279,15 @@ Next == FALSE
 
     match mc.solve_predicate_for_states_to_bulk_prechecked("Init") {
         Err(CheckResult::InvariantViolation {
-            invariant, trace, ..
+            invariant,
+            trace,
+            stats,
         }) => {
             assert_eq!(invariant, "Inv");
+            assert_eq!(
+                stats.raw_initial_states_generated, 1,
+                "the first violating Init state must be reflected in terminal work accounting"
+            );
             assert_eq!(
                 trace.states.len(),
                 1,
@@ -264,6 +304,42 @@ Next == FALSE
             panic!("expected init invariant violation from prechecked bulk solve, got {other:?}")
         }
     }
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_prechecked_candidate_terminal_counts_only_states_satisfying_init() {
+    let module = parse_module(
+        r#"
+---- MODULE InitBulkPrecheckedCandidateCount ----
+EXTENDS Naturals
+VARIABLE x
+TypeOK == x \in 0..3
+Init == TypeOK /\ x >= 1 /\ x <= 2
+Inv == x < 2
+Next == FALSE
+====
+"#,
+    );
+    let config = Config {
+        init: Some("Init".to_string()),
+        next: Some("Next".to_string()),
+        invariants: vec!["Inv".to_string()],
+        ..Default::default()
+    };
+    let mut mc = ModelChecker::new(&module, &config);
+
+    let result = match mc.solve_predicate_for_states_to_bulk_prechecked("Init") {
+        Err(result) => result,
+        Ok(_) => panic!("x = 2 should violate Inv"),
+    };
+    assert_eq!(
+        result.stats().raw_initial_states_generated,
+        2,
+        "candidate x = 0 does not satisfy Init; x = 1 and violating x = 2 do"
+    );
+    assert_eq!(result.stats().states_generated(), 2);
+    assert_eq!(mc.stats.raw_initial_states_generated, 2);
 }
 
 #[cfg_attr(test, ntest::timeout(10000))]
@@ -297,8 +373,8 @@ Next == FALSE
     let storage = bulk_init.storage;
 
     assert_eq!(
-        enumeration.generated, 1,
-        "only the constraint-admitted state should survive prechecked enumeration"
+        enumeration.generated, 2,
+        "raw generation must count both Init states before the state constraint"
     );
     assert_eq!(enumeration.added, 1);
     assert_eq!(storage.len(), 1);
@@ -342,10 +418,14 @@ Next == FALSE
             property,
             kind,
             trace,
-            ..
+            stats,
         }) => {
             assert_eq!(property, "BadInit");
             assert_eq!(kind, crate::check::PropertyViolationKind::StateLevel);
+            assert_eq!(
+                stats.raw_initial_states_generated, 1,
+                "the first violating Init state must be reflected in terminal work accounting"
+            );
             assert_eq!(
                 trace.states.len(),
                 1,

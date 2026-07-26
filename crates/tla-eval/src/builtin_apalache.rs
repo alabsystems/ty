@@ -20,7 +20,6 @@ use super::{
     apply_closure_with_values, check_arity, create_closure_from_arg, eval,
     eval_iter_set_tlc_normalized, EvalCtx, EvalError, EvalResult, Expr, Span, Spanned, Value,
 };
-use std::sync::Arc;
 use tla_value::Rp;
 
 pub(super) fn eval_builtin_apalache(

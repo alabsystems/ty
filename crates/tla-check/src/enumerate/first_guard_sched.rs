@@ -23,10 +23,10 @@
 
 #[cfg(test)]
 use std::cell::Cell;
-#[cfg(test)]
-use tla_value::Rp;
 use std::cell::RefCell;
 use std::sync::Arc;
+#[cfg(test)]
+use tla_value::Rp;
 
 use rustc_hash::FxHashMap;
 use tla_core::ast::{BoundVar, Expr, OperatorDef};

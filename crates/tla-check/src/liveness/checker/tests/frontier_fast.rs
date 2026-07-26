@@ -137,7 +137,7 @@ fn test_fast_path_equivalence_cycle() {
                 checker_fast
                     .graph()
                     .get_node_info(&node)
-                    .is_some_and(|info| info.successors.contains(&node))
+                    .is_some_and(|info| info.successors().contains(&node))
             }
         })
         .collect();
@@ -164,7 +164,7 @@ fn test_fast_path_equivalence_cycle() {
                 checker_full
                     .graph()
                     .get_node_info(&node)
-                    .is_some_and(|info| info.successors.contains(&node))
+                    .is_some_and(|info| info.successors().contains(&node))
             }
         })
         .collect();
@@ -201,7 +201,7 @@ fn test_fast_path_preserves_self_loops() {
         .get_node_info(&bg_node)
         .expect("node should exist in graph");
     assert!(
-        info.successors.contains(&bg_node),
+        info.successors().contains(&bg_node),
         "fast path must preserve self-loop edges (TLC stuttering detection requires this)"
     );
 }

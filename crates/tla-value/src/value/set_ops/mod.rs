@@ -16,6 +16,7 @@ mod set_compound_ops;
 mod set_pred;
 mod span_normalize;
 
+pub(crate) use set_binary_ops::clear_set_cup_membership_cache;
 pub use set_binary_ops::{SetCapValue, SetCupValue, SetDiffValue};
 pub use set_compound_ops::{SeqSetValue, UnionValue};
 pub use set_pred::{SetPredCaptures, SetPredIdentity, SetPredIdentityVisitor, SetPredValue};

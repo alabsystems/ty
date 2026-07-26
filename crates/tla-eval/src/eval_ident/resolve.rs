@@ -521,18 +521,7 @@ fn eval_ident_slow(
             }
             if let crate::binding_chain::BindingSourceRef::Instance(_) = source {
                 if let Some(lazy) = bv.as_lazy() {
-                    let lazy_ptr = lazy as *const crate::binding_chain::LazyBinding as usize;
-                    if let Some(cached) =
-                        crate::cache::small_caches::instance_lazy_cache_get(lazy_ptr, mode as u8)
-                    {
-                        lazy_binding_cache_hit_deps(
-                            ctx,
-                            lazy,
-                            source,
-                            &cached,
-                            resolved_op_name_id,
-                            mode,
-                        );
+                    if let Some(cached) = crate::instance_lazy_cache_hit(ctx, lazy, mode) {
                         return Ok(cached);
                     }
                 }

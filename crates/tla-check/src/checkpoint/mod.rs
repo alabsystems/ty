@@ -55,7 +55,7 @@ use std::path::Path;
 use std::time::SystemTime;
 
 /// Checkpoint version
-const CHECKPOINT_VERSION: u32 = 1;
+const CHECKPOINT_VERSION: u32 = 2;
 
 /// Checkpoint metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,8 +90,12 @@ pub struct CheckpointStats {
     pub states_found: usize,
     /// Number of initial states.
     pub initial_states: usize,
+    /// Number of initial states generated before constraints and deduplication.
+    pub raw_initial_states_generated: usize,
     /// Transitions explored so far.
     pub transitions: usize,
+    /// Raw successors generated before constraints/reductions.
+    pub raw_successors_generated: usize,
     /// Maximum BFS depth reached so far.
     pub max_depth: usize,
     /// Number of states in the unexplored frontier at checkpoint time.
@@ -103,7 +107,9 @@ impl From<&CheckStats> for CheckpointStats {
         CheckpointStats {
             states_found: stats.states_found,
             initial_states: stats.initial_states,
+            raw_initial_states_generated: stats.raw_initial_states_generated,
             transitions: stats.transitions,
+            raw_successors_generated: stats.raw_successors_generated,
             max_depth: stats.max_depth,
             frontier_size: 0, // Set separately
         }

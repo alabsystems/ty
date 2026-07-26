@@ -834,6 +834,23 @@ impl FingerprintSet for FingerprintStorage {
         FingerprintStorage::stats(self)
     }
 
+    fn release_terminal_entries(&mut self) -> Option<usize> {
+        match self {
+            FingerprintStorage::InMemory {
+                set,
+                last_warned_multiple,
+                ..
+            } => {
+                let entries = std::mem::replace(set.get_mut(), crate::state::fp_hashset());
+                let len = entries.len();
+                last_warned_multiple.store(0, AtomicOrdering::Relaxed);
+                drop(entries);
+                Some(len)
+            }
+            FingerprintStorage::Mmap(_) | FingerprintStorage::Disk(_) => None,
+        }
+    }
+
     fn prefers_disk_successor_graph(&self) -> bool {
         matches!(self, FingerprintStorage::Disk(_))
     }

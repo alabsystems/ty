@@ -17,7 +17,8 @@
 
 use super::{BehaviorGraphNode, LivenessChecker, TirProgram};
 use crate::error::{EvalError, EvalResult};
-use crate::state::{Fingerprint, State};
+use crate::state::{compute_fingerprint_from_compact_array, ArrayState, Fingerprint, State};
+use crate::var_index::VarRegistry;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -98,6 +99,46 @@ impl LivenessChecker {
             {
                 let bg_node = BehaviorGraphNode::new(state_fp, tableau_idx);
                 added.push(bg_node);
+                self.stats.graph_nodes += 1;
+            }
+        }
+
+        self.stats.states_explored += 1;
+        Ok(added)
+    }
+
+    /// Seed an initial state whose authoritative compact payload already
+    /// exists. The transient `State` is used only for tableau consistency; the
+    /// graph retains the Arc-backed `ArrayState` supplied by the caller.
+    fn add_initial_array_state_with_fp<F>(
+        &mut self,
+        array_state: &ArrayState,
+        state: &State,
+        state_fp: Fingerprint,
+        get_successors: &mut F,
+        tir: Option<&TirProgram<'_>>,
+    ) -> EvalResult<Vec<BehaviorGraphNode>>
+    where
+        F: FnMut(&State) -> EvalResult<Vec<State>>,
+    {
+        let mut added = Vec::new();
+
+        for tableau_idx in 0..self.tableau.init_count() {
+            let consistent = self.check_consistency_cached_with_fp(
+                state,
+                state_fp,
+                tableau_idx,
+                get_successors,
+                tir,
+            )?;
+            if consistent
+                && self.graph.try_add_init_array_state_with_fp(
+                    array_state,
+                    state_fp,
+                    tableau_idx,
+                )?
+            {
+                added.push(BehaviorGraphNode::new(state_fp, tableau_idx));
                 self.stats.graph_nodes += 1;
             }
         }
@@ -327,13 +368,6 @@ impl LivenessChecker {
         let mut queue: std::collections::VecDeque<BehaviorGraphNode> =
             std::collections::VecDeque::new();
 
-        // Flat-state mode: a shared or checker-owned compact ArrayState cache is
-        // installed, so we do NOT retain successor `Vec<State>` (only
-        // fingerprints, recorded in `add_successors_with_state_fp`). Successors
-        // are recomputed transiently per BFS node; the Vec is dropped at the end
-        // of each iteration.
-        let fp_mode = self.graph.has_compact_state_cache();
-
         // Add all initial states (with timing)
         let init_start = Instant::now();
         for init_state in init_states {
@@ -342,6 +376,66 @@ impl LivenessChecker {
             queue.extend(added);
         }
         self.stats.init_state_time_us += init_start.elapsed().as_micros() as u64;
+
+        self.explore_bfs_from_queue(queue, get_successors, tir, state_fp_of)
+    }
+
+    /// Explore from compact initial roots without retaining a `Vec<State>`.
+    ///
+    /// Only one root is materialized transiently at a time for tableau
+    /// consistency. The behavior graph shares each root's compact value array
+    /// and reconstructs full states lazily after seeding.
+    pub(crate) fn explore_bfs_with_raw_array_init_states<'a, F, I>(
+        &mut self,
+        init_states: I,
+        registry: &VarRegistry,
+        get_successors: &mut F,
+        tir: Option<&TirProgram<'_>>,
+    ) -> EvalResult<usize>
+    where
+        F: FnMut(&State) -> EvalResult<Vec<State>>,
+        I: IntoIterator<Item = &'a ArrayState>,
+    {
+        assert!(
+            self.graph.has_owned_state_cache(),
+            "compact initial roots require an owned behavior-graph cache"
+        );
+        let mut queue = std::collections::VecDeque::new();
+        let init_start = Instant::now();
+        for init_array in init_states {
+            // Do not trust ArrayState::fp_cache or the liveness-cache tuple
+            // fingerprint here: storage modes may rekey both into a compiled
+            // flat domain. OTF behavior graphs without VIEW/symmetry use the
+            // raw State fingerprint domain.
+            let init_state = init_array.to_state(registry);
+            let init_fp = init_state.fingerprint();
+            let added = self.add_initial_array_state_with_fp(
+                init_array,
+                &init_state,
+                init_fp,
+                get_successors,
+                tir,
+            )?;
+            queue.extend(added);
+        }
+        self.stats.init_state_time_us += init_start.elapsed().as_micros() as u64;
+
+        let mut raw_fp = |state: &State| Ok(state.fingerprint());
+        self.explore_bfs_from_queue(queue, get_successors, tir, &mut raw_fp)
+    }
+
+    fn explore_bfs_from_queue<F, G>(
+        &mut self,
+        mut queue: std::collections::VecDeque<BehaviorGraphNode>,
+        get_successors: &mut F,
+        tir: Option<&TirProgram<'_>>,
+        state_fp_of: &mut G,
+    ) -> EvalResult<usize>
+    where
+        F: FnMut(&State) -> EvalResult<Vec<State>>,
+        G: FnMut(&State) -> EvalResult<Fingerprint>,
+    {
+        let fp_mode = self.graph.has_compact_state_cache();
 
         // BFS exploration
         while let Some(current) = queue.pop_front() {
@@ -353,7 +447,15 @@ impl LivenessChecker {
             // Compute (and cache) state successors (with timing).
             // Arc-wrapped to avoid O(n) Vec<State> clones on every BFS cache hit.
             let get_start = Instant::now();
-            let state_successors: Arc<Vec<State>> = if fp_mode {
+            let state_successors: Arc<Vec<State>> = if self.graph.has_owned_state_cache()
+                && self.state_successor_fps.contains_key(&current.state_fp)
+            {
+                // A different tableau node for this same concrete state has
+                // already recorded the complete ordered state-graph adjacency
+                // before consistency pruning. Resolve those owned payloads
+                // instead of re-running Next for every product-graph node.
+                Arc::new(self.successor_states_for_enabled(current.state_fp)?)
+            } else if fp_mode {
                 // Transient: not retained — `add_successors_with_state_fp` keeps
                 // only the successor fingerprints.
                 Arc::new(get_successors(&state)?)
@@ -415,8 +517,6 @@ impl LivenessChecker {
     {
         let mut queue: std::collections::VecDeque<BehaviorGraphNode> =
             std::collections::VecDeque::new();
-        let fp_mode = self.graph.has_compact_state_cache();
-
         // Add all initial states with tableau_idx = 0 (no consistency check needed)
         let init_start = Instant::now();
         for init_state in init_states {
@@ -433,6 +533,60 @@ impl LivenessChecker {
         self.stats.init_state_time_us += init_start.elapsed().as_micros() as u64;
         self.stats.states_explored += init_states.len();
 
+        self.explore_state_graph_direct_from_queue(queue, get_successors, state_fp_of)
+    }
+
+    /// Direct state-graph exploration from compact initial roots.
+    ///
+    /// The no-tableau path never needs to materialize initial `State`s: their
+    /// fingerprints and payloads can be inserted directly into the graph.
+    pub(crate) fn explore_state_graph_direct_with_raw_array_init_states<'a, F, I>(
+        &mut self,
+        init_states: I,
+        registry: &VarRegistry,
+        get_successors: &mut F,
+    ) -> EvalResult<usize>
+    where
+        F: FnMut(&State) -> EvalResult<Vec<State>>,
+        I: IntoIterator<Item = &'a ArrayState>,
+    {
+        assert!(
+            self.graph.has_owned_state_cache(),
+            "compact initial roots require an owned behavior-graph cache"
+        );
+        let mut queue = std::collections::VecDeque::new();
+        let init_start = Instant::now();
+        let mut init_count = 0usize;
+        for init_array in init_states {
+            let init_fp = compute_fingerprint_from_compact_array(init_array.values(), registry);
+            if self
+                .graph
+                .try_add_init_array_state_with_fp(init_array, init_fp, 0)?
+            {
+                queue.push_back(BehaviorGraphNode::new(init_fp, 0));
+                self.stats.graph_nodes += 1;
+            }
+            init_count += 1;
+        }
+        self.stats.init_state_time_us += init_start.elapsed().as_micros() as u64;
+        self.stats.states_explored += init_count;
+
+        let mut raw_fp = |state: &State| Ok(state.fingerprint());
+        self.explore_state_graph_direct_from_queue(queue, get_successors, &mut raw_fp)
+    }
+
+    fn explore_state_graph_direct_from_queue<F, G>(
+        &mut self,
+        mut queue: std::collections::VecDeque<BehaviorGraphNode>,
+        get_successors: &mut F,
+        state_fp_of: &mut G,
+    ) -> EvalResult<usize>
+    where
+        F: FnMut(&State) -> EvalResult<Vec<State>>,
+        G: FnMut(&State) -> EvalResult<Fingerprint>,
+    {
+        let fp_mode = self.graph.has_compact_state_cache();
+
         // BFS exploration — state graph only, no tableau cross-product
         while let Some(current) = queue.pop_front() {
             let clone_start = Instant::now();
@@ -442,7 +596,13 @@ impl LivenessChecker {
             // Compute state successors. In compact mode they remain transient;
             // the exact ordered fingerprint list is retained below instead.
             let get_start = Instant::now();
-            let state_successors: Arc<Vec<State>> = if fp_mode {
+            let state_successors: Arc<Vec<State>> = if self.graph.has_owned_state_cache()
+                && self.state_successor_fps.contains_key(&current.state_fp)
+            {
+                // Reuse the complete ordered raw adjacency transferred from an
+                // earlier liveness group/property instead of re-running Next.
+                Arc::new(self.successor_states_for_enabled(current.state_fp)?)
+            } else if fp_mode {
                 Arc::new(get_successors(&state)?)
             } else if let Some(cached) = self.state_successors.get(&current.state_fp) {
                 Arc::clone(cached)

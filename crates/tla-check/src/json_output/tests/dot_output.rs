@@ -36,7 +36,6 @@ fn test_trace_to_dot_basic() {
 #[test]
 fn test_trace_to_dot_with_special_chars() {
     use crate::{State, Trace};
-    use std::sync::Arc;
 
     // Create state with values containing special DOT characters
     let state = State::from_pairs([("name", Value::String(Rp::from("test|value")))]);
@@ -57,7 +56,6 @@ fn test_trace_to_dot_with_special_chars() {
 fn test_trace_to_dot_with_sets() {
     use crate::value::SortedSet;
     use crate::{State, Trace};
-    use std::sync::Arc;
 
     // Create state with set value
     let state = State::from_pairs([(

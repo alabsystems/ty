@@ -1039,6 +1039,13 @@ fn bmc_value_to_json(val: &tla_ay::BmcValue) -> serde_json::Value {
                 .collect();
             serde_json::Value::Array(pairs)
         }
+        tla_ay::BmcValue::StringFunction(entries) => {
+            let pairs: Vec<serde_json::Value> = entries
+                .iter()
+                .map(|(key, value)| serde_json::json!([key, bmc_value_to_json(value)]))
+                .collect();
+            serde_json::Value::Array(pairs)
+        }
         tla_ay::BmcValue::Record(fields) => {
             let obj: serde_json::Map<String, serde_json::Value> = fields
                 .iter()

@@ -78,6 +78,20 @@ pub(crate) fn is_empty_init_no_solutions(e: &CheckError) -> bool {
     )
 }
 
+/// Choose the worker count and capacity hint for adaptive fingerprint storage.
+///
+/// The pilot's geometric state-space estimate is intentionally conservative
+/// and can greatly exceed the reachable set. A growable single-worker
+/// in-memory set must therefore start from the exact initial-state count, not
+/// eagerly reserve the estimate. Multi-worker Auto storage still needs the
+/// estimate to select ShardedDisk for genuinely large state spaces.
+fn auto_fingerprint_storage_plan(analysis: &PilotAnalysis) -> (usize, usize) {
+    match analysis.strategy {
+        Strategy::Parallel(workers) if workers > 1 => (workers, analysis.estimated_states),
+        Strategy::Sequential | Strategy::Parallel(_) => (1, analysis.initial_states),
+    }
+}
+
 /// Adaptive model checker
 pub struct AdaptiveChecker {
     /// Setup error detected during construction (e.g., missing referenced modules).
@@ -107,6 +121,8 @@ pub struct AdaptiveChecker {
     max_states: Option<usize>,
     /// Maximum depth limit
     max_depth: Option<usize>,
+    /// Absolute wall-clock deadline shared by pilot and selected checker.
+    deadline: Option<std::time::Instant>,
     /// Part of #2751: Memory limit in bytes
     memory_limit: Option<usize>,
     /// Part of #3282: Disk usage limit in bytes.
@@ -195,7 +211,8 @@ impl AdaptiveChecker {
         if let Some(ref resolved) = self.inline_next {
             pilot_checker.register_inline_next(resolved)?;
         }
-        let (num_initial, avg_branching_factor, states_sampled) = pilot_checker
+        self.apply_pilot_limits(&mut pilot_checker);
+        let (num_initial, avg_branching_factor, states_sampled, bounded_reachable) = pilot_checker
             .pilot_sample_init_and_branching_factor(&init_name, &next_name, PILOT_SAMPLE_SIZE)?;
 
         if num_initial == 0 {
@@ -207,7 +224,27 @@ impl AdaptiveChecker {
         // Estimate total states using geometric series approximation
         // For a BFS with branching factor b, after d levels: 1 + b + b^2 + ... + b^d
         // We estimate based on initial states and branching factor
-        let estimated_states = estimate_state_space(num_initial, avg_branching_factor);
+        let heuristic_estimate = estimate_state_space(num_initial, avg_branching_factor);
+
+        // Tiny-spec routing gate: when the bounded reachability BFS in the pilot
+        // proved the ENTIRE reachable set is tiny (`Some(exact)`), trust that
+        // exact count instead of the `initial * 50000` linear-growth heuristic,
+        // which otherwise misroutes finite low-branching specs (e.g. a 12-state
+        // HourClock) to parallel and reserves the ~256 MB CAS-FPSet floor. The
+        // bounded count is only `Some` when the reachable set fully fit under the
+        // cap, so this can only ever downgrade parallel -> sequential for
+        // provably-tiny specs — never de-parallelize a spec that outgrows the cap
+        // (those return `None` and keep the heuristic estimate). Take the MIN so
+        // the exact count never inflates the estimate above the heuristic.
+        let estimated_states = match bounded_reachable {
+            Some(exact) => exact.min(heuristic_estimate),
+            None => heuristic_estimate,
+        };
+        if std::env::var_os("TY_TINY_SEQ_DEBUG").is_some() {
+            eprintln!(
+                "[tiny-seq] run_pilot: num_initial={num_initial} bf={avg_branching_factor:.2} heuristic={heuristic_estimate} bounded={bounded_reachable:?} -> estimated={estimated_states}"
+            );
+        }
 
         // Select strategy based on estimate
         let strategy = select_strategy(estimated_states, self.available_cores);
@@ -219,6 +256,29 @@ impl AdaptiveChecker {
             strategy,
             states_sampled,
         })
+    }
+
+    /// Apply exploration limits to the pilot without transferring callbacks or
+    /// installing result storage. The routing pass is optional analysis, but it
+    /// runs evaluator code and allocates state data, so it must share the real
+    /// run's state/depth/RSS/disk/deadline/collision contract.
+    fn apply_pilot_limits(&self, checker: &mut ModelChecker<'_>) {
+        if let Some(limit) = self.max_states {
+            checker.set_max_states(limit);
+        }
+        if let Some(limit) = self.max_depth {
+            checker.set_max_depth(limit);
+        }
+        if let Some(deadline) = self.deadline {
+            checker.set_deadline(deadline);
+        }
+        if let Some(limit) = self.memory_limit {
+            checker.set_memory_limit(limit);
+        }
+        if let Some(limit) = self.disk_limit {
+            checker.set_disk_limit(limit);
+        }
+        checker.set_collision_check_mode(self.collision_check_mode);
     }
 
     /// Run model checking with adaptive strategy selection
@@ -286,18 +346,17 @@ impl AdaptiveChecker {
             analysis.strategy = Strategy::Sequential;
         }
 
-        // Auto-create factory-managed storage when the pilot estimates a large
-        // state space and no explicit storage override was set. The factory's
-        // Auto mode uses the capacity hint to select ShardedDisk when above
-        // DISK_THRESHOLD, or Sharded/InMemory otherwise. (Part of #2568, Step 4)
+        // Auto-create factory-managed storage when no explicit override was
+        // set. Multi-worker runs retain the pilot estimate so Auto can select
+        // ShardedDisk above DISK_THRESHOLD. Single-worker runs use the exact
+        // initial-state count and let the growable in-memory set expand from
+        // observed work instead of eagerly reserving a geometric estimate.
+        // (Part of #2568, Step 4)
         if self.fingerprint_storage.is_none() {
-            let num_workers = match analysis.strategy {
-                Strategy::Parallel(n) => n,
-                Strategy::Sequential => 1,
-            };
+            let (num_workers, capacity_hint) = auto_fingerprint_storage_plan(&analysis);
             if let Ok(storage) = FingerprintSetFactory::create(StorageConfig {
                 mode: StorageMode::Auto { num_workers },
-                capacity: Some(analysis.estimated_states),
+                capacity: Some(capacity_hint),
                 ..Default::default()
             }) {
                 self.fingerprint_storage = Some(storage);
@@ -381,6 +440,9 @@ impl AdaptiveChecker {
         }
         if let Some(limit) = self.max_depth {
             checker.set_max_depth(limit);
+        }
+        if let Some(deadline) = self.deadline {
+            checker.set_deadline(deadline);
         }
         if let Some(limit) = self.memory_limit {
             checker.set_memory_limit(limit);

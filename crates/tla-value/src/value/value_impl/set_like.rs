@@ -157,6 +157,111 @@ impl Value {
         }
     }
 
+    /// Structural, **non-materializing** emptiness test for set-like values.
+    ///
+    /// Returns `Some(true)`/`Some(false)` when emptiness can be decided from the
+    /// value's structure WITHOUT enumerating or materializing any operand;
+    /// `None` when it cannot be decided cheaply (the caller must then fall back
+    /// to a materializing check such as `set_len`). Every `Some` verdict is
+    /// EXACT — it equals `set_len() == 0` for that shape.
+    ///
+    /// Motivation: `Value::set_len()` on a compound lazy set (`SetCup`, ...) with
+    /// no cheap cardinality routes through `to_sorted_set()`, materializing +
+    /// dedup-hashing the entire set. Emptiness alone never needs the full set:
+    /// `A \cup B` is empty iff BOTH are empty; a record set `[f: S, ...]` is
+    /// empty iff SOME field domain is empty; `[S -> T]` is empty iff `S` is
+    /// non-empty and `T` is empty. Deciding these recursively over structure
+    /// avoids the per-state materialization of large constant record-set unions
+    /// in `TypeOK`-style invariants (e.g. `f \in [D -> Block \cup {NoBlock}]`).
+    pub fn is_empty_set_structural(&self) -> Option<bool> {
+        match self {
+            Value::Set(s) => Some(s.is_empty()),
+            Value::Interval(iv) => Some(iv.low > iv.high),
+            // These are always non-empty:
+            //   SUBSET S always contains {}; Seq(S) always contains <<>>;
+            //   STRING/AnySet/Nat/Int/Real are (infinite and) non-empty.
+            Value::Subset(_) | Value::SeqSet(_) | Value::StringSet | Value::AnySet => Some(false),
+            Value::ModelValue(name) if matches!(name.as_ref(), "Nat" | "Int" | "Real") => {
+                Some(false)
+            }
+            // [S -> T]: empty iff S is non-empty AND T is empty.
+            // ([ {} -> T ] = { <<>> } is non-empty.)
+            Value::FuncSet(fs) => match fs.domain().is_empty_set_structural()? {
+                true => Some(false),
+                false => fs.codomain().is_empty_set_structural(),
+            },
+            // [f: S, g: T, ...]: empty iff ANY field domain is empty.
+            // The zero-field record set `[]` = { <<>> } (empty record) is non-empty.
+            Value::RecordSet(rs) => {
+                if rs.fields_len() == 0 {
+                    return Some(false);
+                }
+                let mut any_unknown = false;
+                for (_name, set) in rs.fields_iter() {
+                    match set.is_empty_set_structural() {
+                        Some(true) => return Some(true),
+                        Some(false) => {}
+                        None => any_unknown = true,
+                    }
+                }
+                if any_unknown {
+                    None
+                } else {
+                    Some(false)
+                }
+            }
+            // S \X T \X ...: empty iff ANY component is empty.
+            Value::TupleSet(ts) => {
+                let mut any_unknown = false;
+                for comp in ts.components_iter() {
+                    match comp.is_empty_set_structural() {
+                        Some(true) => return Some(true),
+                        Some(false) => {}
+                        None => any_unknown = true,
+                    }
+                }
+                if any_unknown {
+                    None
+                } else {
+                    Some(false)
+                }
+            }
+            // A \cup B: empty iff BOTH are empty.
+            Value::SetCup(c) => {
+                let e1 = c.set1().is_empty_set_structural();
+                let e2 = c.set2().is_empty_set_structural();
+                match (e1, e2) {
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                }
+            }
+            // A \cap B: empty if EITHER is empty; otherwise undecidable here
+            // (disjoint non-empty sets also intersect to {}).
+            Value::SetCap(c) => {
+                if c.set1().is_empty_set_structural() == Some(true)
+                    || c.set2().is_empty_set_structural() == Some(true)
+                {
+                    Some(true)
+                } else {
+                    None
+                }
+            }
+            // A \ B: empty if A is empty; otherwise undecidable here (A \subseteq B
+            // also yields {}).
+            Value::SetDiff(d) => {
+                if d.set1().is_empty_set_structural() == Some(true) {
+                    Some(true)
+                } else {
+                    None
+                }
+            }
+            // SetPred (needs ctx), BigUnion, KSubset, other ModelValues, non-sets:
+            // not cheaply decidable here.
+            _ => None,
+        }
+    }
+
     /// Borrow the inner [`SortedSet`] if this is an eager `Value::Set`, else `None`.
     ///
     /// Matches only materialized sets; lazy set forms (intervals, powersets,
@@ -181,7 +286,7 @@ impl Value {
             Value::FuncSet(v) => Some(v),
             Value::RecordSet(v) => Some(v.as_ref()),
             Value::TupleSet(v) => Some(v.as_ref()),
-            Value::SetCup(v) => Some(v),
+            Value::SetCup(v) => Some(&**v),
             Value::SetCap(v) => Some(v),
             Value::SetDiff(v) => Some(v),
             Value::KSubset(v) => Some(v),
@@ -196,6 +301,7 @@ impl Value {
     pub fn set_contains(&self, v: &Value) -> Option<bool> {
         match self {
             Value::Set(s) => Some(s.contains(v)),
+            Value::SetCup(cup) => SetCupValue::contains_shared(cup, v),
             Value::SetPred(_) => None, // Needs eval context
             // StringSet contains all strings
             Value::StringSet => Some(matches!(v, Value::String(_))),
@@ -225,6 +331,21 @@ impl Value {
     pub fn try_set_contains_tuple_elements(&self, tuple: &[Value]) -> Option<bool> {
         match self {
             Value::Set(set) => Some(set.contains_tuple_elements(tuple)),
+            Value::StringSet => Some(false),
+            Value::AnySet => Some(true),
+            Value::ModelValue(name) if matches!(name.as_ref(), "Nat" | "Int" | "Real") => {
+                Some(false)
+            }
+            _ => None,
+        }
+    }
+
+    /// Clone-free variant of [`Self::try_set_contains_tuple_elements`] for the
+    /// virtual 2-tuple `<<first, second>>`. Returns `None` for lazy/compound
+    /// set representations (caller falls back to the owned-tuple path).
+    pub fn try_set_contains_tuple2_refs(&self, first: &Value, second: &Value) -> Option<bool> {
+        match self {
+            Value::Set(set) => Some(set.contains_tuple2_refs(first, second)),
             Value::StringSet => Some(false),
             Value::AnySet => Some(true),
             Value::ModelValue(name) if matches!(name.as_ref(), "Nat" | "Int" | "Real") => {
@@ -282,6 +403,55 @@ impl Value {
         match self {
             Value::Set(s) => Some(BigInt::from(s.len())),
             _ => self.as_lazy_set()?.set_len(),
+        }
+    }
+
+    /// Structural check: does this set-like value have a **record set**
+    /// (`[f: S, ...]`) anywhere in its lazy structure — directly, or as an
+    /// operand of a `SetCup`/`SetCap`/`SetDiff`, the base of a `SUBSET`, the
+    /// codomain/domain of a `[D -> R]`, or a `\X` component?
+    ///
+    /// Used to decide when eagerly materializing a set *union* would be
+    /// expensive (materializing a record set enumerates `Π|field|` records).
+    /// It does NOT recurse into the elements of an already-materialized
+    /// `Value::Set` — that set is concrete, so re-materializing it is cheap and
+    /// there is nothing to keep lazy. The check is O(structure), never O(set).
+    pub fn references_record_set(&self) -> bool {
+        match self {
+            Value::RecordSet(_) => true,
+            Value::SetCup(c) => {
+                c.set1().references_record_set() || c.set2().references_record_set()
+            }
+            Value::SetCap(c) => {
+                c.set1().references_record_set() || c.set2().references_record_set()
+            }
+            Value::SetDiff(d) => {
+                d.set1().references_record_set() || d.set2().references_record_set()
+            }
+            Value::Subset(s) => s.base().references_record_set(),
+            Value::FuncSet(f) => {
+                f.domain().references_record_set() || f.codomain().references_record_set()
+            }
+            Value::TupleSet(t) => t.components_iter().any(Value::references_record_set),
+            _ => false,
+        }
+    }
+
+    /// Cardinality of this set-like value ONLY when it is O(1) to obtain, i.e.
+    /// a materialized `Value::Set` (stored length) or an `Interval` (high−low+1).
+    /// Returns `None` for every lazy/compound set (`SetCup`, `FuncSet`,
+    /// `RecordSet`, `Subset`, ...) whose exact cardinality would require
+    /// enumerating or materializing operands.
+    ///
+    /// Intended for ORDERING/heuristic callers that must never materialize (a
+    /// wrong-but-cheap `None` only changes a tie-break order, never a result).
+    /// Contrast with [`Self::set_len`], which materializes compound sets.
+    pub fn set_len_if_cheap(&self) -> Option<BigInt> {
+        match self {
+            Value::Set(s) => Some(BigInt::from(s.len())),
+            // IntervalValue::set_len is O(1) (high − low + 1); no materialization.
+            Value::Interval(_) => self.as_lazy_set()?.set_len(),
+            _ => None,
         }
     }
 

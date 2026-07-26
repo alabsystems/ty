@@ -165,6 +165,7 @@ fn opcode_writes(op: &Opcode) -> Vec<u8> {
         | Opcode::SetDiff { rd, .. }
         | Opcode::Subseteq { rd, .. }
         | Opcode::RoundStepEq { rd, .. }
+        | Opcode::EdgeFilter { rd, .. }
         | Opcode::Powerset { rd, .. }
         | Opcode::BigUnion { rd, .. }
         | Opcode::KSubset { rd, .. }
@@ -288,6 +289,9 @@ fn opcode_reads(op: &Opcode) -> Vec<u8> {
             vec![value]
         }
         Opcode::RoundStepEq { child, parent, .. } => vec![child, parent],
+        Opcode::EdgeFilter {
+            first, arg, domain, ..
+        } => vec![first, arg, domain],
         Opcode::KSubset { base, k, .. } => vec![base, k],
         Opcode::Range { lo, hi, .. } => vec![lo, hi],
         Opcode::FuncApply { func, arg, .. } => vec![func, arg],

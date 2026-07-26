@@ -1177,12 +1177,36 @@ mod native_seq_tests {
     #[cfg_attr(test, ntest::timeout(20000))]
     #[test]
     fn native_len_unbounded_sat() {
-        // Len(s) > 100 is SAT under native unbounded Seq.
-        // (The bounded array encoding would report UNSAT for max_len < 101.)
+        // Give the native variable a concrete 128-element witness.  AY's model
+        // finder cannot currently synthesize a free sequence from only
+        // `Len(s) > 100` and returns Unknown, but it can validate this explicit
+        // native `seq.++` witness.  Reusing each concat result keeps the term a
+        // small DAG: seven doublings grow a singleton to length 128.  The nominal
+        // max_len of 10 is deliberately exceeded: it is ignored on the native
+        // path, whereas the bounded array encoding would make this UNSAT.
         let mut trans = AYTranslator::new_with_seq();
         trans
             .declare_seq_var("s", TlaSort::Int, 10)
             .expect("declare native seq");
+
+        let zero = trans.solver_mut().int_const(0);
+        let mut witness = trans
+            .solver_mut()
+            .try_seq_unit(zero)
+            .expect("build singleton witness");
+        for _ in 0..7 {
+            witness = trans
+                .solver_mut()
+                .try_seq_concat(witness, witness)
+                .expect("double native witness");
+        }
+        let s = trans.get_native_seq_var("s").expect("native seq info").term;
+        let bind_witness = trans
+            .solver_mut()
+            .try_eq(s, witness)
+            .expect("bind native witness");
+        trans.assert(bind_witness);
+
         assert_sat(&mut trans, &gt(apply("Len", vec![ident("s")]), int(100)));
     }
 

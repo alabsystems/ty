@@ -129,7 +129,6 @@
 //! selections (min/max patterns), which are orbit-equivariant.
 
 use crate::config::{Config, ConstantValue};
-use tla_value::Rp;
 use crate::eval::EvalCtx;
 use crate::value::{FuncValue, Value};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -137,6 +136,7 @@ use std::sync::Arc;
 use tla_core::ast::{Expr, OperatorDef};
 use tla_core::span::Spanned;
 use tla_core::visit::ExprVisitor;
+use tla_value::Rp;
 
 /// Check if auto-symmetry detection is enabled via environment variable.
 ///

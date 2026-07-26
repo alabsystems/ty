@@ -553,10 +553,13 @@ mod tests {
     #[test]
     fn expired_deadline_declines() {
         let ts = counter_transys(5, Some(31));
+        let expired_deadline = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("the monotonic clock should be at least one second past its epoch");
         let out = bdd_reach_check(
             &ts,
             &BddReachConfig::default(),
-            Some(Instant::now() - std::time::Duration::from_secs(1)),
+            Some(expired_deadline),
             &no_cancel(),
         );
         assert!(matches!(out, BddReachOutcome::Declined { .. }));

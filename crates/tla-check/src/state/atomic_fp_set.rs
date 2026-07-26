@@ -1760,6 +1760,10 @@ mod tests {
             stats.max_probe_len >= 1,
             "cumulative max_probe_len should be >= 1"
         );
+        assert!(
+            stats.avg_probe_len >= 1.0 && stats.avg_probe_len.is_finite(),
+            "cumulative average probe length must be finite and nonzero"
+        );
         assert!(stats.resize_count > 0, "resize_count should be > 0");
     }
 

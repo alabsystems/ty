@@ -37,10 +37,10 @@
 //! Part of #4318. See the R27 trust_cg runtime-ABI-scope design (§2.4).
 
 use num_bigint::BigInt;
-use tla_value::Rp;
 use num_traits::One;
 use tla_core::NameId;
 use tla_value::value::{range_set, ComponentDomain, IntIntervalFunc, LazyDomain, SortedSet, Value};
+use tla_value::Rp;
 
 use super::handle::{handle_from_value, handle_to_value, TlaHandle, NIL_HANDLE};
 
@@ -654,7 +654,11 @@ mod tests {
                 Value::SmallInt(2),
                 Value::SmallInt(88),
             ),
-            (record_ab(), Value::String(Rp::from("b")), Value::Bool(false)),
+            (
+                record_ab(),
+                Value::String(Rp::from("b")),
+                Value::Bool(false),
+            ),
         ];
         for (f, k, v) in cases {
             let want = super::value_except(f.clone(), k.clone(), v.clone())

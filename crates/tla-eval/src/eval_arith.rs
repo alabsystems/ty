@@ -11,9 +11,8 @@ use super::{
     EvalError, EvalResult, Span, Value,
 };
 use crate::value::{intern_string, SetCapValue, SetDiffValue};
-use tla_value::Rp;
 use num_integer::Integer;
-use std::sync::Arc;
+use tla_value::Rp;
 // Binary operations and arithmetic helpers for TLA+ evaluation.
 // Extracted from core.rs as part of #1219 decomposition.
 

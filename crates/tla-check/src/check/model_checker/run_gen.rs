@@ -31,6 +31,79 @@ pub(super) const AUTO_POR_BENEFIT_WINDOW_STATES: u64 = 8192;
 /// auto-POR to stay engaged past the benefit window.
 pub(super) const AUTO_POR_MIN_REDUCTION_PERCENT: u64 = 1;
 
+/// Cap for the tiny-spec sequential routing gate.
+///
+/// A spec whose ENTIRE reachable state space is `<= TINY_SEQ_GATE_CAP` states
+/// is unambiguously tiny: the parallel checker's fixed CAS-FPSet reservation
+/// (~256 MB) plus worker spin-up can never beat the sequential path on so few
+/// states. The pilot's `initial * 50000` linear-growth estimate misroutes such
+/// specs (e.g. a 12-state HourClock) to parallel; the bounded-reachability gate
+/// corrects that by proving the reachable set is tiny.
+///
+/// The cap sits below the smallest parallel-beneficiary spec in the corpus
+/// (Disruptor_SPMC ~ 8.5K states), so any spec at or above it hits the cap and
+/// keeps its existing (possibly parallel) routing unchanged. This is what makes
+/// the gate a pure parallel->sequential downgrade for provably-tiny specs and
+/// never a de-parallelization of a spec that benefits from parallel.
+///
+/// Raised 1024 -> 5000 (2026-07-23): several finite low-branching specs whose
+/// entire reachable set is 1.7K-4.3K states (TestGraphs 2790, ACP_NB_TLC 4284,
+/// AllocatorRefinement 1690) were misrouted to parallel and paid the ~256 MB
+/// CAS-FPSet reservation, losing the memory axis to TLC (~120 MB) despite
+/// winning time. 5000 catches them while remaining strictly below Disruptor_SPMC
+/// (8496) so no documented parallel-beneficiary is de-parallelized. The bounded
+/// pilot BFS explores at most `cap` states (discarded); at 5000 that pre-pass is
+/// sub-second for these specs and dwarfed by the RSS win.
+pub(super) const TINY_SEQ_GATE_CAP: usize = 5000;
+
+/// The tiny-spec sequential gate is ON by default. Set `TY_NO_TINY_SEQ_GATE`
+/// (to any value) to disable it — used for A/B measurement and as an escape
+/// hatch. Read fresh each call so a benchmark harness can toggle per process.
+#[must_use]
+pub(super) fn tiny_seq_gate_enabled() -> bool {
+    std::env::var_os("TY_NO_TINY_SEQ_GATE").is_none()
+}
+
+/// Exact bag equality for successor parity. Set equality is insufficient:
+/// duplicate action disjuncts contribute distinct generated transitions even
+/// when they reach the same state.
+#[allow(clippy::mutable_key_type)]
+fn successor_multisets_match<'a, T, L, R>(left: L, right: R) -> bool
+where
+    T: Eq + std::hash::Hash + 'a,
+    L: IntoIterator<Item = &'a T>,
+    R: IntoIterator<Item = &'a T>,
+{
+    let mut counts: rustc_hash::FxHashMap<&T, usize> = rustc_hash::FxHashMap::default();
+    for item in left {
+        *counts.entry(item).or_default() += 1;
+    }
+    for item in right {
+        let Some(count) = counts.get_mut(item) else {
+            return false;
+        };
+        if *count == 0 {
+            return false;
+        }
+        *count -= 1;
+    }
+    counts.values().all(|count| *count == 0)
+}
+
+fn successor_parity_matches<'a, T, L, R>(
+    left: L,
+    right: R,
+    left_raw_count: usize,
+    right_raw_count: usize,
+) -> bool
+where
+    T: Eq + std::hash::Hash + 'a,
+    L: IntoIterator<Item = &'a T>,
+    R: IntoIterator<Item = &'a T>,
+{
+    left_raw_count == right_raw_count && successor_multisets_match(left, right)
+}
+
 /// Per-action successor set produced by `enumerate_per_action_successor_sets`.
 ///
 /// `states` is the canonical `State` form consumed by POR (parity self-check +
@@ -115,12 +188,51 @@ impl Iterator for InterpSuccIter {
 }
 
 impl<'a> ModelChecker<'a> {
+    /// Whether optional pilot work may continue under the real run's resource
+    /// contract. A tripped limit makes routing analysis inconclusive (`None`);
+    /// the selected checker remains responsible for returning the corresponding
+    /// fail-closed `LimitReached` result.
+    fn pilot_optional_work_allowed(&self) -> bool {
+        if self
+            .exploration
+            .deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            return false;
+        }
+        if self
+            .exploration
+            .memory_policy
+            .as_ref()
+            .is_some_and(|policy| matches!(policy.check(), crate::memory::MemoryPressure::Critical))
+        {
+            return false;
+        }
+
+        // This pilot uses only in-memory exact keys and never opens or extends
+        // disk-backed storage, so its disk consumption is exactly zero. The
+        // configured disk limit is therefore satisfied without a filesystem
+        // probe.
+        true
+    }
+
     /// Generate initial states by finding all states satisfying Init
     pub(super) fn generate_initial_states(
         &mut self,
         init_name: &str,
     ) -> Result<Vec<State>, CheckError> {
-        let states = self.solve_predicate_for_states(init_name)?;
+        self.generate_initial_states_with_raw_count(init_name)
+            .map(|(states, _raw_initial_states_generated)| states)
+    }
+
+    /// Generate initial states while preserving the raw pre-dedup count.
+    pub(super) fn generate_initial_states_with_raw_count(
+        &mut self,
+        init_name: &str,
+    ) -> Result<(Vec<State>, usize), CheckError> {
+        let (states, raw_initial_states_generated) =
+            self.solve_predicate_for_states_with_raw_count(init_name)?;
+        self.stats.raw_initial_states_generated = raw_initial_states_generated;
         if self.tir_parity.is_some() {
             let registry = self.ctx.var_registry().clone();
             for state in &states {
@@ -128,7 +240,7 @@ impl<'a> ModelChecker<'a> {
                 self.maybe_check_tir_parity_state(init_name, &array_state)?;
             }
         }
-        Ok(states)
+        Ok((states, raw_initial_states_generated))
     }
 
     /// Pilot helper for the adaptive checker: sample initial state count and branching factor
@@ -136,12 +248,17 @@ impl<'a> ModelChecker<'a> {
     ///
     /// This intentionally uses the same ArrayState diff path as the main checker so
     /// the pilot samples the current single-path successor engine.
+    ///
+    /// Returns `(num_initial, avg_branching_factor, states_sampled, bounded_reachable)`.
+    /// `bounded_reachable` is `Some(exact)` only when the tiny-spec gate proved the
+    /// entire reachable set has `exact <= TINY_SEQ_GATE_CAP` states (see
+    /// [`Self::bounded_reachable_count`]); otherwise `None` (heuristic estimate).
     pub(crate) fn pilot_sample_init_and_branching_factor(
         &mut self,
         init_name: &str,
         next_name: &str,
         sample_size: usize,
-    ) -> Result<(usize, f64, usize), CheckError> {
+    ) -> Result<(usize, f64, usize, Option<usize>), CheckError> {
         if let Some(err) = self.module.setup_error.take() {
             return Err(err);
         }
@@ -192,6 +309,17 @@ impl<'a> ModelChecker<'a> {
             let mut num_initial = 0usize;
             let mut total_successors = 0usize;
             let mut states_sampled = 0usize;
+            // Tiny-spec gate: collect the constrained initial states (capped) to
+            // seed a bounded reachability BFS. Collecting one past the cap is
+            // enough to prove "too many initial states" without cloning them all.
+            let gate_enabled = tiny_seq_gate_enabled();
+            let mut seeds: Vec<ArrayState> = Vec::new();
+            // With an explicit state cap, evaluating arbitrary successor bags
+            // merely to estimate branching can run evaluator code beyond the
+            // admitted-state grant. The exact bounded pass below understands
+            // that cap; the heuristic sample conservatively declines.
+            let sample_successors =
+                self.exploration.max_states.is_none() && self.exploration.max_depth != Some(0);
 
             for idx in 0..num_states {
                 scratch.overwrite_from_slice(bulk_storage.get_state(idx));
@@ -199,8 +327,14 @@ impl<'a> ModelChecker<'a> {
                     continue;
                 }
                 num_initial += 1;
+                if gate_enabled && seeds.len() <= TINY_SEQ_GATE_CAP {
+                    seeds.push(scratch.clone());
+                }
 
-                if states_sampled >= sample_size {
+                if states_sampled >= sample_size
+                    || !sample_successors
+                    || !self.pilot_optional_work_allowed()
+                {
                     continue;
                 }
 
@@ -218,6 +352,9 @@ impl<'a> ModelChecker<'a> {
                     diffs
                 };
 
+                if !self.pilot_optional_work_allowed() {
+                    continue;
+                }
                 match diffs {
                     Ok(Some(diffs)) => {
                         total_successors += diffs.len();
@@ -236,7 +373,7 @@ impl<'a> ModelChecker<'a> {
             }
 
             if num_initial == 0 {
-                return Ok((0, 0.0, 0));
+                return Ok((0, 0.0, 0, Some(0)));
             }
 
             let avg_branching_factor = if states_sampled > 0 {
@@ -245,7 +382,22 @@ impl<'a> ModelChecker<'a> {
                 1.0
             };
 
-            return Ok((num_initial, avg_branching_factor, states_sampled));
+            // Tiny-spec gate: if the (constrained) initial set already fits under
+            // the cap, run the bounded reachability BFS from it. More initial
+            // states than the cap means the reachable set is already too large,
+            // so leave the estimate to the heuristic (None).
+            let bounded_reachable = if gate_enabled && num_initial <= TINY_SEQ_GATE_CAP {
+                self.bounded_reachable_count(seeds, &next_def, &registry, TINY_SEQ_GATE_CAP)?
+            } else {
+                None
+            };
+
+            return Ok((
+                num_initial,
+                avg_branching_factor,
+                states_sampled,
+                bounded_reachable,
+            ));
         }
 
         // Fallback: Vec<State> enumeration (used when streaming init enumeration is not possible).
@@ -260,13 +412,18 @@ impl<'a> ModelChecker<'a> {
         let initial_states = constrained_initial_states;
         let num_initial = initial_states.len();
         if num_initial == 0 {
-            return Ok((0, 0.0, 0));
+            return Ok((0, 0.0, 0, Some(0)));
         }
 
         let mut total_successors = 0usize;
         let mut states_sampled = 0usize;
+        let sample_successors =
+            self.exploration.max_states.is_none() && self.exploration.max_depth != Some(0);
 
         for state in initial_states.iter().take(sample_size) {
+            if !sample_successors || !self.pilot_optional_work_allowed() {
+                break;
+            }
             let current_array = ArrayState::from_state(state, &registry);
             let diffs = {
                 let _state_guard = self.ctx.bind_state_env_guard(current_array.env_ref());
@@ -282,6 +439,9 @@ impl<'a> ModelChecker<'a> {
                 diffs
             };
 
+            if !self.pilot_optional_work_allowed() {
+                break;
+            }
             match diffs {
                 Ok(Some(diffs)) => {
                     total_successors += diffs.len();
@@ -309,7 +469,209 @@ impl<'a> ModelChecker<'a> {
             1.0
         };
 
-        Ok((num_initial, avg_branching_factor, states_sampled))
+        // Tiny-spec gate (fallback path): seed the bounded BFS from the
+        // constrained initial states when they fit under the cap.
+        let bounded_reachable = if tiny_seq_gate_enabled() && num_initial <= TINY_SEQ_GATE_CAP {
+            let seeds: Vec<ArrayState> = initial_states
+                .iter()
+                .map(|s| ArrayState::from_state(s, &registry))
+                .collect();
+            self.bounded_reachable_count(seeds, &next_def, &registry, TINY_SEQ_GATE_CAP)?
+        } else {
+            None
+        };
+
+        Ok((
+            num_initial,
+            avg_branching_factor,
+            states_sampled,
+            bounded_reachable,
+        ))
+    }
+
+    /// Bounded exact reachability count for the adaptive tiny-spec routing gate.
+    ///
+    /// Runs a hard-capped BFS from the (already constraint-filtered) initial
+    /// `seeds`, using fingerprints only to select collision buckets and exact
+    /// compact state values to resolve every bucket. A collision may be accepted
+    /// by the configured main-checker mode, but it cannot justify calling the
+    /// pilot's cardinality exact. Returns:
+    ///
+    /// - `Ok(Some(n))` — the reachable state space was FULLY explored and has
+    ///   exactly `n` (`<= cap`) extensionally distinct states. The adaptive
+    ///   selector can trust this exact count and route tiny specs sequential.
+    /// - `Ok(None)` — the count is UNCERTAIN and the caller must keep the
+    ///   heuristic estimate. This happens when either (a) more than `cap` states
+    ///   are reachable (the cap was hit), or (b) some state needed the slower
+    ///   enumeration fallback (`Ok(None)` from the diff enumerator) so its
+    ///   successors could not be established here.
+    ///
+    /// Soundness for the routing constraint (never de-parallelize a spec that
+    /// benefits from parallel): `Some(n)` is returned ONLY when the frontier
+    /// drains with `<= cap` exact states without crossing the configured
+    /// state/depth/RSS/deadline envelope. A spec whose real reachable set exceeds
+    /// `cap`, whose configured envelope interrupts the pass, or whose successor
+    /// enumeration requests fallback returns `None`, so parallel routing is never
+    /// wrongly downgraded. Enumeration errors reached within the configured
+    /// envelope propagate exactly as the main checker's do.
+    pub(crate) fn bounded_reachable_count(
+        &mut self,
+        seeds: Vec<ArrayState>,
+        next_def: &tla_core::ast::OperatorDef,
+        registry: &crate::var_index::VarRegistry,
+        cap: usize,
+    ) -> Result<Option<usize>, CheckError> {
+        let effective_cap = cap.min(self.exploration.max_states.unwrap_or(usize::MAX));
+        if effective_cap == 0 || !self.pilot_optional_work_allowed() {
+            return Ok(None);
+        }
+
+        // Fingerprints are only bucket selectors. Full compact-value equality
+        // resolves every collision, keeping the cardinality exact without using
+        // an interior-mutable Value representation as the HashMap key.
+        let mut visited: rustc_hash::FxHashMap<
+            crate::Fingerprint,
+            Vec<Vec<tla_value::CompactValue>>,
+        > = rustc_hash::FxHashMap::default();
+        let mut visited_len = 0usize;
+        let mut frontier: std::collections::VecDeque<(ArrayState, usize)> =
+            std::collections::VecDeque::new();
+
+        for mut seed in seeds {
+            let materialize_result = crate::materialize::materialize_array_state(
+                &self.ctx,
+                &mut seed,
+                self.compiled.spec_may_produce_lazy,
+            );
+            if !self.pilot_optional_work_allowed() {
+                return Ok(None);
+            }
+            materialize_result.map_err(EvalCheckError::Eval)?;
+            let fp = seed.fingerprint(registry);
+            let exact = seed.values().to_vec();
+            if visited
+                .get(&fp)
+                .is_some_and(|bucket| bucket.iter().any(|prior| prior == &exact))
+            {
+                continue;
+            }
+            if visited_len >= effective_cap || !self.pilot_optional_work_allowed() {
+                return Ok(None);
+            }
+            visited.entry(fp).or_default().push(exact);
+            visited_len += 1;
+            frontier.push_back((seed, 0));
+        }
+
+        let dbg = std::env::var_os("TY_TINY_SEQ_DEBUG").is_some();
+        while let Some((current, depth)) = frontier.pop_front() {
+            if !self.pilot_optional_work_allowed() {
+                return Ok(None);
+            }
+            if self
+                .exploration
+                .max_states
+                .is_some_and(|max_states| visited_len >= max_states)
+            {
+                // The real checker may stop as soon as this many states have
+                // been admitted. Do not evaluate another state's Next relation
+                // merely to refine routing.
+                return Ok(None);
+            }
+            if self
+                .exploration
+                .max_depth
+                .is_some_and(|max_depth| depth >= max_depth)
+            {
+                // Do not evaluate Next beyond the configured depth merely to
+                // learn whether this boundary state is terminal.
+                return Ok(None);
+            }
+
+            let current_level = u32::try_from(depth.saturating_add(1)).map_err(|_| {
+                ConfigCheckError::Setup(
+                    "tiny-sequential pilot depth exceeds TLC level range".to_string(),
+                )
+            })?;
+            self.ctx.set_tlc_level(current_level);
+            let diffs = {
+                let _state_guard = self.ctx.bind_state_env_guard(current.env_ref());
+                let stack_mark = self.ctx.mark_stack();
+                let diffs = crate::enumerate::enumerate_successors_array_as_diffs(
+                    &mut self.ctx,
+                    next_def,
+                    &current,
+                    &self.module.vars,
+                    None,
+                );
+                self.ctx.pop_to_mark(&stack_mark);
+                diffs
+            };
+            if !self.pilot_optional_work_allowed() {
+                return Ok(None);
+            }
+            if dbg {
+                eprintln!(
+                    "[tiny-seq] pop; depth={depth} visited={} frontier={} diffs={:?}",
+                    visited_len,
+                    frontier.len(),
+                    diffs.as_ref().map(|o| o.as_ref().map(std::vec::Vec::len)),
+                );
+            }
+            let diffs = match diffs {
+                Ok(Some(diffs)) => diffs,
+                // Enumeration requested the slower fallback path: we cannot
+                // establish this state's successors cheaply here, so the
+                // reachable set is unknown. Fail OPEN to the heuristic — never
+                // claim exhaustion (which could de-parallelize a large spec).
+                Ok(None) => return Ok(None),
+                Err(e) => return Err(EvalCheckError::Eval(e).into()),
+            };
+            for diff in diffs {
+                if !self.pilot_optional_work_allowed() {
+                    return Ok(None);
+                }
+                let mut succ = diff.into_array_state(&current, registry, None);
+                let materialize_result = crate::materialize::materialize_array_state(
+                    &self.ctx,
+                    &mut succ,
+                    self.compiled.spec_may_produce_lazy,
+                );
+                if !self.pilot_optional_work_allowed() {
+                    return Ok(None);
+                }
+                materialize_result.map_err(EvalCheckError::Eval)?;
+                let constraint_result = self.successor_passes_constraints(&current, &succ);
+                if !self.pilot_optional_work_allowed() {
+                    return Ok(None);
+                }
+                if !constraint_result? {
+                    continue;
+                }
+                let fp = succ.fingerprint(registry);
+                let exact = succ.values().to_vec();
+                let is_new = !visited
+                    .get(&fp)
+                    .is_some_and(|bucket| bucket.iter().any(|prior| prior == &exact));
+                if dbg {
+                    eprintln!("[tiny-seq]   succ fp={:x} new={is_new}", fp.0);
+                }
+                if !is_new {
+                    continue;
+                }
+                if visited_len >= effective_cap {
+                    return Ok(None);
+                }
+                visited.entry(fp).or_default().push(exact);
+                visited_len += 1;
+                frontier.push_back((succ, depth.saturating_add(1)));
+            }
+        }
+
+        if dbg {
+            eprintln!("[tiny-seq] EXHAUSTED visited={visited_len}");
+        }
+        Ok(Some(visited_len))
     }
 
     /// Generate initial states directly to BulkStateStorage (memory-efficient for no-trace mode).
@@ -325,6 +687,7 @@ impl<'a> ModelChecker<'a> {
     ) -> Result<Option<BulkInitStates>, CheckError> {
         let bulk = self.solve_predicate_for_states_to_bulk(init_name)?;
         if let Some(bulk_init) = bulk.as_ref() {
+            self.stats.raw_initial_states_generated = bulk_init.enumeration.generated;
             if self.tir_parity.is_some() {
                 let mut scratch = ArrayState::new(self.ctx.var_registry().len());
                 let count = u32::try_from(bulk_init.storage.len()).map_err(|_| {
@@ -435,6 +798,11 @@ impl<'a> ModelChecker<'a> {
         // Part of #4290 / #4319: trust-codegen native action dispatch also lives here,
         // so constrained full-state runs must enter this path when trust-codegen has
         // at least one compiled action.
+        // The standalone router must install its detected-action decomposition
+        // before route selection is consulted. This is a one-shot no-op when
+        // the router is disabled.
+        self.ensure_router_ready();
+        self.router_parent_tokens_replay_safe(state);
         let registry = self.ctx.var_registry().clone();
         let use_per_action = self.per_action_successor_dispatch_ready();
         if !use_per_action {
@@ -462,15 +830,14 @@ impl<'a> ModelChecker<'a> {
         let actions = Arc::clone(&self.coverage.actions);
         let por_enabled = self.por.independence.is_some();
 
-        // Fail-closed parity self-check (POR engagement guard): for the first
-        // `POR_PARITY_CHECK_STATES` states after POR engages, verify that the
-        // union of per-action successors equals whole-Next enumeration. On any
-        // mismatch or per-action eval error, permanently disable POR and
-        // per-action dispatch and fall back to whole-Next. A missing reduction
-        // is fine; a wrong verdict is not.
-        let parity_check_pending = por_enabled
+        // POR and the standalone router own separate parity lifecycles. POR
+        // checks its first 64 reduced parents; AUTO router checks/times every
+        // trial parent and then samples deterministically after promotion.
+        let por_parity_check_pending = por_enabled
             && !self.por.parity_failed
             && self.por.parity_checked_states < POR_PARITY_CHECK_STATES;
+        let router_parity_check_pending = self.router_parity_check_due();
+        let parity_check_pending = por_parity_check_pending || router_parity_check_pending;
 
         // WP-17: build `State` successors only when someone will consume them —
         // the caller's `Vec<State>` contract, POR's ample-set filtering, or the
@@ -478,43 +845,125 @@ impl<'a> ModelChecker<'a> {
         // per-successor `to_state` materialization is skipped entirely.
         let states_wanted = caller_needs_states || por_enabled || parity_check_pending;
 
+        let batch_t0 = router_parity_check_pending.then(std::time::Instant::now);
         let per_action =
             self.enumerate_per_action_successor_sets(&actions, state, &registry, states_wanted);
-        let (per_action_successors, had_any_raw_successors) = match per_action {
-            Ok(result) => result,
-            Err(err) if parity_check_pending => {
-                self.fail_close_per_action_after_parity(&format!(
-                    "per-action evaluation error: {err:?}"
-                ));
-                return Ok((
-                    self.generate_successors_whole_next(next_name, state, &registry)?,
-                    None,
-                ));
-            }
-            Err(err) => return Err(err),
-        };
+        let router_batch_ns = batch_t0.map_or(0, |started| started.elapsed().as_nanos());
+        let (per_action_successors, had_any_raw_successors, per_action_raw_successor_count) =
+            match per_action {
+                Err(CheckError::Eval(EvalCheckError::Eval(
+                    crate::error::EvalError::SetTooLarge { .. },
+                ))) if self.router_active() => {
+                    // The cumulative split budget is a routing/memory gate,
+                    // not evidence that the action decomposition is wrong.
+                    // Retire only the router and let canonical whole-Next
+                    // reproduce an actual configured-cap error, if any.
+                    self.failback_router("split raw fanout reached the router successor cap");
+                    return Ok((
+                        self.generate_successors_whole_next(next_name, state, &registry)?,
+                        None,
+                    ));
+                }
+                Ok(result) => result,
+                Err(err) if parity_check_pending => {
+                    self.fail_close_per_action_dispatch(&format!(
+                        "per-action evaluation error: {err:?}"
+                    ));
+                    return Ok((
+                        self.generate_successors_whole_next(next_name, state, &registry)?,
+                        None,
+                    ));
+                }
+                Err(err) if self.router_active() => {
+                    // Even outside a scheduled parity sample, canonical whole-Next
+                    // succeeding where the splitter errored is a splitter
+                    // divergence. Globally distrust the per-action route so a
+                    // forced coverage/POR co-owner cannot select it next parent.
+                    self.fail_close_per_action_dispatch(&format!(
+                        "per-action evaluation error: {err:?}"
+                    ));
+                    return Ok((
+                        self.generate_successors_whole_next(next_name, state, &registry)?,
+                        None,
+                    ));
+                }
+                Err(err) => return Err(err),
+            };
+
+        let per_action_successor_count: usize = per_action_successors
+            .iter()
+            .map(|successors| successors.states.len().max(successors.arrays.len()))
+            .sum();
+        if self.router_active()
+            && self
+                .ctx
+                .shared()
+                .per_state_successor_cap
+                .is_some_and(|cap| per_action_raw_successor_count > cap)
+        {
+            self.failback_router(&format!(
+                "raw per-parent fanout {per_action_raw_successor_count} exceeds the configured successor cap"
+            ));
+            drop(per_action_successors);
+            return Ok((
+                self.generate_successors_whole_next(next_name, state, &registry)?,
+                None,
+            ));
+        }
+        if self.router_auto_memory_cap_active()
+            && !self.router_fanout_admitted(per_action_successor_count)
+        {
+            self.failback_router(&format!(
+                "per-parent fanout {per_action_successor_count} exceeds the AUTO memory cap"
+            ));
+            drop(per_action_successors);
+            return Ok((
+                self.generate_successors_whole_next(next_name, state, &registry)?,
+                None,
+            ));
+        }
 
         if parity_check_pending {
+            let whole_t0 = router_parity_check_pending.then(std::time::Instant::now);
             let whole = self.generate_successors_whole_next(next_name, state, &registry)?;
-            // `State` carries a `OnceLock<Fingerprint>` (lazy canonical cache),
-            // which trips `mutable_key_type`; but `Hash`/`Eq` for `State` only use
-            // the immutable `vars`/`fingerprint` fields, so set membership is sound.
-            #[allow(clippy::mutable_key_type)]
-            let union: rustc_hash::FxHashSet<&State> = per_action_successors
-                .iter()
-                .flat_map(|pa| pa.states.iter())
-                .collect();
-            #[allow(clippy::mutable_key_type)]
-            let whole_set: rustc_hash::FxHashSet<&State> = whole.successors.iter().collect();
-            if union != whole_set {
-                self.fail_close_per_action_after_parity(&format!(
-                    "successor-set mismatch (per-action union: {} distinct, whole-Next: {} distinct)",
-                    union.len(),
-                    whole_set.len()
+            let router_whole_next_ns = whole_t0.map_or(0, |started| started.elapsed().as_nanos());
+            // Compare MULTISETS, not sets: duplicate disjuncts contribute to
+            // transition accounting even when reachability is unchanged.
+            let parity_matches = successor_parity_matches(
+                per_action_successors
+                    .iter()
+                    .flat_map(|per_action| per_action.states.iter()),
+                whole.successors.iter(),
+                per_action_raw_successor_count,
+                whole.raw_successor_count,
+            );
+            if !parity_matches {
+                #[allow(clippy::mutable_key_type)]
+                let per_action_distinct: rustc_hash::FxHashSet<&State> = per_action_successors
+                    .iter()
+                    .flat_map(|per_action| per_action.states.iter())
+                    .collect();
+                #[allow(clippy::mutable_key_type)]
+                let whole_distinct: rustc_hash::FxHashSet<&State> =
+                    whole.successors.iter().collect();
+                self.fail_close_per_action_dispatch(&format!(
+                    "successor-multiset mismatch (per-action: {} total / {} distinct / raw={}, \
+                     whole-Next: {} total / {} distinct / raw={})",
+                    per_action_successor_count,
+                    per_action_distinct.len(),
+                    per_action_raw_successor_count,
+                    whole.successors.len(),
+                    whole_distinct.len(),
+                    whole.raw_successor_count,
                 ));
                 return Ok((whole, None));
             }
-            self.por.parity_checked_states += 1;
+            if por_parity_check_pending {
+                self.por.parity_checked_states += 1;
+            }
+            if router_parity_check_pending {
+                self.note_router_parity_match(router_batch_ns, router_whole_next_ns);
+            }
         }
 
         // Compute ample set and filter successors. The array side-channel is
@@ -579,6 +1028,7 @@ impl<'a> ModelChecker<'a> {
             Ok((
                 SuccessorResult {
                     successors: all_valid_successors,
+                    raw_successor_count: per_action_raw_successor_count,
                     had_raw_successors: had_any_raw_successors,
                 },
                 None,
@@ -599,6 +1049,7 @@ impl<'a> ModelChecker<'a> {
             Ok((
                 SuccessorResult {
                     successors: all_states,
+                    raw_successor_count: per_action_raw_successor_count,
                     had_raw_successors: had_any_raw_successors,
                 },
                 arrays,
@@ -618,6 +1069,7 @@ impl<'a> ModelChecker<'a> {
         registry: &crate::var_index::VarRegistry,
     ) -> Result<SuccessorResult<Vec<State>>, CheckError> {
         let successors = self.generate_successors(next_name, state)?;
+        let raw_successor_count = successors.len();
         let had_raw_successors = !successors.is_empty();
         let current_arr = ArrayState::from_state(state, registry);
         let mut valid = Vec::new();
@@ -631,6 +1083,7 @@ impl<'a> ModelChecker<'a> {
         }
         Ok(SuccessorResult {
             successors: valid,
+            raw_successor_count,
             had_raw_successors,
         })
     }
@@ -681,13 +1134,65 @@ impl<'a> ModelChecker<'a> {
 
     /// Fail-closed disable of POR + per-action successor dispatch after a
     /// parity self-check mismatch or per-action evaluation error.
-    fn fail_close_per_action_after_parity(&mut self, reason: &str) {
+    fn fail_close_per_action_dispatch(&mut self, reason: &str) {
+        let por_armed = self.por.independence.is_some();
+        let router_armed = self.router_active();
+        let armed_by = match (por_armed, router_armed) {
+            (true, true) => "POR/router",
+            (true, false) => "POR",
+            (false, true) => "router",
+            (false, false) => "per-action",
+        };
         eprintln!(
-            "POR: parity self-check FAILED — disabling POR and per-action successor dispatch \
-             ({reason}); falling back to whole-Next enumeration (sound, no reduction)"
+            "{armed_by}: per-action validation FAILED — disabling POR and per-action successor \
+             dispatch ({reason}); falling back to whole-Next enumeration (sound, no reduction)"
         );
+        // This is the global distrust latch read by
+        // `per_action_successor_dispatch_ready`. A router mismatch remains a
+        // splitter mismatch even when implicit coverage co-owns the same path;
+        // disabling only the router would let coverage select it again on the
+        // next parent.
         self.por.parity_failed = true;
-        self.por.independence = None;
+        // Keep the whole-Next fallback run-stable. Clearing coverage below can
+        // otherwise make lazy action-split JIT/native routes newly admissible
+        // on the next parent, even though this run just disproved the shared
+        // action decomposition.
+        self.jit_monolithic_disabled = true;
+        self.compiled_bfs_step = None;
+        self.compiled_bfs_level = None;
+        self.compiled.pc_dispatch = None;
+        self.compiled.pc_var_idx = None;
+        self.set_trust_cg_structural_veto();
+        self.trust_cg_cache = None;
+        self.trust_cg_hybrid_cache = None;
+        self.trust_cg_hybrid_jit_layout = None;
+        if self.value_action_vm.is_armed() {
+            self.value_action_vm
+                .disarm_runtime("per-action validation failed");
+        } else {
+            self.value_action_vm.discard_auto_candidate();
+        }
+        if por_armed {
+            self.por.independence = None;
+        }
+        if router_armed {
+            self.failback_router(reason);
+        }
+        if self.coverage.collect
+            || self.coverage.display
+            || self.coverage.coverage_guided
+            || self.stats.coverage.is_some()
+        {
+            eprintln!(
+                "coverage: invalidating partial action-attribution data after per-action validation failure"
+            );
+            self.coverage.collect = false;
+            self.coverage.display = false;
+            self.coverage.coverage_guided = false;
+            self.coverage.default_dead_action_tracking = false;
+            self.coverage.native_fast_path_skipped = false;
+            self.stats.coverage = None;
+        }
     }
 
     /// C3 cycle proviso — standard BFS fresh-successor form (State path).
@@ -807,8 +1312,9 @@ impl<'a> ModelChecker<'a> {
     }
 
     /// Per-action successor enumeration core: returns `(per_action_successors,
-    /// had_any_raw_successors)` where `per_action_successors` holds the valid
-    /// (constraint-filtered) successors per enabled action index.
+    /// had_any_raw_successors, raw_successor_count)` where
+    /// `per_action_successors` holds the valid (constraint-filtered) successors
+    /// per enabled action index and `raw_successor_count` spans all actions.
     ///
     /// CONTRACT: the union of the per-action successor sets must be IDENTICAL
     /// to whole-Next enumeration on the same state (verified by the parity
@@ -824,7 +1330,7 @@ impl<'a> ModelChecker<'a> {
         state: &State,
         registry: &crate::var_index::VarRegistry,
         states_wanted: bool,
-    ) -> Result<(Vec<PerActionSuccessors>, bool), CheckError> {
+    ) -> Result<(Vec<PerActionSuccessors>, bool, usize), CheckError> {
         // Hybrid per-action dispatch (item 4 M0): classify actions + build the
         // flat-view projection once per run. Inert (a no-op after the first
         // call, and fully disabled) unless `TY_HYBRID_FLAT_VIEW` is set.
@@ -836,9 +1342,15 @@ impl<'a> ModelChecker<'a> {
             self.hybrid_dump_action_guards(actions);
         }
 
+        // The router's raw fanout budget is cumulative across split actions.
+        // Resolve it before borrowing the evaluation scope; each action below
+        // receives only the parent's remaining allowance.
+        let router_raw_successor_cap = self.router_raw_successor_cap();
+
         // RAII guard restores env on drop, including early-return paths (Part of #2738)
         let _scope_guard = self.ctx.scope_guard();
         let mut had_any_raw_successors = false;
+        let mut raw_successor_count = 0usize;
 
         // For POR: track successors per action so we can filter by ample set
         let por_enabled = self.por.independence.is_some();
@@ -874,7 +1386,10 @@ impl<'a> ModelChecker<'a> {
         // brackets each (parent, action) enumeration in an ENABLED-provenance
         // scope whose completion protocol is what makes a TRUE-only witness
         // admissible, and a skipped instance never opens that scope.
-        let guard_precheck_active = super::hybrid_dispatch::action_guard_precheck_enabled()
+        let guard_precheck_requested = super::hybrid_dispatch::action_guard_precheck_enabled()
+            && (!self.router_only_detected_actions()
+                || super::hybrid_dispatch::router_guard_precheck_enabled());
+        let guard_precheck_active = guard_precheck_requested
             && (!por_enabled || super::hybrid_dispatch::guard_precheck_under_por_enabled())
             && !self.liveness_cache.cache_for_liveness
             && !self.inline_liveness_active();
@@ -910,10 +1425,7 @@ impl<'a> ModelChecker<'a> {
                 self.ctx.bind_mut(Arc::clone(name), value.clone());
             }
         }
-        super::hybrid_dispatch::perf_acc(
-            &mut self.hybrid_dispatch.perf.parent_setup_ns,
-            t_parent,
-        );
+        super::hybrid_dispatch::perf_acc(&mut self.hybrid_dispatch.perf.parent_setup_ns, t_parent);
         self.hybrid_dispatch.perf.batch_parents += 1;
 
         // WP-17: project the parent into its hybrid flat view ONCE per parent
@@ -1021,7 +1533,9 @@ impl<'a> ModelChecker<'a> {
                                         Ok(true) => {
                                             // Confirmed duplicate: valid counted
                                             // edge, no materialization needed.
-                                            enabled_count += 1;
+                                            enabled_count = enabled_count.checked_add(1).expect(
+                                                "raw successor generation count overflowed usize",
+                                            );
                                             action_pass_count += 1;
                                             deferred_seen_transitions += 1;
                                             continue;
@@ -1055,7 +1569,9 @@ impl<'a> ModelChecker<'a> {
                                 break;
                             };
 
-                            enabled_count += 1;
+                            enabled_count = enabled_count
+                                .checked_add(1)
+                                .expect("raw successor generation count overflowed usize");
                             let state_ok = self.check_state_constraints_array(&succ_arr)?;
                             let action_ok =
                                 self.check_action_constraints_array(&current_arr, &succ_arr)?;
@@ -1084,6 +1600,9 @@ impl<'a> ModelChecker<'a> {
                             // rather than recording a partial native result.
                         } else {
                             had_any_raw_successors |= enabled_count > 0;
+                            raw_successor_count = raw_successor_count
+                                .checked_add(enabled_count)
+                                .expect("raw successor generation count overflowed usize");
                             if enabled_count > 0 {
                                 self.trust_cg_action_dispatch_stats.enabled += enabled_count;
                             } else {
@@ -1185,6 +1704,9 @@ impl<'a> ModelChecker<'a> {
                         // is only in the BFS hot path (full_state_successors.rs).
                         let mut succ_arr = flat_succ.to_array_state(&current_arr);
                         had_any_raw_successors = true;
+                        raw_successor_count = raw_successor_count
+                            .checked_add(1)
+                            .expect("raw successor generation count overflowed usize");
                         let mut valid = Vec::new();
                         let mut valid_arr: Vec<ArrayState> = Vec::new();
                         let state_ok = self.check_state_constraints_array(&succ_arr)?;
@@ -1332,6 +1854,9 @@ impl<'a> ModelChecker<'a> {
                     }
                     if !eval_failed {
                         had_any_raw_successors |= raw_count > 0;
+                        raw_successor_count = raw_successor_count
+                            .checked_add(raw_count)
+                            .expect("raw successor generation count overflowed usize");
                         if let Some(candidates) = hybrid_native.as_mut() {
                             self.hybrid_commit_authoritative_instance(candidates);
                         }
@@ -1424,13 +1949,24 @@ impl<'a> ModelChecker<'a> {
             // trees included) once per action.
             let t_enum = self.hybrid_dispatch.perf.start();
             let successors = if interp_diff_path {
-                let diffs = crate::enumerate::enumerate_successors_array_as_diffs_body(
-                    &mut self.ctx,
-                    &action.expr,
-                    &current_arr,
-                    &self.module.vars,
-                    None,
-                )
+                let diffs = if let Some(cap) = router_raw_successor_cap {
+                    crate::enumerate::enumerate_successors_array_as_diffs_body_with_cap(
+                        &mut self.ctx,
+                        &action.expr,
+                        &current_arr,
+                        &self.module.vars,
+                        None,
+                        cap.saturating_sub(raw_successor_count),
+                    )
+                } else {
+                    crate::enumerate::enumerate_successors_array_as_diffs_body(
+                        &mut self.ctx,
+                        &action.expr,
+                        &current_arr,
+                        &self.module.vars,
+                        None,
+                    )
+                }
                 .map_err(EvalCheckError::Eval)?
                 .unwrap_or_default();
                 InterpSuccessors::Diffs(diffs)
@@ -1465,6 +2001,9 @@ impl<'a> ModelChecker<'a> {
             if !successors.is_empty() {
                 had_any_raw_successors = true;
             }
+            raw_successor_count = raw_successor_count
+                .checked_add(successors.len())
+                .expect("raw successor generation count overflowed usize");
             self.hybrid_dispatch.perf.interp_succ_count += successors.len() as u64;
 
             let mut valid = Vec::new();
@@ -1622,7 +2161,11 @@ impl<'a> ModelChecker<'a> {
 
         drop(_scope_guard);
 
-        Ok((per_action_successors, had_any_raw_successors))
+        Ok((
+            per_action_successors,
+            had_any_raw_successors,
+            raw_successor_count,
+        ))
     }
 
     /// Streaming flat-primary successor generation with read-only dedup prefilter.
@@ -1643,7 +2186,11 @@ impl<'a> ModelChecker<'a> {
         }
 
         let actions = self.coverage.actions.clone();
-        if actions.is_empty() || !self.prepare_jit_next_state_flat(flat_state) {
+        if self.por.parity_failed
+            || actions.is_empty()
+            || self.router_only_detected_actions()
+            || !self.prepare_jit_next_state_flat(flat_state)
+        {
             return Ok(None);
         }
 
@@ -1670,7 +2217,9 @@ impl<'a> ModelChecker<'a> {
                 };
 
             had_raw_successors |= action_result.raw_successor_count > 0;
-            raw_successor_count += action_result.raw_successor_count;
+            raw_successor_count = raw_successor_count
+                .checked_add(action_result.raw_successor_count)
+                .expect("raw successor generation count overflowed usize");
 
             if let Some(ref mut coverage) = self.stats.coverage {
                 coverage.record_action(action.id, action_result.raw_successor_count);
@@ -1722,7 +2271,10 @@ impl<'a> ModelChecker<'a> {
             .ok_or(ConfigCheckError::MissingNext)?;
 
         // We need per-action dispatch (actions must be discovered).
-        if self.coverage.actions.is_empty() {
+        if self.por.parity_failed
+            || self.coverage.actions.is_empty()
+            || self.router_only_detected_actions()
+        {
             // No actions discovered — cannot do per-action dispatch.
             // Fall back to interpreter path via ArrayState.
             let arr = flat_state.to_array_state(&registry);
@@ -1743,13 +2295,17 @@ impl<'a> ModelChecker<'a> {
                 .collect::<Result<_, CheckError>>()?;
             return Ok(SuccessorResult {
                 successors: flat_succs,
+                raw_successor_count: result.raw_successor_count,
                 had_raw_successors: result.had_raw_successors,
             });
         }
 
         // Low-benefit auto-POR release (see generate_successors_filtered).
         self.maybe_release_low_benefit_auto_por();
-        if self.coverage.actions.is_empty() {
+        if self.por.parity_failed
+            || self.coverage.actions.is_empty()
+            || self.router_only_detected_actions()
+        {
             // Actions were retired by the release — use whole-Next via the
             // interpreter fallback below (mirrors the no-actions path above).
             let arr = flat_state.to_array_state(&registry);
@@ -1769,6 +2325,7 @@ impl<'a> ModelChecker<'a> {
                 .collect::<Result<_, CheckError>>()?;
             return Ok(SuccessorResult {
                 successors: flat_succs,
+                raw_successor_count: result.raw_successor_count,
                 had_raw_successors: result.had_raw_successors,
             });
         }
@@ -1807,6 +2364,7 @@ impl<'a> ModelChecker<'a> {
                 .collect::<Result<_, CheckError>>()?;
             return Ok(SuccessorResult {
                 successors: flat_succs,
+                raw_successor_count: result.raw_successor_count,
                 had_raw_successors: result.had_raw_successors,
             });
         }
@@ -1825,6 +2383,7 @@ impl<'a> ModelChecker<'a> {
             !self.config.constraints.is_empty() || !self.config.action_constraints.is_empty();
 
         let mut had_any_raw_successors = false;
+        let mut raw_successor_count = 0usize;
         let mut per_action_successors: Vec<(usize, Vec<crate::state::FlatState>)> =
             Vec::with_capacity(actions.len());
 
@@ -1872,6 +2431,9 @@ impl<'a> ModelChecker<'a> {
                 match jit_result {
                     Ok(flat_succs) if !flat_succs.is_empty() => {
                         had_any_raw_successors = true;
+                        raw_successor_count = raw_successor_count
+                            .checked_add(flat_succs.len())
+                            .expect("raw successor generation count overflowed usize");
                         // Part of #4196: Skip per-successor ArrayState
                         // conversion when no constraints are configured.
                         // check_*_constraints_array with an empty config
@@ -1953,6 +2515,9 @@ impl<'a> ModelChecker<'a> {
             if !successors.is_empty() {
                 had_any_raw_successors = true;
             }
+            raw_successor_count = raw_successor_count
+                .checked_add(successors.len())
+                .expect("raw successor generation count overflowed usize");
 
             // Part of #4196: Skip constraint checks when none are configured.
             // FlatState::from_array_state is still required to normalize
@@ -2058,7 +2623,31 @@ impl<'a> ModelChecker<'a> {
 
         Ok(SuccessorResult {
             successors: all_valid_flat,
+            raw_successor_count,
             had_raw_successors: had_any_raw_successors,
         })
+    }
+}
+
+#[cfg(test)]
+mod router_multiset_tests {
+    use super::{successor_multisets_match, successor_parity_matches};
+
+    #[test]
+    fn successor_parity_preserves_duplicate_multiplicity() {
+        let routed = [1, 1, 2];
+        let canonical = [2, 1, 1];
+        assert!(successor_multisets_match(&routed, &canonical));
+
+        let missing_duplicate = [1, 2];
+        assert!(!successor_multisets_match(&routed, &missing_duplicate));
+        assert!(!successor_multisets_match(&missing_duplicate, &routed));
+    }
+
+    #[test]
+    fn successor_parity_includes_deadlock_relevant_raw_signal() {
+        let empty: [i32; 0] = [];
+        assert!(successor_parity_matches(&empty, &empty, 0, 0));
+        assert!(!successor_parity_matches(&empty, &empty, 1, 0));
     }
 }

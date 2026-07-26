@@ -60,6 +60,7 @@ impl<'a> ModelChecker<'a> {
     fn solve_next_relation_as_array(
         &mut self,
         current_array: &ArrayState,
+        allow_pc_dispatch: bool,
     ) -> Result<Vec<ArrayState>, CheckError> {
         // Part of #3255: as_deref() avoids String allocation on the common (non-TIR) path.
         // The TIR parity path (env-gated, off by default) creates a local owned copy.
@@ -91,7 +92,7 @@ impl<'a> ModelChecker<'a> {
         // PlusCal pc-dispatch optimization for the ArrayState path.
         // Same logic as in generate_successors_as_diffs_raw — skip actions
         // whose pc guard doesn't match the current state.
-        if !leaf_tir_used {
+        if allow_pc_dispatch && !self.por.parity_failed && !leaf_tir_used {
             if let Some(ref table) = self.compiled.pc_dispatch {
                 let pc_val = current_array.get(table.pc_var_idx);
                 if let Some(action_indices) = table.action_indices_for_current_pc(&pc_val) {
@@ -168,7 +169,7 @@ impl<'a> ModelChecker<'a> {
         self.ensure_hybrid_dispatch_ready();
         let _state_guard = self.ctx.bind_state_env_guard(current_array.env_ref());
 
-        let successors = self.solve_next_relation_as_array(current_array)?;
+        let successors = self.solve_next_relation_as_array(current_array, true)?;
 
         Ok(successors)
     }
@@ -206,6 +207,9 @@ impl<'a> ModelChecker<'a> {
         &mut self,
         current_array: &ArrayState,
     ) -> Result<Option<SuccessorResult<Vec<DiffSuccessor>>>, CheckError> {
+        if self.por.parity_failed {
+            return Ok(None);
+        }
         // The diff engine routes an armed Value action VM away from its
         // unconstrained streaming enumerator and through this batch boundary.
         // Direct batch callers share the same gate; rejected or runtime-disarmed
@@ -368,9 +372,11 @@ impl<'a> ModelChecker<'a> {
                             all_diffs.extend(d);
                         }
                     }
+                    let raw_successor_count = all_diffs.len();
                     let had_raw_successors = !all_diffs.is_empty();
                     return Ok(Some(SuccessorResult {
                         successors: all_diffs,
+                        raw_successor_count,
                         had_raw_successors,
                     }));
                 }
@@ -396,6 +402,7 @@ impl<'a> ModelChecker<'a> {
 
         match diffs_opt {
             Some(mut diffs) => {
+                let raw_successor_count = diffs.len();
                 let registry = self.ctx.var_registry().clone();
                 if self.tir_parity.is_some() && !leaf_tir_used {
                     // Part of #3296: use raw name for TIR parity (matches convention).
@@ -421,6 +428,7 @@ impl<'a> ModelChecker<'a> {
 
                 Ok(Some(SuccessorResult {
                     successors: diffs,
+                    raw_successor_count,
                     had_raw_successors,
                 }))
             }
@@ -454,6 +462,7 @@ impl<'a> ModelChecker<'a> {
                 }
                 Ok(Some(SuccessorResult {
                     successors: valid_diffs,
+                    raw_successor_count: result.raw_successor_count,
                     had_raw_successors: result.had_raw_successors,
                 }))
             }
@@ -506,6 +515,7 @@ impl<'a> ModelChecker<'a> {
             s.set(board_idx, board.clone());
             successors.push(s);
         }
+        let raw_successor_count = successors.len();
         let had_raw_successors = !successors.is_empty();
 
         // Two validation layers share one comparison:
@@ -520,8 +530,11 @@ impl<'a> ModelChecker<'a> {
             std::env::var_os("TY_NESTED_SET_SLIDE_CROSSCHECK").is_some_and(|v| v == "1");
         let tripwire_active = self.nested_set_slide_tripwire > 0;
         if crosscheck_env || tripwire_active {
-            // Arm is currently `None`, so this recursion runs the interpreter.
-            let interp = self.generate_successors_array_raw(current_array)?;
+            // The kernel arm is currently `None`, but other action routes may
+            // still be live. Validation must remain an independent canonical
+            // whole-`Next` oracle rather than recursively validating against
+            // the route under test.
+            let interp = self.generate_successors_array_monolithic_raw(current_array)?;
             let kernel_set: std::collections::BTreeSet<crate::Value> =
                 successors.iter().map(|s| s.get(board_idx)).collect();
             // The interpreter's monolithic `\E e : board' \in update(e, empty)`
@@ -570,6 +583,7 @@ impl<'a> ModelChecker<'a> {
         self.nested_set_slide_arm = Some(arm);
         Ok(Some(SuccessorResult {
             successors,
+            raw_successor_count,
             had_raw_successors,
         }))
     }
@@ -578,6 +592,9 @@ impl<'a> ModelChecker<'a> {
         &mut self,
         current_array: &ArrayState,
     ) -> Result<SuccessorResult<Vec<ArrayState>>, CheckError> {
+        if self.por.parity_failed {
+            return self.generate_successors_array_monolithic_raw(current_array);
+        }
         // Hybrid per-action dispatch (item 4 M0): classify once for the
         // full-state array path (inert unless `TY_HYBRID_FLAT_VIEW` is set).
         self.ensure_hybrid_dispatch_ready();
@@ -626,6 +643,7 @@ impl<'a> ModelChecker<'a> {
                 );
                 return Ok(SuccessorResult {
                     successors: arrays,
+                    raw_successor_count: result.raw_successor_count,
                     had_raw_successors: result.had_raw_successors,
                 });
             }
@@ -637,15 +655,36 @@ impl<'a> ModelChecker<'a> {
                     .into_iter()
                     .map(|s| ArrayState::from_successor_state(&s, current_array, &registry))
                     .collect(),
+                raw_successor_count: result.raw_successor_count,
                 had_raw_successors: result.had_raw_successors,
             });
         }
 
         let successors = self.generate_successors_as_array(current_array)?;
+        let raw_successor_count = successors.len();
         let had_raw_successors = !successors.is_empty();
-
         Ok(SuccessorResult {
             successors,
+            raw_successor_count,
+            had_raw_successors,
+        })
+    }
+
+    /// Canonical array interpreter oracle: evaluate whole-`Next` directly,
+    /// bypassing every per-action/native successor route. Differential
+    /// validators call this helper so the candidate route cannot validate
+    /// against itself.
+    pub(in crate::check::model_checker) fn generate_successors_array_monolithic_raw(
+        &mut self,
+        current_array: &ArrayState,
+    ) -> Result<SuccessorResult<Vec<ArrayState>>, CheckError> {
+        let _state_guard = self.ctx.bind_state_env_guard(current_array.env_ref());
+        let successors = self.solve_next_relation_as_array(current_array, false)?;
+        let raw_successor_count = successors.len();
+        let had_raw_successors = !successors.is_empty();
+        Ok(SuccessorResult {
+            successors,
+            raw_successor_count,
             had_raw_successors,
         })
     }
@@ -679,6 +718,7 @@ impl<'a> ModelChecker<'a> {
 
         Ok(SuccessorResult {
             successors: valid,
+            raw_successor_count: raw.raw_successor_count,
             had_raw_successors: raw.had_raw_successors,
         })
     }
@@ -723,7 +763,7 @@ impl<'a> ModelChecker<'a> {
         // Per-action tagging requires split-action enumeration which is being
         // removed. All successors come from the monolithic unified path with
         // no per-action provenance (tags are None).
-        let succs = self.solve_next_relation_as_array(current_array)?;
+        let succs = self.solve_next_relation_as_array(current_array, true)?;
         let tags: Vec<Option<usize>> = vec![None; succs.len()];
         let (successors, tags, needs_tir_filter) = (succs, tags, false);
 
@@ -743,6 +783,7 @@ impl<'a> ModelChecker<'a> {
                 (successors, tags)
             };
 
+        let raw_successor_count = successors.len();
         let had_raw_successors = !successors.is_empty();
 
         // Apply constraints (preserving tag association)
@@ -750,6 +791,7 @@ impl<'a> ModelChecker<'a> {
             return Ok((
                 SuccessorResult {
                     successors,
+                    raw_successor_count,
                     had_raw_successors,
                 },
                 tags,
@@ -768,6 +810,7 @@ impl<'a> ModelChecker<'a> {
         Ok((
             SuccessorResult {
                 successors: valid,
+                raw_successor_count,
                 had_raw_successors,
             },
             valid_tags,

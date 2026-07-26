@@ -8,6 +8,24 @@ use super::super::super::*;
 
 #[cfg_attr(test, ntest::timeout(10000))]
 #[test]
+fn test_setcup_clone_shares_union_tree() {
+    let original = Value::SetCup(SetCupValue::new(
+        Value::set([Value::int(1)]),
+        Value::set([Value::int(2)]),
+    ));
+    let cloned = original.clone();
+    let equal_but_distinct = Value::SetCup(SetCupValue::new(
+        Value::set([Value::int(1)]),
+        Value::set([Value::int(2)]),
+    ));
+
+    assert!(original.ptr_eq(&cloned));
+    assert!(!original.ptr_eq(&equal_but_distinct));
+    assert_eq!(original, equal_but_distinct);
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
 fn test_setcup_enumerable() {
     // Two enumerable sets -> can convert to SortedSet
     let s1 = Value::set([Value::int(1), Value::int(2)]);

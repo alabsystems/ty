@@ -50,8 +50,14 @@ impl Drop for EnvGuard {
 }
 
 #[test]
-#[ignore = "profiling harness; run explicitly with --ignored --nocapture --test-threads=1"]
 fn profile_current_vs_trust_cg_checked_successors() {
+    if !env::var_os("TY_RUN_PETRI_SUCCESSOR_PROFILE").is_some_and(|value| value == "1") {
+        eprintln!(
+            "SKIP profile_current_vs_trust_cg_checked_successors: set \
+             TY_RUN_PETRI_SUCCESSOR_PROFILE=1 to authorize the profiling campaign"
+        );
+        return;
+    }
     let model_dir = write_lane_model(LANES);
     let net = parser::parse_pnml_dir(model_dir.path()).expect("parse generated lane PNML");
     let sample_markings = sample_lane_markings(LANES, SAMPLE_STATES);

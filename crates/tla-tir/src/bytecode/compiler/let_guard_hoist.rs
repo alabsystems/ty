@@ -57,9 +57,7 @@
 use tla_core::Spanned;
 
 use super::FnCompileState;
-use crate::nodes::{
-    TirBoundPattern, TirBoundVar, TirExpr, TirLetDef, TirNameKind, TirNameRef,
-};
+use crate::nodes::{TirBoundPattern, TirBoundVar, TirExpr, TirLetDef, TirNameKind, TirNameRef};
 
 /// Escape hatch: `TY_GUARD_FIRST_LET=0` restores the eager defs-first order.
 /// Default ON (campaign convention for semantics-tightening fixes).
@@ -246,27 +244,26 @@ impl<'a> FnCompileState<'a> {
             }
         }
 
-        let check_bound =
-            |this: &Self,
-             vars: &[TirBoundVar],
-             body: &Spanned<TirExpr>,
-             locals: &mut Vec<String>,
-             forbidden: &[String]| {
-                for var in vars {
-                    if let Some(domain) = &var.domain {
-                        if !this.expr_is_pure_guard(domain, locals, forbidden) {
-                            return false;
-                        }
+        let check_bound = |this: &Self,
+                           vars: &[TirBoundVar],
+                           body: &Spanned<TirExpr>,
+                           locals: &mut Vec<String>,
+                           forbidden: &[String]| {
+            for var in vars {
+                if let Some(domain) = &var.domain {
+                    if !this.expr_is_pure_guard(domain, locals, forbidden) {
+                        return false;
                     }
                 }
-                let saved = locals.len();
-                for var in vars {
-                    push_bound_var_names(var, locals);
-                }
-                let ok = this.expr_is_pure_guard(body, locals, forbidden);
-                locals.truncate(saved);
-                ok
-            };
+            }
+            let saved = locals.len();
+            for var in vars {
+                push_bound_var_names(var, locals);
+            }
+            let ok = this.expr_is_pure_guard(body, locals, forbidden);
+            locals.truncate(saved);
+            ok
+        };
 
         match &expr.node {
             TirExpr::Const { .. } | TirExpr::ExceptAt => true,

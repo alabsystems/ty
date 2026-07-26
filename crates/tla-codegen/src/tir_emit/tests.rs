@@ -3,12 +3,12 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::{generate_rust_from_tir, TirCodeGenOptions};
-use tla_value::Rp;
 use crate::types::struct_registry::StructRegistry;
 use crate::types::{FieldName, TlaType};
 use std::collections::HashMap;
 use tla_core::{compute_is_recursive, lower, parse, FileId};
 use tla_tir::{lower_module_for_codegen, TirLoweringEnv};
+use tla_value::Rp;
 
 const RECURSIVE_FACTORIAL_SPEC: &str = r#"
 ---- MODULE RecursiveFactorial ----

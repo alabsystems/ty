@@ -11,7 +11,6 @@
 //! - Control: `Case`, `Unchanged`
 
 use super::dispatch::eval_tir;
-use tla_value::Rp;
 use super::StoredTirBody;
 use crate::core::EvalCtx;
 use crate::eval_membership::check_set_pred_membership;
@@ -20,10 +19,10 @@ use crate::helpers::values_equal;
 use num_bigint::BigInt;
 use num_traits::Zero;
 use smallvec::SmallVec;
-use std::sync::Arc;
 use tla_core::{expr_mentions_name_v, Spanned};
 use tla_tir::nodes::{TirCaseArm, TirExpr, TirLetDef, TirNameKind};
 use tla_value::error::{EvalError, EvalResult};
+use tla_value::Rp;
 use tla_value::{big_union, intern_string, SubsetValue, UnionValue, Value};
 
 // === Membership ===
@@ -281,9 +280,13 @@ fn try_tir_unchanged_statevar_fast(
                 let eq = unsafe { state_env.values_equal(next_state_env, idx) };
                 return Some(Ok(Value::Bool(eq)));
             }
-            tla_value::churn_stats::churn_count(tla_value::churn_stats::ChurnSite::StateVarReadUnchanged);
+            tla_value::churn_stats::churn_count(
+                tla_value::churn_stats::ChurnSite::StateVarReadUnchanged,
+            );
             let cur = unsafe { state_env.get_value(idx) };
-            tla_value::churn_stats::churn_count(tla_value::churn_stats::ChurnSite::StateVarReadUnchanged);
+            tla_value::churn_stats::churn_count(
+                tla_value::churn_stats::ChurnSite::StateVarReadUnchanged,
+            );
             let next = unsafe { next_state_env.get_value(idx) };
             Some(if !cur.is_set() && !next.is_set() {
                 Ok(Value::Bool(cur == next))
@@ -307,9 +310,13 @@ fn try_tir_unchanged_statevar_fast(
                     }
                     continue;
                 }
-                tla_value::churn_stats::churn_count(tla_value::churn_stats::ChurnSite::StateVarReadUnchanged);
+                tla_value::churn_stats::churn_count(
+                    tla_value::churn_stats::ChurnSite::StateVarReadUnchanged,
+                );
                 let cur = unsafe { state_env.get_value(idx) };
-                tla_value::churn_stats::churn_count(tla_value::churn_stats::ChurnSite::StateVarReadUnchanged);
+                tla_value::churn_stats::churn_count(
+                    tla_value::churn_stats::ChurnSite::StateVarReadUnchanged,
+                );
                 let next = unsafe { next_state_env.get_value(idx) };
                 let eq = if !cur.is_set() && !next.is_set() {
                     cur == next

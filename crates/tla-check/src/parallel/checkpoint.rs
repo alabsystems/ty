@@ -117,8 +117,14 @@ impl ParallelChecker {
         checkpoint.metadata.stats = CheckpointStats {
             states_found: self.states_count(),
             initial_states: 0, // Will be recomputed on resume.
+            raw_initial_states_generated: self
+                .total_raw_initial_states_generated
+                .load(std::sync::atomic::Ordering::SeqCst),
             transitions: self
                 .total_transitions
+                .load(std::sync::atomic::Ordering::SeqCst),
+            raw_successors_generated: self
+                .total_raw_successors_generated
                 .load(std::sync::atomic::Ordering::SeqCst),
             max_depth: self.max_depth.load(std::sync::atomic::Ordering::SeqCst),
             frontier_size: 0, // No frontier in parallel checkpoint.
@@ -335,6 +341,14 @@ impl ParallelChecker {
             .store(checkpoint.metadata.stats.max_depth, Ordering::SeqCst);
         self.total_transitions
             .store(checkpoint.metadata.stats.transitions, Ordering::SeqCst);
+        self.total_raw_initial_states_generated.store(
+            checkpoint.metadata.stats.raw_initial_states_generated,
+            Ordering::SeqCst,
+        );
+        self.total_raw_successors_generated.store(
+            checkpoint.metadata.stats.raw_successors_generated,
+            Ordering::SeqCst,
+        );
 
         // Restore first_violation from continue-on-error mode.
         if let Some(ref violation) = checkpoint.first_violation {
@@ -428,7 +442,12 @@ impl ParallelChecker {
             let stats = CheckStats {
                 states_found: checkpoint.metadata.stats.states_found,
                 initial_states: checkpoint.metadata.stats.initial_states,
+                raw_initial_states_generated: checkpoint
+                    .metadata
+                    .stats
+                    .raw_initial_states_generated,
                 transitions: checkpoint.metadata.stats.transitions,
+                raw_successors_generated: checkpoint.metadata.stats.raw_successors_generated,
                 max_depth: checkpoint.metadata.stats.max_depth,
                 detected_actions,
                 detected_action_ids,
@@ -452,7 +471,12 @@ impl ParallelChecker {
             let stats = CheckStats {
                 states_found: checkpoint.metadata.stats.states_found,
                 initial_states: checkpoint.metadata.stats.initial_states,
+                raw_initial_states_generated: checkpoint
+                    .metadata
+                    .stats
+                    .raw_initial_states_generated,
                 transitions: checkpoint.metadata.stats.transitions,
+                raw_successors_generated: checkpoint.metadata.stats.raw_successors_generated,
                 max_depth: checkpoint.metadata.stats.max_depth,
                 detected_actions,
                 detected_action_ids,

@@ -56,6 +56,7 @@ impl AdaptiveChecker {
             stuttering_allowed: true,
             max_states: None,
             max_depth: None,
+            deadline: None,
             memory_limit: None,
             disk_limit: None,
             progress_callback: None,
@@ -190,6 +191,20 @@ impl AdaptiveChecker {
     /// Set maximum BFS depth to explore
     pub fn set_max_depth(&mut self, limit: usize) {
         self.max_depth = Some(limit);
+    }
+
+    /// Set an absolute wall-clock deadline for both pilot analysis and the
+    /// selected checker. Sharing one deadline prevents the pilot from extending
+    /// the user's total grant.
+    pub fn set_deadline(&mut self, deadline: std::time::Instant) {
+        self.deadline = Some(deadline);
+    }
+
+    /// Set a wall-clock budget relative to now.
+    pub fn set_time_budget(&mut self, budget: std::time::Duration) {
+        if let Some(deadline) = std::time::Instant::now().checked_add(budget) {
+            self.deadline = Some(deadline);
+        }
     }
 
     /// Part of #2751: Set memory limit for threshold-triggered stop.

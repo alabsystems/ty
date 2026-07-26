@@ -771,9 +771,19 @@ impl ModelChecker<'_> {
         parent_slice: &[i64],
         registry: &tla_core::VarRegistry,
     ) -> Result<Vec<CompiledBfsInterpreterActionSuccessors>, CheckResult> {
+        if self.por.parity_failed {
+            return Err(CheckResult::from_error(
+                RuntimeCheckError::Internal(
+                    "compiled BFS action oracle requested after per-action validation failed"
+                        .to_string(),
+                )
+                .into(),
+                self.stats.clone(),
+            ));
+        }
         let parent_state = self.try_reconstruct_state_from_flat(parent_slice, registry)?;
         let actions = self.coverage.actions.clone();
-        if actions.is_empty() {
+        if actions.is_empty() || self.router_only_detected_actions() {
             return Ok(Vec::new());
         }
 
@@ -1609,7 +1619,12 @@ impl ModelChecker<'_> {
                                     }
                                     self.record_transitions(
                                         usize::try_from(level_result.total_generated)
-                                            .unwrap_or(usize::MAX),
+                                            .expect("compiled successor count does not fit usize"),
+                                    );
+                                    self.record_raw_successors_generated(
+                                        usize::try_from(level_result.total_generated).expect(
+                                            "compiled raw successor count does not fit usize",
+                                        ),
                                     );
                                     if level_result.total_generated > 0 {
                                         self.stats.max_depth = self.stats.max_depth.max(succ_depth);
@@ -1766,7 +1781,11 @@ impl ModelChecker<'_> {
                             } else {
                                 self.record_transitions(
                                     usize::try_from(level_result.total_generated)
-                                        .unwrap_or(usize::MAX),
+                                        .expect("compiled successor count does not fit usize"),
+                                );
+                                self.record_raw_successors_generated(
+                                    usize::try_from(level_result.total_generated)
+                                        .expect("compiled raw successor count does not fit usize"),
                                 );
                                 if level_result.total_generated > 0 {
                                     self.stats.max_depth = self.stats.max_depth.max(succ_depth);
@@ -3886,9 +3905,16 @@ impl ModelChecker<'_> {
                 level_parents += 1;
                 let output_generated_count = output.generated_count();
                 self.record_transitions(
-                    usize::try_from(output_generated_count).unwrap_or(usize::MAX),
+                    usize::try_from(output_generated_count)
+                        .expect("compiled successor count does not fit usize"),
                 );
-                level_generated += u64::from(output_generated_count);
+                self.record_raw_successors_generated(
+                    usize::try_from(output_generated_count)
+                        .expect("compiled raw successor count does not fit usize"),
+                );
+                level_generated = level_generated
+                    .checked_add(u64::from(output_generated_count))
+                    .expect("compiled level raw successor count overflowed u64");
 
                 if crosscheck_with_interpreter {
                     let parent_slice = crosscheck_parent.as_deref().ok_or_else(|| {
@@ -7218,6 +7244,8 @@ Next == x' = x + 1
         }
     }
 
+    /// Emits two identical successors in one fused batch so the second must be
+    /// justified by the first candidate's local payload witness.
     struct IntraBatchDuplicateFusedLevel;
 
     impl CompiledBfsLevel for IntraBatchDuplicateFusedLevel {
@@ -8238,6 +8266,78 @@ Next == x' = x + 1
                 .compiled_flat_payload_witnesses
                 .census(),
             fresh_witness_census
+        );
+    }
+
+    #[test]
+    fn compiled_bfs_fused_batch_admission_uses_intra_batch_payload_witness_for_duplicate() {
+        let module = parse_module(
+            r#"
+---- MODULE CompiledBfsIntraBatchDuplicateAdmissionTest ----
+VARIABLE x
+Init == x = 0
+Next == x' = x + 1
+====
+"#,
+        );
+        let config = Config {
+            init: Some("Init".to_string()),
+            next: Some("Next".to_string()),
+            check_deadlock: false,
+            ..Default::default()
+        };
+        let mut checker = ModelChecker::new(&module, &config);
+        checker.flat_state_primary = true;
+        checker.compiled_bfs_level = Some(Box::new(IntraBatchDuplicateFusedLevel));
+        checker.compiled_bfs_step = None;
+        checker.set_max_depth(1);
+
+        let layout = Arc::new(StateLayout::new(
+            checker.ctx.var_registry(),
+            vec![VarLayoutKind::Scalar],
+        ));
+        checker.flat_bfs_adapter = Some(crate::state::FlatBfsAdapter::from_layout(layout.clone()));
+        let mut flat_queue = FlatBfsFrontier::new(layout);
+        let parent_fp = crate::check::model_checker::invariants::fingerprint_flat_compiled(&[0]);
+        checker
+            .mark_state_seen_fp_only_checked(parent_fp, None, 0)
+            .expect("seed parent fingerprint");
+        flat_queue.push_raw_buffer(&[0], parent_fp, 0, 0);
+        let mut storage = FingerprintOnlyStorage::new(
+            BulkStateStorage::empty(checker.ctx.var_registry().len()),
+            1,
+        );
+
+        let result = checker.run_compiled_bfs_loop(&mut storage, &mut flat_queue);
+
+        match result {
+            CheckResult::LimitReached { stats, .. } => {
+                assert_eq!(stats.transitions, 2);
+                assert_eq!(stats.states_found, 2);
+                assert_eq!(stats.max_depth, 1);
+            }
+            other => panic!(
+                "expected duplicate to be admitted through intra-batch payload witness, got {other:?}"
+            ),
+        }
+        let successor_fp = crate::check::model_checker::invariants::fingerprint_flat_compiled(&[1]);
+        assert_eq!(checker.test_seen_fps_len(), 2);
+        assert_eq!(flat_queue.len(), 0);
+        assert_eq!(
+            checker
+                .state_storage
+                .compiled_flat_payload_witnesses
+                .confirm_flat_i64_slots(parent_fp, &[0]),
+            Some(true),
+            "depth-limited completion must retain the parent witness for resume"
+        );
+        assert_eq!(
+            checker
+                .state_storage
+                .compiled_flat_payload_witnesses
+                .confirm_flat_i64_slots(successor_fp, &[1]),
+            None,
+            "same-batch confirmation must not copy the inserted payload into the durable table"
         );
     }
 

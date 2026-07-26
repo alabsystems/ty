@@ -16,6 +16,7 @@
 
 use super::*;
 use ay_dpll::api::SolveResult;
+use tla_core::ast::BoundVar;
 
 /// Helper: create a BMC translator with array support.
 fn bmc_array(k: usize) -> BmcTranslator {
@@ -410,4 +411,174 @@ fn test_bmc_powerset_enumerate_range() {
     ));
     let subsets = bmc.enumerate_powerset_subsets(&base).unwrap();
     assert_eq!(subsets.len(), 8);
+}
+
+fn singleton_powerset_bound(name: &str) -> BoundVar {
+    BoundVar {
+        name: spanned(name.to_string()),
+        domain: Some(Box::new(spanned(Expr::Powerset(Box::new(spanned(
+            Expr::SetEnum(vec![spanned(Expr::Int(BigInt::from(1)))]),
+        )))))),
+        pattern: None,
+    }
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_bmc_powerset_bound_scalar_shadow_is_restored() {
+    let mut bmc = bmc_array(1);
+    bmc.declare_var("T", TlaSort::Int).unwrap();
+    let original_terms = bmc.vars.get("T").unwrap().terms.clone();
+    let body = spanned(Expr::In(
+        Box::new(spanned(Expr::Int(BigInt::from(1)))),
+        Box::new(spanned(Expr::Ident(
+            "T".to_string(),
+            tla_core::name_intern::NameId::INVALID,
+        ))),
+    ));
+    let exists = spanned(Expr::Exists(
+        vec![singleton_powerset_bound("T")],
+        Box::new(body),
+    ));
+
+    bmc.translate_init(&exists).unwrap();
+    let restored = bmc.vars.get("T").unwrap();
+    assert_eq!(restored.sort, TlaSort::Int);
+    assert_eq!(restored.terms, original_terms);
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_bmc_powerset_bound_shadow_restores_after_error() {
+    let mut bmc = bmc_array(1);
+    bmc.declare_var("T", TlaSort::Bool).unwrap();
+    let original_terms = bmc.vars.get("T").unwrap().terms.clone();
+    let invalid_body = spanned(Expr::Add(
+        Box::new(spanned(Expr::Int(BigInt::from(1)))),
+        Box::new(spanned(Expr::Int(BigInt::from(1)))),
+    ));
+    let exists = spanned(Expr::Exists(
+        vec![singleton_powerset_bound("T")],
+        Box::new(invalid_body),
+    ));
+
+    assert!(bmc.translate_init(&exists).is_err());
+    let restored = bmc.vars.get("T").unwrap();
+    assert_eq!(restored.sort, TlaSort::Bool);
+    assert_eq!(restored.terms, original_terms);
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_bmc_powerset_bound_tuple_collision_fails_closed() {
+    let mut bmc = bmc_array(0);
+    bmc.declare_tuple_var("T", vec![TlaSort::Int]).unwrap();
+    let exists = spanned(Expr::Exists(
+        vec![singleton_powerset_bound("T")],
+        Box::new(spanned(Expr::Bool(true))),
+    ));
+
+    assert!(bmc.translate_init(&exists).is_err());
+    assert!(bmc.tuple_vars.contains_key("T"));
+    assert!(!bmc.vars.contains_key("T"));
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_bmc_powerset_enumerates_actual_intersection_not_support_superset() {
+    let mut bmc = bmc_array(0);
+    let base = spanned(Expr::Intersect(
+        Box::new(spanned(Expr::SetEnum(vec![
+            spanned(Expr::Int(BigInt::from(1))),
+            spanned(Expr::Int(BigInt::from(2))),
+        ]))),
+        Box::new(spanned(Expr::SetEnum(vec![
+            spanned(Expr::Int(BigInt::from(2))),
+            spanned(Expr::Int(BigInt::from(3))),
+        ]))),
+    ));
+
+    // The actual base is {2}, so its powerset has exactly two values. The old
+    // support-union encoding incorrectly enumerated all eight subsets of
+    // {1,2,3}.
+    let subsets = bmc.enumerate_powerset_subsets(&base).unwrap();
+    assert_eq!(subsets.len(), 2);
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_bmc_powerset_rejects_symbolic_and_filtered_bases_before_aux_mutation() {
+    let mut bmc = bmc_array(0);
+    bmc.declare_var(
+        "S",
+        TlaSort::Set {
+            element_sort: Box::new(TlaSort::Int),
+        },
+    )
+    .unwrap();
+    let s = spanned(Expr::Ident(
+        "S".to_string(),
+        tla_core::name_intern::NameId::INVALID,
+    ));
+    let before = bmc.aux_var_counter;
+    assert!(bmc.enumerate_powerset_subsets(&s).is_err());
+    assert!(bmc.encode_symbolic_subset(&s).is_err());
+
+    let bound = BoundVar {
+        name: spanned("x".to_string()),
+        domain: Some(Box::new(spanned(Expr::SetEnum(vec![spanned(Expr::Int(
+            BigInt::from(1),
+        ))])))),
+        pattern: None,
+    };
+    let filter = spanned(Expr::SetFilter(bound, Box::new(spanned(Expr::Bool(true)))));
+    assert!(bmc.enumerate_powerset_subsets(&filter).is_err());
+    assert_eq!(bmc.aux_var_counter, before);
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_bmc_string_powerset_quantifier_preserves_element_sort() {
+    let mut bmc = bmc_array(0);
+    let bound = BoundVar {
+        name: spanned("T".to_string()),
+        domain: Some(Box::new(spanned(Expr::Powerset(Box::new(spanned(
+            Expr::SetEnum(vec![spanned(Expr::String("a".to_string()))]),
+        )))))),
+        pattern: None,
+    };
+    let body = spanned(Expr::In(
+        Box::new(spanned(Expr::String("a".to_string()))),
+        Box::new(spanned(Expr::Ident(
+            "T".to_string(),
+            tla_core::name_intern::NameId::INVALID,
+        ))),
+    ));
+    let exists = spanned(Expr::Exists(vec![bound], Box::new(body)));
+
+    let term = bmc.translate_init(&exists).unwrap();
+    bmc.assert(term);
+    assert!(matches!(bmc.check_sat(), SolveResult::Sat));
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_bmc_bool_and_nested_string_powersets_fail_closed() {
+    let mut bmc = bmc_array(0);
+    let bool_base = spanned(Expr::SetEnum(vec![spanned(Expr::Bool(true))]));
+    assert!(bmc.enumerate_powerset_subsets(&bool_base).is_err());
+
+    let nested_string_domain =
+        spanned(Expr::Powerset(Box::new(spanned(Expr::Powerset(Box::new(
+            spanned(Expr::SetEnum(vec![spanned(Expr::String("a".to_string()))])),
+        ))))));
+    let forall = spanned(Expr::Forall(
+        vec![BoundVar {
+            name: spanned("T".to_string()),
+            domain: Some(Box::new(nested_string_domain)),
+            pattern: None,
+        }],
+        Box::new(spanned(Expr::Bool(true))),
+    ));
+    assert!(bmc.translate_init(&forall).is_err());
 }

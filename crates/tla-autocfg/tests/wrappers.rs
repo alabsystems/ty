@@ -4,7 +4,6 @@
 
 extern crate autocfg;
 
-
 mod support;
 
 /// Tests that autocfg uses the RUSTC_WRAPPER and/or RUSTC_WORKSPACE_WRAPPER

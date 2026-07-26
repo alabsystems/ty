@@ -28,6 +28,7 @@ impl ParallelChecker {
             max_queue: Arc::clone(&self.max_queue_depth),
             max_depth_atomic: Arc::clone(&self.max_depth),
             total_transitions: Arc::clone(&self.total_transitions),
+            total_raw_successors_generated: Arc::clone(&self.total_raw_successors_generated),
             result_tx: result_tx.clone(),
             first_violation: Arc::clone(&self.first_violation),
             first_action_property_violation: Arc::clone(&self.first_action_property_violation),

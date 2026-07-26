@@ -144,8 +144,8 @@ pub(crate) fn trust_cg_auto_select_enabled() -> bool {
 
 // Whether to emit a one-line per-run summary naming the execution engine tier
 // actually used (interpreter / trust-cg per-action callout / trust-cg
-// native-fused). Off by default so default runs and snapshot tests are
-// unaffected; opt in with TY_ENGINE_TIER=1 to measure which tier ran.
+// native-fused / parallel BFS). Off by default so default runs and snapshot
+// tests are unaffected; opt in with TY_ENGINE_TIER=1 to measure which tier ran.
 feature_flag!(pub(crate) engine_tier_report_enabled, "TY_ENGINE_TIER");
 
 /// Whether JIT compilation of invariants is enabled.

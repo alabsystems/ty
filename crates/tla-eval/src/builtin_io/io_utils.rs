@@ -4,7 +4,6 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use tla_value::Rp;
-use std::sync::Arc;
 
 use num_traits::ToPrimitive;
 

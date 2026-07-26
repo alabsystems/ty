@@ -256,8 +256,9 @@ path = "src/bin/ty-mcc-smoke.rs"
 
 # TLC baseline collector — Rust port of `scripts/collect_tlc_baseline/`.
 # Single compiler-enforced interface for baseline collection: runs TLC
-# against every spec in `tests/tlc_comparison/spec_catalog.py`, parses
-# stdout/stderr, classifies the verdict, and emits or refreshes
+# against every eligible row in
+# `tests/tlc_comparison/strict_corpus_manifest.json`, retains every excluded
+# row with its stable reason, parses stdout/stderr, and emits or refreshes
 # `tests/tlc_comparison/spec_baseline.json` (schema v3) with full
 # provenance and a JCS digest of the specs map. Replaces
 # `scripts/collect_tlc_baseline/*.py` and the standalone

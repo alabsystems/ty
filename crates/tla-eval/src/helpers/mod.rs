@@ -24,6 +24,7 @@ mod module_ref_label;
 mod module_ref_operator;
 mod param_cache;
 pub(crate) mod quantifiers;
+mod recursion_stats;
 mod recursive_fold;
 mod set_construction;
 mod set_semantics;
@@ -34,11 +35,12 @@ pub use self::lazy_func_materialize::materialize_lazy_func_to_func;
 pub(crate) use self::module_ref::module_ref_compound_key;
 pub use self::module_ref::{
     apply_substitutions, clear_eager_bindings_cache, clear_module_ref_caches,
-    compose_substitutions, evict_next_state_eager_bindings, expr_has_any_prime,
-    expr_has_primed_param, prepare_registered_named_module_ref_call,
+    clear_module_ref_run_memos, compose_substitutions, evict_next_state_eager_bindings,
+    expr_has_any_prime, expr_has_primed_param, prepare_registered_named_module_ref_call,
     registered_named_module_ref_dispatch_is_direct, trim_module_ref_caches,
 };
 pub(crate) use self::param_cache::clear_param_name_caches;
+pub use self::recursion_stats::print_recursion_memo_stats;
 // Part of #3962: clear_fold_cache removed — fold_result_cache consolidated into SMALL_CACHES.
 pub use self::quantifiers::push_bound_var_mut;
 pub use self::set_semantics::{
@@ -62,7 +64,12 @@ pub(super) use self::closures::{build_lazy_func_from_ctx, create_closure_from_ar
 pub(super) use self::function_values::{
     eval_except, eval_func_apply, eval_func_def, try_borrow_materialized_read,
 };
-pub(super) use self::module_ref::{build_lazy_subst_bindings, eval_module_ref_target};
+pub(super) use self::module_ref::eval_module_ref_target;
+// Raw (unmemoized) subst-chain builder — production goes through the memoized
+// variant (cache::subst_chain_memo); the raw wrapper remains for tests.
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(super) use self::module_ref::build_lazy_subst_bindings;
+pub(crate) use self::module_ref_instance::build_lazy_subst_bindings_with_local_ops;
 pub(super) use self::quantifiers::{
     eval_choose, eval_exists, eval_forall, into_bind_local_bound_var,
     into_bind_local_bound_var_cached, push_bound_var_mut_preinterned, PreInternedBound,

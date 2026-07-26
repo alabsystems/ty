@@ -6,19 +6,23 @@
 use super::super::debug::debug_liveness_formula;
 use super::super::debug::liveness_profile;
 use super::super::{
-    check_error_to_result, Arc, CheckResult, Expr, Fingerprint, FxHashMap, LiveExpr,
+    check_error_to_result, Arc, ArrayState, CheckResult, Expr, Fingerprint, FxHashMap, LiveExpr,
     LivenessChecker, ModelChecker, PropertySafetyParts, Spanned, State, SuccessorWitnessMap,
 };
 use crate::liveness::GroupedLivenessPlan;
+use crate::state::{compute_fingerprint_from_compact_array, FpHashMap};
 use crate::storage::{
     ActionBitmaskLookup, ActionBitmaskMap, StateBitmaskLookup, StateBitmaskMap, SuccessorGraph,
 };
+use crate::var_index::VarRegistry;
 use crate::ConfigCheckError;
 use tla_eval::tir::TirProgram;
 
+mod exact_raw_cache;
 mod explore;
 mod fp_only;
 mod results;
+pub(super) use exact_raw_cache::OtfExactRawCacheSession;
 
 /// Bundled context for checking a liveness property.
 ///
@@ -36,6 +40,151 @@ pub(in crate::check::model_checker) struct LivenessPropertyCtx<'a> {
     pub cross_action_bitmasks: &'a ActionBitmaskMap,
 }
 
+/// Run-scoped BFS adjacency retained across the automatic regeneration trip.
+///
+/// The graph is keyed in the frozen BFS fingerprint domain. Initial-state
+/// tuples carry keys in that same domain, so wide-Init specs can resolve a
+/// retained successor payload without duplicating the ArrayState itself. A
+/// source is replayed only when every destination key resolves through this
+/// index; partial resolution always falls back to evaluating Next. The session
+/// owns the graph so both it and the Init index can be released between groups
+/// once an admitted exact-raw cache covers the fixed run-wide roots.
+pub(in crate::check::model_checker::liveness) struct OtfRetainedSuccessors<'a> {
+    graph: Option<SuccessorGraph>,
+    init_states: &'a [(Fingerprint, ArrayState)],
+    init_index: Option<FpHashMap<usize>>,
+}
+
+impl<'a> OtfRetainedSuccessors<'a> {
+    pub(in crate::check::model_checker::liveness) fn new(
+        graph: SuccessorGraph,
+        init_states: &'a [(Fingerprint, ArrayState)],
+    ) -> Self {
+        let mut init_index = crate::state::fp_hashmap_with_capacity(init_states.len());
+        for (idx, (fp, _)) in init_states.iter().enumerate() {
+            init_index.entry(*fp).or_insert(idx);
+        }
+        Self {
+            graph: Some(graph),
+            init_states,
+            init_index: Some(init_index),
+        }
+    }
+
+    fn successor_fps(&self, source_fp: &Fingerprint) -> Option<Vec<Fingerprint>> {
+        self.graph.as_ref()?.get(source_fp)
+    }
+
+    fn init_state(&self, fp: &Fingerprint) -> Option<&ArrayState> {
+        let idx = *self.init_index.as_ref()?.get(fp)?;
+        let (stored_fp, state) = self.init_states.get(idx)?;
+        debug_assert_eq!(stored_fp, fp);
+        Some(state)
+    }
+
+    pub(in crate::check::model_checker::liveness) fn is_active(&self) -> bool {
+        self.graph.is_some()
+    }
+
+    fn exact_raw_cache_floor_counts(&self, add_stuttering: bool) -> Option<(usize, usize, usize)> {
+        let graph = self.graph.as_ref()?;
+        let sources = graph.len();
+        let successor_values = graph
+            .total_successors()
+            .saturating_add(add_stuttering.then_some(sources).unwrap_or_default());
+        Some((sources, sources, successor_values))
+    }
+
+    /// Complete the checker-owned exact cache from retained adjacency when
+    /// every retained parent and destination resolves through wide Init.
+    ///
+    /// The tuple keys are in the frozen BFS fingerprint domain. Exact-cache
+    /// keys are recomputed from the authoritative compact values, so compiled
+    /// or otherwise foreign tuple fingerprints are never reused as raw keys.
+    /// Existing exact entries avoid disk reads; only tableau-pruned gaps read
+    /// and translate their retained ordered successor lists.
+    fn complete_exact_raw_cache_from_retained(
+        &self,
+        checker: &mut LivenessChecker,
+        registry: &VarRegistry,
+        add_stuttering: bool,
+    ) -> bool {
+        let started = std::time::Instant::now();
+        let (Some(graph), Some(init_index)) = (&self.graph, &self.init_index) else {
+            return false;
+        };
+        if graph.len() > init_index.len() {
+            return false;
+        }
+
+        let mut covered_parents = 0usize;
+        let mut translated_sources = 0usize;
+        for (source_idx, (bfs_fp, source)) in self.init_states.iter().enumerate() {
+            // The production Init slice is already deduplicated. Preserve the
+            // constructor's first-writer behavior for defensive collision
+            // fixtures without giving up sequential payload access.
+            if init_index.get(bfs_fp).copied() != Some(source_idx) {
+                continue;
+            }
+            if !graph.contains_parent(bfs_fp) {
+                continue;
+            }
+            covered_parents += 1;
+
+            let raw_fp = compute_fingerprint_from_compact_array(source.values(), registry);
+            if checker.exact_raw_source_is_present_for(raw_fp, source) {
+                continue;
+            }
+
+            let Some(successor_fps) = graph.get(bfs_fp) else {
+                return false;
+            };
+            let mut successors = Vec::with_capacity(successor_fps.len());
+            for successor_fp in &successor_fps {
+                let Some(successor) = self.init_state(successor_fp) else {
+                    return false;
+                };
+                successors.push(successor);
+            }
+            if !checker.seed_exact_raw_source_from_arrays(
+                source,
+                successors,
+                registry,
+                add_stuttering,
+            ) || !checker.exact_raw_source_is_present_for(raw_fp, source)
+            {
+                return false;
+            }
+            translated_sources += 1;
+        }
+
+        let complete = covered_parents == graph.len();
+        if complete && liveness_profile() {
+            eprintln!(
+                "[liveness] exact raw cache covers {covered_parents}/{} retained sources ({translated_sources} translated from retained adjacency) in {:.3}s",
+                graph.len(),
+                started.elapsed().as_secs_f64(),
+            );
+        }
+        complete
+    }
+
+    /// Release graph-owned edge storage and the wide-Init fingerprint index.
+    ///
+    /// A complete exact-raw cache remains authoritative for every source the
+    /// retained graph could replay. Sources that were never retained still
+    /// evaluate Next because an inactive session returns `None`.
+    pub(in crate::check::model_checker::liveness) fn release(&mut self) -> bool {
+        let was_active = self.graph.take().is_some();
+        self.init_index = None;
+        was_active
+    }
+
+    pub(in crate::check::model_checker::liveness) fn into_graph(self) -> Option<SuccessorGraph> {
+        self.graph
+    }
+}
+
 /// Resolved per-group state cache from `resolve_group_state_cache`.
 pub(super) struct GroupResolution {
     pub(super) state_cache: Arc<FxHashMap<Fingerprint, crate::state::ArrayState>>,
@@ -44,6 +193,16 @@ pub(super) struct GroupResolution {
 }
 
 impl ModelChecker<'_> {
+    pub(in crate::check::model_checker) fn liveness_exact_raw_fp_leaf_fast_path_allowed(
+        &self,
+    ) -> bool {
+        !crate::tir_mode::tir_eval_stats_requested()
+            && self
+                .tir_parity
+                .as_ref()
+                .is_none_or(super::super::tir_parity::TirParityState::is_implicit_default_eval_mode)
+    }
+
     fn property_definition_body(&self, prop_name: &str) -> Result<Spanned<Expr>, CheckResult> {
         self.module
             .op_defs
@@ -333,6 +492,7 @@ impl ModelChecker<'_> {
 
         crate::liveness::clear_enabled_cache();
         crate::liveness::clear_leaf_result_cache();
+        self.rearm_inline_fairness_metadata();
         if liveness_profile() {
             eprintln!("[liveness] check_liveness_property: starting '{prop_name}'");
         }
@@ -414,12 +574,17 @@ impl ModelChecker<'_> {
         None
     }
 
-    pub(in crate::check::model_checker) fn check_liveness_property_on_the_fly(
+    pub(in crate::check::model_checker::liveness) fn check_liveness_property_on_the_fly(
         &mut self,
         prop_name: &str,
+        init_states: &[(Fingerprint, ArrayState)],
+        mut retained_successors: Option<&mut OtfRetainedSuccessors<'_>>,
+        exact_raw_cache: &mut OtfExactRawCacheSession,
+        use_owned_compact_cache: bool,
     ) -> Option<CheckResult> {
         crate::liveness::clear_enabled_cache();
         crate::liveness::clear_leaf_result_cache();
+        self.rearm_inline_fairness_metadata();
         if liveness_profile() {
             eprintln!("[liveness] on-the-fly check_liveness_property: starting '{prop_name}'");
         }
@@ -430,7 +595,8 @@ impl ModelChecker<'_> {
         };
         let (safety_parts, liveness_expr) =
             self.separate_property_parts_with_profile(prop_name, &body)?;
-        if let Some(result) = self.check_property_safety_parts_on_the_fly(prop_name, &safety_parts)
+        if let Some(result) =
+            self.check_property_safety_parts_on_the_fly(prop_name, &safety_parts, init_states)
         {
             return Some(result);
         }
@@ -452,21 +618,72 @@ impl ModelChecker<'_> {
         });
 
         for (group_idx, plan) in grouped_plans.iter().enumerate() {
+            let retained_for_explore = retained_successors
+                .as_deref()
+                .filter(|retained| retained.is_active());
             let mut checker = match self.explore_grouped_liveness_plan_on_the_fly(
                 group_idx,
                 grouped_plans.len(),
                 plan,
+                init_states,
+                retained_for_explore,
                 tir.as_ref(),
+                exact_raw_cache,
+                use_owned_compact_cache,
             ) {
                 Ok(checker) => checker,
                 Err(check_result) => return Some(check_result),
             };
+            let direct_traversal = matches!(&plan.tf, crate::liveness::LiveExpr::Bool(true));
+            let retained_replacement_complete =
+                retained_successors.as_deref().is_some_and(|retained| {
+                    if !retained.is_active() || !exact_raw_cache.may_attempt_retained_release() {
+                        false
+                    } else {
+                        retained
+                            .exact_raw_cache_floor_counts(self.exploration.stuttering_allowed)
+                            .is_some_and(|(states, sources, successor_values)| {
+                                exact_raw_cache.retained_translation_floor_is_admitted(
+                                    states,
+                                    sources,
+                                    successor_values,
+                                    self.module.vars.len(),
+                                ) && (direct_traversal
+                                    || retained.complete_exact_raw_cache_from_retained(
+                                        &mut checker,
+                                        self.ctx.var_registry(),
+                                        self.exploration.stuttering_allowed,
+                                    ))
+                            })
+                    }
+                });
+            if exact_raw_cache.can_release_retained_before_check(
+                &checker,
+                self.module.vars.len(),
+                retained_replacement_complete,
+            ) {
+                if let Some(retained) = retained_successors.as_deref_mut() {
+                    if retained.release() && liveness_profile() {
+                        eprintln!(
+                            "[liveness] released retained BFS adjacency after complete \
+                             exact-raw cache"
+                        );
+                    }
+                }
+            }
+            // Exploration and any retained-adjacency translation are now
+            // complete. Release redundant retained adjacency before packing so
+            // the CSR copy does not overlap it at the high-water mark. Pack
+            // only a structurally closed exact-raw relation; a later group can
+            // append newly reachable rows through the sparse extension path.
+            checker.freeze_complete_exact_raw_adjacency();
             let check_result = checker.check_liveness_grouped_with_inline_cache(
                 plan,
                 max_fairness_tag,
                 None,
                 tir.as_ref(),
             );
+            exact_raw_cache.recover_from(&mut checker, self.module.vars.len());
             if liveness_profile() {
                 crate::liveness::log_cache_stats();
             }

@@ -10,7 +10,6 @@
 //! path; this module mirrors that boundary.
 
 use super::super::api::{check_error_to_result, CheckResult, ResolvedSpec, INLINE_NEXT_NAME};
-use tla_value::Rp;
 use super::super::check_error::CheckError;
 use super::debug::debug_bytecode_vm;
 #[cfg(debug_assertions)]
@@ -29,6 +28,7 @@ use tla_core::span::Spanned;
 use tla_core::{
     free_vars, substitution_would_capture, BoundNameStack, ExprFold, SpanPolicy, SubstituteExpr,
 };
+use tla_value::Rp;
 // Part of #4398: consume fail-closed compiled-backend types through tla-check's local shim.
 use crate::compiled_backend_unavailable::JitInvariantCache as JitInvariantCacheImpl;
 
@@ -1581,9 +1581,9 @@ fn action_flat_scalar_from_value(value: &crate::Value) -> Option<crate::state::F
         crate::Value::String(value) => {
             Some(crate::state::FlatScalarValue::String(value.clone().into()))
         }
-        crate::Value::ModelValue(value) => {
-            Some(crate::state::FlatScalarValue::ModelValue(value.clone().into()))
-        }
+        crate::Value::ModelValue(value) => Some(crate::state::FlatScalarValue::ModelValue(
+            value.clone().into(),
+        )),
         _ => None,
     }
 }
@@ -6126,7 +6126,22 @@ impl ModelChecker<'_> {
             .as_deref()
             .filter(|layout| layout.is_fully_flat())
         {
-            let state_layout = crate::state::check_layout_to_jit_layout(flat_layout);
+            let Some(state_layout) = crate::state::try_check_layout_to_jit_layout(flat_layout)
+            else {
+                let flat_slots = flat_layout.total_slots();
+                eprintln!(
+                    "[jit] native layout upgrade DECLINED (fail-closed): the authoritative \
+                     flat layout has no byte-exact, structurally compatible JIT ABI carrier"
+                );
+                self.jit_state_layout = None;
+                self.clear_layout_sensitive_compiled_bfs_artifacts(
+                    "authoritative flat layout has no faithful JIT ABI carrier",
+                    Some(flat_slots),
+                );
+                self.trust_cg_lazy_pending = false;
+                self.jit_monolithic_disabled = true;
+                return;
+            };
             if stats_enabled {
                 eprintln!(
                     "[jit] using authoritative flat layout for JIT: {} vars, {} compact slots",
@@ -6960,13 +6975,13 @@ mod wp33_constant_binder_domain_tests {
     //! already walks into function ranges, and the identical clause written as
     //! `\A r \in RSet` with `RSet == Readers` produced the proof.
 
-    use tla_value::Rp;
     use super::{full_homogeneous_domain_values, ProofScope};
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use tla_core::ast::Expr;
     use tla_core::kani_types::HashMap;
     use tla_core::name_intern::{intern_name, NameId};
+    use tla_value::Rp;
 
     struct EnvVarGuard {
         name: &'static str,
@@ -7001,13 +7016,11 @@ mod wp33_constant_binder_domain_tests {
 
     /// `Readers = {r1, r2, r3}` bound as a CONSTANT (the Disruptor `.cfg` shape).
     fn readers_constants() -> HashMap<NameId, crate::Value> {
-        let set = crate::Value::Set(Rp::new(tla_value::value::SortedSet::from_sorted_vec(
-            vec![
-                crate::Value::ModelValue(Rp::from("r1")),
-                crate::Value::ModelValue(Rp::from("r2")),
-                crate::Value::ModelValue(Rp::from("r3")),
-            ],
-        )));
+        let set = crate::Value::Set(Rp::new(tla_value::value::SortedSet::from_sorted_vec(vec![
+            crate::Value::ModelValue(Rp::from("r1")),
+            crate::Value::ModelValue(Rp::from("r2")),
+            crate::Value::ModelValue(Rp::from("r3")),
+        ])));
         let mut constants = HashMap::default();
         constants.insert(intern_name("Readers"), set);
         constants

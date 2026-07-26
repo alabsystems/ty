@@ -41,9 +41,8 @@
 //! attached).
 
 use smallvec::SmallVec;
-use tla_value::Rp;
 use std::cell::RefCell;
-use std::sync::Arc;
+use tla_value::Rp;
 
 use super::implied_verdict_cache::ImpliedVerdictCacheSpec;
 use crate::eval::EvalCtx;

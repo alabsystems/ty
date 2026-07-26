@@ -25,9 +25,9 @@ use crate::layout::{
     TAG_SET, TAG_STRING, TAG_TUPLE,
 };
 use crate::JitRuntimeError;
-use tla_value::Rp;
 use tla_core::NameId;
 use tla_value::value::{FuncValue, IntIntervalFunc, RecordValue, SeqValue, SortedSet, Value};
+use tla_value::Rp;
 
 // ============================================================================
 // Serialization: Value -> flat i64 buffer

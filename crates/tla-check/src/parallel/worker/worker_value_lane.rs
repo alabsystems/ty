@@ -8,7 +8,6 @@
 //! out of `work_item.rs` so queue ownership and transport logic stay unchanged.
 
 use crate::state::worker_value_hash::{parallel_worker_values, WorkerArrayState};
-use tla_value::Rp;
 use crate::state::ArrayState;
 use crate::Value;
 
@@ -55,12 +54,11 @@ fn value_supported(value: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use tla_value::Rp;
     use super::{maybe_worker_current_state_if_enabled, supports_worker_value_lane};
     use crate::state::ArrayState;
     use crate::value::{IntIntervalFunc, SortedSet};
     use crate::Value;
-    use std::sync::Arc;
+    use tla_value::Rp;
 
     #[test]
     fn test_supports_worker_value_lane_accepts_hot_top_level_families() {
@@ -70,9 +68,9 @@ mod tests {
             Value::string("x"),
             Value::ModelValue(Rp::from("mv")),
             Value::Set(Rp::new(SortedSet::from_iter([Value::SmallInt(1)]))),
-            Value::Func(Rp::new(crate::value::FuncValue::from_sorted_entries(
-                vec![(Value::SmallInt(1), Value::SmallInt(2))],
-            ))),
+            Value::Func(Rp::new(crate::value::FuncValue::from_sorted_entries(vec![
+                (Value::SmallInt(1), Value::SmallInt(2)),
+            ]))),
             Value::IntFunc(Rp::new(IntIntervalFunc::new(
                 1,
                 1,

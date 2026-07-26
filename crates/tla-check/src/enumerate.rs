@@ -163,6 +163,7 @@ use symbolic_assignments::{evaluate_symbolic_assignments, extract_symbolic_assig
 mod const_domain_cache;
 pub(crate) use const_domain_cache::clear_const_domain_cache;
 mod complete_action_filter;
+pub(crate) use complete_action_filter::is_replay_stable_named_builtin;
 mod subst_cache;
 pub(crate) use subst_cache::clear_enum_subst_cache;
 pub(crate) mod subset_constrained;
@@ -185,12 +186,14 @@ mod init_enumerate;
 #[cfg(test)]
 #[allow(unused_imports)]
 use init_enumerate::compute_values_fingerprint;
+#[cfg(test)]
+pub(crate) use init_enumerate::enumerate_constraints_to_bulk;
 pub(crate) use init_enumerate::{
-    enumerate_constraints_to_bulk, enumerate_constraints_to_bulk_with_stats,
+    enumerate_constraints_to_bulk_with_stats,
     enumerate_constraints_to_bulk_with_stats_filter_error,
     enumerate_states_from_constraint_branches, enumerate_states_from_constraint_branches_probed,
-    eval_filter_expr, BulkConstraintEnumerationError,
-    BulkConstraintEnumerationStats,
+    enumerate_states_from_constraint_branches_with_multiplicity, eval_filter_expr,
+    BulkConstraintEnumerationError, BulkConstraintEnumerationStats,
 };
 
 // Part of #3461: local_scope is only used by build_tests, gate to suppress dead_code warning.

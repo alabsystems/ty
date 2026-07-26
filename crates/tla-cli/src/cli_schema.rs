@@ -171,11 +171,23 @@ pub(crate) enum SupremacyMode {
 /// Backend compared against TLC by `ty supremacy compare`.
 #[derive(Clone, Copy, Debug, Default, ValueEnum, PartialEq, Eq)]
 pub(crate) enum SupremacyCompareBackend {
-    /// Tree-walking interpreter.
+    /// Tree-walking interpreter (the pure oracle: forces `--backend
+    /// interpreter`, which disengages the AUTO-only certified value-action VM
+    /// and trust-cg native — verified via engine provenance).
     #[default]
     Interpreter,
     /// trust-codegen compiled backend.
     TrustCg,
+    /// Production-default AUTO routing (burndown P4): no `--backend` flag, no
+    /// env pins — the child selects native / value-VM / interpreter / GPU
+    /// exactly as a user's `ty check` would. Rows attribute via engine_tier.
+    #[value(alias = "production")]
+    Auto,
+    /// Production AUTO with the GPU excluded (`--no-gpu`): the
+    /// single-thread-eligible sound production arm — the only configuration
+    /// that measures the AUTO-certified value-action VM on a CUDA host
+    /// without hardware-track rows.
+    AutoCpu,
 }
 
 /// Spec source mode for `ty supremacy compare`.
@@ -412,19 +424,27 @@ pub(crate) struct SupremacyCompareArgs {
     /// Worker counts to evaluate for both TLC and TY.
     #[arg(long = "workers", num_args = 1.., default_values_t = vec![1usize])]
     pub workers: Vec<usize>,
+    /// Number of paired TLC/TY repetitions per spec, worker count, and case.
+    /// Enforced speed policies require an even count of at least 6 pairs.
+    #[arg(long, default_value = "1")]
+    pub runs: usize,
     /// Gate behavior: warn for reporting, enforce to fail on policy failures.
     #[arg(long, value_enum, default_value = "enforce")]
     pub mode: SupremacyMode,
     /// Policy to enforce over completed runs.
     #[arg(long = "policy", value_enum, default_value = "parity")]
     pub policy: SupremacyComparePolicy,
-    /// Minimum TLC/TY speedup required by either performance policy.
-    #[arg(long, default_value = "1.0")]
+    /// TLC/TY speedup threshold that either performance policy must strictly exceed.
+    #[arg(long, default_value = "1.05")]
     pub min_speedup: f64,
-    /// Maximum TY/TLC peak-RSS ratio required by
-    /// --policy parity-and-speed-and-memory. Values below 1 require TY to use
-    /// proportionally less peak memory than TLC.
-    #[arg(long, default_value = "1.0")]
+    /// TY/TLC process-tree peak-memory threshold for
+    /// --policy parity-and-speed-and-memory.
+    ///
+    /// Qualifying Linux evidence uses cgroup-v2 `memory.peak`, which includes
+    /// all cgroup-accounted memory and is broader than literal RSS. Values
+    /// below 1 require TY to use proportionally less peak memory than TLC; the
+    /// observed ratio must be strictly below this value.
+    #[arg(long, default_value = "0.95")]
     pub max_memory_ratio: f64,
     /// Output artifact directory. Defaults under reports/perf/.
     #[arg(long)]
@@ -441,7 +461,14 @@ pub(crate) struct SupremacyCompareArgs {
     /// CommunityModules jar for Java TLC classpath. Defaults to COMMUNITY_MODULES or ~/tlaplus/CommunityModules.jar when present.
     #[arg(long)]
     pub community_modules: Option<PathBuf>,
-    /// TLA library directory injected for both TLC and TY. Defaults to TLA_LIBRARY/TLA_PLUS_LIBRARY or test_specs/tla_library.
+    /// TLA library directory injected into BOTH tools' module paths. Resolution
+    /// order: this flag, `TLA_LIBRARY`, `TLA_PLUS_LIBRARY`, the installed upstream
+    /// proof library (`~/tlaplus/tla-library`, from `ty install-tlc proof-library`),
+    /// a system TLAPS install (`~/tlapm/library`), then the repo's first-party
+    /// `test_specs/tla_library` stub set. Upstream outranks the stub because 25
+    /// eligible corpus rows cannot be parsed by TLC without a proof library, and
+    /// the claim should not depend on a TY-authored one. `ty corpus doctor` reports
+    /// which resolved and whether it is strict-qualified.
     #[arg(long)]
     pub tla_library: Option<PathBuf>,
     /// Timeout per subprocess run in seconds.
@@ -557,12 +584,18 @@ pub(crate) struct SupremacyMatrixArgs {
     /// Timeout per --refresh-runtime subprocess in seconds.
     #[arg(long, default_value = "300")]
     pub runtime_timeout: u64,
+    /// Number of paired TLC/production-TY repetitions per check-mode row.
+    /// Tool order alternates; strict PASS_BOTH evidence requires an even count
+    /// of at least six so both launch orders have equal representation.
+    #[arg(long, default_value = "6")]
+    pub runtime_runs: usize,
     /// Also measure each refreshed check-mode row under the TY production-default
-    /// configuration (auto-POR/auto-symmetry free to engage; same workers/force/backend
-    /// args) and record it as ty.production_runtime_seconds/ty.production_states.
+    /// configuration (AUTO routing and reductions, with no backend/reduction override)
+    /// and record it separately from the exact count-verification arm.
     /// Speed classification then uses the production number while verified_match keeps
     /// using the pinned count-verify run. Roughly doubles per-row TY refresh cost; each
-    /// production run respects --runtime-timeout. Disable with --production-runtime false.
+    /// production run respects --runtime-timeout. Disabling it leaves check rows
+    /// without promotable strict performance evidence.
     #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
     pub production_runtime: bool,
     /// Pre-built ty binary for --refresh-runtime TY trust-codegen runs; preflighted with `ty check --backend trust_cg` before row collection.
@@ -577,7 +610,14 @@ pub(crate) struct SupremacyMatrixArgs {
     /// CommunityModules jar for --refresh-runtime TLC classpath. Defaults to COMMUNITY_MODULES or ~/tlaplus/CommunityModules.jar when present.
     #[arg(long)]
     pub runtime_community_modules: Option<PathBuf>,
-    /// TLA library directory passed to TLC as -DTLA-Library for --refresh-runtime runs. Defaults to TLA_LIBRARY, TLA_PLUS_LIBRARY, or ~/tlapm/library when present.
+    /// TLA library directory injected into BOTH tools' module paths. Resolution
+    /// order: this flag, `TLA_LIBRARY`, `TLA_PLUS_LIBRARY`, the installed upstream
+    /// proof library (`~/tlaplus/tla-library`, from `ty install-tlc proof-library`),
+    /// a system TLAPS install (`~/tlapm/library`), then the repo's first-party
+    /// `test_specs/tla_library` stub set. Upstream outranks the stub because 25
+    /// eligible corpus rows cannot be parsed by TLC without a proof library, and
+    /// the claim should not depend on a TY-authored one. `ty corpus doctor` reports
+    /// which resolved and whether it is strict-qualified.
     #[arg(long)]
     pub runtime_tla_library: Option<PathBuf>,
 }
@@ -604,6 +644,11 @@ pub(crate) struct SupremacyMatrixFullSuiteArgs {
     /// Timeout per runtime-refresh subprocess in seconds.
     #[arg(long, default_value = "300")]
     pub runtime_timeout: u64,
+    /// Number of paired TLC/production-TY repetitions per check-mode row.
+    /// Tool order alternates; strict PASS_BOTH evidence requires an even count
+    /// of at least six so both launch orders have equal representation.
+    #[arg(long, default_value = "6")]
+    pub runtime_runs: usize,
     /// Also measure each refreshed check-mode row under the TY production-default
     /// configuration (auto-POR/auto-symmetry free to engage). Default ON for the full
     /// suite so the speed axis reflects what users get; the pinned count-verify run
@@ -622,9 +667,145 @@ pub(crate) struct SupremacyMatrixFullSuiteArgs {
     /// CommunityModules jar for TLC classpath. Defaults to COMMUNITY_MODULES or ~/tlaplus/CommunityModules.jar when present.
     #[arg(long)]
     pub runtime_community_modules: Option<PathBuf>,
-    /// TLA library directory passed to TLC as -DTLA-Library. Defaults to TLA_LIBRARY, TLA_PLUS_LIBRARY, or ~/tlapm/library when present.
+    /// TLA library directory injected into BOTH tools' module paths. Resolution
+    /// order: this flag, `TLA_LIBRARY`, `TLA_PLUS_LIBRARY`, the installed upstream
+    /// proof library (`~/tlaplus/tla-library`, from `ty install-tlc proof-library`),
+    /// a system TLAPS install (`~/tlapm/library`), then the repo's first-party
+    /// `test_specs/tla_library` stub set. Upstream outranks the stub because 25
+    /// eligible corpus rows cannot be parsed by TLC without a proof library, and
+    /// the claim should not depend on a TY-authored one. `ty corpus doctor` reports
+    /// which resolved and whether it is strict-qualified.
     #[arg(long)]
     pub runtime_tla_library: Option<PathBuf>,
+}
+
+/// Arguments for a canonical, digest-bound segmented matrix campaign plan.
+#[derive(Clone, Debug, Args)]
+pub(crate) struct SupremacyMatrixCampaignPlanArgs {
+    /// Baseline JSON whose complete batchable all-runnable row set is planned.
+    #[arg(long, default_value = "tests/tlc_comparison/spec_baseline.json")]
+    pub baseline: PathBuf,
+    /// Optional supremacy policy file bound into the digest-bound campaign.
+    #[arg(long)]
+    pub policy: Option<PathBuf>,
+    /// New absolute campaign-plan JSON path. Existing files are never overwritten.
+    #[arg(long)]
+    pub output: PathBuf,
+    /// Fresh absolute root that owns every Rust evidence output in this campaign.
+    #[arg(long)]
+    pub artifact_root: PathBuf,
+    /// Maximum number of complete rows assigned to each deterministic segment.
+    #[arg(long, default_value = "1")]
+    pub segment_size: usize,
+    /// Required timeout per runtime subprocess, immutably bound by the campaign plan.
+    #[arg(long)]
+    pub runtime_timeout: u64,
+    /// Number of paired repetitions per check-mode row, bound by the plan.
+    #[arg(long, default_value = "6")]
+    pub runtime_runs: usize,
+    /// Require the production-default TY measurement arm.
+    #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
+    pub production_runtime: bool,
+    /// Exact TY binary independently attested by path and SHA-256.
+    #[arg(long)]
+    pub runtime_ty_bin: Option<PathBuf>,
+    /// TLC jar independently attested by path and SHA-256.
+    #[arg(long)]
+    pub runtime_tlc_jar: Option<PathBuf>,
+    /// CommunityModules jar independently attested by path and SHA-256.
+    #[arg(long)]
+    pub runtime_community_modules: Option<PathBuf>,
+    /// TLA library tree independently attested by path and tree SHA-256.
+    #[arg(long)]
+    pub runtime_tla_library: Option<PathBuf>,
+    /// Sampled per-observation allocation limit. Kernel quota remains the hard guard.
+    #[arg(long, default_value_t = 135_291_469_824)]
+    pub max_observation_allocated_bytes: u64,
+    /// Kernel-enforced per-observation allocated-byte ceiling.
+    #[arg(long, default_value_t = 137_438_953_472)]
+    pub hard_observation_allocated_bytes: u64,
+    /// Sampled per-observation filesystem-entry limit.
+    #[arg(long, default_value_t = 80_000)]
+    pub max_observation_entries: u64,
+    /// Kernel-enforced per-observation inode ceiling.
+    #[arg(long, default_value_t = 90_000)]
+    pub hard_observation_inodes: u64,
+    /// Normal evidence-write ceiling for the segment evidence project.
+    #[arg(long, default_value_t = 5_368_709_120)]
+    pub evidence_soft_allocated_bytes: u64,
+    /// Kernel-enforced evidence-project ceiling, including finalization reserve.
+    #[arg(long, default_value_t = 6_442_450_944)]
+    pub evidence_hard_allocated_bytes: u64,
+    /// Normal evidence-project inode ceiling.
+    #[arg(long, default_value_t = 10_000)]
+    pub evidence_soft_inodes: u64,
+    /// Kernel-enforced evidence-project inode ceiling.
+    #[arg(long, default_value_t = 12_000)]
+    pub evidence_hard_inodes: u64,
+    /// Filesystem free-space floor maintained throughout every observation.
+    #[arg(long, default_value_t = 80_530_636_800)]
+    pub minimum_filesystem_available_bytes: u64,
+    /// Filesystem free-space required before each observation is admitted.
+    #[arg(long, default_value_t = 226_559_524_864)]
+    pub minimum_prelaunch_available_bytes: u64,
+    /// Filesystem free-inode floor maintained throughout every observation.
+    #[arg(long, default_value_t = 1_000_000)]
+    pub minimum_filesystem_available_inodes: u64,
+    /// Filesystem free inodes required before assigning both project quotas.
+    #[arg(long, default_value_t = 1_104_000)]
+    pub minimum_prelaunch_available_inodes: u64,
+    /// Disk-budget polling interval in milliseconds.
+    #[arg(long, default_value_t = 50)]
+    pub monitor_interval_ms: u64,
+    /// Maximum retained stdout bytes for one observation.
+    #[arg(long, default_value_t = 67_108_864)]
+    pub stdout_max_bytes: u64,
+    /// Maximum retained stderr bytes for one observation.
+    #[arg(long, default_value_t = 67_108_864)]
+    pub stderr_max_bytes: u64,
+    /// First ext4 project ID in this campaign's unique even evidence/payload pair range.
+    #[arg(long)]
+    pub segment_project_id_start: u32,
+}
+
+/// Arguments for one plan-bound matrix campaign segment.
+#[derive(Clone, Debug, Args)]
+pub(crate) struct SupremacyMatrixSegmentArgs {
+    /// Absolute canonical campaign plan created by matrix-campaign-plan.
+    #[arg(long)]
+    pub campaign_plan: PathBuf,
+    /// Exact segment identifier from the campaign plan.
+    #[arg(long)]
+    pub segment_id: String,
+    /// Fresh directory for this segment's four strict receipt artifacts.
+    #[arg(long)]
+    pub runtime_output_dir: Option<PathBuf>,
+    /// Gate behavior. Strict evidence requires explicit enforce mode.
+    #[arg(long, value_enum, default_value = "enforce")]
+    pub mode: SupremacyMode,
+    /// Output format.
+    #[arg(long, value_enum, default_value = "human")]
+    pub format: SupremacyOutputFormat,
+}
+
+/// Arguments for fail-closed aggregation of finalized campaign segments.
+#[derive(Clone, Debug, Args)]
+pub(crate) struct SupremacyMatrixMergeArgs {
+    /// Absolute canonical campaign plan shared by every segment.
+    #[arg(long)]
+    pub campaign_plan: PathBuf,
+    /// Finalized segment runtime_evidence.json. Supply exactly one per planned segment.
+    #[arg(long = "segment-report", num_args = 1..)]
+    pub segment_reports: Vec<PathBuf>,
+    /// Fresh directory for the aggregate's four strict receipt artifacts.
+    #[arg(long)]
+    pub runtime_output_dir: Option<PathBuf>,
+    /// Gate behavior. Strict aggregate evidence requires explicit enforce mode.
+    #[arg(long, value_enum, default_value = "enforce")]
+    pub mode: SupremacyMode,
+    /// Output format.
+    #[arg(long, value_enum, default_value = "human")]
+    pub format: SupremacyOutputFormat,
 }
 
 /// Arguments for the native production-default soundness sweep + triage.
@@ -690,7 +871,7 @@ pub(crate) enum SupremacyCommand {
     Gate(SupremacyGateArgs),
     /// Run a Rust TLC-vs-TY comparison gate over baseline or explicit specs.
     #[command(
-        long_about = "Run the Rust TLC-vs-TY comparison gate for targeted parity, speed, and peak-memory evidence.\n\nThis command replaces Python perf-gate scripts for baseline-backed or explicit TLA+/cfg pairs. It runs TLC and one TY backend (`--backend interpreter|trust_cg`) at the selected `--workers`, writes compare.json and compare.md, and enforces `--policy parity`, `--policy parity-and-speed --min-speedup <N>`, or `--policy parity-and-speed-and-memory --min-speedup <N> --max-memory-ratio <N>`. Enforced performance evidence uses the Java TLC runner with recorded single-thread JVM controls; opaque TLC executable wrappers are diagnostic-only for performance claims.\n\nThis is targeted comparison evidence only. It is not launch acceptance evidence; launch acceptance still requires the current three-spec launch-corpus gate: `ty supremacy gate --mode enforce --gate-mode full-native-fused --runs 3`. Any compatibility wrapper around this command must preserve its exit code and must not implement independent corpus selection, parsing, or verdict policy."
+        long_about = "Run the Rust TLC-vs-TY comparison gate for targeted parity, runtime, and process-tree peak-memory diagnostics.\n\nThis command replaces Python perf-gate scripts for baseline-backed or explicit TLA+/cfg pairs. It runs paired repetitions with alternating TLC/TY order, writes every raw run to compare.json, and gates on the median within-pair ratio. Enforced performance policies require an even count of at least six pairs so both launch orders have equal representation. `--backend auto` measures genuine AUTO/default routing without a child `--backend` flag or environment pins; it is GPU-eligible and therefore a separate hardware track. `--backend auto-cpu` adds `--no-gpu`. Both AUTO modes use a separate `--bfs-only --no-reduction --workers 1` count-verification arm. Enforced performance diagnostics also require the auditable Java TLC runner, exact count-arm parity, runtime speedup strictly greater than 1.05 by default, and TY/TLC process-tree peak memory strictly less than 0.95 by default.\n\nThis remains targeted diagnostic evidence and is not admitted by the tightened strict Linux launcher. Broad strict-superiority acceptance requires the complete pinned all-runnable matrix artifact; the three-spec native-fused gate remains a separate hot-path release check. Any compatibility wrapper around this command must preserve its exit code and must not implement independent corpus selection, parsing, or verdict policy."
     )]
     Compare(SupremacyCompareArgs),
     /// One-command reproduce of the single-thread TY-vs-TLC(+Apalache) runtime+memory comparison.
@@ -715,6 +896,30 @@ pub(crate) enum SupremacyCommand {
         long_about = "Explicitly refresh the full batchable all-runnable matrix runtime suite.\n\nThis is a Rust convenience alias for `ty supremacy matrix --refresh-runtime --runtime-scope all-runnable` with no --runtime-limit and no --runtime-spec values: every batchable row with a runnable source mode is selected, and the refreshed baseline is written under --runtime-output-dir, or the timestamped reports/perf default when --runtime-output-dir is omitted. It is broad all-runnable matrix refresh/audit evidence, not launch acceptance evidence. Use `ty supremacy matrix --refresh-runtime --runtime-scope all-runnable --runtime-limit <N>` for intentionally chunked refreshes; in chunked runs, simulation and generate rows consume slots in the same hard cap as check-mode rows."
     )]
     MatrixFullSuite(SupremacyMatrixFullSuiteArgs),
+    /// Write an exclusively created, digest-bound row-segment campaign plan.
+    #[command(
+        name = "matrix-campaign-plan",
+        long_about = "Write a canonical, digest-bound plan for a segmented full all-runnable matrix campaign. The exclusively created plan fixes the input baseline and policy, runtime contract, independently attested source revision and tool/input hashes, complete batchable row order, blocked rows, and deterministic segment membership. The plan is preparation metadata, not runtime evidence or a superiority claim."
+    )]
+    MatrixCampaignPlan(SupremacyMatrixCampaignPlanArgs),
+    /// Collect one complete, plan-bound row segment.
+    #[command(
+        name = "matrix-segment",
+        long_about = "Collect exactly one row segment named by a digest-bound matrix campaign plan. Rows and runtime/tool inputs cannot be overridden on this command. A successful segment proves only its selected-row collection and remains explicitly ineligible to claim full-corpus completion or superiority until every finalized segment is validated by matrix-merge."
+    )]
+    MatrixSegment(SupremacyMatrixSegmentArgs),
+    /// Seal the complete campaign inventory without claiming superiority.
+    #[command(
+        name = "matrix-merge-inventory",
+        long_about = "Fail-closed integrity merge of exactly one finalized report for every planned segment. It receipt-seals a complete current loser inventory and exits successfully after coverage/integrity completion even when blockers remain. It always records corpus_claim_pass=false and is categorically inadmissible as a public superiority baseline."
+    )]
+    MatrixMergeInventory(SupremacyMatrixMergeArgs),
+    /// Merge an exact set of finalized campaign segments.
+    #[command(
+        name = "matrix-merge",
+        long_about = "Fail-closed merge of exactly one finalized, receipt-bound report for every segment in a matrix campaign plan. The merge rejects missing, duplicate, overlapping, foreign, stale, or contract-mismatched segments, reconstructs the refreshed baseline from the original plan baseline and segment rows, and is the only segmented-campaign command eligible to claim full-corpus completion or pass."
+    )]
+    MatrixMerge(SupremacyMatrixMergeArgs),
     /// Validate that the candidate preserves soundness vs baselines on two axes: exact reachability (POR off) and safety verdict (production default).
     #[command(
         name = "soundness-sweep",
@@ -5790,6 +5995,89 @@ pub(crate) enum CorpusAction {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Preflight the corpus for TY-vs-TLC comparability, one row at a time.
+    ///
+    /// For every eligible row of `strict_corpus_manifest.json`, answers whether
+    /// it can be compared against TLC at all, and whether we already know where
+    /// it stands. Three things make a row non-comparable, and the definition of
+    /// done requires each be classified explicitly rather than silently omitted:
+    ///
+    /// * `tlc-unparseable` — TLC's parser cannot resolve a module. 25 eligible
+    ///   rows EXTEND TLAPS / FiniteSetTheorems / NaturalsInduction; the missing
+    ///   module is named. Fix with `ty install-tlc proof-library`.
+    /// * `parity-impossible` — TY refuses TLC's declared SYMMETRY because a
+    ///   property needs the genuine liveness checker (that orbit quotient is
+    ///   unsound for liveness). TY explores the full space, TLC explores the
+    ///   quotient, so exact distinct-state parity can never hold. This is a
+    ///   soundness premium, NOT a performance loss.
+    /// * `unmeasured` — comparable, but no TY runtime exists yet.
+    ///
+    /// Both engine-side checks run the real tools (SANY for TLC; `ty check
+    /// --max-states 1` for the symmetry decision, which stops after model
+    /// preparation), so the answers cannot drift from what a collection run
+    /// would actually do.
+    ///
+    /// Also reconciles the manifest against the baseline that `ty supremacy
+    /// matrix` classifies, and reports which TLA library resolved and whether
+    /// it is strict-qualified (upstream + pinned) or the repo's first-party
+    /// stub set.
+    Doctor {
+        /// Corpus install directory override (see `fetch --dest`).
+        #[arg(long)]
+        dest: Option<PathBuf>,
+        /// Strict corpus manifest (default:
+        /// `tests/tlc_comparison/strict_corpus_manifest.json`).
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+        /// Baseline whose TY-runtime coverage is reported (default:
+        /// `tests/tlc_comparison/spec_baseline.json`).
+        #[arg(long)]
+        baseline: Option<PathBuf>,
+        /// TLC jar (default: `~/tlaplus/tytools.jar`).
+        #[arg(long)]
+        tlc_jar: Option<PathBuf>,
+        /// CommunityModules jar (default: `~/tlaplus/CommunityModules.jar`).
+        #[arg(long)]
+        community_modules: Option<PathBuf>,
+        /// TLA library directory given to both tools. Default resolution order:
+        /// `TLA_LIBRARY`, `TLA_PLUS_LIBRARY`, the installed upstream proof
+        /// library (`~/tlaplus/tla-library`), then the repo's first-party
+        /// `test_specs/tla_library`.
+        #[arg(long)]
+        tla_library: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = CorpusDoctorFormat::Table)]
+        format: CorpusDoctorFormat,
+        /// `warn` reports and exits 0; `enforce` exits non-zero if any eligible
+        /// row is not ready for strict collection.
+        #[arg(long, value_enum, default_value_t = SupremacyMode::Warn)]
+        mode: SupremacyMode,
+        /// Parallel probe workers.
+        #[arg(long, default_value_t = 4)]
+        jobs: usize,
+        /// Only check rows whose name or cfg path contains this substring.
+        #[arg(long)]
+        filter: Option<String>,
+        /// Skip the TLC parse probe (no JDK available, or a fast re-check of
+        /// only the symmetry and measurement axes).
+        #[arg(long)]
+        skip_parse: bool,
+        /// Write the report to this path instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+}
+
+/// Output format for `ty corpus doctor`.
+#[derive(Clone, Copy, Debug, Default, ValueEnum, PartialEq, Eq)]
+pub(crate) enum CorpusDoctorFormat {
+    /// Human-readable toolchain block, reconciliation, and per-row table.
+    #[default]
+    Table,
+    /// Structured JSON (`ty.corpus-doctor/v1`).
+    Json,
+    /// Markdown, ready to paste into a burndown or session report.
+    Markdown,
 }
 
 /// Output format for `ty corpus sweep`.
@@ -5822,6 +6110,13 @@ pub(crate) enum TlcAction {
         /// Re-download even if the jars are already present.
         #[arg(long)]
         force: bool,
+        /// Also install the upstream TLA+ proof library (see `proof-library`).
+        ///
+        /// Recommended for corpus work: without it TLC cannot parse the 25
+        /// eligible rows that EXTEND TLAPS / FiniteSetTheorems /
+        /// NaturalsInduction.
+        #[arg(long)]
+        with_proof_library: bool,
     },
     /// Print the resolved install directory and exit.
     Path {
@@ -5831,6 +6126,35 @@ pub(crate) enum TlcAction {
     },
     /// Verify the TLC jars are present (and TLC runs) at the install dir.
     Verify {
+        /// Install directory override (see `install --dest`).
+        #[arg(long)]
+        dest: Option<PathBuf>,
+    },
+    /// Install the upstream TLA+ proof-system module library into
+    /// `<dest>/tla-library`.
+    ///
+    /// This is `tlaplus/tlapm`'s `library/` at a pinned commit — the genuine
+    /// `TLAPS.tla`, `FiniteSetTheorems.tla`, `NaturalsInduction.tla` and
+    /// companions — with every module verified against a per-file sha256 pin
+    /// (a tarball digest would not survive GitHub recompression).
+    ///
+    /// Why you want it: 25 of the 141 eligible rows in the strict corpus
+    /// manifest do not parse under TLC without these modules. The repo also
+    /// ships a first-party stub set at `test_specs/tla_library` that makes
+    /// those rows run, but a TY-authored artifact mediating 18% of the claim
+    /// corpus is not something strict evidence should depend on. With this
+    /// library installed, all 141 eligible rows parse from upstream sources.
+    ProofLibrary {
+        /// Install directory override (see `install --dest`). The library lands
+        /// at `<dest>/tla-library`.
+        #[arg(long)]
+        dest: Option<PathBuf>,
+        /// Re-download even if a verified library is already present.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Verify the installed proof library matches its per-file sha256 pin.
+    VerifyProofLibrary {
         /// Install directory override (see `install --dest`).
         #[arg(long)]
         dest: Option<PathBuf>,

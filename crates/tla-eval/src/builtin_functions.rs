@@ -6,7 +6,6 @@ use super::{
     check_arity, eval, eval_iter_set, EvalCtx, EvalError, EvalResult, Expr, FuncValue, SortedSet,
     Span, Spanned, Value,
 };
-use std::sync::Arc;
 use tla_value::Rp;
 // Built-in Functions module operators (Restrict, IsInjective, Injection, Surjection, Bijection, etc.)
 
@@ -270,9 +269,7 @@ pub(super) fn eval_builtin_functions(
 
             collect_surjective_function_values(&source_elems, &target_elems, &mut surjections);
 
-            Ok(Some(Value::Set(Rp::new(SortedSet::from_iter(
-                surjections,
-            )))))
+            Ok(Some(Value::Set(Rp::new(SortedSet::from_iter(surjections)))))
         }
 
         "Bijection" => {

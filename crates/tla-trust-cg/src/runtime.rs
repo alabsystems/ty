@@ -187,7 +187,15 @@ pub static RUNTIME_HELPERS: &[RuntimeHelper] = &[
     RuntimeHelper {
         symbol: "tla_hybrid_compound_apply2_i64",
         // (var_idx, key0, key0_kind, key1, key1_kind, expect_kind, out) -> status
-        params: &[Ty::I64, Ty::I64, Ty::I64, Ty::I64, Ty::I64, Ty::I64, Ty::Ptr],
+        params: &[
+            Ty::I64,
+            Ty::I64,
+            Ty::I64,
+            Ty::I64,
+            Ty::I64,
+            Ty::I64,
+            Ty::Ptr,
+        ],
         ret: Ty::I64,
     },
     // clear_tla_iter_arena — iteration-boundary quantifier-iter arena reset.

@@ -9,7 +9,6 @@
 //! not the specific Bug #179 tuple/func/seq membership regressions.
 
 use super::super::super::*;
-use crate::rp::Rp as Arc;
 use crate::rp::Rp;
 #[cfg_attr(test, ntest::timeout(10000))]
 #[test]
@@ -17,9 +16,7 @@ fn test_value_partial_eq_consistent_with_cmp_for_mixed_cases() {
     use std::cmp::Ordering;
 
     let tuple = Value::Tuple(vec![Value::SmallInt(1), Value::SmallInt(2)].into());
-    let seq = Value::Seq(Rp::new(
-        vec![Value::SmallInt(1), Value::SmallInt(2)].into(),
-    ));
+    let seq = Value::Seq(Rp::new(vec![Value::SmallInt(1), Value::SmallInt(2)].into()));
     let tuple_like_func = {
         let mut fb = FuncBuilder::new();
         fb.insert(Value::SmallInt(1), Value::SmallInt(1));

@@ -10,7 +10,6 @@
 //! so tests must never write it (this also sidesteps env-serialization).
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use tla_value::Rp;
 
 use tla_core::name_intern::intern_name;

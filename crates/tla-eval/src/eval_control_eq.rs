@@ -184,9 +184,15 @@ pub(super) fn eval_eq(
     b: &Spanned<tla_core::ast::Expr>,
     span: Option<Span>,
 ) -> EvalResult<Value> {
-    let av = eval(ctx, a)?;
-    let bv = eval(ctx, b)?;
-    let eq = values_equal(ctx, &av, &bv, span)?;
+    // Churn elimination: `=` only READS its operands, so borrow state-rooted
+    // read chains (`f[i]`, `r.a.b`, `f[i][j]`) in place instead of cloning the
+    // apply / field result out only to compare and drop it (the hot
+    // `participant[i].decision = undecided` guard). Same left-then-right order,
+    // same `values_equal` semantics, same error behavior. Mirrors the TIR
+    // `eval_tir_cmp` borrowed-operand path.
+    let av = crate::helpers::function_values::eval_read_chain_operand(ctx, a)?;
+    let bv = crate::helpers::function_values::eval_read_chain_operand(ctx, b)?;
+    let eq = values_equal(ctx, av.as_value(), bv.as_value(), span)?;
     Ok(Value::Bool(eq))
 }
 
@@ -203,9 +209,14 @@ pub(super) fn eval_neq(
     if is_empty_set_expr(&a.node) {
         return eval_is_nonempty_set(ctx, b, span);
     }
-    let av = eval(ctx, a)?;
-    let bv = eval(ctx, b)?;
-    Ok(Value::Bool(!values_equal(ctx, &av, &bv, span)?))
+    let av = crate::helpers::function_values::eval_read_chain_operand(ctx, a)?;
+    let bv = crate::helpers::function_values::eval_read_chain_operand(ctx, b)?;
+    Ok(Value::Bool(!values_equal(
+        ctx,
+        av.as_value(),
+        bv.as_value(),
+        span,
+    )?))
 }
 
 /// Evaluate unary negation with SmallInt fast path.

@@ -282,6 +282,7 @@ pub(super) struct WorkerSharedState {
     pub(super) max_queue: Arc<AtomicUsize>,
     pub(super) max_depth_atomic: Arc<AtomicUsize>,
     pub(super) total_transitions: Arc<AtomicUsize>,
+    pub(super) total_raw_successors_generated: Arc<AtomicUsize>,
     pub(super) result_tx: Sender<WorkerResult>,
     pub(super) first_violation: Arc<OnceLock<(String, Fingerprint)>>,
     pub(super) first_action_property_violation: Arc<OnceLock<(String, Fingerprint)>>,

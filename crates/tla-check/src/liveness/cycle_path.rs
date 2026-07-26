@@ -40,7 +40,7 @@ pub(crate) fn find_cycle_in_scc(
                     ),
                     span: None,
                 })?;
-            if info.successors.contains(&node) {
+            if info.successors().contains(&node) {
                 return Ok(Some(vec![node, node]));
             }
         }
@@ -69,7 +69,7 @@ pub(crate) fn find_cycle_in_scc(
             ),
             span: None,
         })?;
-    for succ in &start_info.successors {
+    for succ in start_info.successors() {
         if scc_set.contains(succ) {
             visited.insert(*succ);
             parent.insert(*succ, start);
@@ -99,7 +99,7 @@ pub(crate) fn find_cycle_in_scc(
         }
 
         if let Some(info) = graph.get_node_info(&current) {
-            for succ in &info.successors {
+            for succ in info.successors() {
                 if scc_set.contains(succ) && !visited.contains(succ) {
                     visited.insert(*succ);
                     parent.insert(*succ, current);

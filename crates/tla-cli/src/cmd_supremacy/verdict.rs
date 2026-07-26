@@ -17,6 +17,10 @@ use sha2::{Digest, Sha256};
 
 use super::matrix;
 use super::policy::{PlannedGate, SelftestRequirement, TelemetryRequirement};
+use super::runner::{
+    COMMAND_SCOPED_ENV_KEYS, COMMAND_SCRATCH_DIR_NAME, DISK_SCOPE_CONTRACT_SCHEMA,
+    DISK_USAGE_SAMPLE_INTERVAL, DISK_USAGE_SCAN_BUDGET, DISK_USAGE_SCAN_ENTRY_LIMIT,
+};
 use super::summary::SUMMARY_SCHEMA;
 use super::PreparedSupremacy;
 
@@ -24,7 +28,7 @@ const VERDICT_SCHEMA: &str = "ty.single_thread_supremacy.policy_verdict.v1";
 const MATRIX_SUMMARY_SCHEMA: &str = "ty.supremacy.matrix_summary.v1";
 const FLAT_PRIMARY_REBUILD_MARKER: &str = "[compiled-bfs] clearing layout-sensitive compiled artifacts before rebuild: reason=flat_state_primary layout promotion";
 const STRICT_SELFTEST_FALSE_RESULT_KINDS: &[&str] = &["invariant", "state_constraint"];
-const COMMAND_ARTIFACT_SCHEMA: &str = "ty.supremacy.command.v1";
+const COMMAND_ARTIFACT_SCHEMA: &str = "ty.supremacy.command.v4";
 const TY_CACHE_DIR_ENV: &str = "TY_CACHE_DIR";
 const MATRIX_STRICT_BLOCKER_COUNT_FIELDS: &[&str] = &[
     "unsupported",
@@ -184,9 +188,9 @@ fn evaluate(prepared: &PreparedSupremacy, summary_path: &Path) -> Result<PolicyV
         anti_overfit_evidence,
         required_trust_cg_env,
         generated_state_count_sources: BTreeMap::from([
-            ("tlc", "runs[].states_generated (TLC diagnostic count)"),
-            ("interp", "runs[].transitions"),
-            ("trust-cg", "runs[].transitions"),
+            ("tlc", "runs[].raw_successors_generated"),
+            ("interp", "runs[].raw_successors_generated"),
+            ("trust-cg", "runs[].raw_successors_generated"),
         ]),
         planned_gate: gate_plan.cloned(),
     })
@@ -1023,15 +1027,40 @@ fn resolve_summary_artifact_path(
 }
 
 fn current_git_commit(prepared: &PreparedSupremacy) -> Option<String> {
+    // `PATH` is process-global. Coordinate this reader with the crate's
+    // restore-on-exit environment editors so a concurrent fake-tool test (or
+    // other scoped launcher setup) cannot make `git` transiently disappear.
+    let _env_lock = crate::env_guard::lock_env();
     let repo_root = policy_repo_root(prepared).unwrap_or_else(|| PathBuf::from("."));
-    Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(repo_root)
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .filter(|value| !value.is_empty())
+    // Large parallel test or gate processes can briefly exhaust the host's
+    // process slots. Do not turn that transient `spawn(2)` condition into an
+    // "unknown" build identity. Retry only interrupt/resource errors; a real
+    // Git failure (not a repository, invalid HEAD, permission error) remains an
+    // immediate fail-closed `None`.
+    for attempt in 0..3 {
+        match Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&repo_root)
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                return (!value.is_empty()).then_some(value);
+            }
+            Ok(_) => return None,
+            Err(error)
+                if attempt < 2
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                    ) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(_) => return None,
+        }
+    }
+    None
 }
 
 fn git_commit_matches(summary: &str, current: &str) -> bool {
@@ -1134,8 +1163,6 @@ fn evaluate_row(
         .expected_generated_state_counts
         .get(spec)
         .copied();
-    let native_state_constrained =
-        gate_plan.is_some() && state_constraint_generated_parity_waiver_active(spec, row, errors);
 
     require_no_row_gate_failures(spec, row, errors);
 
@@ -1148,8 +1175,7 @@ fn evaluate_row(
         row.get("tlc"),
         prepared.runs,
         expected_states,
-        None,
-        "states_generated",
+        expected_generated,
         errors,
     );
     let interp = evaluate_mode(
@@ -1162,7 +1188,6 @@ fn evaluate_row(
         prepared.runs,
         expected_states,
         expected_generated,
-        "transitions",
         errors,
     );
     let trust_cg = evaluate_mode(
@@ -1174,20 +1199,13 @@ fn evaluate_row(
         row.get("trust_cg"),
         prepared.runs,
         expected_states,
-        if native_state_constrained {
-            None
-        } else {
-            expected_generated
-        },
-        "transitions",
+        expected_generated,
         errors,
     );
 
     if let Some(plan) = gate_plan {
         require_state_parity_flags(spec, row, errors);
-        if !native_state_constrained {
-            require_generated_parity(spec, plan, &interp, &trust_cg, errors);
-        }
+        require_generated_parity(spec, plan, &tlc, &interp, &trust_cg, errors);
         require_trust_cg_runs(prepared, summary_path, plan, spec, row, errors);
     }
 
@@ -1262,132 +1280,17 @@ fn require_state_parity_flags(spec: &str, row: &Value, errors: &mut Vec<String>)
     }
 }
 
-fn state_constraint_generated_parity_waiver_active(
-    spec: &str,
-    row: &Value,
-    errors: &mut Vec<String>,
-) -> bool {
-    let Some(runs) = row
-        .get("trust_cg")
-        .and_then(|mode| mode.get("runs"))
-        .and_then(Value::as_array)
-    else {
-        return false;
-    };
-    let row_has_state_constraint_signal = runs.iter().any(|run| {
-        !matches!(
-            run_native_state_constraint_waiver_count(run),
-            NativeStateConstraintWaiver::Absent
-        )
-    });
-    if !row_has_state_constraint_signal {
-        return false;
-    }
-
-    let mut all_runs_have_admissible_state_constraints = !runs.is_empty();
-    for (position, run) in runs.iter().enumerate() {
-        let label = run_label(run, position);
-        match run_native_state_constraint_waiver_count(run) {
-            NativeStateConstraintWaiver::Absent => {
-                all_runs_have_admissible_state_constraints = false;
-                errors.push(format!(
-                    "{spec}: trust-cg {label}: state-constrained generated-count waiver requires \
-                     active native fused state constraints with compiled=total=count; run did \
-                     not report state_constraint_checking native fused telemetry"
-                ));
-            }
-            NativeStateConstraintWaiver::Admissible => {}
-            NativeStateConstraintWaiver::Incomplete(reason) => {
-                all_runs_have_admissible_state_constraints = false;
-                errors.push(format!(
-                    "{spec}: trust-cg {label}: state-constrained generated-count waiver requires \
-                     active native fused state constraints with compiled=total=count; {reason}"
-                ));
-            }
-        }
-    }
-    all_runs_have_admissible_state_constraints
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NativeStateConstraintWaiver {
-    Absent,
-    Admissible,
-    Incomplete(&'static str),
-}
-
-fn run_native_state_constraint_waiver_count(run: &Value) -> NativeStateConstraintWaiver {
-    let Some(telemetry) = run.get("trust_cg_telemetry").and_then(Value::as_object) else {
-        return NativeStateConstraintWaiver::Absent;
-    };
-    let mode = telemetry
-        .get("trust_cg_native_fused_mode")
-        .and_then(Value::as_str);
-    let native_count = telemetry
-        .get("trust_cg_native_fused_state_constraint_count")
-        .and_then(|value| non_negative_integer_value(Some(value)));
-    let has_state_constraint_signal =
-        mode == Some("state_constraint_checking") || native_count.is_some_and(|count| count > 0);
-    if !has_state_constraint_signal {
-        return NativeStateConstraintWaiver::Absent;
-    }
-    if mode != Some("state_constraint_checking") {
-        return NativeStateConstraintWaiver::Incomplete(
-            "trust_cg_native_fused_mode was not state_constraint_checking",
-        );
-    }
-    let Some(native_count) = native_count else {
-        return NativeStateConstraintWaiver::Incomplete(
-            "trust_cg_native_fused_state_constraint_count was missing",
-        );
-    };
-    if native_count == 0 {
-        return NativeStateConstraintWaiver::Incomplete(
-            "trust_cg_native_fused_state_constraint_count was zero",
-        );
-    }
-    if telemetry
-        .get("trust_cg_native_fused_level_active")
-        .and_then(Value::as_bool)
-        != Some(true)
-    {
-        return NativeStateConstraintWaiver::Incomplete(
-            "trust_cg_native_fused_level_active was not true",
-        );
-    }
-    if telemetry
-        .get("compiled_bfs_level_loop_fused")
-        .and_then(Value::as_bool)
-        != Some(true)
-    {
-        return NativeStateConstraintWaiver::Incomplete(
-            "compiled_bfs_level_loop_fused was not true",
-        );
-    }
-
-    let compiled = telemetry
-        .get("trust_cg_state_constraints_compiled")
-        .and_then(|value| non_negative_integer_value(Some(value)));
-    if compiled != Some(native_count) {
-        return NativeStateConstraintWaiver::Incomplete(
-            "trust_cg_state_constraints_compiled did not match native state constraint count",
-        );
-    }
-    let total = telemetry
-        .get("trust_cg_state_constraints_total")
-        .and_then(|value| non_negative_integer_value(Some(value)));
-    if total != Some(native_count) {
-        return NativeStateConstraintWaiver::Incomplete(
-            "trust_cg_state_constraints_total did not match native state constraint count",
-        );
-    }
-    NativeStateConstraintWaiver::Admissible
-}
-
 #[derive(Default)]
 struct ModeFacts {
     median: Option<f64>,
-    generated_by_run: BTreeMap<u64, u64>,
+    generated_by_run: BTreeMap<u64, RawGeneratedCounts>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RawGeneratedCounts {
+    initial: u64,
+    successors: u64,
+    total: u64,
 }
 
 fn evaluate_mode(
@@ -1400,7 +1303,6 @@ fn evaluate_mode(
     expected_run_count: Option<usize>,
     expected_states: Option<u64>,
     expected_generated: Option<u64>,
-    generated_field: &str,
     errors: &mut Vec<String>,
 ) -> ModeFacts {
     let mut facts = ModeFacts::default();
@@ -1466,16 +1368,18 @@ fn evaluate_mode(
                 mode_name,
                 &label,
                 run,
-                generated_field,
+                "raw_successors_generated",
                 expected,
                 errors,
             );
         }
-        if let (Some(index), Some(generated)) = (
-            run_index,
-            integer_field(run, generated_field).map(|value| value as u64),
-        ) {
-            facts.generated_by_run.insert(index as u64, generated);
+        if gate_plan.is_some() {
+            if let (Some(index), Some(generated)) = (
+                run_index.and_then(|value| u64::try_from(value).ok()),
+                require_raw_generated_counts(spec, mode_name, &label, run, errors),
+            ) {
+                facts.generated_by_run.insert(index, generated);
+            }
         }
         match finite_float_field(run, "elapsed_seconds") {
             Some(value) if value >= 0.0 => elapsed.push(value),
@@ -1514,6 +1418,49 @@ fn evaluate_mode(
         )),
     }
     facts
+}
+
+fn require_raw_generated_counts(
+    spec: &str,
+    mode_name: &str,
+    label: &str,
+    run: &Value,
+    errors: &mut Vec<String>,
+) -> Option<RawGeneratedCounts> {
+    let read = |field: &str, errors: &mut Vec<String>| {
+        non_negative_u64_value(run.get(field)).or_else(|| {
+            errors.push(format!(
+                "{spec}: {mode_name} {label}: {field} was {}, expected a non-negative integer",
+                display_value(run.get(field))
+            ));
+            None
+        })
+    };
+    let initial = read("raw_initial_states_generated", errors);
+    let successors = read("raw_successors_generated", errors);
+    let total = read("states_generated", errors);
+    let (Some(initial), Some(successors), Some(total)) = (initial, successors, total) else {
+        return None;
+    };
+    match initial.checked_add(successors) {
+        Some(recomputed) if recomputed == total => Some(RawGeneratedCounts {
+            initial,
+            successors,
+            total,
+        }),
+        Some(recomputed) => {
+            errors.push(format!(
+                "{spec}: {mode_name} {label}: states_generated was {total}, expected raw_initial_states_generated + raw_successors_generated = {recomputed}"
+            ));
+            None
+        }
+        None => {
+            errors.push(format!(
+                "{spec}: {mode_name} {label}: raw generated-state counts overflowed while recomputing the total"
+            ));
+            None
+        }
+    }
 }
 
 fn require_run_identity(
@@ -1594,9 +1541,373 @@ fn require_command_artifact(
             display_value(command.get("cwd"))
         )),
     }
+    require_command_disk_evidence(spec, mode_name, label, &artifact_dir, &command, errors);
     require_command_returncode(spec, mode_name, label, run, &command, errors);
     require_command_env(spec, mode_name, label, run, &command, errors);
     require_command_argv(spec, mode_name, label, &command, errors);
+}
+
+fn require_command_disk_evidence(
+    spec: &str,
+    mode_name: &str,
+    label: &str,
+    artifact_dir: &Path,
+    command: &Value,
+    errors: &mut Vec<String>,
+) {
+    let context = format!("{spec}: {mode_name} {label}: command");
+    let Some(resource) = command.get("resource_evidence").and_then(Value::as_object) else {
+        errors.push(format!(
+            "{context} resource_evidence missing or not an object"
+        ));
+        return;
+    };
+    require_exact_bool(
+        &context,
+        resource.get("strict_qualified"),
+        "resource_evidence.strict_qualified",
+        true,
+        errors,
+    );
+    require_empty_array(
+        &context,
+        resource.get("qualification_failures"),
+        "resource_evidence.qualification_failures",
+        errors,
+    );
+
+    let Some(disk) = resource.get("disk").and_then(Value::as_object) else {
+        errors.push(format!(
+            "{context} resource_evidence.disk missing or not an object"
+        ));
+        return;
+    };
+
+    for (field, expected) in [
+        ("contract_schema", DISK_SCOPE_CONTRACT_SCHEMA),
+        ("scope", "command_artifact_and_scratch_tree"),
+        ("method", "recursive_filesystem_metadata_polling"),
+        ("sampling_execution", "inline_runner_poll_loop"),
+    ] {
+        require_exact_string(
+            &context,
+            disk.get(field),
+            &format!("disk.{field}"),
+            expected,
+            errors,
+        );
+    }
+    require_exact_bool(
+        &context,
+        disk.get("peak_exact"),
+        "disk.peak_exact",
+        false,
+        errors,
+    );
+    require_exact_bool(
+        &context,
+        disk.get("sampling_can_perturb_elapsed"),
+        "disk.sampling_can_perturb_elapsed",
+        true,
+        errors,
+    );
+
+    let sampling_interval_ms =
+        u64::try_from(DISK_USAGE_SAMPLE_INTERVAL.as_millis()).expect("interval fits u64");
+    let scan_budget_ms =
+        u64::try_from(DISK_USAGE_SCAN_BUDGET.as_millis()).expect("budget fits u64");
+    for (field, expected) in [
+        ("sampling_interval_ms", sampling_interval_ms),
+        ("scan_budget_ms", scan_budget_ms),
+        ("scan_entry_limit", DISK_USAGE_SCAN_ENTRY_LIMIT),
+        ("samples_partial", 0),
+    ] {
+        require_exact_u64(
+            &context,
+            disk.get(field),
+            &format!("disk.{field}"),
+            expected,
+            errors,
+        );
+    }
+
+    let total_scan_nanoseconds = require_u64(
+        &context,
+        disk.get("total_scan_nanoseconds"),
+        "disk.total_scan_nanoseconds",
+        errors,
+    );
+    let max_scan_nanoseconds = require_u64(
+        &context,
+        disk.get("max_scan_nanoseconds"),
+        "disk.max_scan_nanoseconds",
+        errors,
+    );
+    if let (Some(total), Some(maximum)) = (total_scan_nanoseconds, max_scan_nanoseconds) {
+        if maximum > total {
+            errors.push(format!(
+                "{context} disk.max_scan_nanoseconds was {maximum}, greater than total_scan_nanoseconds {total}"
+            ));
+        }
+    }
+    let samples_attempted = require_u64(
+        &context,
+        disk.get("samples_attempted"),
+        "disk.samples_attempted",
+        errors,
+    );
+    let samples_complete = require_u64(
+        &context,
+        disk.get("samples_complete"),
+        "disk.samples_complete",
+        errors,
+    );
+    if let Some(attempted) = samples_attempted {
+        if attempted < 2 {
+            errors.push(format!(
+                "{context} disk.samples_attempted was {attempted}, expected at least 2"
+            ));
+        }
+        if samples_complete != Some(attempted) {
+            errors.push(format!(
+                "{context} disk.samples_complete was {samples_complete:?}, expected {attempted}"
+            ));
+        }
+    }
+    for field in [
+        "peak_allocated_bytes",
+        "peak_apparent_bytes",
+        "peak_entries_observed",
+    ] {
+        let value = require_u64(&context, disk.get(field), &format!("disk.{field}"), errors);
+        if field == "peak_entries_observed" && value == Some(0) {
+            errors.push(format!(
+                "{context} disk.peak_entries_observed was 0, expected a positive integer"
+            ));
+        }
+    }
+
+    for field in [
+        "initial_sample_complete",
+        "final_sample_complete",
+        "setup_complete",
+        "environment_confinement_complete",
+        "scope_identity_stable",
+        "ownership_verified",
+        "accounting_complete",
+        "polling_complete",
+        "process_tree_lifetime_complete",
+        "complete",
+        "strict_qualified",
+    ] {
+        require_exact_bool(
+            &context,
+            disk.get(field),
+            &format!("disk.{field}"),
+            true,
+            errors,
+        );
+    }
+    require_empty_array(
+        &context,
+        disk.get("diagnostics"),
+        "disk.diagnostics",
+        errors,
+    );
+    require_empty_array(
+        &context,
+        disk.get("qualification_failures"),
+        "disk.qualification_failures",
+        errors,
+    );
+
+    let canonical_artifact =
+        require_canonical_directory(&context, artifact_dir, "artifact directory", errors);
+    let Some(canonical_artifact) = canonical_artifact else {
+        return;
+    };
+    let canonical_scope = canonical_artifact.display().to_string();
+    require_exact_string(
+        &context,
+        disk.get("scope_root"),
+        "disk.scope_root",
+        &canonical_scope,
+        errors,
+    );
+
+    let scratch = canonical_artifact.join(COMMAND_SCRATCH_DIR_NAME);
+    let canonical_scratch =
+        require_canonical_directory(&context, &scratch, "command scratch directory", errors);
+    let Some(canonical_scratch) = canonical_scratch else {
+        return;
+    };
+    if canonical_scratch.parent() != Some(canonical_artifact.as_path()) {
+        errors.push(format!(
+            "{context} command scratch directory was not a direct child of the canonical artifact directory"
+        ));
+    }
+    let canonical_scratch_text = canonical_scratch.display().to_string();
+    require_exact_string(
+        &context,
+        disk.get("scratch_root"),
+        "disk.scratch_root",
+        &canonical_scratch_text,
+        errors,
+    );
+
+    let Some(confinement) = disk
+        .get("environment_confinement")
+        .and_then(Value::as_object)
+    else {
+        errors.push(format!(
+            "{context} disk.environment_confinement missing or not an object"
+        ));
+        return;
+    };
+    let expected_keys = COMMAND_SCOPED_ENV_KEYS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let actual_keys = confinement
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if actual_keys != expected_keys {
+        errors.push(format!(
+            "{context} disk.environment_confinement keys were {actual_keys:?}, expected {expected_keys:?}"
+        ));
+    }
+    for key in COMMAND_SCOPED_ENV_KEYS {
+        require_exact_string(
+            &context,
+            confinement.get(*key),
+            &format!("disk.environment_confinement.{key}"),
+            &canonical_scratch_text,
+            errors,
+        );
+    }
+}
+
+fn require_canonical_directory(
+    context: &str,
+    path: &Path,
+    description: &str,
+    errors: &mut Vec<String>,
+) -> Option<PathBuf> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            errors.push(format!(
+                "{context} {description} {} was a symlink",
+                path.display()
+            ));
+            return None;
+        }
+        Ok(metadata) if !metadata.file_type().is_dir() => {
+            errors.push(format!(
+                "{context} {description} {} was not a directory",
+                path.display()
+            ));
+            return None;
+        }
+        Ok(_) => {}
+        Err(err) => {
+            errors.push(format!(
+                "{context} could not inspect {description} {}: {err}",
+                path.display()
+            ));
+            return None;
+        }
+    }
+    match fs::canonicalize(path) {
+        Ok(canonical) => Some(canonical),
+        Err(err) => {
+            errors.push(format!(
+                "{context} could not canonicalize {description} {}: {err}",
+                path.display()
+            ));
+            None
+        }
+    }
+}
+
+fn require_exact_string(
+    context: &str,
+    value: Option<&Value>,
+    field: &str,
+    expected: &str,
+    errors: &mut Vec<String>,
+) {
+    if value.and_then(Value::as_str) != Some(expected) {
+        errors.push(format!(
+            "{context} {field} was {}, expected {expected:?}",
+            display_value(value)
+        ));
+    }
+}
+
+fn require_exact_bool(
+    context: &str,
+    value: Option<&Value>,
+    field: &str,
+    expected: bool,
+    errors: &mut Vec<String>,
+) {
+    if value.and_then(Value::as_bool) != Some(expected) {
+        errors.push(format!(
+            "{context} {field} was {}, expected {expected}",
+            display_value(value)
+        ));
+    }
+}
+
+fn require_u64(
+    context: &str,
+    value: Option<&Value>,
+    field: &str,
+    errors: &mut Vec<String>,
+) -> Option<u64> {
+    let parsed = value.and_then(Value::as_u64);
+    if parsed.is_none() {
+        errors.push(format!(
+            "{context} {field} was {}, expected a non-negative integer",
+            display_value(value)
+        ));
+    }
+    parsed
+}
+
+fn require_exact_u64(
+    context: &str,
+    value: Option<&Value>,
+    field: &str,
+    expected: u64,
+    errors: &mut Vec<String>,
+) {
+    if value.and_then(Value::as_u64) != Some(expected) {
+        errors.push(format!(
+            "{context} {field} was {}, expected {expected}",
+            display_value(value)
+        ));
+    }
+}
+
+fn require_empty_array(
+    context: &str,
+    value: Option<&Value>,
+    field: &str,
+    errors: &mut Vec<String>,
+) {
+    match value.and_then(Value::as_array) {
+        Some(items) if items.is_empty() => {}
+        Some(items) => errors.push(format!(
+            "{context} {field} contained {} item(s), expected []",
+            items.len()
+        )),
+        None => errors.push(format!(
+            "{context} {field} was {}, expected []",
+            display_value(value)
+        )),
+    }
 }
 
 fn require_command_returncode(
@@ -1770,6 +2081,7 @@ fn string_array(value: Option<&Value>) -> Option<Vec<String>> {
 fn require_generated_parity(
     spec: &str,
     plan: &PlannedGate,
+    tlc: &ModeFacts,
     interp: &ModeFacts,
     trust_cg: &ModeFacts,
     errors: &mut Vec<String>,
@@ -1777,11 +2089,12 @@ fn require_generated_parity(
     if !plan.require_generated_state_parity_by_run_index {
         return;
     }
-    for (run_index, interp_generated) in &interp.generated_by_run {
+    for (run_index, tlc_generated) in &tlc.generated_by_run {
+        let interp_generated = interp.generated_by_run.get(run_index);
         let trust_cg_generated = trust_cg.generated_by_run.get(run_index);
-        if trust_cg_generated != Some(interp_generated) {
+        if interp_generated != Some(tlc_generated) || trust_cg_generated != Some(tlc_generated) {
             errors.push(format!(
-                "{spec}: generated-state parity failed at run {run_index}: interp={interp_generated}, trust_cg={trust_cg_generated:?}"
+                "{spec}: raw generated-state parity failed at run {run_index}: tlc={tlc_generated:?}, interp={interp_generated:?}, trust_cg={trust_cg_generated:?}"
             ));
         }
     }
@@ -2513,7 +2826,7 @@ mod verdict_write_tests {
             ("TY_BYTECODE_VM_STATS", "1"),
             ("TY_TRUST_CG_NATIVE_CALLOUT_SELFTEST", "strict"),
             ("TY_TRUST_CG_NATIVE_FUSED_STRICT", "1"),
-            ("TY_TRUST_CG_NATIVE_CALLOUT_COMPILE_JOBS", "27"),
+            ("TY_TRUST_CG_NATIVE_CALLOUT_COMPILE_JOBS", "1"),
             ("TY_TRUST_CG_NATIVE_FUSED_ENABLE_LOCAL_DEDUP", "1"),
             ("TY_DISABLE_ARTIFACT_CACHE", "1"),
         ])
@@ -2575,12 +2888,17 @@ mod verdict_write_tests {
                     "artifact_dir": artifact_dir,
                 });
                 if kind == "tlc" {
+                    run["raw_initial_states_generated"] = json!(1);
+                    run["raw_successors_generated"] = json!(generated);
                     run["states_generated"] = json!(generated + 1);
                     run["transitions"] = json!(generated);
                 } else {
                     run["mode"] = json!(kind);
                     run["env_overrides"] = json!(interp_env());
                     run["transitions"] = json!(generated);
+                    run["raw_initial_states_generated"] = json!(1);
+                    run["raw_successors_generated"] = json!(generated);
+                    run["states_generated"] = json!(generated + 1);
                 }
                 write_command_artifact(output_dir, spec, kind, &run);
                 run
@@ -2598,9 +2916,12 @@ mod verdict_write_tests {
     fn write_command_artifact(output_dir: &Path, spec: &str, mode: &str, run: &Value) {
         let artifact_path = output_dir.join(run["artifact_dir"].as_str().unwrap());
         fs::create_dir_all(&artifact_path).unwrap();
+        fs::create_dir(artifact_path.join(COMMAND_SCRATCH_DIR_NAME)).unwrap();
         fs::write(
             artifact_path.join("command.json"),
-            serde_json::to_string_pretty(&command_artifact(spec, mode, run)).unwrap() + "\n",
+            serde_json::to_string_pretty(&command_artifact(spec, mode, run, &artifact_path))
+                .unwrap()
+                + "\n",
         )
         .unwrap();
         if !artifact_path.join("stdout.txt").exists() {
@@ -2609,7 +2930,7 @@ mod verdict_write_tests {
         fs::write(artifact_path.join("stderr.txt"), "").unwrap();
     }
 
-    fn command_artifact(spec: &str, mode: &str, run: &Value) -> Value {
+    fn command_artifact(spec: &str, mode: &str, run: &Value, artifact_path: &Path) -> Value {
         let argv = if mode == "tlc" {
             let mut argv = vec!["java".to_string()];
             argv.extend(
@@ -2649,6 +2970,48 @@ mod verdict_write_tests {
                 .to_string(),
             ]
         };
+        let artifact_path = fs::canonicalize(artifact_path).unwrap();
+        let scratch_path = fs::canonicalize(artifact_path.join(COMMAND_SCRATCH_DIR_NAME)).unwrap();
+        let scratch_text = scratch_path.display().to_string();
+        let environment_confinement = COMMAND_SCOPED_ENV_KEYS
+            .iter()
+            .map(|key| ((*key).to_string(), json!(scratch_text.clone())))
+            .collect::<serde_json::Map<_, _>>();
+        let disk_evidence = json!({
+            "contract_schema": DISK_SCOPE_CONTRACT_SCHEMA,
+            "scope_root": artifact_path.display().to_string(),
+            "scratch_root": scratch_text,
+            "scope": "command_artifact_and_scratch_tree",
+            "method": "recursive_filesystem_metadata_polling",
+            "peak_exact": false,
+            "sampling_execution": "inline_runner_poll_loop",
+            "sampling_can_perturb_elapsed": true,
+            "peak_allocated_bytes": 4096,
+            "peak_apparent_bytes": 1024,
+            "sampling_interval_ms": DISK_USAGE_SAMPLE_INTERVAL.as_millis() as u64,
+            "scan_budget_ms": DISK_USAGE_SCAN_BUDGET.as_millis() as u64,
+            "scan_entry_limit": DISK_USAGE_SCAN_ENTRY_LIMIT,
+            "total_scan_nanoseconds": 2000,
+            "max_scan_nanoseconds": 1000,
+            "samples_attempted": 2,
+            "samples_complete": 2,
+            "samples_partial": 0,
+            "peak_entries_observed": 2,
+            "initial_sample_complete": true,
+            "final_sample_complete": true,
+            "setup_complete": true,
+            "environment_confinement": environment_confinement,
+            "environment_confinement_complete": true,
+            "scope_identity_stable": true,
+            "ownership_verified": true,
+            "accounting_complete": true,
+            "polling_complete": true,
+            "process_tree_lifetime_complete": true,
+            "complete": true,
+            "strict_qualified": true,
+            "diagnostics": [],
+            "qualification_failures": [],
+        });
         json!({
             "schema": COMMAND_ARTIFACT_SCHEMA,
             "argv": argv,
@@ -2658,6 +3021,11 @@ mod verdict_write_tests {
             "env_overrides": run.get("env_overrides").cloned().unwrap_or_else(|| json!({})),
             "timed_out": false,
             "peak_rss_bytes": null,
+            "resource_evidence": {
+                "strict_qualified": true,
+                "qualification_failures": [],
+                "disk": disk_evidence,
+            },
         })
     }
 
@@ -2782,6 +3150,9 @@ mod verdict_write_tests {
                             "workers": 1,
                             "returncode": 0,
                             "transitions": generated,
+                            "raw_initial_states_generated": 1,
+                            "raw_successors_generated": generated,
+                            "states_generated": generated + 1,
                             "artifact_dir": artifact_dir,
                             "trust_cg_telemetry": telemetry.clone(),
                             "env_overrides": required_env_with_cache(output_dir),
@@ -2833,7 +3204,7 @@ mod verdict_write_tests {
                         "workers": 1,
                         "cache_dir": output_dir.join("trust_cg-artifact-cache").display().to_string(),
                         "artifact_cache_disabled_env": "1",
-                        "native_callout_compile_jobs": "27",
+                        "native_callout_compile_jobs": "1",
                     },
                 },
             },
@@ -2878,11 +3249,11 @@ mod verdict_write_tests {
         assert_eq!(verdict["verdict"], "pass");
         assert_eq!(
             verdict["generated_state_count_sources"]["trust-cg"],
-            "runs[].transitions"
+            "runs[].raw_successors_generated"
         );
         assert_eq!(
             verdict["generated_state_count_sources"]["tlc"],
-            "runs[].states_generated (TLC diagnostic count)"
+            "runs[].raw_successors_generated"
         );
     }
 

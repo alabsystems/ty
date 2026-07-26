@@ -7,10 +7,10 @@
 //!
 //! Part of #3412: extracted from `parallel_intern.rs` (lines 364-610).
 
-use std::sync::atomic::Ordering;
-use crate::rp::Rp as Arc;
 use super::super::Value;
 use super::state::{worker_overlay_cap, WorkerInternState, WORKER_INTERN, WORKER_TOKEN_COUNTER};
+use crate::rp::Rp as Arc;
+use std::sync::atomic::Ordering;
 
 /// Sound cliff-clear of the per-worker `set_overlay` when its growth beyond the
 /// preloaded frozen baseline would exceed `worker_overlay_cap()`.

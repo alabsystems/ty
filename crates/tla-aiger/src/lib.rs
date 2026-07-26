@@ -91,9 +91,6 @@
 #![allow(clippy::filter_map_identity)]
 #![allow(clippy::unnecessary_filter_map)]
 #![allow(clippy::bind_instead_of_map)]
-// Manual division-by-zero check is clearer than checked_div().unwrap_or in
-// percentage-compression calculations.
-#![allow(clippy::manual_checked_ops)]
 // Index-based loops document iteration order in IC3/BMC cube/trace machinery.
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::explicit_counter_loop)]

@@ -21,6 +21,61 @@ use crate::symbolic_colored::{
     SymbolicColoredError,
 };
 
+const HEAVY_CAMPAIGN_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+static HEAVY_CAMPAIGN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static HEAVY_CAMPAIGN_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+struct HeavyCampaignGuard {
+    _serial: std::sync::MutexGuard<'static, ()>,
+    deadline: std::time::Instant,
+    test_name: &'static str,
+}
+
+impl HeavyCampaignGuard {
+    fn deadline_with_cap(&self, seconds: u64) -> std::time::Instant {
+        let now = std::time::Instant::now();
+        assert!(
+            now < self.deadline,
+            "{}: shared 15-minute symbolic campaign budget exhausted during setup",
+            self.test_name
+        );
+        std::cmp::min(
+            now.checked_add(std::time::Duration::from_secs(seconds))
+                .expect("per-test symbolic deadline should fit in Instant"),
+            self.deadline,
+        )
+    }
+}
+
+fn heavy_campaign_guard(test_name: &'static str) -> Option<HeavyCampaignGuard> {
+    if !std::env::var_os("TY_RUN_HEAVY_SYMBOLIC_COLORED_TESTS").is_some_and(|value| value == "1") {
+        eprintln!(
+            "SKIP {test_name}: set TY_RUN_HEAVY_SYMBOLIC_COLORED_TESTS=1 to authorize \
+             the serialized, 15-minute symbolic-colored campaign"
+        );
+        return None;
+    }
+
+    let serial = HEAVY_CAMPAIGN_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let start = *HEAVY_CAMPAIGN_START.get_or_init(std::time::Instant::now);
+    let deadline = start
+        .checked_add(HEAVY_CAMPAIGN_TOTAL_BUDGET)
+        .expect("symbolic campaign deadline should fit in Instant");
+    assert!(
+        std::time::Instant::now() < deadline,
+        "{test_name}: shared 15-minute symbolic campaign budget exhausted while waiting for \
+         another heavy test"
+    );
+
+    Some(HeavyCampaignGuard {
+        _serial: serial,
+        deadline,
+        test_name,
+    })
+}
+
 /// The four StateSpace metrics, normalized for comparison across engines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Metrics {
@@ -135,18 +190,13 @@ fn metrics_of(
 /// stack). The gate-only/test win demonstrations cross 100k levels, hence this.
 fn metrics_on_big_stack(
     colored: &ColoredNet,
-    secs: u64,
+    deadline: std::time::Instant,
 ) -> Result<tla_mdd::MddStateSpaceMetrics, SymbolicColoredError> {
     let colored = colored.clone();
     std::thread::Builder::new()
         .name("tla-symbolic-colored-test".into())
         .stack_size(tla_dd::DD_WORKER_STACK_BYTES)
-        .spawn(move || {
-            colored_state_space_metrics(
-                &colored,
-                Some(std::time::Instant::now() + std::time::Duration::from_secs(secs)),
-            )
-        })
+        .spawn(move || colored_state_space_metrics(&colored, Some(deadline)))
         .expect("spawn big-stack worker")
         .join()
         .expect("worker did not panic")
@@ -541,14 +591,16 @@ fn build_wide_color_place(m: usize) -> ColoredNet {
 /// StateSpace directly. Soundness is pinned on a SMALLER member of the SAME
 /// family that the oracle CAN enumerate, where the symbolic count == the oracle.
 ///
-/// `#[ignore]` by default: crossing the 100k place cap is intrinsically O(100k)
-/// setup (parse + level build), so this runs in ~tens of seconds — too slow for
-/// the inner CI loop. The always-green soundness gate is the differential
-/// battery + the small-member anchor here; run this on demand with
-/// `cargo test -p tla-petri --features dd-backend win_decides -- --ignored --nocapture`.
+/// Crossing the 100k place cap is intrinsically O(100k) setup (parse + level
+/// build), so this runs only when the caller explicitly authorizes the heavy
+/// campaign. The always-green soundness gate is the differential battery + the
+/// small-member anchor here.
 #[test]
-#[ignore = "win proof; crossing the 100k place cap is intrinsically O(100k) setup"]
 fn win_decides_where_unfold_exceeds_place_budget() {
+    let Some(campaign) = heavy_campaign_guard("win_decides_where_unfold_exceeds_place_budget")
+    else {
+        return;
+    };
     // (a) Soundness anchor: a small member, symbolic == explicit-BFS oracle.
     let small = build_wide_color_place(100);
     assert!(
@@ -575,7 +627,7 @@ fn win_decides_where_unfold_exceeds_place_budget() {
     }
     // ... while the SYMBOLIC engine completes and returns the exact count.
     let t0 = std::time::Instant::now();
-    let m_big = metrics_on_big_stack(&big, 120)
+    let m_big = metrics_on_big_stack(&big, campaign.deadline_with_cap(120))
         .expect("symbolic engine must DECIDE the 120k-color net the unfolder cannot");
     eprintln!(
         "WIN(places): wide_color_place(120_000) symbolic StateSpace |R|={} \
@@ -594,7 +646,7 @@ fn win_decides_where_unfold_exceeds_place_budget() {
     );
 }
 
-/// DELIVERABLE (3), HEADLINE (ignored by default — DELIBERATELY EXPENSIVE): a
+/// DELIVERABLE (3), HEADLINE (explicitly qualified — DELIBERATELY EXPENSIVE): a
 /// colored TOKEN RING over `M` colors whose unfolded P/T form has `M` places +
 /// `M` transitions, past the unfolder's caps. `unfold_to_pt` DECLINES; the
 /// symbolic engine returns the exact non-trivial four metrics (`|R| = M`,
@@ -603,13 +655,16 @@ fn win_decides_where_unfold_exceeds_place_budget() {
 /// NOTE: at `M = 120_000` the ring has diameter ~120k AND ~120k transitions, so
 /// the saturation fixpoint's per-pass relprod verification sweep is heavy — this
 /// can take MINUTES (and is given a 600s engine deadline). It is the richer
-/// non-trivial-metric companion to the FAST, always-runnable place-cap win
-/// (`win_decides_where_unfold_exceeds_place_budget`, ~0.5s), which is the
-/// primary deliverable-(3) proof. Run on demand with:
-/// `cargo test -p tla-petri --features dd-backend win_headline -- --ignored --nocapture`.
+/// non-trivial-metric companion to the lighter place-cap win
+/// (`win_decides_where_unfold_exceeds_place_budget`), which is the primary
+/// deliverable-(3) proof. Run on demand with:
+/// `TY_RUN_HEAVY_SYMBOLIC_COLORED_TESTS=1 cargo test -p tla-petri
+/// --features dd-backend win_headline -- --nocapture`.
 #[test]
-#[ignore = "headline win proof; DELIBERATELY EXPENSIVE (minutes) on the M=120k ring"]
 fn win_headline_token_ring_past_budget() {
+    let Some(campaign) = heavy_campaign_guard("win_headline_token_ring_past_budget") else {
+        return;
+    };
     // Soundness anchor on a small member.
     let small = build_color_ring(50);
     assert!(assert_agrees("color_ring(50)", &small));
@@ -629,7 +684,8 @@ fn win_headline_token_ring_past_budget() {
         "unfold_to_pt must exceed budget on the 120k-color ring"
     );
     let t0 = std::time::Instant::now();
-    let m = metrics_on_big_stack(&big, 600).expect("symbolic engine must DECIDE the 120k ring");
+    let m = metrics_on_big_stack(&big, campaign.deadline_with_cap(600))
+        .expect("symbolic engine must DECIDE the 120k ring");
     eprintln!(
         "WIN(headline): color_ring(120_000) |R|={} edges={} in {:?}",
         m.state_count_u128,
@@ -713,7 +769,8 @@ fn build_binding_cap_net(k: usize) -> ColoredNet {
 /// silently fall back), and its metrics must equal the v1 enumerate path AND the
 /// explicit-BFS oracle EXACTLY. This is the non-vacuous proof that the quantified
 /// recursion actually runs on this family; the heavy member that crosses the cap
-/// lives in the `#[ignore]`d `win_binding_quantified_defeats_binding_cap` below.
+/// lives in the explicitly qualified
+/// `win_binding_quantified_defeats_binding_cap` below.
 #[test]
 fn binding_cap_family_quantified_anchor() {
     for k in [3usize, 4, 6] {
@@ -733,8 +790,8 @@ fn binding_cap_family_quantified_anchor() {
     }
 }
 
-/// DELIVERABLE (3), the HEADLINE BINDING-cap WIN (ignored — O(k)-level setup is
-/// intrinsically multi-second). A member whose binding PRODUCT exceeds
+/// DELIVERABLE (3), the HEADLINE BINDING-cap WIN (explicitly qualified because
+/// O(k)-level setup is intrinsically multi-second). A member whose binding PRODUCT exceeds
 /// `MAX_BINDING_ITERATIONS` (50M) makes v1 / `unfold_to_pt` DECLINE at the
 /// binding cap, while the binding-QUANTIFIED driver DECIDES it with the SAME
 /// family `|R| = 2` (validated vs the small member in
@@ -742,10 +799,13 @@ fn binding_cap_family_quantified_anchor() {
 ///
 /// `k = 8000` ⇒ binding product `64M > 50M`, 8000 `(place,color)` levels (under
 /// the 200k symbolic cap). Run on demand:
-/// `cargo test -p tla-petri --features dd-backend win_binding -- --ignored --nocapture`.
+/// `TY_RUN_HEAVY_SYMBOLIC_COLORED_TESTS=1 cargo test -p tla-petri
+/// --features dd-backend win_binding -- --nocapture`.
 #[test]
-#[ignore = "binding-cap win proof; O(k)-level MDD chains ⇒ intrinsically multi-second at k=8000"]
 fn win_binding_quantified_defeats_binding_cap() {
+    let Some(campaign) = heavy_campaign_guard("win_binding_quantified_defeats_binding_cap") else {
+        return;
+    };
     // (a) NON-VACUOUS soundness anchor on a small member v1 CAN enumerate
     //     (k=3 ⇒ 9 bindings): quantified == enumerated == oracle, |R| = 2.
     let small = build_binding_cap_net(3);
@@ -781,11 +841,8 @@ fn win_binding_quantified_defeats_binding_cap() {
     // ... while the binding-QUANTIFIED driver DECIDES it (O(k) work, the prune
     // cuts every x != c0 sub-tree), returning the SAME family |R| = 2.
     let t0 = std::time::Instant::now();
-    let m_big = colored_state_space_metrics_quantified(
-        &big,
-        Some(std::time::Instant::now() + std::time::Duration::from_secs(120)),
-    )
-    .expect("quantified driver must DECIDE the binding-cap net v1/unfold cannot");
+    let m_big = colored_state_space_metrics_quantified(&big, Some(campaign.deadline_with_cap(120)))
+        .expect("quantified driver must DECIDE the binding-cap net v1/unfold cannot");
     eprintln!(
         "WIN(binding-cap): k={k} (binding product {} > 50M cap) binding-QUANTIFIED \
          StateSpace |R|={} edges={} max_in_place={} in {:?} \

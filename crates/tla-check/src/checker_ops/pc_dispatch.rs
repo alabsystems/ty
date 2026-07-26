@@ -29,6 +29,7 @@
 //!   determine the effective pc value for the current process.
 
 use std::cell::RefCell;
+#[cfg(test)]
 use tla_value::Rp;
 
 use rustc_hash::FxHashMap;

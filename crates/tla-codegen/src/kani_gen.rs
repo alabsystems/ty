@@ -19,7 +19,7 @@
 //!
 //! # Usage
 //!
-//! ```rust,ignore
+//! ```text
 //! use tla_codegen::kani_gen::{generate_kani_harnesses, KaniGenOptions, SpecInfo, VarInfo};
 //! use tla_codegen::TlaType;
 //!
@@ -119,21 +119,33 @@ pub fn generate_kani_harnesses(spec: &SpecInfo, options: &KaniGenOptions) -> Str
 // ---------------------------------------------------------------------------
 
 fn emit_header(out: &mut String, spec: &SpecInfo) {
-    writeln!(out, "// ---------------------------------------------------------------------------").expect(W);
+    writeln!(
+        out,
+        "// ---------------------------------------------------------------------------"
+    )
+    .expect(W);
     writeln!(
         out,
         "// Kani proof harnesses for {} (auto-generated)",
         spec.module_name
     )
     .expect(W);
-    writeln!(out, "// ---------------------------------------------------------------------------").expect(W);
+    writeln!(
+        out,
+        "// ---------------------------------------------------------------------------"
+    )
+    .expect(W);
     writeln!(out).expect(W);
 }
 
 /// Base case: every initial state satisfies every invariant.
 fn emit_kani_base_case(out: &mut String, spec: &SpecInfo) {
     let machine = &spec.machine_type;
-    writeln!(out, "/// Base case: every initial state satisfies all invariants.").expect(W);
+    writeln!(
+        out,
+        "/// Base case: every initial state satisfies all invariants."
+    )
+    .expect(W);
     writeln!(out, "#[cfg(kani)]").expect(W);
     writeln!(out, "#[kani::proof]").expect(W);
     writeln!(out, "fn prove_init_satisfies_inv() {{").expect(W);
@@ -272,9 +284,21 @@ fn emit_test_module(out: &mut String, spec: &SpecInfo, options: &KaniGenOptions)
     let state_ty = &spec.state_type;
     let max_states = options.test_max_states;
 
-    writeln!(out, "// ---------------------------------------------------------------------------").expect(W);
-    writeln!(out, "// Standard test fallbacks (run without Kani via `cargo test`)").expect(W);
-    writeln!(out, "// ---------------------------------------------------------------------------").expect(W);
+    writeln!(
+        out,
+        "// ---------------------------------------------------------------------------"
+    )
+    .expect(W);
+    writeln!(
+        out,
+        "// Standard test fallbacks (run without Kani via `cargo test`)"
+    )
+    .expect(W);
+    writeln!(
+        out,
+        "// ---------------------------------------------------------------------------"
+    )
+    .expect(W);
     writeln!(out).expect(W);
     writeln!(out, "#[cfg(test)]").expect(W);
     writeln!(out, "mod kani_fallback_tests {{").expect(W);
@@ -282,7 +306,11 @@ fn emit_test_module(out: &mut String, spec: &SpecInfo, options: &KaniGenOptions)
     writeln!(out).expect(W);
 
     // Test: init satisfies inv
-    writeln!(out, "    /// Test: every initial state satisfies all invariants.").expect(W);
+    writeln!(
+        out,
+        "    /// Test: every initial state satisfies all invariants."
+    )
+    .expect(W);
     writeln!(out, "    #[test]").expect(W);
     writeln!(out, "    fn test_init_satisfies_inv() {{").expect(W);
     writeln!(out, "        let sm = {machine};").expect(W);
@@ -397,11 +425,7 @@ fn emit_kani_any_decl(out: &mut String, var: &VarInfo, indent: &str) {
                 "{indent}// TODO: kani::any() not supported for {rust_ty}; using default",
             )
             .expect(W);
-            writeln!(
-                out,
-                "{indent}let {field}: {rust_ty} = Default::default();",
-            )
-            .expect(W);
+            writeln!(out, "{indent}let {field}: {rust_ty} = Default::default();",).expect(W);
         }
     }
 }
@@ -428,24 +452,24 @@ fn emit_kani_any_set(out: &mut String, var: &VarInfo, elem: &TlaType, indent: &s
             writeln!(out, "{indent}    {field}_vec.push(elem);").expect(W);
             writeln!(out, "{indent}    {field}_i += 1;").expect(W);
             writeln!(out, "{indent}}}").expect(W);
-            writeln!(
-                out,
-                "{indent}let {field} = TlaSet::from_iter({field}_vec);",
-            )
-            .expect(W);
+            writeln!(out, "{indent}let {field} = TlaSet::from_iter({field}_vec);",).expect(W);
         }
         TlaType::Bool => {
             // A set of booleans has at most 4 subsets: {}, {T}, {F}, {T,F}.
             writeln!(out, "{indent}let {field}_has_t: bool = kani::any();").expect(W);
             writeln!(out, "{indent}let {field}_has_f: bool = kani::any();").expect(W);
             writeln!(out, "{indent}let mut {field}_vec: Vec<bool> = Vec::new();").expect(W);
-            writeln!(out, "{indent}if {field}_has_t {{ {field}_vec.push(true); }}").expect(W);
-            writeln!(out, "{indent}if {field}_has_f {{ {field}_vec.push(false); }}").expect(W);
             writeln!(
                 out,
-                "{indent}let {field} = TlaSet::from_iter({field}_vec);",
+                "{indent}if {field}_has_t {{ {field}_vec.push(true); }}"
             )
             .expect(W);
+            writeln!(
+                out,
+                "{indent}if {field}_has_f {{ {field}_vec.push(false); }}"
+            )
+            .expect(W);
+            writeln!(out, "{indent}let {field} = TlaSet::from_iter({field}_vec);",).expect(W);
         }
         _ => {
             let rust_ty = var.ty.to_rust_type();
@@ -454,11 +478,7 @@ fn emit_kani_any_set(out: &mut String, var: &VarInfo, elem: &TlaType, indent: &s
                 "{indent}// TODO: kani::any() not supported for {rust_ty}; using default",
             )
             .expect(W);
-            writeln!(
-                out,
-                "{indent}let {field}: {rust_ty} = Default::default();",
-            )
-            .expect(W);
+            writeln!(out, "{indent}let {field}: {rust_ty} = Default::default();",).expect(W);
         }
     }
 }
@@ -497,11 +517,7 @@ fn emit_kani_any_seq(out: &mut String, var: &VarInfo, elem: &TlaType, indent: &s
                 "{indent}// TODO: kani::any() not supported for {rust_ty}; using default",
             )
             .expect(W);
-            writeln!(
-                out,
-                "{indent}let {field}: {rust_ty} = Default::default();",
-            )
-            .expect(W);
+            writeln!(out, "{indent}let {field}: {rust_ty} = Default::default();",).expect(W);
         }
     }
 }
@@ -612,10 +628,7 @@ mod tests {
             code.contains("ModularCounter::check_inv(state)"),
             "should check invariant Inv via check_inv"
         );
-        assert!(
-            code.contains("sm.init()"),
-            "should call init()"
-        );
+        assert!(code.contains("sm.init()"), "should call init()");
     }
 
     #[test]
@@ -749,10 +762,7 @@ mod tests {
         let spec = modular_counter_spec();
         let code = generate_kani_harnesses(&spec, &KaniGenOptions::default());
 
-        assert!(
-            code.contains("#[cfg(test)]"),
-            "should contain #[cfg(test)]"
-        );
+        assert!(code.contains("#[cfg(test)]"), "should contain #[cfg(test)]");
         assert!(
             code.contains("mod kani_fallback_tests"),
             "should contain fallback test module"
@@ -991,10 +1001,7 @@ mod tests {
 
         // Verify the cfg gates.
         let cfg_kani_count = code.matches("#[cfg(kani)]").count();
-        assert_eq!(
-            cfg_kani_count, 3,
-            "should have 3 #[cfg(kani)] gates"
-        );
+        assert_eq!(cfg_kani_count, 3, "should have 3 #[cfg(kani)] gates");
         assert!(code.contains("#[cfg(test)]"));
     }
 

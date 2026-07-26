@@ -48,6 +48,7 @@
 //! Part of #4126: FlatState as native BFS representation (Phase E of supremacy plan).
 
 use std::sync::Arc;
+#[cfg(test)]
 use tla_value::Rp;
 
 use super::flat_bfs_bridge::FlatBfsBridge;
@@ -616,11 +617,13 @@ mod tests {
         let original_fp = array.fingerprint(&registry);
         let flat = adapter.array_to_flat(&array);
         let roundtrip_fp = adapter.traditional_fingerprint(&flat, &registry, None);
+        let flat_fp = adapter.flat_fingerprint(&flat);
 
         assert_eq!(
             original_fp, roundtrip_fp,
             "traditional fingerprint must be preserved through flat roundtrip"
         );
+        assert_eq!(flat_fp, adapter.flat_fingerprint(&flat));
     }
 
     #[cfg_attr(test, ntest::timeout(10000))]

@@ -42,10 +42,11 @@ const fn inductive_safety_certificate_route_allowed(
 
 impl ModelChecker<'_> {
     pub(in crate::check) fn report_init_progress(
-        &self,
+        &mut self,
         states_generated: usize,
         distinct_states: usize,
     ) {
+        self.stats.raw_initial_states_generated = states_generated;
         if let Some(ref callback) = self.hooks.init_progress_callback {
             let init = InitProgress {
                 states_generated,
@@ -60,7 +61,15 @@ impl ModelChecker<'_> {
         &mut self,
         result: CheckResult,
     ) -> CheckResult {
-        let storage_stats = FingerprintSet::stats(&*self.state_storage.seen_fps);
+        // Exact terminal liveness may have released only the physical
+        // membership table. Preserve the authoritative pre-release snapshot in
+        // results while observability paths such as the memory census continue
+        // to query the backend's current (now smaller) residency directly.
+        let storage_stats = if self.state_storage.retired_seen_fps_len.is_some() {
+            self.stats.storage_stats
+        } else {
+            FingerprintSet::stats(&*self.state_storage.seen_fps)
+        };
         self.stats.storage_stats = storage_stats;
         result.with_storage_stats(storage_stats)
     }

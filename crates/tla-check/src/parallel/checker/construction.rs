@@ -177,6 +177,8 @@ impl ParallelChecker {
             max_queue_depth: Arc::new(AtomicUsize::new(0)),
             max_depth: Arc::new(AtomicUsize::new(0)),
             total_transitions: Arc::new(AtomicUsize::new(0)),
+            total_raw_initial_states_generated: Arc::new(AtomicUsize::new(0)),
+            total_raw_successors_generated: Arc::new(AtomicUsize::new(0)),
             vars,
             op_defs: op_defs.into_iter().collect(),
             config: config.clone(),

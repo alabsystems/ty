@@ -259,6 +259,32 @@ pub(super) fn try_run_gpu_check(
     // stops the search early, so the retained arena stays shallow) instead of
     // declining to the CPU engine to re-derive it.
     engine_config.trace_on_violation = true;
+
+    // Never ask the device for a configuration that cannot fit: project the
+    // footprint of every configuration (initial AND each retry rung) against
+    // the CUDA budget and decline to the CPU engine instead of requesting the
+    // impossible. Without this, the grow-and-retry ladder below escalated to
+    // a single 96 GiB arena request on unified-memory hardware (2026-07-21),
+    // where "GPU memory" is host RAM and the request consumed the machine.
+    // Advisory only (`None` when the projection or budget is unavailable):
+    // the allocation-time budget transaction in tla-gpu stays authoritative.
+    let footprint_over_budget =
+        |config: &tla_gpu::GpuBfsConfig, spec: &tla_gpu::GpuBfsSpec| -> Option<(u64, u64)> {
+            let projected = tla_gpu::projected_device_bytes(spec, config).ok()?;
+            let budget = tla_gpu::allocation_headroom_bytes().ok()?;
+            (projected > budget).then_some((projected, budget))
+        };
+    let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+    if let Some((projected, budget)) = footprint_over_budget(&engine_config, &spec) {
+        eprintln!(
+            "[gpu] projected device footprint {:.1} GiB exceeds the {:.1} GiB CUDA budget; \
+             falling back to the CPU engine",
+            gib(projected),
+            gib(budget)
+        );
+        return Ok(false);
+    }
+
     let mut attempts = 0;
     let outcome = loop {
         match tla_gpu::run_bfs(&spec, &engine_config) {
@@ -285,6 +311,16 @@ pub(super) fn try_run_gpu_check(
                 } else {
                     engine_config.frontier_cap_rows *= 4;
                 }
+                if let Some((projected, budget)) = footprint_over_budget(&engine_config, &spec) {
+                    eprintln!(
+                        "[gpu] {what} capacity exceeded ({needed} > {capacity}); a larger \
+                         allocation would need {:.1} GiB against the {:.1} GiB CUDA budget; \
+                         falling back to the CPU engine",
+                        gib(projected),
+                        gib(budget)
+                    );
+                    return Ok(false);
+                }
                 eprintln!(
                     "[gpu] {what} capacity exceeded ({needed} > {capacity}); retrying with larger allocation"
                 );
@@ -295,6 +331,10 @@ pub(super) fn try_run_gpu_check(
             }
         }
     };
+    let outcome_distinct_states = usize::try_from(outcome.distinct_states)
+        .map_err(|_| anyhow::anyhow!("GPU distinct-state count does not fit usize"))?;
+    let outcome_raw_successors = usize::try_from(outcome.transitions)
+        .map_err(|_| anyhow::anyhow!("GPU raw successor count does not fit usize"))?;
 
     if outcome.violation.is_some() {
         // The GPU engine reconstructed the init->bad counterexample path on
@@ -305,10 +345,18 @@ pub(super) fn try_run_gpu_check(
         if let Some(trace_rows) = &outcome.violation_trace {
             if let Some((invariant, states)) = checker.gpu_violation_report(trace_rows) {
                 let mut vstats = CheckStats::default();
-                vstats.states_found = outcome.distinct_states as usize;
+                vstats.states_found = outcome_distinct_states;
                 vstats.initial_states = initial_state_count;
-                vstats.transitions = outcome.transitions as usize;
+                vstats.raw_initial_states_generated = program.raw_initial_states_generated;
+                vstats.transitions = outcome_raw_successors;
+                vstats.raw_successors_generated = outcome_raw_successors;
                 vstats.max_depth = states.len().saturating_sub(1);
+                vstats.engine_provenance = Some(serde_json::json!({
+                    "tier": "gpu",
+                    "device": info.device_name,
+                    "search_wall_s": outcome.wall.as_secs_f64(),
+                    "nvrtc_compile_ms": outcome.compile_wall.as_secs_f64() * 1e3,
+                }));
                 let result = CheckResult::InvariantViolation {
                     invariant,
                     trace: tla_check::Trace::from_states(states),
@@ -366,11 +414,20 @@ pub(super) fn try_run_gpu_check(
     // engine reports, so the serializer (human or JSON) is engine-agnostic.
     // CheckStats is #[non_exhaustive] — construct via Default + field sets.
     let mut gpu_stats = CheckStats::default();
-    gpu_stats.states_found = outcome.distinct_states as usize;
+    gpu_stats.states_found = outcome_distinct_states;
     gpu_stats.initial_states = initial_state_count;
-    gpu_stats.transitions = outcome.transitions as usize;
+    gpu_stats.raw_initial_states_generated = program.raw_initial_states_generated;
+    gpu_stats.transitions = outcome_raw_successors;
+    gpu_stats.raw_successors_generated = outcome_raw_successors;
     // `levels` = diameter + 1 (the seed level counts as level 0).
     gpu_stats.max_depth = (outcome.levels.saturating_sub(1)) as usize;
+    gpu_stats.engine_provenance = Some(serde_json::json!({
+        "tier": "gpu",
+        "device": info.device_name,
+        "search_wall_s": outcome.wall.as_secs_f64(),
+        "nvrtc_compile_ms": outcome.compile_wall.as_secs_f64() * 1e3,
+    }));
+    let gpu_states_generated = gpu_stats.states_generated();
     let result = CheckResult::Success(gpu_stats);
     let elapsed = outcome.wall + outcome.compile_wall;
 
@@ -379,6 +436,12 @@ pub(super) fn try_run_gpu_check(
         println!();
         println!("Statistics:");
         println!("  States found: {}", outcome.distinct_states);
+        println!("  Initial states: {}", initial_state_count);
+        println!(
+            "  Initial states generated: {}",
+            program.raw_initial_states_generated
+        );
+        println!("  States generated: {}", gpu_states_generated);
         println!("  Transitions: {}", outcome.transitions);
         println!("  Time: {:.3}s", elapsed.as_secs_f64());
     } else {
@@ -395,6 +458,11 @@ fn print_cpu_probe_summary(stats: &CheckStats, elapsed: std::time::Duration) {
     println!("Statistics:");
     println!("  States found: {}", stats.states_found);
     println!("  Initial states: {}", stats.initial_states);
+    println!(
+        "  Initial states generated: {}",
+        stats.raw_initial_states_generated
+    );
+    println!("  States generated: {}", stats.states_generated());
     println!("  Transitions: {}", stats.transitions);
     println!("  Max queue depth: {}", stats.max_queue_depth);
     println!("  Time: {:.3}s", elapsed.as_secs_f64());

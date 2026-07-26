@@ -3,7 +3,6 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::helpers::fnv_hash;
-use tla_value::Rp;
 use super::*;
 use crate::value::RecordValue;
 use std::collections::hash_map::DefaultHasher;
@@ -11,6 +10,7 @@ use std::sync::Arc;
 use tla_core::ast::{BoundVar, Expr};
 use tla_core::kani_types::HashMap;
 use tla_core::Spanned;
+use tla_value::Rp;
 
 #[cfg_attr(test, ntest::timeout(10000))]
 #[test]

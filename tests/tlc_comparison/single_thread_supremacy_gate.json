@@ -102,7 +102,7 @@
       "required_trust_cg_env": {
         "TY_TRUST_CG_NATIVE_CALLOUT_SELFTEST": "strict",
         "TY_TRUST_CG_NATIVE_FUSED_STRICT": "1",
-        "TY_TRUST_CG_NATIVE_CALLOUT_COMPILE_JOBS": "27",
+        "TY_TRUST_CG_NATIVE_CALLOUT_COMPILE_JOBS": "1",
         "TY_TRUST_CG_NATIVE_FUSED_ENABLE_LOCAL_DEDUP": "1",
         "TY_DISABLE_ARTIFACT_CACHE": "1"
       },

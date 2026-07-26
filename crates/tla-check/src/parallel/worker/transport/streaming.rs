@@ -111,7 +111,9 @@ impl<T: BfsWorkItem> ParallelTransport<T> {
             let current_ref = current;
 
             let mut sink = ClosureSink::new(|diff: DiffSuccessor| -> ControlFlow<()> {
-                total_count += 1;
+                total_count = total_count
+                    .checked_add(1)
+                    .expect("raw successor generation count overflowed usize");
 
                 // Part of #3254: Check if diff has lazy values needing
                 // post-enumeration materialization. If so, the fingerprint
@@ -273,6 +275,16 @@ impl<T: BfsWorkItem> ParallelTransport<T> {
                 self.stats.transitions += total_count;
                 self.total_transitions
                     .fetch_add(total_count, Ordering::Relaxed);
+                self.stats.raw_successors_generated = self
+                    .stats
+                    .raw_successors_generated
+                    .checked_add(total_count)
+                    .expect("worker raw successor generation count overflowed usize");
+                crate::parallel::checked_atomic_add_usize(
+                    &self.total_raw_successors_generated,
+                    total_count,
+                    "parallel raw successor generation count",
+                );
                 // Part of #3254: Count pre-admitted diffs for profiling.
                 self.stats.streaming_preadmits += admitted_diffs.len();
 
@@ -352,6 +364,7 @@ impl<T: BfsWorkItem> ParallelTransport<T> {
                         work_remaining: &self.work_remaining,
                         max_depth_atomic: &self.max_depth_atomic,
                         total_transitions: &self.total_transitions,
+                        total_raw_successors_generated: &self.total_raw_successors_generated,
                         successors_cache: &self.successors_cache,
                         successor_witnesses_cache: &self.successor_witnesses_cache,
                         mvperms: &self.mvperms,

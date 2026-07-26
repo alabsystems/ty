@@ -42,10 +42,13 @@ pub(super) fn split_action_instances_rec(
         }
 
         // IF expression: split named branch actions, but keep direct IF-shaped
-        // actions monolithic. A direct `Next == IF ... THEN x' = ... ELSE ...`
-        // has no branch operator name for safe bytecode compilation; keeping it
-        // as one leaf lets the caller name it `Next` and compile the rewritten
-        // branch bytecode.
+        // actions monolithic. Preserve branch selection with IF wrappers: an
+        // action-level `cond /\ action` would enumerate every proof of an
+        // existential condition and could emit duplicate successors, whereas
+        // IF consumes the condition as one Boolean value. A direct
+        // `Next == IF ... THEN x' = ... ELSE ...` has no branch operator name
+        // for safe bytecode compilation; keeping it as one leaf lets the caller
+        // name it `Next` and compile the rewritten branch bytecode.
         Expr::If(cond, then_branch, else_branch) => {
             let cond_expr = (**cond).clone();
             let mut branch_actions = Vec::new();
@@ -53,12 +56,11 @@ pub(super) fn split_action_instances_rec(
             let mut then_split = split.clone();
             then_split
                 .wrappers
-                .push(SplitWrapper::Guard(cond_expr.clone()));
+                .push(SplitWrapper::IfThen(cond_expr.clone()));
             split_action_instances_rec(ctx, then_branch, &then_split, &mut branch_actions)?;
 
-            let not_cond = Spanned::new(Expr::Not(Box::new(cond_expr.clone())), cond_expr.span);
             let mut else_split = split.clone();
-            else_split.wrappers.push(SplitWrapper::Guard(not_cond));
+            else_split.wrappers.push(SplitWrapper::IfElse(cond_expr));
             split_action_instances_rec(ctx, else_branch, &else_split, &mut branch_actions)?;
 
             if if_branch_split_has_stable_action_names(split, &branch_actions) {
@@ -306,9 +308,29 @@ fn push_leaf_action(
                 let span = wrapped.span;
                 Spanned::new(Expr::Let(defs.clone(), Box::new(wrapped)), span)
             }
-            SplitWrapper::Guard(guard) => {
-                let span = merged_span(guard.span, wrapped.span);
-                Spanned::new(Expr::And(Box::new(guard.clone()), Box::new(wrapped)), span)
+            SplitWrapper::IfThen(cond) => {
+                let span = merged_span(cond.span, wrapped.span);
+                let false_expr = Spanned::new(Expr::Bool(false), span);
+                Spanned::new(
+                    Expr::If(
+                        Box::new(cond.clone()),
+                        Box::new(wrapped),
+                        Box::new(false_expr),
+                    ),
+                    span,
+                )
+            }
+            SplitWrapper::IfElse(cond) => {
+                let span = merged_span(cond.span, wrapped.span);
+                let false_expr = Spanned::new(Expr::Bool(false), span);
+                Spanned::new(
+                    Expr::If(
+                        Box::new(cond.clone()),
+                        Box::new(false_expr),
+                        Box::new(wrapped),
+                    ),
+                    span,
+                )
             }
         };
     }

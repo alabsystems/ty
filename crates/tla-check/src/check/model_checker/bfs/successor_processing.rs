@@ -334,6 +334,35 @@ impl ModelChecker<'_> {
         }
     }
 
+    /// Record successors at TLC's accounting boundary: immediately after
+    /// `Next` enumeration and before state/action constraints or exploration
+    /// reductions. Parity probes and discarded fallback attempts must not call
+    /// this; only the authoritative parent-expansion consumer does.
+    #[inline]
+    pub(in crate::check::model_checker) fn record_raw_successors_generated(
+        &mut self,
+        count: usize,
+    ) {
+        self.stats.raw_successors_generated = self
+            .stats
+            .raw_successors_generated
+            .checked_add(count)
+            .expect("raw successor generation count overflowed usize");
+    }
+
+    /// Remove generation work from an abandoned speculative/fallback path.
+    #[inline]
+    pub(in crate::check::model_checker) fn rollback_raw_successors_generated(
+        &mut self,
+        count: usize,
+    ) {
+        self.stats.raw_successors_generated = self
+            .stats
+            .raw_successors_generated
+            .checked_sub(count)
+            .expect("raw successor generation rollback exceeded recorded count");
+    }
+
     /// Record monolithic successor count to cooperative per-action metrics.
     ///
     /// Only active when cooperative mode is enabled (fused BFS+symbolic).

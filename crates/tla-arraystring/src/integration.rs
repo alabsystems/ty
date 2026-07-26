@@ -370,6 +370,7 @@ mod tests {
         );
     }
 
+    #[cfg(all(feature = "diesel-traits", feature = "std"))]
     #[test]
     fn diesel_derive_query_compare_update() {
         let array = DeriveDiesel {
@@ -408,51 +409,35 @@ mod tests {
         );
     }
 
+    #[cfg(all(feature = "diesel-traits", feature = "std"))]
     #[test]
-    #[ignore]
-    #[cfg(feature = "std")]
     fn diesel_select_query_compiles() {
-        let conn = pg::PgConnection::establish("").unwrap();
-        let select_array: Vec<DeriveDiesel> = derives::table
-            .select(derives::all_columns)
-            .load(&conn)
-            .unwrap();
-        let select_cache: Vec<Derive2Diesel> = derives::table
-            .select(derives::all_columns)
-            .load(&conn)
-            .unwrap();
-        assert_eq!(
-            select_cache
-                .into_iter()
-                .map(|d| d.name.to_string())
-                .collect::<Vec<_>>(),
-            select_array
-                .into_iter()
-                .map(|d| d.name.to_string())
-                .collect::<Vec<_>>()
-        );
-        let _: std::time::SystemTime = derives::table.select(dsl::now).first(&conn).unwrap();
-        let _: std::time::SystemTime = derives::table.select(dsl::now).first(&conn).unwrap();
+        fn assert_load_query<Connection, Query, Row>(_query: &Query)
+        where
+            Connection: diesel::Connection,
+            Query: diesel::query_dsl::LoadQuery<Connection, Row>,
+        {
+        }
 
-        let conn = mysql::MysqlConnection::establish("").unwrap();
-        let select_array: Vec<DeriveDiesel> = derives::table
-            .select(derives::all_columns)
-            .load(&conn)
-            .unwrap();
-        let select_cache: Vec<Derive2Diesel> = derives::table
-            .select(derives::all_columns)
-            .load(&conn)
-            .unwrap();
-        assert_eq!(
-            select_array
-                .into_iter()
-                .map(|d| d.name.to_string())
-                .collect::<Vec<_>>(),
-            select_cache
-                .into_iter()
-                .map(|d| d.name.to_string())
-                .collect::<Vec<_>>()
+        let select = derives::table.select(derives::all_columns);
+        assert_load_query::<pg::PgConnection, _, DeriveDiesel>(&select);
+        assert_load_query::<pg::PgConnection, _, Derive2Diesel>(&select);
+        assert_load_query::<mysql::MysqlConnection, _, DeriveDiesel>(&select);
+        assert_load_query::<mysql::MysqlConnection, _, Derive2Diesel>(&select);
+
+        let pg_sql = debug_query::<pg::Pg, _>(&select).to_string();
+        let mysql_sql = debug_query::<mysql::Mysql, _>(&select).to_string();
+        assert!(
+            pg_sql.contains("SELECT"),
+            "unexpected PostgreSQL SQL: {pg_sql}"
         );
+        assert!(
+            mysql_sql.contains("SELECT"),
+            "unexpected MySQL SQL: {mysql_sql}"
+        );
+
+        let now = derives::table.select(dsl::now);
+        assert_load_query::<pg::PgConnection, _, std::time::SystemTime>(&now);
     }
 
     #[cfg(all(feature = "diesel-traits", feature = "std"))]

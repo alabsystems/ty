@@ -58,8 +58,37 @@ pub(super) fn check_and_guards(
     debug: bool,
     tir: Option<&TirProgram<'_>>,
 ) -> Result<bool, EvalError> {
+    check_and_guards_with_mode(ctx, expr, debug, tir, GuardCheckMode::Exact)
+}
+
+/// Conservative whole-action precheck used only as a reject-only fast path.
+///
+/// Unlike [`check_and_guards`], this defers action-free quantifiers so ordered
+/// successor enumeration can preserve TLC's witness/proof-path multiplicity.
+pub(super) fn check_and_guards_precheck(
+    ctx: &EvalCtx,
+    expr: &Spanned<Expr>,
+    debug: bool,
+    tir: Option<&TirProgram<'_>>,
+) -> Result<bool, EvalError> {
+    check_and_guards_with_mode(ctx, expr, debug, tir, GuardCheckMode::RejectOnlyPrecheck)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GuardCheckMode {
+    Exact,
+    RejectOnlyPrecheck,
+}
+
+fn check_and_guards_with_mode(
+    ctx: &EvalCtx,
+    expr: &Spanned<Expr>,
+    debug: bool,
+    tir: Option<&TirProgram<'_>>,
+    mode: GuardCheckMode,
+) -> Result<bool, EvalError> {
     // Use stack_safe to grow stack on demand for deeply nested And trees
-    crate::eval::stack_safe(|| check_and_guards_inner(ctx, expr, debug, tir))
+    crate::eval::stack_safe(|| check_and_guards_inner(ctx, expr, debug, tir, mode))
 }
 
 /// Evaluate a guard expression and interpret the result as a boolean guard check.
@@ -106,6 +135,7 @@ fn check_and_guards_inner(
     expr: &Spanned<Expr>,
     debug: bool,
     tir: Option<&TirProgram<'_>>,
+    mode: GuardCheckMode,
 ) -> Result<bool, EvalError> {
     // Part of #575: Add entry debug to trace what expressions are being checked
     debug_eprintln!(
@@ -118,7 +148,7 @@ fn check_and_guards_inner(
     debug_log_stage_guard(&expr.node, "found guard");
     match &expr.node {
         // Label: transparent wrapper — unwrap and recurse into body.
-        Expr::Label(label) => check_and_guards(ctx, &label.body, debug, tir),
+        Expr::Label(label) => check_and_guards_with_mode(ctx, &label.body, debug, tir, mode),
 
         Expr::And(a, b) => {
             // Part of #1106: Debug And tree traversal
@@ -133,7 +163,7 @@ fn check_and_guards_inner(
             // successor enumerator against the partially-built next state.
             // Pre-evaluating them here can fire Assert/Print side effects in
             // branches that an angle action (A /\ ~UNCHANGED v) disables.
-            if !check_and_guards(ctx, a, debug, tir)? {
+            if !check_and_guards_with_mode(ctx, a, debug, tir, mode)? {
                 debug_eprintln!(
                     debug_stage(),
                     "[DEBUG STAGE] And: left side returned false, short-circuiting"
@@ -151,7 +181,7 @@ fn check_and_guards_inner(
                 debug_stage(),
                 "[DEBUG STAGE] And: left side returned true, checking right side"
             );
-            check_and_guards(ctx, b, debug, tir)
+            check_and_guards_with_mode(ctx, b, debug, tir, mode)
         }
         // LET expressions: bind definitions and recurse into body
         // This is essential for patterns like:
@@ -188,8 +218,8 @@ fn check_and_guards_inner(
             // The merged env is memoized on Arc identity of the ambient scope +
             // the interned defs (see tla-eval cache/openv_memo.rs). The thunks
             // above capture the AMBIENT local_ops (pre-merge), same as before.
-            let (merged, merged_id, merged_recursive) = tla_eval::merged_let_env_memoized(
-                new_ctx.local_ops().as_ref(),
+            let (merged, merged_id, merged_recursive) = tla_eval::merged_let_env_memoized_with_ctx(
+                &new_ctx,
                 defs,
                 tla_eval::MergedLetSite::GuardCheck,
                 |_| true,
@@ -197,24 +227,30 @@ fn check_and_guards_inner(
             // Enter the LET scope with the memoized scope id instead of
             // INVALIDATED (one-shot guard check on new_ctx; no restore needed).
             let _ = new_ctx.enter_let_scope_premerged(merged, merged_id, merged_recursive);
-            check_and_guards(&new_ctx, body, debug, tir)
+            check_and_guards_with_mode(&new_ctx, body, debug, tir, mode)
         }
         // Or expressions: do NOT evaluate guards inside Or branches.
         // Each Or branch has its own guards that should be checked AFTER distribution.
         // Walking into Or branches and checking guards like `cnt # 0` would incorrectly
         // reject the entire action when only some branches have that guard.
         Expr::Or(_, _) => Ok(true),
+        // TLC's next-state generator treats both bounded quantifiers as
+        // structural action items. Even an action-free EXISTS can yield one
+        // tail visit per successful witness, while FORALL can multiply nested
+        // OR/EXISTS proof paths. The whole-AND precheck is reject-only and has
+        // no tri-state "proven true" result, so defer both there. Exact-filter
+        // callers retain the established behavior below.
+        Expr::Exists(_, _) | Expr::Forall(_, _) if mode == GuardCheckMode::RejectOnlyPrecheck => {
+            Ok(true)
+        }
         // Part of #342: EXISTS needs careful handling:
         // - EXISTS WITH primes → nondeterministic choice, must be enumerated (return true)
         // - EXISTS WITHOUT primes → pure guard, must be evaluated
         // Example: `\E n \in Node : ReadLog(n, idx) /= NoNode` is a pure guard
         // Example: `\E x \in S : x' = f(x)` is nondeterministic choice
         Expr::Exists(_bindings, body) => {
-            // Check if the EXISTS body contains primes (action expressions)
             let body_has_primes = expr_contains_prime_ctx(ctx, &body.node);
             if body_has_primes {
-                // Nondeterministic choice - must be enumerated, not evaluated as guard
-                // Part of #86: PaxosCommit under-exploration fix.
                 if debug {
                     eprintln!(
                         "check_and_guards: EXISTS with primes, treating as nondeterministic choice"
@@ -222,7 +258,6 @@ fn check_and_guards_inner(
                 }
                 Ok(true)
             } else {
-                // Pure guard - evaluate and return the boolean result
                 if debug {
                     eprintln!("check_and_guards: EXISTS without primes, evaluating as guard");
                 }
@@ -234,8 +269,6 @@ fn check_and_guards_inner(
                         Ok(result)
                     }
                     Ok(other) => {
-                        // TLC treats quantified predicates as boolean-only.
-                        // Non-boolean results are fatal type errors.
                         if debug {
                             eprintln!(
                                 "check_and_guards: EXISTS guard returned non-boolean: {}",
@@ -256,7 +289,6 @@ fn check_and_guards_inner(
                             crate::guard_error_stats::record_suppressed_action_level_error();
                             return Ok(true);
                         }
-                        // TLC propagates non-action-level guard evaluation errors.
                         if debug {
                             eprintln!("check_and_guards: EXISTS guard evaluation error: {:?}", e);
                         }
@@ -283,7 +315,7 @@ fn check_and_guards_inner(
                                 i
                             );
                         }
-                        return check_and_guards(ctx, &arm.body, debug, tir);
+                        return check_and_guards_with_mode(ctx, &arm.body, debug, tir, mode);
                     }
                     Ok(Value::Bool(false)) => {
                         if debug {
@@ -312,7 +344,7 @@ fn check_and_guards_inner(
                 if debug {
                     eprintln!("check_and_guards: CASE no arm matched, checking OTHER");
                 }
-                return check_and_guards(ctx, other_body, debug, tir);
+                return check_and_guards_with_mode(ctx, other_body, debug, tir, mode);
             }
             // No arm matched and no OTHER - action is disabled (no valid branch)
             if debug {
@@ -326,6 +358,15 @@ fn check_and_guards_inner(
         Expr::Ident(name, _) => {
             let resolved = ctx.resolve_op_name(name.as_str());
             if let Some(def) = ctx.get_op(resolved) {
+                // A user-defined operator can hide OR/EXISTS/FORALL proof
+                // structure. The reject-only whole-AND precheck must not
+                // evaluate or recursively enter it and then let ordered
+                // enumeration evaluate it again. Deferring every user
+                // operator reference is conservative and follows arbitrary
+                // zero-argument alias chains without a separate AST walk.
+                if mode == GuardCheckMode::RejectOnlyPrecheck {
+                    return Ok(true);
+                }
                 // Check if this is an action operator (contains primes)
                 let is_action_op = def.contains_prime || expr_contains_prime(&def.body.node);
                 if is_action_op && def.params.is_empty() {
@@ -336,7 +377,7 @@ fn check_and_guards_inner(
                         );
                     }
                     // Recurse into operator body to check guards
-                    return check_and_guards(ctx, &def.body, debug, tir);
+                    return check_and_guards_with_mode(ctx, &def.body, debug, tir, mode);
                 }
             }
             // Not an action operator or has params - use default handling
@@ -350,6 +391,18 @@ fn check_and_guards_inner(
         // in the operator body. When the CASE arm body is Write(actor), we need to bind the
         // parameters and recurse into Write's body to check guards like `readers = {}`.
         Expr::Apply(op_expr, args) => {
+            // As with a bare Ident above, a user-defined call can hide TLC
+            // proof structure. Its arguments and body must be evaluated only
+            // by ordered enumeration on the reject-only precheck path.
+            if mode == GuardCheckMode::RejectOnlyPrecheck {
+                if let Expr::Ident(op_name, _) = &op_expr.node {
+                    let resolved = ctx.resolve_op_name(op_name.as_str());
+                    if ctx.get_op(resolved).is_some() {
+                        return Ok(true);
+                    }
+                }
+            }
+
             // Part of #357 (corrected): Check if ANY argument is action-level FIRST.
             // This applies to ALL operators, not just action operators.
             // Example: MCReply(p, d, oldMemInt, newMemInt) == newMemInt = <<p, d>>
@@ -395,7 +448,7 @@ fn check_and_guards_inner(
                             new_ctx.push_binding(Arc::from(param.name.node.as_str()), arg_val);
                         }
                         // Recurse into operator body with parameters bound
-                        return check_and_guards(&new_ctx, &def.body, debug, tir);
+                        return check_and_guards_with_mode(&new_ctx, &def.body, debug, tir, mode);
                     }
                 }
             }
@@ -439,5 +492,72 @@ fn check_and_guards_inner(
                 Ok(true)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tla_core::{lower, parse_to_syntax_tree, FileId};
+
+    #[test]
+    fn quantifier_deferral_is_scoped_to_reject_only_precheck() {
+        let tree = parse_to_syntax_tree(
+            r#"
+---- MODULE GuardCheckQuantifierModes ----
+FalseExists == /\ TRUE
+               /\ \E i \in {1, 2} : FALSE
+FalseForall == /\ TRUE
+               /\ \A i \in {1, 2} : FALSE
+====
+"#,
+        );
+        let lowered = lower(FileId(0), &tree);
+        assert!(lowered.errors.is_empty(), "{:?}", lowered.errors);
+        let module = lowered.module.expect("test module should lower");
+        let mut ctx = EvalCtx::new();
+        ctx.load_module(&module);
+
+        for name in ["FalseExists", "FalseForall"] {
+            let body = &ctx.get_op(name).expect("test operator should exist").body;
+            assert!(
+                !check_and_guards(&ctx, body, false, None).expect("exact guard check"),
+                "exact-filter callers must still reject {name}"
+            );
+            assert!(
+                check_and_guards_precheck(&ctx, body, false, None)
+                    .expect("reject-only guard precheck"),
+                "whole-AND precheck must defer {name} to ordered enumeration"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_only_precheck_does_not_enter_quantifier_operator_aliases() {
+        let tree = parse_to_syntax_tree(
+            r#"
+---- MODULE GuardCheckQuantifierAlias ----
+EXTENDS TLC
+QuantifiedBoom == \A i \in {1, 2} : Assert(FALSE, "must not run in precheck")
+Guard == QuantifiedBoom
+====
+"#,
+        );
+        let lowered = lower(FileId(0), &tree);
+        assert!(lowered.errors.is_empty(), "{:?}", lowered.errors);
+        let module = lowered.module.expect("test module should lower");
+        let mut ctx = EvalCtx::new();
+        ctx.load_module(&module);
+        let guard = &ctx.get_op("Guard").expect("Guard should exist").body;
+
+        assert!(
+            check_and_guards_precheck(&ctx, guard, false, None)
+                .expect("reject-only precheck must defer the alias"),
+            "a deferred operator reference is not known false"
+        );
+        assert!(
+            check_and_guards(&ctx, guard, false, None).is_err(),
+            "exact-filter callers must still evaluate the alias"
+        );
     }
 }

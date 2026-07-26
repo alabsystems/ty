@@ -65,6 +65,17 @@ OnlyForward == x' = x + 1
     assert_eq!(seq_stats.states_found, 4);
     assert_eq!(par_stats.states_found, 4);
     assert_eq!(seq_stats.transitions, 3);
+    assert_eq!(seq_stats.raw_initial_states_generated, 1);
+    assert_eq!(seq_stats.raw_successors_generated, 6);
+    assert_eq!(seq_stats.states_generated(), 7);
+    assert_eq!(
+        seq_stats.raw_successors_generated, par_stats.raw_successors_generated,
+        "Raw successor count must match before ACTION_CONSTRAINT filtering"
+    );
+    assert_eq!(
+        seq_stats.raw_initial_states_generated,
+        par_stats.raw_initial_states_generated
+    );
     assert_eq!(
         seq_stats.transitions, par_stats.transitions,
         "Transition count differs between sequential ({}) and parallel ({}) under ACTION_CONSTRAINT filtering",
@@ -123,10 +134,62 @@ WithinBound == x <= 1
     assert_eq!(seq_stats.states_found, 2);
     assert_eq!(par_stats.states_found, 2);
     assert_eq!(seq_stats.transitions, 3);
+    assert_eq!(seq_stats.raw_initial_states_generated, 1);
+    assert_eq!(seq_stats.raw_successors_generated, 4);
+    assert_eq!(seq_stats.states_generated(), 5);
+    assert_eq!(
+        seq_stats.raw_successors_generated, par_stats.raw_successors_generated,
+        "Raw successor count must match before CONSTRAINT filtering"
+    );
     assert_eq!(
         seq_stats.transitions, par_stats.transitions,
         "Transition count differs between sequential ({}) and parallel ({}) under CONSTRAINT filtering",
         seq_stats.transitions, par_stats.transitions
     );
+    Ok(())
+}
+
+#[cfg_attr(test, ntest::timeout(60_000))]
+#[test]
+fn test_raw_initial_count_precedes_state_constraint_in_sequential_and_parallel(
+) -> Result<(), String> {
+    let _serial = crate::test_utils::acquire_interner_lock();
+    let src = r#"
+---- MODULE InitialConstraintGenerationParity ----
+EXTENDS Integers
+VARIABLE x
+Init == x \in 0..3 \/ x = 0
+Next == FALSE
+WithinBound == x <= 1
+====
+"#;
+    let module = parse_module(src)?;
+    let config = Config {
+        init: Some("Init".to_string()),
+        next: Some("Next".to_string()),
+        constraints: vec!["WithinBound".to_string()],
+        ..Default::default()
+    };
+
+    let mut seq_checker = crate::check::ModelChecker::new(&module, &config);
+    seq_checker.set_deadlock_check(false);
+    let seq_stats = match seq_checker.check() {
+        CheckResult::Success(stats) => stats,
+        other => return Err(format!("Expected sequential success, got {other:?}")),
+    };
+
+    let mut par_checker = ParallelChecker::new(&module, &config, 4);
+    par_checker.set_deadlock_check(false);
+    let par_stats = match par_checker.check() {
+        CheckResult::Success(stats) => stats,
+        other => return Err(format!("Expected parallel success, got {other:?}")),
+    };
+
+    for stats in [&seq_stats, &par_stats] {
+        assert_eq!(stats.initial_states, 2);
+        assert_eq!(stats.raw_initial_states_generated, 5);
+        assert_eq!(stats.raw_successors_generated, 0);
+        assert_eq!(stats.states_generated(), 5);
+    }
     Ok(())
 }

@@ -3,10 +3,9 @@
 // Licensed under the Apache License, Version 2.0
 
 use crate::kani_harnesses::test_helpers::{make_func, make_set};
-use tla_value::Rp;
 use crate::state::State;
 use crate::value::{RecordBuilder, Value};
-use std::sync::Arc;
+use tla_value::Rp;
 
 #[cfg_attr(test, ntest::timeout(10000))]
 #[test]
@@ -46,10 +45,7 @@ fn test_set_equality_reflexive() {
 #[cfg_attr(test, ntest::timeout(10000))]
 #[test]
 fn test_func_equality_reflexive() {
-    let f = Value::Func(Rp::new(make_func(vec![(
-        Value::int(1),
-        Value::Bool(true),
-    )])));
+    let f = Value::Func(Rp::new(make_func(vec![(Value::int(1), Value::Bool(true))])));
     assert_eq!(f, f, "Function equality must be reflexive");
 }
 
@@ -97,10 +93,7 @@ fn test_tuple_equality_reflexive() {
 fn test_cross_type_inequality() {
     let s = make_set(vec![Value::int(1)]);
     let seq = Value::Seq(Rp::new(vec![Value::int(1)].into()));
-    let f = Value::Func(Rp::new(make_func(vec![(
-        Value::int(1),
-        Value::Bool(true),
-    )])));
+    let f = Value::Func(Rp::new(make_func(vec![(Value::int(1), Value::Bool(true))])));
 
     let mut builder = RecordBuilder::new();
     builder.insert_str("x", Value::int(1));

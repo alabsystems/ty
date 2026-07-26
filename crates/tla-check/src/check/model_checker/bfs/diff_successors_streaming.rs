@@ -146,7 +146,9 @@ impl ModelChecker<'_> {
             // Captures disjoint borrows: state_storage (for dedup), registry +
             // current_array (for fingerprinting), local accumulators.
             let mut sink = ClosureSink::new(|diff: DiffSuccessor| -> ControlFlow<()> {
-                total_count += 1;
+                total_count = total_count
+                    .checked_add(1)
+                    .expect("raw successor generation count overflowed usize");
 
                 // Nested-set A6: the per-successor escape MONITOR on the HOT diff
                 // path — unbypassable. Observes the board BEFORE dedup/store; fails
@@ -265,6 +267,7 @@ impl ModelChecker<'_> {
 
         prof.count_successors(total_count);
         self.record_transitions(total_count);
+        self.record_raw_successors_generated(total_count);
 
         self.ctx.set_tlc_level(succ_level);
 

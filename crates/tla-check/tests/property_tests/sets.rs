@@ -4,9 +4,8 @@
 
 use super::helpers::{eval_str, int_set, small_int_set};
 use proptest::prelude::*;
-use std::sync::Arc;
 use tla_check::Value;
-use tla_value::SortedSet;
+use tla_value::{Rp, SortedSet};
 
 // ============================================================================
 // Set operator property tests
@@ -100,7 +99,7 @@ proptest! {
         // S \cap {} = {}
         let s_str = format!("{{{}}}", s.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join(", "));
         let result = eval_str(&format!(r#"{} \cap {{}}"#, s_str)).unwrap();
-        prop_assert_eq!(result, Value::Set(Arc::new(SortedSet::new())));
+        prop_assert_eq!(result, Value::Set(Rp::new(SortedSet::new())));
     }
 
     // --- Set difference properties ---
@@ -111,7 +110,7 @@ proptest! {
         // S \ S = {}
         let s_str = format!("{{{}}}", s.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join(", "));
         let result = eval_str(&format!(r#"{} \ {}"#, s_str, s_str)).unwrap();
-        prop_assert_eq!(result, Value::Set(Arc::new(SortedSet::new())));
+        prop_assert_eq!(result, Value::Set(Rp::new(SortedSet::new())));
     }
 
     #[cfg_attr(test, ntest::timeout(10000))]
@@ -130,7 +129,7 @@ proptest! {
         // {} \ S = {}
         let s_str = format!("{{{}}}", s.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join(", "));
         let result = eval_str(&format!(r#"{{}} \ {}"#, s_str)).unwrap();
-        prop_assert_eq!(result, Value::Set(Arc::new(SortedSet::new())));
+        prop_assert_eq!(result, Value::Set(Rp::new(SortedSet::new())));
     }
 
     // --- Subset properties ---

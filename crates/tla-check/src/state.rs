@@ -38,9 +38,9 @@ mod flat_state_store;
 // (model_checker/fingerprint.rs); the `allow(dead_code)` is the slice
 // boundary, not an accident.
 #[allow(dead_code)]
-pub(crate) mod flat_symmetry;
-#[allow(dead_code)]
 mod flat_successor;
+#[allow(dead_code)]
+pub(crate) mod flat_symmetry;
 mod hybrid_flat_view;
 pub(crate) mod layout_bridge;
 mod layout_inference;
@@ -83,13 +83,17 @@ pub(crate) use flat_successor::{flat_state_bytes, FlatSuccessor};
 pub(crate) use hybrid_flat_view::HybridFlatView;
 #[allow(unused_imports)]
 pub(crate) use layout_bridge::{
-    check_layout_to_jit_layout, jit_layout_to_check_layout, layouts_compatible,
+    jit_layout_to_check_layout, layouts_compatible, try_check_layout_to_jit_layout,
 };
 #[allow(unused_imports)]
 pub(crate) use layout_inference::{
-    apply_scalar_tuple_union_var_overrides, apply_tagged_scalar_union_var_overrides,
+    apply_fixed_scalar_range_tuple_function_var_overrides, apply_scalar_tuple_union_var_overrides,
+    apply_tagged_scalar_union_function_var_overrides,
+    apply_tagged_scalar_union_tuple_function_var_overrides,
+    apply_tagged_scalar_union_var_overrides, apply_tagged_union_var_overrides,
     apply_tuple_keyed_tagged_scalar_union_range_overrides,
     collect_duplicate_free_sequence_capacity_proofs,
+    collect_fixed_scalar_range_tuple_function_var_type_proofs_with_ops,
     collect_fixed_scalar_range_type_proofs_with_ops,
     collect_fixed_scalar_range_writer_proofs_with_ops,
     collect_fixed_scalar_var_type_proofs_with_ops, collect_fixed_scalar_var_writer_proofs_with_ops,
@@ -100,17 +104,11 @@ pub(crate) use layout_inference::{
     collect_set_bitmask_range_type_proofs_with_ops, collect_set_bitmask_type_proofs_with_ops,
     collect_tagged_scalar_set_range_type_proofs_with_ops,
     collect_tagged_scalar_set_range_writer_proofs_with_ops,
-    collect_tagged_scalar_union_range_type_proofs_with_ops,
-    collect_tagged_scalar_union_var_type_proofs_with_ops,
     collect_tagged_scalar_union_function_var_type_proofs_with_ops,
+    collect_tagged_scalar_union_range_type_proofs_with_ops,
     collect_tagged_scalar_union_tuple_function_var_type_proofs_with_ops,
-    collect_fixed_scalar_range_tuple_function_var_type_proofs_with_ops,
-    collect_tagged_union_var_type_proofs_with_ops,
-    collect_tagged_union_var_writer_proofs_with_ops,
-    apply_tagged_scalar_union_function_var_overrides,
-    apply_tagged_scalar_union_tuple_function_var_overrides,
-    apply_fixed_scalar_range_tuple_function_var_overrides,
-    apply_tagged_union_var_overrides,
+    collect_tagged_scalar_union_var_type_proofs_with_ops,
+    collect_tagged_union_var_type_proofs_with_ops, collect_tagged_union_var_writer_proofs_with_ops,
     derive_set_valued_sequence_element_proofs, expr_contains_module_ref, infer_layout,
     infer_layout_from_wavefront,
     infer_layout_from_wavefront_with_sequence_layout_and_tagged_proofs,
@@ -124,25 +122,25 @@ pub(crate) use layout_inference::{
     infer_layout_with_sequence_proofs, nested_set_promotion_enabled, nonscalar_writer_vetoed_vars,
     retain_writer_corroborated_fixed_scalar_range_proofs,
     retain_writer_corroborated_fixed_scalar_var_proofs, DuplicateFreeSeqProofHooks,
-    ScalarTupleUnionVarWriterProof,
-    FixedScalarRangeTypeProof, FixedScalarVarTypeProof, RecordSetBitmaskTypeProof,
-    SequenceCapacityPathStep, SequenceCapacityProof, SequenceElementLayoutProof,
-    SequenceFixedDomainTypeProof, SequenceUniverseProof, SetBitmaskRangeTypeProof,
-    SetBitmaskTypeProof, TaggedScalarSetRangeTypeProof, TaggedScalarUnionRangeTypeProof,
-    TaggedScalarUnionVarTypeProof,
-    TaggedScalarUnionFunctionVarTypeProof, TaggedScalarUnionTupleFunctionVarTypeProof,
-    FixedScalarRangeTupleFunctionVarTypeProof, TaggedUnionVarTypeProof,
+    FixedScalarRangeTupleFunctionVarTypeProof, FixedScalarRangeTypeProof, FixedScalarVarTypeProof,
+    RecordSetBitmaskTypeProof, ScalarTupleUnionVarWriterProof, SequenceCapacityPathStep,
+    SequenceCapacityProof, SequenceElementLayoutProof, SequenceFixedDomainTypeProof,
+    SequenceUniverseProof, SetBitmaskRangeTypeProof, SetBitmaskTypeProof,
+    TaggedScalarSetRangeTypeProof, TaggedScalarUnionFunctionVarTypeProof,
+    TaggedScalarUnionRangeTypeProof, TaggedScalarUnionTupleFunctionVarTypeProof,
+    TaggedScalarUnionVarTypeProof, TaggedUnionVarTypeProof,
 };
 #[allow(unused_imports)]
 pub(crate) use nested_set_discovery::{
-    derive_nested_set_universe, freeze_nested_set_var, is_nested_set_value,
-    validate_roundtrip as validate_nested_set_roundtrip, DiscoveredNestedSet,
+    derive_nested_set_universe, derive_nested_set_universe_static, freeze_nested_set_var,
+    is_nested_set_value, validate_roundtrip as validate_nested_set_roundtrip, DiscoveredNestedSet,
     NestedSetEncodeOutcome, NestedSetValidationReport, NestedSetVarMonitor,
 };
 #[allow(unused_imports)]
 pub(crate) use nested_set_slide::{
     value_to_pos as slide_value_to_pos, SlideGeometry, SlideKernelArm,
 };
+#[cfg(test)]
 pub(crate) use payload_witness::StatePayloadWitness;
 #[cfg(test)]
 pub(crate) use payload_witness::StatePayloadWitnessKind;

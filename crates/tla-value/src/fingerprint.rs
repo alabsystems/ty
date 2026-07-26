@@ -25,7 +25,6 @@
 //! - Original authors: Allan Heydon and Marc Najork (Compaq, 1999)
 
 use crate::Value;
-use crate::rp::Rp;
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 
@@ -352,8 +351,8 @@ pub fn value_fingerprint(value: &Value) -> crate::value::value_fingerprint::Fing
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FuncValue, IntIntervalFunc, SeqValue, Value};
     use crate::rp::Rp;
+    use crate::{FuncValue, IntIntervalFunc, SeqValue, Value};
 
     #[cfg_attr(test, ntest::timeout(10000))]
     #[test]

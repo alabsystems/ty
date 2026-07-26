@@ -5,11 +5,10 @@
 //! Synthetic Disruptor NoDataRaces counterexample parity.
 
 use super::*;
-use tla_value::Rp;
 use crate::cache::lifecycle::clear_for_test_reset;
 use crate::tir::TirProgram;
-use std::sync::Arc;
 use tla_value::IntIntervalFunc;
+use tla_value::Rp;
 
 const DISRUPTOR_NODATARACES_COUNTEREXAMPLE_MODULE: &str = "\
 ---- MODULE TirDisruptorNoDataRaces ----

@@ -85,16 +85,16 @@ pub(crate) mod buchi;
 pub(crate) mod circulation_loop;
 pub mod cli;
 
+pub(crate) mod colored_dead_transitions;
+pub(crate) mod colored_reduce;
+pub(crate) mod colored_relevance;
+pub(crate) mod encode_aiger;
 /// Single blessed choke point for process-environment mutation (test/CLI
 /// plumbing). Always compiled so in-crate `#[cfg(test)]` tests, the `ty-mcc`
 /// binary, and out-of-crate integration tests reach the same choke point. The
 /// one `env_mutation` allow lives on `env_guard::raw_env_write`.
 #[doc(hidden)]
 pub mod env_guard;
-pub(crate) mod colored_dead_transitions;
-pub(crate) mod colored_reduce;
-pub(crate) mod colored_relevance;
-pub(crate) mod encode_aiger;
 // TODO(#4210): Wire decompose() into examination pipeline; remove allow(dead_code).
 #[allow(dead_code)]
 pub(crate) mod deadlock_region;

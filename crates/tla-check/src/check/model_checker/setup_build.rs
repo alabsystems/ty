@@ -149,10 +149,7 @@ impl<'a> ModelChecker<'a> {
         let invariant_verdict_cache =
             super::super::invariants::InvariantVerdictCache::new(&ctx, &config.invariants);
         let state_constraint_verdict_cache =
-            super::super::invariants::StateConstraintVerdictCache::new(
-                &ctx,
-                &config.constraints,
-            );
+            super::super::invariants::StateConstraintVerdictCache::new(&ctx, &config.constraints);
 
         ModelChecker {
             trust_cg_structural_veto: std::sync::atomic::AtomicBool::new(false),
@@ -172,6 +169,7 @@ impl<'a> ModelChecker<'a> {
                 seen: fp_hashmap(),
                 seen_fps: FingerprintSetFactory::create(StorageConfig::default())
                     .expect("in-memory storage creation is infallible"),
+                retired_seen_fps_len: None,
                 store_full_states: false,
                 compiled_flat_payload_witnesses: FingerprintPayloadWitnesses::new(),
             },
@@ -245,6 +243,8 @@ impl<'a> ModelChecker<'a> {
                 action_provenance_tags: Vec::new(),
                 action_fast_path_provenance_tags: Vec::new(),
                 enabled_action_groups: Vec::new(),
+                whole_next_enabled_tags: Vec::new(),
+                whole_next_action_tags: Vec::new(),
                 provenance_covered_tags: rustc_hash::FxHashSet::default(),
                 provenance_uncovered_action_leaves: Vec::new(),
                 enabled_provenance: Vec::new(),
@@ -307,6 +307,12 @@ impl<'a> ModelChecker<'a> {
                 group_names: Vec::new(),
                 auto_detected: false,
                 auto_symmetry_override: None,
+                yield_cutoff_active: false,
+                yield_cutoff_declined: false,
+                yield_cutoff_fired_at: 0,
+                yield_cutoff_skipped: 0,
+                yield_merges: 0,
+                yield_merge_probe: rustc_hash::FxHashSet::default(),
             },
             tir_parity: TirParityState::from_env(main_module, rewritten_exts),
             invariant_verdict_cache,
@@ -316,6 +322,8 @@ impl<'a> ModelChecker<'a> {
             bytecode: None,
             action_bytecode: None,
             value_action_vm: super::super::value_action_vm::ValueActionVmDispatch::from_env(),
+            executed_tier_compiled: None,
+            engine_tier_hot_swapped: false,
             // Lever 1 (#EWD998PCal): populated by compile_constraint_bytecode()
             // during run_prepare when CONSTRAINTs are present.
             constraint_bytecode: None,

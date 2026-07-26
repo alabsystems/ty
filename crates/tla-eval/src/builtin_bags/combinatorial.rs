@@ -11,9 +11,8 @@ use super::super::{
     Span, Spanned, Value,
 };
 use num_bigint::BigInt;
-use tla_value::Rp;
 use num_traits::{ToPrimitive, Zero};
-use std::sync::Arc;
+use tla_value::Rp;
 
 pub(super) fn eval_bag_union(
     ctx: &EvalCtx,

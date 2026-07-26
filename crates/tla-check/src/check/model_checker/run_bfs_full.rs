@@ -63,10 +63,13 @@ impl ModelChecker<'_> {
     pub(in crate::check) fn constrained_initial_states(
         &mut self,
         init_name: &str,
-    ) -> Result<Vec<State>, CheckResult> {
-        let initial_states = self
-            .generate_initial_states(init_name)
+    ) -> Result<(Vec<State>, usize), CheckResult> {
+        let (initial_states, raw_initial_states_generated) = self
+            .generate_initial_states_with_raw_count(init_name)
             .map_err(|error| check_error_to_result(error, &self.stats))?;
+        // Make the complete raw count available to any terminal constraint
+        // error before the outer init-progress report runs.
+        self.stats.raw_initial_states_generated = raw_initial_states_generated;
 
         let registry = self.ctx.var_registry().clone();
         let mut constrained_initial_states = Vec::with_capacity(initial_states.len());
@@ -81,7 +84,7 @@ impl ModelChecker<'_> {
             }
         }
 
-        Ok(constrained_initial_states)
+        Ok((constrained_initial_states, raw_initial_states_generated))
     }
 
     /// Process a single initial state through all pre-admission checks.
@@ -235,6 +238,7 @@ impl ModelChecker<'_> {
             self.solve_predicate_for_states_to_bulk_prechecked(init_name)?
         {
             let init_generated_count = bulk_init.enumeration.generated;
+            self.stats.raw_initial_states_generated = init_generated_count;
             let bulk_storage = bulk_init.storage;
             let mut scratch = ArrayState::new(registry.len());
             let num_states = u32::try_from(bulk_storage.len()).map_err(|_| {
@@ -302,6 +306,7 @@ impl ModelChecker<'_> {
                 Ok(None) => false,
                 Ok(Some(bulk_init)) => {
                     let init_generated_count = bulk_init.enumeration.generated;
+                    self.stats.raw_initial_states_generated = init_generated_count;
                     let bulk_storage = bulk_init.storage;
                     // Streaming successful! Process states from BulkStateStorage directly.
                     // Filter by constraints and add to seen.
@@ -390,10 +395,9 @@ impl ModelChecker<'_> {
 
         // Fall back to Vec<State> path if streaming not available
         if !used_streaming {
-            let initial_states = self.constrained_initial_states(init_name)?;
-
-            // Part of #2163: capture pre-dedup count for states_generated reporting
-            init_generated = initial_states.len();
+            let (initial_states, raw_initial_states_generated) =
+                self.constrained_initial_states(init_name)?;
+            init_generated = raw_initial_states_generated;
 
             // Part of #254: Set TLC level for TLCGet("level") - TLC uses 1-based indexing
             // Initial states are at level 1 in TLC
@@ -562,6 +566,10 @@ impl ModelChecker<'_> {
         self.arm_nested_set_slide_kernel();
 
         let mut storage = FullStateStorage;
+        // Full-state (trace-capable) mode always runs the interpreter loop —
+        // compiled BFS is a notrace-path capability. Record the tier so
+        // engine provenance covers this path too.
+        self.record_engine_tier(false);
         self.run_bfs_loop(&mut storage, &mut queue)
     }
 
@@ -880,36 +888,111 @@ impl ModelChecker<'_> {
             // Fast path for every non-nested spec: byte-identical, no sampling.
             return;
         }
-        let samples =
-            self.sample_nested_set_boards(registry, &next_name, seeds, &nested_var_indices);
+
+        // CHEAP DISCOVERY (gap 2): when `Next` is the recognized rigid-slide
+        // relation, the complete piece-shape universe is derivable STATICALLY
+        // (all grid-fitting translates of the INIT pieces) with NO sampling BFS
+        // and NO full-state retention — see `derive_nested_set_universe_static`.
+        // Only vars WITHOUT a static universe fall back to the expensive sampler,
+        // so a recognized spec (`SlidingPuzzles`) pays ~O(#pieces × grid) instead
+        // of a full reachable-space re-exploration.
+        let static_universes = self.try_static_nested_set_universes(registry, seeds);
+        let needs_sampling: Vec<usize> = nested_var_indices
+            .iter()
+            .copied()
+            .filter(|vi| !static_universes.contains_key(vi))
+            .collect();
+        let samples = if needs_sampling.is_empty() {
+            std::collections::BTreeMap::new()
+        } else {
+            self.sample_nested_set_boards(registry, &next_name, seeds, &needs_sampling)
+        };
+
         for &vi in &nested_var_indices {
             let var_name = registry
                 .name(crate::var_index::VarIndex::new(vi))
                 .to_string();
-            let board_samples = samples.get(&vi).map(Vec::as_slice).unwrap_or(&[]);
-            let sample_refs: Vec<&crate::Value> = board_samples.iter().collect();
-            let Some(discovered) = crate::state::derive_nested_set_universe(&sample_refs) else {
-                eprintln!(
-                    "[nested-set] A5: var '{var_name}' did not converge to a finite universe \
-                     (|distinct boards|={}); staying Dynamic (no monitor)",
-                    board_samples.len(),
-                );
-                continue;
-            };
+            let (discovered, provenance, sampled_count) =
+                if let Some(discovered) = static_universes.get(&vi) {
+                    (discovered.clone(), "static", 0usize)
+                } else {
+                    let board_samples = samples.get(&vi).map(Vec::as_slice).unwrap_or(&[]);
+                    let sample_refs: Vec<&crate::Value> = board_samples.iter().collect();
+                    let Some(discovered) = crate::state::derive_nested_set_universe(&sample_refs)
+                    else {
+                        eprintln!(
+                            "[nested-set] A5: var '{var_name}' did not converge to a finite \
+                             universe (|distinct boards|={}); staying Dynamic (no monitor)",
+                            board_samples.len(),
+                        );
+                        continue;
+                    };
+                    (discovered, "sampled", board_samples.len())
+                };
             let Some(monitor) = crate::state::freeze_nested_set_var(vi, &discovered) else {
                 eprintln!("[nested-set] A5: var '{var_name}' freeze failed; staying Dynamic");
                 continue;
             };
             telemetry_eprintln!(
-                "[nested-set] A5 PROMOTED (monitor_enforced): var '{var_name}' \
+                "[nested-set] A5 PROMOTED (monitor_enforced, {provenance}): var '{var_name}' \
                  |inner_universe|={} |outer_universe|={} distinct_boards_sampled={} slots={}",
                 discovered.inner_len,
                 discovered.outer_len,
-                board_samples.len(),
+                sampled_count,
                 monitor.slot_count(),
             );
             self.nested_set_monitors.push(monitor);
         }
+    }
+
+    /// CHEAP DISCOVERY (gap 2): derive the nested-set universe STATICALLY (no
+    /// sampling BFS) for any board variable whose `Next` the static recognizer
+    /// PROVES is the rigid-unit-slide relation. Under that proof every reachable
+    /// board's pieces are rigid translates of the INIT pieces, so the complete
+    /// piece-shape universe is exactly the grid-fitting translates of the INIT
+    /// pieces — enumerable in O(#pieces × grid) with zero exploration. Returns a
+    /// per-var map of the derived universes; empty when nothing is recognized
+    /// (the caller then falls back to the sampler for those vars).
+    fn try_static_nested_set_universes(
+        &self,
+        registry: &crate::var_index::VarRegistry,
+        seeds: &[ArrayState],
+    ) -> std::collections::BTreeMap<usize, crate::state::DiscoveredNestedSet> {
+        let mut out = std::collections::BTreeMap::new();
+        // The slide recognizer only accepts single-variable specs.
+        if registry.len() != 1 || seeds.is_empty() {
+            return out;
+        }
+        let Some(next_name) = self
+            .trace
+            .cached_next_name
+            .clone()
+            .or_else(|| self.config.next.clone())
+        else {
+            return out;
+        };
+        let Some(recognized) = super::slide_recognize::recognize_slide_next(&self.ctx, &next_name)
+        else {
+            return out;
+        };
+        let vi = recognized.board_var_idx;
+        let init_boards: Vec<crate::Value> = seeds
+            .iter()
+            .filter_map(|s| {
+                let v = crate::Value::from(&s.values()[vi]);
+                crate::state::is_nested_set_value(&v).then_some(v)
+            })
+            .collect();
+        if init_boards.is_empty() {
+            return out;
+        }
+        let board_refs: Vec<&crate::Value> = init_boards.iter().collect();
+        if let Some(discovered) =
+            crate::state::derive_nested_set_universe_static(&recognized.positions, &board_refs)
+        {
+            out.insert(vi, discovered);
+        }
+        out
     }
 
     /// Identify set-of-sets ("nested set") state vars from the seeds. A var

@@ -18,6 +18,22 @@ use super::execute_helpers::{
     value_except,
 };
 
+// `TY_NO_VM_TUPLE2_REFS=1` reverts the clone-free membership path to the
+// historical owned-tuple `[first.clone(), second.clone()]` construction (for
+// A/B soundness and perf attribution).
+feature_flag!(no_vm_tuple2_refs, "TY_NO_VM_TUPLE2_REFS");
+
+// `TY_NO_VM_LAZY_UNION=1` reverts the `SetUnion` opcode to the historical eager
+// path that materializes BOTH operands via `to_sorted_set` and returns a
+// concrete `Value::Set`. The default (flag unset) mirrors the interpreter's
+// `union_values`: a union of compound/lazy operands (RecordSet, FuncSet,
+// SetCup, ...) is kept as a lazy `Value::SetCup` instead of materializing the
+// operands. This is the fix for the bytecode VM re-materializing a large
+// constant record-set codomain on EVERY state in `TypeOK`-style invariants
+// like `f \in [D -> RecordSet \cup {x}]` (NanoBlockchain MCNano). See the
+// SetUnion opcode for the soundness argument (byte-identical to the interpreter).
+feature_flag!(no_vm_lazy_union, "TY_NO_VM_LAZY_UNION");
+
 /// Test membership of a two-element tuple without allocating on concrete sets.
 ///
 /// Lazy/compound set values receive the exact materialized tuple used by the
@@ -29,6 +45,16 @@ pub(super) fn tuple2_set_contains(
     second: &Value,
     set: &Value,
 ) -> Result<bool, VmError> {
+    // Clone-free fast path: concrete/`Nat`/`Int` set-like values answer
+    // membership by reading `first`/`second` directly (binary search or the
+    // trivial arms), never cloning the two heap-backed tuple elements — pure
+    // Arc-refcount churn eliminated on the hot `<<a,b>> \in S` path. Result is
+    // byte-identical to the owned-tuple path below.
+    if !no_vm_tuple2_refs() {
+        if let Some(contains) = set.try_set_contains_tuple2_refs(first, second) {
+            return Ok(contains);
+        }
+    }
     // Stack storage only: the concrete-set path compares these elements
     // directly and never constructs an Arc-backed tuple.
     let tuple = [first.clone(), second.clone()];
@@ -45,6 +71,74 @@ pub(super) fn tuple2_set_contains(
                 })
         }
     }
+}
+
+/// Evaluate the fused `EdgeFilter` comprehension `{ c \in domain : <<first, c>>
+/// \in E }` where `E == arg[projection_index]`.
+///
+/// Semantically identical to the historical `SetFilterBegin` loop over the
+/// projection-hoisted predicate `<<first, c>> \in Edges(dag)`: the domain is
+/// validated and empty-checked exactly like `LoopElements::from_domain`, the
+/// `E` projection is deferred until the domain is known non-empty (matching the
+/// hoisted preheader skip), and the naive membership scan
+/// ([`edge_filter_naive`]) is reused verbatim whenever the range-scan fast path
+/// cannot apply (non-concrete `E`, non-`Value::Set` domain, or an alternate
+/// tuple representation in the scanned region). The fast path
+/// ([`SortedSet::edge_children`]) only replaces *how* the same result set is
+/// computed for concrete sorted `E` and a concrete `Value::Set` domain.
+fn eval_edge_filter(
+    first: &Value,
+    arg: &Value,
+    domain: &Value,
+    projection_index: i64,
+) -> Result<Value, VmError> {
+    match domain {
+        Value::Set(d_set) => {
+            if d_set.is_empty() {
+                return Ok(Value::empty_set());
+            }
+            let edges = func_apply(arg, &Value::SmallInt(projection_index))?;
+            if let Value::Set(e_set) = &edges {
+                if let Some(children) = e_set.edge_children(first, d_set) {
+                    return Ok(Value::Set(Rp::new(SortedSet::from_iter(children))));
+                }
+            }
+            edge_filter_naive(first, &edges, d_set.as_slice())
+        }
+        other => {
+            let Some(iter) = other.iter_set() else {
+                return Err(VmError::TypeError {
+                    expected: "enumerable set for set filter",
+                    actual: format!("{other:?}"),
+                });
+            };
+            let elements: Vec<Value> = iter.collect();
+            if elements.is_empty() {
+                return Ok(Value::empty_set());
+            }
+            let edges = func_apply(arg, &Value::SmallInt(projection_index))?;
+            edge_filter_naive(first, &edges, &elements)
+        }
+    }
+}
+
+/// Naive `{ c \in domain_elements : <<first, c>> \in edges }` — the exact
+/// per-element predicate the historical `SetFilterBegin`/`Tuple2SetIn` loop
+/// runs, iterating `domain_elements` in the same order (so the first membership
+/// error, if any, is raised on the same element).
+#[inline]
+fn edge_filter_naive(
+    first: &Value,
+    edges: &Value,
+    domain_elements: &[Value],
+) -> Result<Value, VmError> {
+    let mut collected: Vec<Value> = Vec::new();
+    for c in domain_elements {
+        if tuple2_set_contains(first, c, edges)? {
+            collected.push(c.clone());
+        }
+    }
+    Ok(Value::Set(Rp::new(SortedSet::from_iter(collected))))
 }
 
 /// Evaluate ordinary bytecode `Subseteq` semantics for two values.
@@ -220,9 +314,44 @@ impl<'a> BytecodeVm<'a> {
                 regs[*rd as usize] = Value::Bool(subset);
             }
             Opcode::SetUnion { rd, r1, r2 } => {
-                let a = to_sorted_set(&regs[*r1 as usize])?;
-                let b = to_sorted_set(&regs[*r2 as usize])?;
-                regs[*rd as usize] = Value::Set(Rp::new(a.union(&b)));
+                let a_ref = &regs[*r1 as usize];
+                let b_ref = &regs[*r2 as usize];
+                // Keep the union LAZY only for a *record-set* union — the case
+                // where the historical eager path re-materialized (and
+                // dedup-hashed) a large constant record set on EVERY state in a
+                // `TypeOK`-style invariant `f \in [D -> Block \cup {NoBlock}]`
+                // (NanoBlockchain). For every OTHER union (integer/model-value
+                // sets, `SUBSET`-of-scalar unions, ...) keep the ORIGINAL eager
+                // behavior that returns a concrete `Value::Set`: those are cheap
+                // to materialize AND the trust-cg native invariant tier's flat
+                // layout admission consumes the VM-evaluated codomain and
+                // requires it concrete (a lazy `SetCup` there disables native
+                // invariant compilation — see the lazy-union trust_cg tests).
+                // Record-set unions never reach that native tier anyway (record
+                // reads are not yet lowerable), so narrowing the lazy path to
+                // record-set operands preserves the win with zero native-tier
+                // blast radius. Both paths yield a set with identical elements,
+                // fingerprint, and membership, so the choice is sound either way.
+                let use_lazy = !no_vm_lazy_union()
+                    && (a_ref.references_record_set() || b_ref.references_record_set());
+                if use_lazy {
+                    // Mirror the interpreter's `union_values` EXACTLY: a union of
+                    // compound/lazy sets stays a lazy `Value::SetCup` (O(fields)
+                    // membership, no materialization). Byte-identical to what the
+                    // interpreter produces for `A \cup B`, so every downstream
+                    // consumer (VM `SetIn`/`set_contains`, fingerprinting,
+                    // comparison, iteration) behaves as a full interpreter run.
+                    let a = a_ref.clone();
+                    let b = b_ref.clone();
+                    regs[*rd as usize] = crate::eval_constructors::union_values(a, b, None, None)
+                        .map_err(VmError::Eval)?;
+                } else {
+                    // Historical eager path: materialize both operands and return
+                    // a concrete `Value::Set`.
+                    let a = to_sorted_set(a_ref)?;
+                    let b = to_sorted_set(b_ref)?;
+                    regs[*rd as usize] = Value::Set(Rp::new(a.union(&b)));
+                }
             }
             Opcode::SetIntersect { rd, r1, r2 } => {
                 let a = to_sorted_set(&regs[*r1 as usize])?;
@@ -293,6 +422,21 @@ impl<'a> BytecodeVm<'a> {
                 )?;
                 let equal = self.equality_opcode_result(&child_round, &parent_minus_one)?;
                 regs[*rd as usize] = Value::Bool(equal);
+            }
+            Opcode::EdgeFilter {
+                rd,
+                first,
+                arg,
+                domain,
+                projection_index,
+            } => {
+                let result = eval_edge_filter(
+                    &regs[*first as usize],
+                    &regs[*arg as usize],
+                    &regs[*domain as usize],
+                    *projection_index,
+                )?;
+                regs[*rd as usize] = result;
             }
             Opcode::Powerset { rd, rs } => {
                 let base_val = &regs[*rs as usize];

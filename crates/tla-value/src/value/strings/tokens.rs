@@ -2,10 +2,10 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
+use crate::rp::Rp as Arc;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
-use std::sync::{OnceLock};
-use crate::rp::Rp as Arc;
+use std::sync::OnceLock;
 
 // ============================================================================
 // TLC-Compatible String Token Registry (Part of #3193)
@@ -64,6 +64,15 @@ pub fn tlc_string_token(s: &Arc<str>) -> u32 {
         .entry(Arc::clone(s))
         .or_insert_with(|| TLC_STRING_TOKEN_COUNTER.fetch_add(1, AtomicOrdering::Relaxed))
         .value()
+}
+
+/// Return an already-assigned TLC string token without creating one.
+///
+/// Replay/admission analysis uses this to distinguish a read-only string
+/// literal from one whose first evaluation would mutate global TLC ordering.
+#[inline]
+pub fn lookup_tlc_string_token(s: &str) -> Option<u32> {
+    get_token_table().get(s).map(|token| *token.value())
 }
 
 /// Snapshot the TLC string token table into an immutable FxHashMap.

@@ -12,11 +12,35 @@
 use super::super::debug::debug_safety_temporal;
 use super::super::debug::{liveness_profile, skip_liveness};
 use super::super::{
-    Arc, CheckResult, Fingerprint, FxHashMap, ModelChecker, SafetyTemporalPropertyOutcome,
-    SuccessorWitnessMap,
+    Arc, ArrayState, CheckResult, Fingerprint, FxHashMap, ModelChecker,
+    SafetyTemporalPropertyOutcome, SuccessorWitnessMap,
 };
 use super::{check_property, compute_fingerprint_from_compact_values, LivenessMode};
-use crate::storage::{ActionBitmaskMap, StateBitmaskMap, SuccessorGraph};
+use crate::storage::{
+    ActionBitmaskMap, StateBitmaskMap, SuccessorGraph, TraceLocationStorage, TraceLocationsStorage,
+};
+
+#[allow(clippy::fn_params_excessive_bools)]
+pub(super) const fn exact_otf_owned_cache_admitted(
+    partial_graph: bool,
+    on_the_fly: bool,
+    has_view: bool,
+    has_symmetry: bool,
+    compact_cache_enabled: bool,
+    init_state_count: usize,
+    expected_initial_states: usize,
+    states_found: usize,
+) -> bool {
+    !partial_graph
+        && on_the_fly
+        && !has_view
+        && !has_symmetry
+        && compact_cache_enabled
+        && init_state_count == expected_initial_states
+        && init_state_count <= states_found
+        && (states_found == 0 || init_state_count != 0)
+}
+
 impl ModelChecker<'_> {
     /// Build the raw-state-fingerprint -> canonical graph fingerprint map.
     ///
@@ -79,16 +103,117 @@ impl ModelChecker<'_> {
         self.is_property_fully_promoted(prop_name)
     }
 
+    /// Release BFS payload indexes once complete retained Init roots and the
+    /// snapshotted exact on-the-fly route guarantee that this liveness pass can
+    /// regenerate and own every concrete payload needed for verdicts and
+    /// counterexamples.
+    ///
+    /// Keep the fingerprint backend object and trace file alive: terminal
+    /// storage-error precedence still consults the former, while the latter is
+    /// a cheap fallback artifact if a future cold path needs it. A uniquely
+    /// owned, opt-in backend may release only its membership entries after the
+    /// authoritative count and storage statistics have been snapshotted.
+    fn release_exact_otf_bfs_payloads(&mut self) {
+        let seen = std::mem::take(&mut self.state_storage.seen);
+        let trace_locs = std::mem::replace(
+            &mut self.trace.trace_locs,
+            TraceLocationsStorage::in_memory(),
+        );
+        // Full-state BFS normally maintains this index eagerly. After retiring
+        // it, allow an unforeseen cold trace consumer to reconstruct it from
+        // the retained trace file instead of treating the empty index as final.
+        self.trace.lazy_trace_index = true;
+        let seen_len = seen.len();
+        let trace_loc_len = trace_locs.len();
+        drop(seen);
+        drop(trace_locs);
+        let fingerprint_len = self
+            .state_storage
+            .try_release_terminal_seen_fps_entries(self.stats.states_found);
+
+        if liveness_profile() {
+            eprintln!(
+                "[liveness] released exact-OTF BFS payloads: {seen_len} state witnesses, \
+                 {trace_loc_len} trace locations, {fingerprint_len} fingerprint membership \
+                 entries (fingerprint backend retained)"
+            );
+        }
+    }
+
     fn run_liveness_properties_on_the_fly(&mut self, partial_graph: bool) -> Option<CheckResult> {
         if partial_graph {
             return None;
         }
 
+        // Detach the potentially wide compact Init vector and move the retained
+        // graph into a run-scoped session. Mutable successor closures can then
+        // replay a complete retained source or evaluate Next without aliasing
+        // `self`, and the session can release redundant storage between groups.
+        let init_states = std::mem::take(&mut self.liveness_cache.init_states);
+        // Snapshot this routing decision once. In particular, do not re-read
+        // the compact-cache kill switch after dropping the only BFS payload
+        // indexes: exact exploration must remain on the owned-cache route for
+        // this entire liveness pass.
+        let use_owned_compact_cache = exact_otf_owned_cache_admitted(
+            partial_graph,
+            self.should_run_on_the_fly_liveness(),
+            self.compiled.cached_view_name.is_some(),
+            !self.symmetry.perms.is_empty(),
+            crate::liveness::debug::liveness_otf_compact_cache_enabled(),
+            init_states.len(),
+            self.stats.initial_states,
+            self.stats.states_found,
+        );
+        if use_owned_compact_cache {
+            self.release_exact_otf_bfs_payloads();
+        }
+        let retained_successors = std::mem::take(&mut self.liveness_cache.successors);
+        let (result, retained_successors) =
+            if self.liveness_cache.regenerate_on_the_fly && retained_successors.len() != 0 {
+                let mut retained =
+                    check_property::OtfRetainedSuccessors::new(retained_successors, &init_states);
+                let result = self.run_liveness_properties_on_the_fly_with_init_states(
+                    &init_states,
+                    Some(&mut retained),
+                    use_owned_compact_cache,
+                );
+                (result, retained.into_graph().unwrap_or_default())
+            } else {
+                let result = self.run_liveness_properties_on_the_fly_with_init_states(
+                    &init_states,
+                    None,
+                    use_owned_compact_cache,
+                );
+                (result, retained_successors)
+            };
+        debug_assert!(self.liveness_cache.init_states.is_empty());
+        debug_assert_eq!(self.liveness_cache.successors.len(), 0);
+        self.liveness_cache.init_states = init_states;
+        self.liveness_cache.successors = retained_successors;
+        result
+    }
+
+    fn run_liveness_properties_on_the_fly_with_init_states(
+        &mut self,
+        init_states: &[(Fingerprint, ArrayState)],
+        mut retained_successors: Option<&mut check_property::OtfRetainedSuccessors<'_>>,
+        use_owned_compact_cache: bool,
+    ) -> Option<CheckResult> {
+        // The exact-raw cross-group cache is run-scoped and drops here. The
+        // caller restores retained BFS adjacency unless an admitted exact-raw
+        // cache covers it completely and lets this invocation release it early.
+        let mut exact_raw_cache = check_property::OtfExactRawCacheSession::default();
         for prop_name in self.config.properties.clone() {
             if self.should_skip_promoted_liveness_property(&prop_name) {
                 continue;
             }
-            if let Some(result) = self.check_liveness_property_on_the_fly(&prop_name) {
+            if let Some(result) = self.check_liveness_property_on_the_fly(
+                &prop_name,
+                init_states,
+                retained_successors.as_deref_mut(),
+                &mut exact_raw_cache,
+                use_owned_compact_cache,
+            ) {
                 return Some(result);
             }
         }

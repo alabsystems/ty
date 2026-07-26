@@ -15,12 +15,19 @@ use tla_bdd::petri::{
 };
 use tla_bdd::Bdd;
 
-/// Perf data point (run with `--ignored --nocapture`): complemented-edge core vs
-/// plain Bdd on a reachability fixpoint. Quantifies whether the ~2× node
-/// reduction translates to wall-clock — informs the live-engine migration.
+/// Perf data point (run with `TY_RUN_CEDGE_PERF=1` and `--nocapture`):
+/// complemented-edge core vs plain Bdd on a reachability fixpoint. Quantifies
+/// whether the ~2× node reduction translates to wall-clock — informs the
+/// live-engine migration.
 #[test]
-#[ignore = "perf measurement"]
 fn perf_cedge_vs_bdd_reachability() {
+    if !std::env::var_os("TY_RUN_CEDGE_PERF").is_some_and(|value| value == "1") {
+        eprintln!(
+            "SKIP perf_cedge_vs_bdd_reachability: set TY_RUN_CEDGE_PERF=1 \
+             to authorize the timing campaign"
+        );
+        return;
+    }
     use std::time::Instant;
     // 8 independent 0..=3 counters: |R| = 4^8 = 65536.
     let np = 8;

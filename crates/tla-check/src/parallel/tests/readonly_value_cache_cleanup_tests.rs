@@ -13,7 +13,10 @@ impl Drop for ReadonlyCacheCleanupGuard {
     }
 }
 
-#[cfg_attr(test, ntest::timeout(10000))]
+// This test shares the process-wide interner lock with many model-checking
+// tests. In the full suite, lock wait time can legitimately exceed ten seconds
+// even though the isolated check completes in under a second.
+#[cfg_attr(test, ntest::timeout(60000))]
 #[test]
 fn test_check_module_parallel_disables_parallel_readonly_value_caches_after_run() {
     let _serial = super::acquire_interner_lock();

@@ -210,6 +210,75 @@ pub(in crate::value) fn cmp_tuple_elements_with_value(tuple: &[Value], rhs: &Val
     }
 }
 
+/// Lexicographic comparison of the *virtual* 2-element tuple `[first, second]`
+/// against `other`, identical to `<[Value]>::cmp` on a materialized
+/// `[first.clone(), second.clone()]` — but without cloning `first`/`second`.
+#[inline]
+fn cmp_two_refs_with_slice(first: &Value, second: &Value, other: &[Value]) -> Ordering {
+    match other.first() {
+        None => return Ordering::Greater,
+        Some(o0) => match first.cmp(o0) {
+            Ordering::Equal => {}
+            ord => return ord,
+        },
+    }
+    match other.get(1) {
+        None => return Ordering::Greater,
+        Some(o1) => match second.cmp(o1) {
+            Ordering::Equal => {}
+            ord => return ord,
+        },
+    }
+    // Both prefix elements compared equal; the virtual tuple has length 2.
+    2usize.cmp(&other.len())
+}
+
+/// Clone-free variant of [`cmp_tuple_elements_with_value`] specialized to a
+/// 2-element tuple whose elements are held by reference. The result is
+/// byte-identical to `cmp_tuple_elements_with_value(&[first.clone(),
+/// second.clone()], rhs)` for every `rhs`; the fast arms avoid materializing
+/// the owned `[Value; 2]` (the hot `<<a,b>> \in S` membership path), and the
+/// rare function-like `rhs` reps delegate through the exact owned path.
+#[inline]
+pub(in crate::value) fn cmp_tuple2_refs_with_value(
+    first: &Value,
+    second: &Value,
+    rhs: &Value,
+) -> Ordering {
+    match rhs {
+        Value::Tuple(other) => cmp_two_refs_with_slice(first, second, other.as_ref()),
+        Value::Seq(other) => cmp_two_refs_with_slice(first, second, other.flat_slice()),
+        _ => {
+            let tuple = [first.clone(), second.clone()];
+            cmp_tuple_elements_with_value(&tuple, rhs)
+        }
+    }
+}
+
+/// Clone-free variant of [`eq_tuple_elements_with_value`] for a 2-element
+/// tuple held by reference. Byte-identical to
+/// `eq_tuple_elements_with_value(&[first.clone(), second.clone()], rhs)`.
+#[inline]
+pub(in crate::value) fn eq_tuple2_refs_with_value(
+    first: &Value,
+    second: &Value,
+    rhs: &Value,
+) -> bool {
+    match rhs {
+        Value::Tuple(other) => {
+            other.as_ref().len() == 2 && *first == other.as_ref()[0] && *second == other.as_ref()[1]
+        }
+        Value::Seq(other) => {
+            let o = other.flat_slice();
+            o.len() == 2 && *first == o[0] && *second == o[1]
+        }
+        _ => {
+            let tuple = [first.clone(), second.clone()];
+            eq_tuple_elements_with_value(&tuple, rhs)
+        }
+    }
+}
+
 #[inline]
 pub(in crate::value) fn cmp_cross_type(lhs: &Value, rhs: &Value) -> Option<Ordering> {
     match (lhs, rhs) {
@@ -256,9 +325,7 @@ pub(in crate::value) fn cmp_cross_type(lhs: &Value, rhs: &Value) -> Option<Order
         (Value::Bag(b), Value::Func(f)) => Some(cmp_bag_with_func(b, f)),
         (Value::Func(f), Value::Bag(b)) => Some(cmp_bag_with_func(b, f).reverse()),
         (Value::Bag(a), Value::Bag(b)) => Some(cmp_bag_with_bag(a, b)),
-        (Value::Bag(bag), Value::IntFunc(i)) => {
-            Some(cmp_func_with_intfunc(bag.as_func_value(), i))
-        }
+        (Value::Bag(bag), Value::IntFunc(i)) => Some(cmp_func_with_intfunc(bag.as_func_value(), i)),
         (Value::IntFunc(i), Value::Bag(bag)) => {
             Some(cmp_func_with_intfunc(bag.as_func_value(), i).reverse())
         }
@@ -277,9 +344,7 @@ pub(in crate::value) fn cmp_cross_type(lhs: &Value, rhs: &Value) -> Option<Order
         (Value::Bag(bag), Value::Record(r)) => {
             Some(cmp_record_with_func(r, bag.as_func_value()).reverse())
         }
-        (Value::Record(r), Value::Bag(bag)) => {
-            Some(cmp_record_with_func(r, bag.as_func_value()))
-        }
+        (Value::Record(r), Value::Bag(bag)) => Some(cmp_record_with_func(r, bag.as_func_value())),
         _ => None,
     }
 }

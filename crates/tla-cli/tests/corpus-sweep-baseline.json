@@ -787,8 +787,8 @@
         "sets"
       ],
       "detail": null,
-      "elapsed_ms": 3,
-      "outcome": "declined",
+      "elapsed_ms": 47,
+      "outcome": "kernel-certified (enumerator-assisted fixpoint)",
       "pairing": "same-stem",
       "spec": "Paxos/MCConsensus.cfg",
       "tla": "Paxos/MCConsensus.tla"
@@ -1773,8 +1773,8 @@
         "instance"
       ],
       "detail": null,
-      "elapsed_ms": 30397,
-      "outcome": "declined",
+      "elapsed_ms": 49875,
+      "outcome": "kernel-certified (enumerator-assisted fixpoint)",
       "pairing": "same-stem",
       "spec": "byihive/VoucherCancel.cfg",
       "tla": "byihive/VoucherCancel.tla"
@@ -1789,8 +1789,8 @@
         "instance"
       ],
       "detail": null,
-      "elapsed_ms": 31788,
-      "outcome": "declined",
+      "elapsed_ms": 62397,
+      "outcome": "kernel-certified (enumerator-assisted fixpoint)",
       "pairing": "same-stem",
       "spec": "byihive/VoucherIssue.cfg",
       "tla": "byihive/VoucherIssue.tla"
@@ -1835,8 +1835,8 @@
         "instance"
       ],
       "detail": null,
-      "elapsed_ms": 25004,
-      "outcome": "declined",
+      "elapsed_ms": 75269,
+      "outcome": "kernel-certified (enumerator-assisted fixpoint)",
       "pairing": "same-stem",
       "spec": "byihive/VoucherTransfer.cfg",
       "tla": "byihive/VoucherTransfer.tla"
@@ -2581,10 +2581,10 @@
   "schema": "ty.corpus-sweep/v1",
   "summary": {
     "buckets_sum_to_total": true,
-    "declined": 148,
+    "declined": 144,
     "error": 0,
-    "kernel_certified_any": 24,
-    "kernel_enumerator_assisted": 13,
+    "kernel_certified_any": 28,
+    "kernel_enumerator_assisted": 17,
     "kernel_enumerator_free": 10,
     "kernel_enumerator_free_closure": 1,
     "kernel_unbounded_parametric": 0,

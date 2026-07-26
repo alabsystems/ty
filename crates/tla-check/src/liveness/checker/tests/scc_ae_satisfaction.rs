@@ -108,7 +108,8 @@ fn test_scc_ae_action_satisfied_self_loop() {
     graph.add_successor(n0, &s0, 0).unwrap();
 
     // Action check 0 passes on the self-loop edge
-    graph.get_node_info_mut(&n0).unwrap().action_check_masks = vec![CheckMask::from_u64(0b01u64)];
+    graph.get_node_info_mut(&n0).unwrap().action_check_masks =
+        vec![CheckMask::from_u64(0b01u64)].into();
 
     let scc = Scc::new(vec![n0]);
     let scc_set: FxHashSet<_> = scc.nodes().iter().copied().collect();
@@ -177,8 +178,10 @@ fn test_scc_ae_action_satisfied_ea_edge_filter() {
     // AE check 0 passes on both edges.
     // EA check 1 passes only on n0→n1 (bit 1 set on n0's edge, not n1's).
     // EA check 2 passes on neither edge (simulates empty allowed set).
-    graph.get_node_info_mut(&n0).unwrap().action_check_masks = vec![CheckMask::from_u64(0b011u64)]; // bits 0,1 set
-    graph.get_node_info_mut(&n1).unwrap().action_check_masks = vec![CheckMask::from_u64(0b001u64)]; // bit 0 only
+    graph.get_node_info_mut(&n0).unwrap().action_check_masks =
+        vec![CheckMask::from_u64(0b011u64)].into(); // bits 0,1 set
+    graph.get_node_info_mut(&n1).unwrap().action_check_masks =
+        vec![CheckMask::from_u64(0b001u64)].into(); // bit 0 only
 
     let scc = Scc::new(vec![n0, n1]);
     let scc_set: FxHashSet<_> = scc.nodes().iter().copied().collect();
@@ -230,7 +233,8 @@ fn test_scc_ae_action_satisfied_ignores_non_scc_successors() {
     let _n1 = BehaviorGraphNode::from_state(&s1, 0);
 
     // n0->n1: check 0 passes (but n1 is NOT in the SCC)
-    graph.get_node_info_mut(&n0).unwrap().action_check_masks = vec![CheckMask::from_u64(0b01u64)];
+    graph.get_node_info_mut(&n0).unwrap().action_check_masks =
+        vec![CheckMask::from_u64(0b01u64)].into();
 
     // SCC contains only n0 (n1 is outside — n1 exists in graph but not in SCC set)
     let scc = Scc::new(vec![n0]);
@@ -298,7 +302,7 @@ fn test_scc_ae_action_satisfied_boundary_index_63() {
 
     // Self-loop: action check 63 passes (final bit in the first u64 word)
     graph.get_node_info_mut(&n0).unwrap().action_check_masks =
-        vec![CheckMask::from_u64(1u64 << 63)];
+        vec![CheckMask::from_u64(1u64 << 63)].into();
 
     let scc = Scc::new(vec![n0]);
     let scc_set: FxHashSet<_> = scc.nodes().iter().copied().collect();
@@ -385,7 +389,7 @@ fn test_scc_ae_action_satisfied_multiword_boundaries() {
     let mut mask = CheckMask::new();
     mask.set(64);
     mask.set(127);
-    graph.get_node_info_mut(&n0).unwrap().action_check_masks = vec![mask];
+    graph.get_node_info_mut(&n0).unwrap().action_check_masks = vec![mask].into();
 
     let scc = Scc::new(vec![n0]);
     let scc_set: FxHashSet<_> = scc.nodes().iter().copied().collect();
@@ -491,12 +495,9 @@ fn test_scc_aggregate_state_mask_unions_nodes() {
     graph.get_node_info_mut(&n1).unwrap().state_check_mask = CheckMask::from_u64(0b10);
 
     let scc = Scc::new(vec![n0, n1]);
-    let scc_set = scc.build_node_set();
     let sccs: Vec<&Scc> = vec![&scc];
-    let scc_sets = vec![scc_set];
 
-    let aggregates =
-        LivenessChecker::try_build_scc_aggregates(&sccs, &scc_sets, None, &graph).unwrap();
+    let aggregates = LivenessChecker::try_build_scc_aggregates(&sccs, None, &graph).unwrap();
     assert_eq!(aggregates.len(), 1);
 
     // Aggregate should have both bits 0 and 1 set
@@ -550,16 +551,14 @@ fn test_scc_aggregate_action_mask_intra_scc_only() {
     // n0->s2 (succ_idx 1): bit 1 set (but s2 is outside SCC, should be excluded)
     // n1->n0 (succ_idx 0): bit 2 set
     graph.get_node_info_mut(&n0).unwrap().action_check_masks =
-        vec![CheckMask::from_u64(0b01), CheckMask::from_u64(0b10)];
-    graph.get_node_info_mut(&n1).unwrap().action_check_masks = vec![CheckMask::from_u64(0b100)];
+        vec![CheckMask::from_u64(0b01), CheckMask::from_u64(0b10)].into();
+    graph.get_node_info_mut(&n1).unwrap().action_check_masks =
+        vec![CheckMask::from_u64(0b100)].into();
 
     let scc = Scc::new(vec![n0, n1]);
-    let scc_set = scc.build_node_set();
     let sccs: Vec<&Scc> = vec![&scc];
-    let scc_sets = vec![scc_set];
 
-    let aggregates =
-        LivenessChecker::try_build_scc_aggregates(&sccs, &scc_sets, None, &graph).unwrap();
+    let aggregates = LivenessChecker::try_build_scc_aggregates(&sccs, None, &graph).unwrap();
     let agg = &aggregates[0];
 
     // Only intra-SCC edges: n0->n1 (bit 0) and n1->n0 (bit 2)
@@ -605,17 +604,18 @@ fn test_scc_aggregate_matches_per_node_ae_check() {
 
     // Action bits on edges:
     // n0->n1: bit 0, n1->n2: bit 1, n2->n0: bit 2
-    graph.get_node_info_mut(&n0).unwrap().action_check_masks = vec![CheckMask::from_u64(0b001)];
-    graph.get_node_info_mut(&n1).unwrap().action_check_masks = vec![CheckMask::from_u64(0b010)];
-    graph.get_node_info_mut(&n2).unwrap().action_check_masks = vec![CheckMask::from_u64(0b100)];
+    graph.get_node_info_mut(&n0).unwrap().action_check_masks =
+        vec![CheckMask::from_u64(0b001)].into();
+    graph.get_node_info_mut(&n1).unwrap().action_check_masks =
+        vec![CheckMask::from_u64(0b010)].into();
+    graph.get_node_info_mut(&n2).unwrap().action_check_masks =
+        vec![CheckMask::from_u64(0b100)].into();
 
     let scc = Scc::new(vec![n0, n1, n2]);
     let scc_set = scc.build_node_set();
     let sccs: Vec<&Scc> = vec![&scc];
-    let scc_sets = vec![scc_set.clone()];
 
-    let aggregates =
-        LivenessChecker::try_build_scc_aggregates(&sccs, &scc_sets, None, &graph).unwrap();
+    let aggregates = LivenessChecker::try_build_scc_aggregates(&sccs, None, &graph).unwrap();
     let agg = &aggregates[0];
 
     // Test various AE state index combinations against both methods
@@ -673,29 +673,27 @@ fn test_scc_aggregate_with_ea_filter() {
 
     // n0->n1: action bits 0 and 1, state bits: n0 has bit 5
     // n1->n0: action bit 0
-    graph.get_node_info_mut(&n0).unwrap().action_check_masks = vec![CheckMask::from_u64(0b011)];
+    graph.get_node_info_mut(&n0).unwrap().action_check_masks =
+        vec![CheckMask::from_u64(0b011)].into();
     graph.get_node_info_mut(&n0).unwrap().state_check_mask = CheckMask::from_u64(1 << 5);
-    graph.get_node_info_mut(&n1).unwrap().action_check_masks = vec![CheckMask::from_u64(0b001)];
+    graph.get_node_info_mut(&n1).unwrap().action_check_masks =
+        vec![CheckMask::from_u64(0b001)].into();
     graph.get_node_info_mut(&n1).unwrap().state_check_mask = CheckMask::new();
 
     let scc = Scc::new(vec![n0, n1]);
-    let scc_set = scc.build_node_set();
     let sccs: Vec<&Scc> = vec![&scc];
-    let scc_sets = vec![scc_set];
 
     // EA filter requires action bit 1 on edges. Only n0->n1 passes.
     let ea_check = EaEdgeCheck::new(&[1], &[]);
 
     // Without EA filter: aggregate action includes bits 0 and 1
-    let agg_no_ea =
-        LivenessChecker::try_build_scc_aggregates(&sccs, &scc_sets, None, &graph).unwrap();
+    let agg_no_ea = LivenessChecker::try_build_scc_aggregates(&sccs, None, &graph).unwrap();
     assert!(agg_no_ea[0].action_mask.get(0));
     assert!(agg_no_ea[0].action_mask.get(1));
 
     // With EA filter: n1->n0 is excluded (no bit 1), only n0->n1 survives
     let agg_with_ea =
-        LivenessChecker::try_build_scc_aggregates(&sccs, &scc_sets, ea_check.as_ref(), &graph)
-            .unwrap();
+        LivenessChecker::try_build_scc_aggregates(&sccs, ea_check.as_ref(), &graph).unwrap();
     assert!(
         agg_with_ea[0].action_mask.get(0),
         "n0->n1 passes EA and has bit 0"

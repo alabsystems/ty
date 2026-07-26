@@ -148,9 +148,7 @@ pub(super) fn eval_tir_cmp(
     if matches!(&left.node, TirExpr::Tuple(e) if !e.is_empty())
         || matches!(&right.node, TirExpr::Tuple(e) if !e.is_empty())
     {
-        tla_value::churn_stats::churn_count(
-            tla_value::churn_stats::ChurnSite::TupleKeyCmpTirBuild,
-        );
+        tla_value::churn_stats::churn_count(tla_value::churn_stats::ChurnSite::TupleKeyCmpTirBuild);
     }
     match op {
         TirCmpOp::Eq => {

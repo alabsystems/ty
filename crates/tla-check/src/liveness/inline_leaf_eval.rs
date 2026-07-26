@@ -58,11 +58,21 @@ fn eval_subscript_changed_uncached(
     s2: &State,
     subscript: &Arc<Spanned<Expr>>,
 ) -> EvalResult<bool> {
+    // Part of #ewd998-refine-fix: `with_explicit_env` sets `state_env = None`, so
+    // s1 and s2 collide at `state_identity = 0` in every per-state cache. Clearing
+    // only SUBST_CACHE (the historical Fix #2780) leaks the CHOOSE caches across the
+    // two states, so an INSTANCE refinement mapping's `CHOOSE` (e.g. EWD998Chan's
+    // `tpos`) computed for s1 is served STALE to s2. Also clear the CHOOSE caches (via
+    // `invalidate_state_identity_tracking`), matching the post-BFS
+    // `eval_subscript_changed` path; the `eval_choose` root fix keeps the mapping's
+    // zero-arg operators from being mis-cached as constants during ENABLED scope.
     let ctx1 = ctx.with_explicit_env((*build_state_env(ctx, s1)).clone());
     crate::eval::clear_subst_cache();
+    crate::eval::invalidate_state_identity_tracking();
     let val1 = super::eval_live_entry(&ctx1, subscript)?;
 
     crate::eval::clear_subst_cache();
+    crate::eval::invalidate_state_identity_tracking();
 
     let ctx2 = ctx.with_explicit_env((*build_state_env(ctx, s2)).clone());
     let val2 = super::eval_live_entry(&ctx2, subscript)?;

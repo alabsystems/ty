@@ -6,9 +6,9 @@
 
 use super::super::Value;
 use super::{SeqValue, SEQ_VALUE_FP_UNSET};
-use std::sync::atomic::Ordering as AtomicOrdering;
-use std::sync::{OnceLock};
 use crate::rp::Rp as Arc;
+use std::sync::atomic::Ordering as AtomicOrdering;
+use std::sync::OnceLock;
 
 impl SeqValue {
     #[inline]

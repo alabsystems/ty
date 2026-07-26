@@ -6,12 +6,12 @@
 
 use super::super::Value;
 use super::SeqValue;
+use crate::rp::Rp as Arc;
 use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{OnceLock};
-use crate::rp::Rp as Arc;
+use std::sync::OnceLock;
 use tla_core::kani_types::Vector;
 
 impl Clone for SeqValue {

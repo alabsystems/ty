@@ -8,7 +8,6 @@
 //! Extracted from `helpers/mod.rs` as part of #1669.
 
 use super::super::{apply_builtin_binary_op, eval, EvalCtx, EvalError, EvalResult};
-use tla_value::Rp;
 use super::builtin_dispatch::{eval_builtin, should_prefer_builtin_override};
 use super::closures::{build_closure_ctx, create_closure_from_arg};
 use super::function_values::apply_func_value_eager;
@@ -30,6 +29,7 @@ use std::sync::Arc;
 use tla_core::ast::{Expr, OperatorDef, Substitution};
 use tla_core::name_intern::{intern_name, resolve_name_id};
 use tla_core::{NameId, Span, Spanned};
+use tla_value::Rp;
 
 /// Inline capacity for preinterned binding buffers. Operators with <= 4 parameters
 /// (the vast majority — TLA+ operators rarely exceed 3-4 params) avoid heap
@@ -359,32 +359,7 @@ fn prepare_user_op_cache(
         return None;
     }
 
-    let is_instance_op = ctx
-        .local_ops
-        .as_ref()
-        .and_then(|lo| lo.get(resolved_name))
-        .is_some();
-    let key = NaryOpCacheKey {
-        shared_id: ctx.shared.id,
-        local_ops_id: crate::cache::scope_ids::resolve_local_ops_id_with_recursive(
-            ctx.scope_ids.local_ops,
-            &ctx.local_ops,
-            ctx.scope_ids.local_ops_recursive,
-        ),
-        instance_subs_id: crate::cache::scope_ids::resolve_instance_subs_id(
-            ctx.scope_ids.instance_substitutions,
-            &ctx.instance_substitutions,
-        ),
-        op_name: resolved_name_id,
-        def_loc: def.body.span.start,
-        is_next_state: current_state_lookup_mode(ctx) == crate::cache::StateLookupMode::Next,
-        args_hash: hash_args(arg_values),
-        param_args_hash: if is_instance_op {
-            ctx.stable.param_args_hash
-        } else {
-            0
-        },
-    };
+    let key = operator_cache_key(ctx, resolved_name, resolved_name_id, def, arg_values);
 
     // Churn elimination: `nary_lookup_value` fuses the lookup with the
     // `finish_nary_cache_hit` step inside the cache borrow — state hits
@@ -407,6 +382,49 @@ fn prepare_user_op_cache(
     }
 
     Some(UserOpCacheOutcome::Miss(key))
+}
+
+/// Build the scope- and state-mode-discriminated operator key shared by the
+/// ordinary n-ary cache and the recursive-result memo.
+///
+/// Recursive definitions can be reused through multiple INSTANCE/local-op
+/// environments while retaining the same `Arc<OperatorDef>`. Keying those
+/// results by definition address alone aliases semantically distinct calls.
+/// Keeping this construction shared prevents the recursive lane from drifting
+/// from the established n-ary cache discrimination contract.
+fn operator_cache_key(
+    ctx: &EvalCtx,
+    resolved_name: &str,
+    resolved_name_id: NameId,
+    def: &Arc<OperatorDef>,
+    arg_values: &[Value],
+) -> NaryOpCacheKey {
+    let is_instance_op = ctx
+        .local_ops
+        .as_ref()
+        .and_then(|lo| lo.get(resolved_name))
+        .is_some();
+    NaryOpCacheKey {
+        shared_id: ctx.shared.id,
+        local_ops_id: crate::cache::scope_ids::resolve_local_ops_id_with_recursive(
+            ctx.scope_ids.local_ops,
+            &ctx.local_ops,
+            ctx.scope_ids.local_ops_recursive,
+        ),
+        instance_subs_id: crate::cache::scope_ids::resolve_instance_subs_id(
+            ctx.scope_ids.instance_substitutions,
+            &ctx.instance_substitutions,
+        ),
+        op_name: resolved_name_id,
+        def_loc: def.body.span.start,
+        is_next_state: current_state_lookup_mode(ctx) == crate::cache::StateLookupMode::Next,
+        args_hash: hash_args(arg_values),
+        param_args_hash: if is_instance_op {
+            ctx.stable.param_args_hash
+        } else {
+            0
+        },
+    }
 }
 
 fn eval_user_op_body_with_bindings(
@@ -462,6 +480,190 @@ fn eval_user_op_body_with_bindings(
     eval(&new_ctx, &def.body)
 }
 
+/// Kill switch for the linear/chain-recursive operator memo
+/// (`TY_DISABLE_RECURSIVE_MEMO=1`). When set, recursive operators fall through to
+/// normal (un-memoized) evaluation — used by the differential soundness gate.
+#[inline]
+fn recursive_memo_disabled() -> bool {
+    static FLAG: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("TY_DISABLE_RECURSIVE_MEMO").map_or(false, |v| !v.is_empty() && v != "0")
+    });
+    *FLAG
+}
+
+/// Soft cap on the recursive-operator memo (matches the implied-fp cache bound);
+/// cleared wholesale when exceeded so memory stays bounded on large runs.
+const RECURSIVE_MEMO_CAP: usize = 131_072;
+
+/// Try to evaluate a linear/chain-recursive operator (NOT a set-fold) via a
+/// process-long memo keyed by the established n-ary context key plus exact
+/// argument values.
+///
+/// Detects the *tail/linear recursion* idiom that `try_eval_recursive_fold`
+/// rejects — e.g. `PublicKeyOf(ledger, h) == IF ... THEN ... ELSE
+/// PublicKeyOf(ledger, ledger[h].block.previous)` — where the operator walks a
+/// data structure toward a base case. Because the op-result (n-ary) cache skips
+/// recursive operators, without this memo each such call re-walks the entire
+/// chain, giving O(D²) work per state when an invariant/action calls it for many
+/// elements (Nano's `CryptographicInvariant` does exactly this).
+///
+/// SOUNDNESS. A recursive operator is a pure function of its arguments **iff it
+/// reads no state except through those arguments**. We do not assume this — we
+/// PROVE it per call via the same dependency tracking the n-ary cache trusts:
+/// the body is evaluated under an `OpDepGuard`, and the result is stored ONLY
+/// when the tracked deps show no current-state read, no next-state read, no
+/// TLC-level read, no INSTANCE-lazy taint, and no unstripped local dep. For such
+/// results the value depends solely on the scope-discriminated, extensional,
+/// exactly-keyed argument values, so a hit is byte-identical to recomputation in
+/// the same evaluation scope.
+/// State-dependent recursive ops fall through uncached (the value is still
+/// returned correctly, with its deps propagated to the caller). Keys use exact
+/// `Value` equality — no fingerprint, hence no collision risk. Returns `Ok(None)`
+/// for shapes the memo does not handle (falls back to normal recursive eval).
+fn try_eval_recursive_memoized(
+    ctx: &EvalCtx,
+    resolved_name: &str,
+    resolved_name_id: NameId,
+    def: &Arc<OperatorDef>,
+    args: &[Spanned<Expr>],
+) -> EvalResult<Option<Value>> {
+    use super::recursion_stats::{rec_count, RecSite};
+
+    // Only value-parameter operators can be keyed by argument values.
+    if def.params.is_empty() || !def.params.iter().all(|p| p.arity == 0) {
+        return Ok(None);
+    }
+    // Operators that (transitively) contain a prime or take a primed parameter can
+    // observe next-state directly; keying on unprimed argument values would be
+    // unsound, and primed-param operators must use call-by-name, not value-apply.
+    // (The dep-tracking gate below also rejects next-state reads; this is belt.)
+    if def.contains_prime || def.has_primed_param {
+        return Ok(None);
+    }
+
+    // Count every eligible-shaped recursive application, even when the memo is
+    // disabled, so TY_REC_STATS measures the true (un-memoized) recursion volume.
+    rec_count(RecSite::Apply);
+
+    if recursive_memo_disabled() {
+        return Ok(None);
+    }
+
+    // Preserve the historical parameter-name interning and selective-laziness
+    // contract. The normal operator path interns every parameter name before it
+    // evaluates any argument, and evaluates only O(1) argument shapes eagerly;
+    // all other arity-0 arguments are LazyBindings and may never be forced. A
+    // memo probe needs every argument value, so it is eligible only when the
+    // normal path would eagerly evaluate every argument anyway.
+    let _cached_params = get_param_cache(def);
+    if !args.iter().all(|arg| is_trivially_evaluable(&arg.node)) {
+        return Ok(None);
+    }
+
+    // Evaluate in the same left-to-right order as normal eager parameter
+    // binding. Errors are returned directly; falling through would re-evaluate
+    // earlier arguments and could perturb first-seen string-token ordering.
+    let mut arg_values: Vec<Value> = Vec::with_capacity(args.len());
+    for arg in args {
+        arg_values.push(eval(ctx, arg)?);
+    }
+    // Only extensionally-comparable argument values can key a cross-state cache
+    // (identity-like LazyFunc/Closure values are rejected — same rule as the
+    // recursive-fold cache).
+    if !super::recursive_fold::fold_cache_args_safe(&arg_values) {
+        // Still evaluate via the tracked body path (avoids re-evaluating args) but
+        // do not cache.
+        let (value, _pure) = eval_recursive_body_tracked(ctx, def, &arg_values)?;
+        rec_count(RecSite::Compute);
+        return Ok(Some(value));
+    }
+
+    let context_key = operator_cache_key(ctx, resolved_name, resolved_name_id, def, &arg_values);
+
+    // Memo lookup. A hit is a proven state-independent value → nothing to
+    // propagate to the caller's dep frame (a constant carries no dependency).
+    let hit = crate::cache::small_caches::SMALL_CACHES.with(|sc| {
+        sc.borrow()
+            .recursive_result_cache
+            .get(&(context_key.clone(), arg_values.clone()))
+            .cloned()
+    });
+    if let Some(value) = hit {
+        rec_count(RecSite::Hit);
+        return Ok(Some(value));
+    }
+
+    // Miss: evaluate the body under dependency tracking.
+    let (value, state_independent) = eval_recursive_body_tracked(ctx, def, &arg_values)?;
+    rec_count(RecSite::Compute);
+
+    if state_independent {
+        rec_count(RecSite::Cached);
+        crate::cache::small_caches::SMALL_CACHES.with(|sc| {
+            let mut sc = sc.borrow_mut();
+            if sc.recursive_result_cache.len() >= RECURSIVE_MEMO_CAP {
+                sc.recursive_result_cache.clear();
+            }
+            sc.recursive_result_cache
+                .insert((context_key, arg_values), value.clone());
+        });
+    } else {
+        rec_count(RecSite::Impure);
+    }
+    Ok(Some(value))
+}
+
+/// Bind `arg_values` as the operator's parameters and evaluate its body under an
+/// `OpDepGuard`, returning the value and whether the tracked deps prove the
+/// result state-independent. Mirrors `eval_user_op_body_with_bindings`'s dep
+/// discipline (caller-relative `base_stack_len`, strip internal locals, propagate
+/// deps upward) so the classification matches the n-ary cache's "constant" notion.
+fn eval_recursive_body_tracked(
+    ctx: &EvalCtx,
+    def: &Arc<OperatorDef>,
+    arg_values: &[Value],
+) -> EvalResult<(Value, bool)> {
+    let cached_params = get_param_cache(def);
+    let mut preinterned: PreinternedBuf = SmallVec::with_capacity(def.params.len());
+    for (i, value) in arg_values.iter().enumerate() {
+        let (ref interned, name_id) = cached_params[i];
+        preinterned.push((
+            Arc::clone(interned),
+            BindingValue::eager(value.clone()),
+            name_id,
+        ));
+    }
+    let mut new_ctx = ctx.bind_preinterned(preinterned);
+    new_ctx.install_outermost_tlc_action_context(def);
+
+    let base_stack_len = ctx.binding_depth;
+    let guard = OpDepGuard::from_ctx(ctx, base_stack_len);
+    let result = eval(&new_ctx, &def.body)?;
+    let mut deps = guard.try_take_deps().ok_or_else(|| EvalError::Internal {
+        message: "recursive-memo dependency frame unexpectedly empty".into(),
+        span: Some(def.body.span),
+    })?;
+    deps.strip_internal_locals(&ctx.bindings, base_stack_len);
+    // A FuncDef can construct a LazyFunc without reading the captured arrays
+    // during construction. Dependency tracking is therefore empty even though
+    // replaying that value in another state would observe stale state. Match the
+    // established persistent-cache admission rule and fail closed for every
+    // state-environment-capturing value.
+    if result.captures_state_environment() {
+        deps.instance_lazy_read = true;
+    }
+    propagate_cached_deps(ctx, &deps);
+
+    let state_independent = !deps.inconsistent
+        && deps.state.is_empty()
+        && deps.next.is_empty()
+        && deps.local.is_empty()
+        && deps.tlc_level.is_none()
+        && !deps.instance_lazy_read;
+
+    Ok((result, state_independent))
+}
+
 fn apply_user_op_with_exprs(
     ctx: &EvalCtx,
     resolved_name: &str,
@@ -487,6 +689,15 @@ fn apply_user_op_with_exprs(
 
     if def.is_recursive {
         if let Some(result) = super::recursive_fold::try_eval_recursive_fold(ctx, def, args, span)?
+        {
+            return Ok(result);
+        }
+        // Linear/chain recursion (e.g. NanoBlockchain's PublicKeyOf walking
+        // block.previous) that the fold path rejects: memoize by argument values
+        // so it is not re-walked O(D) times per state. See the function's
+        // SOUNDNESS note — results are cached only when proven state-independent.
+        if let Some(result) =
+            try_eval_recursive_memoized(ctx, resolved_name, resolved_name_id, def, args)?
         {
             return Ok(result);
         }
@@ -1272,6 +1483,100 @@ mod tests {
             resolved_operator_name_id(&source, pre_resolved, replacement),
             intern_name(replacement),
             "operator replacements must be keyed by the replacement identity",
+        );
+    }
+
+    #[test]
+    fn recursive_memo_preserves_parameter_string_token_order() {
+        const PARAM: &str = "__ty_recursive_memo_param_token_20260723";
+        const ARGUMENT: &str = "__ty_recursive_memo_argument_token_20260723";
+
+        let def = Arc::new(OperatorDef {
+            name: Spanned::dummy("RecursiveIdentity".to_string()),
+            params: vec![OpParam {
+                name: Spanned::dummy(PARAM.to_string()),
+                arity: 0,
+            }],
+            body: Spanned::dummy(Expr::Ident(PARAM.to_string(), NameId::INVALID)),
+            local: false,
+            contains_prime: false,
+            guards_depend_on_prime: false,
+            has_primed_param: false,
+            is_recursive: true,
+            self_call_count: 0,
+        });
+        let argument = Spanned::dummy(Expr::String(ARGUMENT.to_string()));
+
+        assert_eq!(
+            apply_user_op_with_exprs(
+                &EvalCtx::new(),
+                "RecursiveIdentity",
+                intern_name("RecursiveIdentity"),
+                &def,
+                &[argument],
+                None,
+            )
+            .expect("recursive identity should evaluate"),
+            Value::String(crate::value::intern_string(ARGUMENT)),
+        );
+
+        let sentinel = crate::value::intern_string("__ty_recursive_memo_sentinel_20260723");
+        let param = crate::value::intern_string(PARAM);
+        let argument = crate::value::intern_string(ARGUMENT);
+        assert!(
+            crate::value::tlc_string_token(&param) < crate::value::tlc_string_token(&argument),
+            "recursive memo must intern parameter names before evaluating arguments",
+        );
+        assert!(
+            crate::value::tlc_string_token(&argument) < crate::value::tlc_string_token(&sentinel),
+            "the regression must observe first-seen ordering from this call",
+        );
+    }
+
+    #[test]
+    fn recursive_memo_key_discriminates_operator_scopes() {
+        let base = EvalCtx::new();
+        let def = Arc::new(OperatorDef {
+            name: Spanned::dummy("ScopedRecursive".to_string()),
+            params: vec![OpParam {
+                name: Spanned::dummy("n".to_string()),
+                arity: 0,
+            }],
+            body: Spanned::dummy(Expr::Ident("n".to_string(), NameId::INVALID)),
+            local: false,
+            contains_prime: false,
+            guards_depend_on_prime: false,
+            has_primed_param: false,
+            is_recursive: true,
+            self_call_count: 0,
+        });
+        let alternate = Arc::new(OperatorDef {
+            name: Spanned::dummy("Alternate".to_string()),
+            params: Vec::new(),
+            body: Spanned::dummy(Expr::Int(1.into())),
+            local: false,
+            contains_prime: false,
+            guards_depend_on_prime: false,
+            has_primed_param: false,
+            is_recursive: false,
+            self_call_count: 0,
+        });
+
+        let mut first_ops = tla_core::OpEnv::new();
+        first_ops.insert("ScopedRecursive".into(), Arc::clone(&def));
+        let first = base.with_local_ops(first_ops);
+
+        let mut second_ops = tla_core::OpEnv::new();
+        second_ops.insert("Alternate".into(), alternate);
+        let second = base.with_local_ops(second_ops);
+
+        let op_name = intern_name("ScopedRecursive");
+        let args = [Value::int(7)];
+        let first_key = operator_cache_key(&first, "ScopedRecursive", op_name, &def, &args);
+        let second_key = operator_cache_key(&second, "ScopedRecursive", op_name, &def, &args);
+        assert_ne!(
+            first_key, second_key,
+            "one recursive definition reused in distinct local-op scopes must not alias",
         );
     }
 

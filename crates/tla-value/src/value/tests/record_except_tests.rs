@@ -35,6 +35,10 @@ fn test_record_update_existing_field_id_same_value_reuses_storage() {
 
 #[test]
 fn test_record_update_existing_field_id_changed_value_reuses_unique_buffer() {
+    // Build OUTSIDE the record intern table: interned records are pinned by
+    // the table (shared), which forces COW — this test exercises the
+    // unique-owner in-place fast path, so it needs an un-interned record.
+    let _skip = crate::value::InterningSkipGuard::new();
     let record = sample_record();
     let b_id = intern_name("b");
     let before_ptr = record

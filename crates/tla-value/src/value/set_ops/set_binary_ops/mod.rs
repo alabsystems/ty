@@ -14,6 +14,7 @@ mod diff;
 mod helpers;
 
 pub use cap::SetCapValue;
+pub(crate) use cup::clear_set_cup_membership_cache;
 pub use cup::SetCupValue;
 pub use diff::SetDiffValue;
 pub(crate) use helpers::all_in_set;

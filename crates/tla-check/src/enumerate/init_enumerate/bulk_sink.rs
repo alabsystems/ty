@@ -95,14 +95,20 @@ where
         return Ok(());
     }
 
-    *sink.generated_count += 1;
+    *sink.generated_count = sink
+        .generated_count
+        .checked_add(1)
+        .expect("raw initial-state generation count overflowed usize");
     let fingerprint = compute_values_fingerprint(values);
     if !sink.seen.insert(fingerprint) {
         return Ok(());
     }
 
     sink.storage.push_from_values(values);
-    *sink.added_count += 1;
+    *sink.added_count = sink
+        .added_count
+        .checked_add(1)
+        .expect("distinct initial-state count overflowed usize");
     Ok(())
 }
 

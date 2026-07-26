@@ -2184,9 +2184,8 @@ Next == B
 #[test]
 fn test_deep_operator_chain_degrades_to_opaque() {
     const DEPTH: usize = 40; // > MAX_OPERATOR_RESOLVE_DEPTH (32)
-    let mut spec = String::from(
-        "---- MODULE PorDeepChain ----\nEXTENDS Integers\n\nVARIABLES w, v\n\n",
-    );
+    let mut spec =
+        String::from("---- MODULE PorDeepChain ----\nEXTENDS Integers\n\nVARIABLES w, v\n\n");
     for i in 0..DEPTH {
         spec.push_str(&format!("RECURSIVE F{i}(_)\n"));
     }
@@ -2197,7 +2196,9 @@ fn test_deep_operator_chain_degrades_to_opaque() {
                 i + 1
             ));
         } else {
-            spec.push_str(&format!("F{i}(n) == IF n <= 0 THEN 0 ELSE w + F{i}(n - 1)\n"));
+            spec.push_str(&format!(
+                "F{i}(n) == IF n <= 0 THEN 0 ELSE w + F{i}(n - 1)\n"
+            ));
         }
     }
     spec.push_str("\nB == F0(v) = 0 /\\ v' = 1 /\\ UNCHANGED w\n\nNext == B\n====\n");
@@ -2628,8 +2629,7 @@ fn test_btree_get_value_shape_stays_opaque_under_default_policy() {
 
     let (ctx, actions) = setup_detected_actions(BTREE_GET_VALUE_SHAPE);
     let expanded = crate::enumerate::expand_operators_with_primes(&ctx, &actions[0].expr);
-    let deps =
-        extract_action_dependencies_with_policy(&ctx, &expanded, ResolutionPolicy::OPAQUE);
+    let deps = extract_action_dependencies_with_policy(&ctx, &expanded, ResolutionPolicy::OPAQUE);
 
     assert!(
         deps.opaque,

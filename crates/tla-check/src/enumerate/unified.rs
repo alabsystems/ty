@@ -52,7 +52,8 @@ pub(super) use super::unified_dispatch::enumerate_unified_inner;
 
 // Conjunct handlers from extracted submodules
 use super::unified_conjuncts::{
-    conjunct_and, conjunct_case, conjunct_exists, conjunct_if, conjunct_in, conjunct_or,
+    conjunct_and, conjunct_case, conjunct_exists, conjunct_forall, conjunct_if, conjunct_in,
+    conjunct_or,
 };
 use super::unified_emit::{emit_successor, process_conjunct_guard_or_assignment};
 use super::unified_fast_path::all_assigned_fast_path;
@@ -92,6 +93,7 @@ pub(super) fn trace_expr_tag(expr: &Expr) -> &'static str {
         Expr::And(_, _) => "And",
         Expr::Or(_, _) => "Or",
         Expr::Exists(_, _) => "Exists",
+        Expr::Forall(_, _) => "Forall",
         Expr::If(_, _, _) => "If",
         Expr::In(_, _) => "In",
         Expr::Let(_, _) => "Let",
@@ -109,6 +111,7 @@ fn trace_kind_hint(expr: &Expr) -> &'static str {
         Expr::And(_, _)
         | Expr::Or(_, _)
         | Expr::Exists(_, _)
+        | Expr::Forall(_, _)
         | Expr::If(_, _, _)
         | Expr::Case(_, _) => "branch",
         Expr::In(lhs, _) => {
@@ -210,6 +213,7 @@ pub(super) fn enumerate_conjuncts<'a>(
             Expr::And(_a, _b) => conjunct_and(ctx, conjunct, &tail, p, m),
             Expr::Or(a, b) => conjunct_or(ctx, a, b, &tail, p, m),
             Expr::Exists(bounds, body) => conjunct_exists(ctx, bounds, body, conjunct, &tail, p, m),
+            Expr::Forall(bounds, body) => conjunct_forall(ctx, bounds, body, conjunct, &tail, p, m),
             Expr::If(..) => conjunct_if(ctx, conjunct, &tail, p, m),
             Expr::In(lhs, rhs) => conjunct_in(ctx, lhs, rhs, conjunct, &tail, p, m),
             Expr::Let(defs, body) => conjunct_let(ctx, defs, body, &tail, p, m),

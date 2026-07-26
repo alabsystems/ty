@@ -318,6 +318,7 @@ impl JsonOutput {
             self.add_warning(error_codes::TLC_GUARD_ERRORS_SUPPRESSED, &msg);
         }
         self.backend_capability_report = result.stats().backend_capability_report.clone();
+        self.engine_provenance = result.stats().engine_provenance.clone();
         self
     }
 
@@ -355,6 +356,7 @@ impl JsonOutput {
         });
         self.statistics = stats_to_json(bfs_result.stats(), elapsed);
         self.backend_capability_report = bfs_result.stats().backend_capability_report.clone();
+        self.engine_provenance = bfs_result.stats().engine_provenance.clone();
         self
     }
 }
@@ -365,6 +367,9 @@ fn stats_to_json(stats: &CheckStats, elapsed: Duration) -> StatisticsInfo {
     StatisticsInfo {
         states_found: stats.states_found,
         states_initial: stats.initial_states,
+        raw_initial_states_generated: stats.raw_initial_states_generated,
+        raw_successors_generated: stats.raw_successors_generated,
+        states_generated: stats.states_generated(),
         states_distinct: Some(stats.states_found),
         transitions: stats.transitions,
         suppressed_guard_errors: (stats.suppressed_guard_errors > 0)

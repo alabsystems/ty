@@ -46,9 +46,9 @@
 //! Part of #3848.
 
 use super::error::JitRuntimeError;
-use tla_value::Rp;
 use tla_core::NameId;
 use tla_value::value::{FuncValue, IntIntervalFunc, RecordValue, SeqValue, SortedSet, Value};
+use tla_value::Rp;
 
 // ============================================================================
 // Value type tags for the flat i64 representation

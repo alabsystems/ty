@@ -32,9 +32,16 @@ pub enum BindingValue {
     /// Deferred computation — captures expression + enclosing chain.
     /// Evaluated on first access, result cached via interior mutability.
     /// Part of #2956: Used for RECURSIVE operator arity-0 arguments (TLC LazyValue parity).
-    /// Part of #3063: Boxed to reduce BindingNode from ~484B to ~196B. LazyBinding is only
-    /// used for INSTANCE substitution arguments (cold path), not quantifier hot paths.
+    /// Part of #3063: Boxed to reduce BindingNode from ~484B to ~196B. Used by
+    /// operator-argument lazy values and by the diagnostic INSTANCE fallback.
     Lazy(Box<LazyBinding>),
+    /// INSTANCE substitution binding shared between the visible substitution
+    /// chain and the enclosing chain captured by earlier substitutions. Both
+    /// positions represent the exact same deferred expression and scope, so
+    /// one allocation and one per-state lazy-cache identity are sufficient.
+    /// Set `TY_NO_SHARED_SUBST_LAZY=1` to restore separate boxed allocations
+    /// for focused same-binary performance comparisons.
+    SharedLazy(Arc<LazyBinding>),
 }
 
 /// Deferred binding that captures expression + enclosing scope.
@@ -154,6 +161,12 @@ impl LazyBinding {
 
     /// Get deps captured during forcing for the given mode.
     /// Part of #3056 Phase 5: Mode-aware dep tracking.
+    ///
+    /// Production no longer reads these OnceLocks: forced deps ride the
+    /// epoch-scoped `instance_lazy_cache` entry next to the forced value
+    /// (see `cache::subst_chain_memo` module docs — deps embed read values,
+    /// so they must not outlive the epoch, while shared LazyBindings do).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn get_forced_deps(&self, mode: StateLookupMode) -> Option<&OpEvalDeps> {
         match mode {
             StateLookupMode::Current => self.forced_deps.get(),
@@ -163,6 +176,9 @@ impl LazyBinding {
 
     /// Store deps captured during forcing for the given mode.
     /// Part of #3056 Phase 5: Mode-aware dep tracking.
+    ///
+    /// Production no longer writes these OnceLocks (see `get_forced_deps`).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn set_forced_deps(&self, deps: OpEvalDeps, mode: StateLookupMode) {
         match mode {
             StateLookupMode::Current => {
@@ -206,7 +222,7 @@ impl BindingValue {
     ) -> Option<Value> {
         match self {
             BindingValue::Eager(v) => Some(Value::from(v)),
-            BindingValue::Lazy(_) => None,
+            BindingValue::Lazy(_) | BindingValue::SharedLazy(_) => None,
         }
     }
 
@@ -226,7 +242,7 @@ impl BindingValue {
     ) -> bool {
         match self {
             BindingValue::Eager(value) => value == expected,
-            BindingValue::Lazy(_) => false,
+            BindingValue::Lazy(_) | BindingValue::SharedLazy(_) => false,
         }
     }
 
@@ -235,6 +251,7 @@ impl BindingValue {
     pub(crate) fn as_lazy(&self) -> Option<&LazyBinding> {
         match self {
             BindingValue::Lazy(lazy) => Some(lazy.as_ref()),
+            BindingValue::SharedLazy(lazy) => Some(lazy.as_ref()),
             BindingValue::Eager(_) => None,
         }
     }

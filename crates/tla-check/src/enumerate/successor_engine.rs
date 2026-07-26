@@ -133,6 +133,7 @@ pub(super) fn run_unified_with_tir_and_cap<'a>(
 ///
 /// Part of #3923: when `pc_var_idx` is `Some`, Or branches with non-matching
 /// `pc = "label"` guards are skipped, avoiding wasted evaluation in PlusCal specs.
+#[cfg(test)]
 pub(super) fn run_unified_with_options<'a>(
     ctx: &mut EvalCtx,
     body: &Spanned<Expr>,

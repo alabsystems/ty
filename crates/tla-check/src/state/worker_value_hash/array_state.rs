@@ -6,7 +6,6 @@
 //!
 //! Part of #3337.
 
-use std::sync::Arc;
 use tla_value::Rp;
 
 use crate::var_index::{VarIndex, VarRegistry};

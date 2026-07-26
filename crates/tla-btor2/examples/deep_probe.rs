@@ -1,7 +1,8 @@
 // One-off probe: deep_overflow_bug through the BMC lane with a raised read cap.
 fn main() {
     let src = std::fs::read_to_string(
-        std::env::var("HOME").unwrap() + "/hwmcc/benchmarks/wordlevel/array/2020/mann/deep_overflow_bug.btor2",
+        std::env::var("HOME").unwrap()
+            + "/hwmcc/benchmarks/wordlevel/array/2020/mann/deep_overflow_bug.btor2",
     )
     .unwrap();
     let prog = tla_btor2::parse_btor2(&src).unwrap();

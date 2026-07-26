@@ -4,10 +4,11 @@
 
 use super::super::tokens::get_token_table;
 use super::super::{
-    clear_string_intern_table, clear_tlc_string_tokens, intern_string, tlc_string_token,
+    clear_string_intern_table, clear_tlc_string_tokens, intern_string, lookup_tlc_string_token,
+    tlc_string_token,
 };
-use crate::value::Value;
 use crate::rp::Rp as Arc;
+use crate::value::Value;
 /// Part of #3287: Verify that intern_string() eagerly assigns TLC tokens.
 /// After interning, the token should already exist in the token table
 /// without needing a separate tlc_string_token() call.
@@ -22,10 +23,14 @@ fn intern_string_eagerly_assigns_tlc_token() {
     let b = intern_string("eager_bravo");
     let c = intern_string("eager_charlie");
 
+    let eagerly_assigned_a = lookup_tlc_string_token("eager_alpha")
+        .expect("intern_string must assign a token before explicit token lookup");
+
     // Tokens should already be assigned (by intern_string, not by this test)
     let ta = tlc_string_token(&a);
     let tb = tlc_string_token(&b);
     let tc = tlc_string_token(&c);
+    assert_eq!(eagerly_assigned_a, ta);
 
     // Tokens should reflect intern order: a < b < c
     assert!(

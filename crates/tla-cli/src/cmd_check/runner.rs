@@ -190,6 +190,9 @@ fn print_bmc_trace_human(trace: &[tla_check::BmcState]) {
                 tla_check::BmcValue::Function(entries) => {
                     eprintln!("    {} = [func] ({} entries)", var, entries.len());
                 }
+                tla_check::BmcValue::StringFunction(entries) => {
+                    eprintln!("    {} = [string-func] ({} entries)", var, entries.len());
+                }
                 tla_check::BmcValue::Record(fields) => {
                     let field_names: Vec<&str> =
                         fields.iter().map(|(name, _)| name.as_str()).collect();
@@ -2431,8 +2434,7 @@ pub(super) fn run_fused_mode(
     let retry_disk_limit_bytes = checker_config.disk_limit_bytes;
     let retry_continue_on_error = checker_config.continue_on_error;
     let retry_store_states = checker_config.store_states;
-    let mut result =
-        run_fused_check_with_config(module, checker_modules, config, checker_config);
+    let mut result = run_fused_check_with_config(module, checker_modules, config, checker_config);
 
     // Graceful flat-storage value-overflow handling, mirroring the sequential
     // path in cmd_check and the portfolio route above: when the fused BFS lane
@@ -2701,6 +2703,11 @@ pub(super) fn run_fused_mode(
                 println!("Statistics:");
                 println!("  States found: {}", stats.states_found);
                 println!("  Initial states: {}", stats.initial_states);
+                println!(
+                    "  Initial states generated: {}",
+                    stats.raw_initial_states_generated
+                );
+                println!("  States generated: {}", stats.states_generated());
                 println!("  Transitions: {}", stats.transitions);
                 println!("  Max queue depth: {}", stats.max_queue_depth);
                 if let Some(ref summary) = result.symbolic_summary {
@@ -2758,6 +2765,18 @@ pub(super) fn run_fused_mode(
                 if let Some(ref info) = degradation_info {
                     eprintln!("  {info}");
                 }
+                // Standard count summary, like the success arm — harnesses
+                // (supremacy compare) parse these lines to establish state
+                // parity on expected-violation rows; without them a fused
+                // violation row reads as "no TY count" and fails comparison.
+                eprintln!("  States found: {}", stats.states_found);
+                eprintln!("  Initial states: {}", stats.initial_states);
+                eprintln!(
+                    "  Initial states generated: {}",
+                    stats.raw_initial_states_generated
+                );
+                eprintln!("  States generated: {}", stats.states_generated());
+                eprintln!("  Transitions: {}", stats.transitions);
                 eprintln!("  Resolved by: {winner_str}");
                 // Storage backend stats (mmap/disk), to stderr like the verdict.
                 crate::check_report::print_storage_stats(&stats.storage_stats, true);
@@ -2783,7 +2802,7 @@ pub(super) fn run_fused_mode(
             }
             std::process::exit(1);
         }
-        tla_check::CheckResult::Deadlock { trace, .. } => {
+        tla_check::CheckResult::Deadlock { trace, stats } => {
             // A reachable deadlock state (a state with no Next successor) is a
             // property failure, exactly like the explicit-BFS/BMC deadlock paths
             // (and the InvariantViolation arm above). Render it cleanly and exit
@@ -2802,6 +2821,15 @@ pub(super) fn run_fused_mode(
                 if let Some(ref info) = degradation_info {
                     eprintln!("  {info}");
                 }
+                // Standard count summary — see the InvariantViolation arm.
+                eprintln!("  States found: {}", stats.states_found);
+                eprintln!("  Initial states: {}", stats.initial_states);
+                eprintln!(
+                    "  Initial states generated: {}",
+                    stats.raw_initial_states_generated
+                );
+                eprintln!("  States generated: {}", stats.states_generated());
+                eprintln!("  Transitions: {}", stats.transitions);
                 eprintln!("  Resolved by: {winner_str}");
                 eprintln!();
                 eprintln!("Time: {:.3}s", elapsed.as_secs_f64());
@@ -2853,6 +2881,11 @@ pub(super) fn run_fused_mode(
                 println!("Statistics:");
                 println!("  States found: {}", stats.states_found);
                 println!("  Initial states: {}", stats.initial_states);
+                println!(
+                    "  Initial states generated: {}",
+                    stats.raw_initial_states_generated
+                );
+                println!("  States generated: {}", stats.states_generated());
                 println!("  Transitions: {}", stats.transitions);
                 println!("  Max depth: {}", stats.max_depth);
                 println!("  Resolved by: {winner_str}");

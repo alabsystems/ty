@@ -11,6 +11,7 @@
 #[allow(clippy::module_inception)]
 mod tests {
     use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
 
     use crate::lower::{
         apply_loop_next_shape_transfer, binding_shape_from_domain,
@@ -18,27 +19,26 @@ mod tests {
         compound_read_callout_extern_names, const_shape_and_scalar,
         derive_tagged_scalar_union_int_arm, exact_int_set_mask_via_compact_universe_match,
         finite_set_diff_shape, finite_set_intersect_shape, finite_set_union_shape,
-        infer_callee_return_shape_for_args,
-        integer_values_disjoint_from_set_bitmask_universe, lower_entry_invariant_with_chunk,
-        lower_entry_next_state_with_chunk, lower_invariant, lower_module_invariant,
-        lower_module_next_state, lower_next_state, lower_next_state_loop_scaffold,
-        merge_compatible_shapes, nonempty_powerset_shape_from_const_set_elements,
-        record_bit_key_index, record_set_bitmask_slot_count_ir,
-        record_set_bitmask_slot_valid_mask_ir, resolve_call_external_chunk_target,
-        sequence_append_shape, sequence_subseq_shape, sequence_tail_shape,
-        tagged_scalar_union_shape_from_carrier, uniform_shape, uniform_tuple_element_shape,
-        unsanctioned_tla_extern_names, ActionLocalSetDomainProof, ActionLocalSetRegisterProof,
-        AggregateShape, CompactFunctionDomain, CompactStateSlot, Ctx, FuncDefShapeFrame,
-        LoweringMode, LoweringOptions, RecordBitKey, ScalarShape, SequenceExtent,
-        SetBitmaskUniverse, ShapeSummary, SymbolicDomain, TaggedUnionIntArm,
-        sanctioned_handle_extern_site, sanctioned_handle_mode_extern_names,
-        SanctionedHandleExternSite, SANCTIONED_COMPOUND_READ_CALLOUT_EXTERNS,
+        infer_callee_return_shape_for_args, integer_values_disjoint_from_set_bitmask_universe,
+        lower_entry_invariant_with_chunk, lower_entry_next_state_with_chunk, lower_invariant,
+        lower_module_invariant, lower_module_next_state, lower_next_state,
+        lower_next_state_loop_scaffold, lower_next_state_loop_with_chunk, merge_compatible_shapes,
+        nonempty_powerset_shape_from_const_set_elements, record_bit_key_index,
+        record_set_bitmask_slot_count_ir, record_set_bitmask_slot_valid_mask_ir,
+        resolve_call_external_chunk_target, sanctioned_handle_extern_site,
+        sanctioned_handle_mode_extern_names, sequence_append_shape, sequence_subseq_shape,
+        sequence_tail_shape, tagged_scalar_union_shape_from_carrier, uniform_shape,
+        uniform_tuple_element_shape, unsanctioned_tla_extern_names, ActionLocalSetDomainProof,
+        ActionLocalSetRegisterProof, AggregateShape, CompactFunctionDomain, CompactStateSlot, Ctx,
+        FuncDefShapeFrame, LoweringMode, LoweringOptions, RecordBitKey, SanctionedHandleExternSite,
+        ScalarShape, SequenceExtent, SetBitmaskUniverse, ShapeSummary, SymbolicDomain,
+        TaggedUnionIntArm, SANCTIONED_COMPOUND_READ_CALLOUT_EXTERNS,
         SANCTIONED_HANDLE_EXTERN_SITES, SANCTIONED_HANDLE_MODE_TLA_EXTERNS, STATUS_OFFSET,
     };
     use crate::TrustIrError;
     use tla_jit_abi::{
-        CompoundLayout, JitRuntimeErrorKind, JitStatus, ScalarSlotKind, SetBitmaskElement, StateLayout,
-        VarLayout,
+        CompoundLayout, JitRuntimeErrorKind, JitStatus, ScalarSlotKind, SetBitmaskElement,
+        StateLayout, VarLayout,
     };
     use tla_tir::bytecode::{BytecodeChunk, BytecodeFunction, ConstantPool, Opcode};
     use tla_value::{Rp, Value};
@@ -3048,9 +3048,7 @@ mod tests {
                 .with_constants(&ConstantPool::new())
                 .with_layout(&layout),
         )
-        .expect(
-            "runtime interned union-range replacement must encode via the member compare-fold",
-        );
+        .expect("runtime interned union-range replacement must encode via the member compare-fold");
         let mut saw_bool_or = false;
         for block in &module.functions[0].blocks {
             for node in &block.body {
@@ -4166,7 +4164,6 @@ mod tests {
 
     #[test]
     fn test_const_func_dense_ordered_int_domain_tracks_domain_lo() {
-        use std::sync::Arc;
         use tla_value::FuncValue;
 
         let dense = Value::Func(Rp::new(FuncValue::from_sorted_entries(vec![
@@ -4202,8 +4199,6 @@ mod tests {
 
     #[test]
     fn test_const_model_value_set_tracks_exact_scalar_set() {
-        use std::sync::Arc;
-
         let shape = const_shape_and_scalar(&Value::set([
             Value::ModelValue(Rp::from("r1")),
             Value::ModelValue(Rp::from("r2")),
@@ -4227,8 +4222,6 @@ mod tests {
 
     #[test]
     fn test_const_mixed_scalar_set_does_not_track_exact_scalar_set() {
-        use std::sync::Arc;
-
         let shape = const_shape_and_scalar(&Value::set([
             Value::String(Rp::from("r1")),
             Value::ModelValue(Rp::from("r2")),
@@ -4571,7 +4564,6 @@ mod tests {
 
     #[test]
     fn test_store_var_compact_function_rejects_unknown_to_dense_domain_copy() {
-        use std::sync::Arc;
         use tla_value::FuncValue;
 
         let mut pool = ConstantPool::new();
@@ -5336,7 +5328,10 @@ mod tests {
         // Position 1 is an Int and position 2 a model value, so each read is
         // stored back into the var of its OWN lane.
         let dest_var = if position == 1 { 1 } else { 2 };
-        func.emit(Opcode::StoreVar { var_idx: dest_var, rs: 2 });
+        func.emit(Opcode::StoreVar {
+            var_idx: dest_var,
+            rs: 2,
+        });
         func.emit(Opcode::LoadBool { rd: 3, value: true });
         func.emit(Opcode::Ret { rs: 3 });
         lower_next_state(
@@ -5358,10 +5353,7 @@ mod tests {
         assert!(
             inst_count(&module, 0, |inst| matches!(
                 inst,
-                Inst::ICmp {
-                    op: ICmpOp::Eq,
-                    ..
-                }
+                Inst::ICmp { op: ICmpOp::Eq, .. }
             )) >= 2,
             "both admissible tags must be compared"
         );
@@ -5384,10 +5376,7 @@ mod tests {
         assert_eq!(
             inst_count(&module, 0, |inst| matches!(
                 inst,
-                Inst::ICmp {
-                    op: ICmpOp::Eq,
-                    ..
-                }
+                Inst::ICmp { op: ICmpOp::Eq, .. }
             )),
             1,
             "exactly one arm carries position 2, so exactly one tag is admitted"
@@ -5666,8 +5655,6 @@ mod tests {
 
     #[test]
     fn test_derived_boolean_equality_constant_folds_mixed_lanes() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let string_idx = pool.add_value(Value::String(Rp::from("flag")));
 
@@ -5798,8 +5785,6 @@ mod tests {
 
     #[test]
     fn test_scalar_equality_allows_same_known_lanes() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let left_string = pool.add_value(Value::String(Rp::from("left")));
         let right_string = pool.add_value(Value::String(Rp::from("right")));
@@ -7710,14 +7695,12 @@ mod tests {
 
     #[test]
     fn test_store_var_loadconst_dense_function_shorter_than_sequence_capacity_zeroes_tail() {
-        use std::sync::Arc;
         use tla_value::FuncValue;
 
         let mut pool = ConstantPool::new();
-        let line_lens =
-            pool.add_value(Value::Func(Rp::new(FuncValue::from_sorted_entries(vec![
-                (Value::SmallInt(1), Value::SmallInt(9)),
-            ]))));
+        let line_lens = pool.add_value(Value::Func(Rp::new(FuncValue::from_sorted_entries(vec![
+            (Value::SmallInt(1), Value::SmallInt(9)),
+        ]))));
 
         let mut func = BytecodeFunction::new(
             "LoadContent__typed_dense_function_sequence_capacity_store".to_string(),
@@ -7761,14 +7744,12 @@ mod tests {
 
     #[test]
     fn test_store_var_dense_function_source_completes_value_shape_from_sequence_layout() {
-        use std::sync::Arc;
         use tla_value::FuncValue;
 
         let mut pool = ConstantPool::new();
-        let line_lens =
-            pool.add_value(Value::Func(Rp::new(FuncValue::from_sorted_entries(vec![
-                (Value::SmallInt(1), Value::SmallInt(9)),
-            ]))));
+        let line_lens = pool.add_value(Value::Func(Rp::new(FuncValue::from_sorted_entries(vec![
+            (Value::SmallInt(1), Value::SmallInt(9)),
+        ]))));
 
         let mut func = BytecodeFunction::new(
             "LoadContent__typed_dense_function_sequence_source_completion".to_string(),
@@ -8494,10 +8475,8 @@ mod tests {
         let int_idx = pool.add_value(Value::ModelValue(Rp::from("Int")));
         let null_idx = pool.add_value(Value::ModelValue(Rp::from("NULL")));
 
-        let mut func = BytecodeFunction::new(
-            "set_in_lazy_union_symbolic_int_model_value".to_string(),
-            0,
-        );
+        let mut func =
+            BytecodeFunction::new("set_in_lazy_union_symbolic_int_model_value".to_string(), 0);
         func.emit(Opcode::LoadConst {
             rd: 0,
             idx: int_idx,
@@ -8693,8 +8672,6 @@ mod tests {
     /// through `tracked_shape_from_compound_layout`.
     #[test]
     fn test_func_apply_subset_range_read_threads_universe_for_subseteq() {
-        use std::sync::Arc;
-
         let s_idx = {
             let mut pool = ConstantPool::new();
             // S = {r1}, a static subset of the proven range universe {r1, r2}.
@@ -8746,8 +8723,6 @@ mod tests {
     /// fabricates one.
     #[test]
     fn test_func_apply_universeless_set_range_read_rejects_subseteq() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let s_const = pool.add_value(Value::set([Value::ModelValue(Rp::from("r1"))]));
 
@@ -10104,8 +10079,6 @@ mod tests {
 
     #[test]
     fn test_func_apply_model_value_keyed_raw_compact_state_function_compares_to_string_const() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let _procs = pool.add_value(Value::set([
             Value::ModelValue(Rp::from("p1")),
@@ -10153,8 +10126,6 @@ mod tests {
 
     #[test]
     fn test_func_apply_model_value_keyed_raw_compact_state_function_uses_explicit_layout_domain() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let p2 = pool.add_value(Value::ModelValue(Rp::from("p2")));
         let li0 = pool.add_value(Value::String("Li0".into()));
@@ -10208,8 +10179,6 @@ mod tests {
 
     #[test]
     fn test_func_apply_mixed_dynamic_explicit_domain_uses_compact_state_slots() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let rm2 = pool.add_value(Value::ModelValue(Rp::from("rm2")));
         let rs = pool.add_value(Value::String("RS".into()));
@@ -10427,8 +10396,6 @@ mod tests {
 
     #[test]
     fn test_func_apply_nested_explicit_domain_value_keeps_compact_domain_metadata() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let p2 = pool.add_value(Value::ModelValue(Rp::from("p2")));
 
@@ -10490,8 +10457,6 @@ mod tests {
 
     #[test]
     fn test_called_func_apply_nested_explicit_domain_return_keeps_metadata() {
-        use std::sync::Arc;
-
         let mut chunk = BytecodeChunk::new();
         let mut pool = ConstantPool::new();
         let p2 = pool.add_value(Value::ModelValue(Rp::from("p2")));
@@ -10569,8 +10534,6 @@ mod tests {
 
     #[test]
     fn test_func_apply_raw_compact_function_rejects_missing_domain_metadata() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let p2 = pool.add_value(Value::ModelValue(Rp::from("p2")));
 
@@ -10616,8 +10579,6 @@ mod tests {
 
     #[test]
     fn test_func_apply_mixed_scalar_keyed_raw_compact_state_function_recovers_const_pool_domain() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let _proc_set = pool.add_value(Value::set([
             Value::ModelValue(Rp::from("rm1")),
@@ -10717,8 +10678,6 @@ mod tests {
 
     #[test]
     fn test_exists_over_scalar_compact_func_apply_fails_closed_without_set_domain_proof() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let p1 = pool.add_value(Value::ModelValue(Rp::from("p1")));
 
@@ -10773,8 +10732,6 @@ mod tests {
 
     #[test]
     fn test_exists_over_tagged_scalar_or_set_func_apply_decodes_set_branch() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let p1 = pool.add_value(Value::ModelValue(Rp::from("p1")));
         let p2 = pool.add_value(Value::ModelValue(Rp::from("p2")));
@@ -10852,8 +10809,6 @@ mod tests {
 
     #[test]
     fn test_exists_over_scalar_compact_func_apply_uses_typed_action_local_set_domain_proof() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let p1 = pool.add_value(Value::ModelValue(Rp::from("p1")));
         let p2 = pool.add_value(Value::ModelValue(Rp::from("p2")));
@@ -10945,8 +10900,6 @@ mod tests {
 
     #[test]
     fn test_choose_over_tagged_scalar_or_set_func_apply_fails_closed() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let p1 = pool.add_value(Value::ModelValue(Rp::from("p1")));
 
@@ -11000,8 +10953,6 @@ mod tests {
 
     #[test]
     fn test_setin_over_scalar_compact_func_apply_fails_closed_without_set_domain_proof() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let p1 = pool.add_value(Value::ModelValue(Rp::from("p1")));
         let p2 = pool.add_value(Value::ModelValue(Rp::from("p2")));
@@ -11046,8 +10997,6 @@ mod tests {
 
     #[test]
     fn test_setdiff_over_scalar_compact_func_apply_fails_closed_without_tagged_set_proof() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let p1 = pool.add_value(Value::ModelValue(Rp::from("p1")));
 
@@ -11094,8 +11043,6 @@ mod tests {
 
     #[test]
     fn test_setin_over_scalar_compact_func_apply_uses_action_local_set_domain_proof() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let p1 = pool.add_value(Value::ModelValue(Rp::from("p1")));
         let p2 = pool.add_value(Value::ModelValue(Rp::from("p2")));
@@ -11160,8 +11107,6 @@ mod tests {
 
     #[test]
     fn test_setin_over_tagged_scalar_or_set_func_apply_decodes_set_branch() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let p1 = pool.add_value(Value::ModelValue(Rp::from("p1")));
         let p2 = pool.add_value(Value::ModelValue(Rp::from("p2")));
@@ -11225,8 +11170,6 @@ mod tests {
 
     #[test]
     fn test_setdiff_over_tagged_scalar_or_set_func_apply_decodes_set_branch() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let p1 = pool.add_value(Value::ModelValue(Rp::from("p1")));
 
@@ -11295,8 +11238,6 @@ mod tests {
 
     #[test]
     fn test_setdiff_over_tagged_scalar_or_set_func_apply_accepts_model_value_singleton_rhs() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let p1 = pool.add_value(Value::ModelValue(Rp::from("p1")));
         let p2 = pool.add_value(Value::ModelValue(Rp::from("p2")));
@@ -11364,8 +11305,6 @@ mod tests {
     #[test]
     fn test_func_apply_model_value_keyed_raw_compact_state_function_from_compact_arg_compares_to_string_const(
     ) {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let _procs = pool.add_value(Value::set([
             Value::ModelValue(Rp::from("p1")),
@@ -11418,8 +11357,6 @@ mod tests {
 
     #[test]
     fn test_func_apply_model_value_keyed_nested_function_result_keeps_explicit_domain() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let _procs = pool.add_value(Value::set([
             Value::ModelValue(Rp::from("p1")),
@@ -11484,8 +11421,6 @@ mod tests {
 
     #[test]
     fn test_func_except_model_value_keyed_raw_compact_state_function_updates_const_path() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let _procs = pool.add_value(Value::set([
             Value::ModelValue(Rp::from("p1")),
@@ -11542,8 +11477,6 @@ mod tests {
 
     #[test]
     fn test_func_except_model_value_keyed_raw_slot_recovers_layout_domain_after_metadata_drop() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let p2 = pool.add_value(Value::ModelValue(Rp::from("p2")));
         let li2 = pool.add_value(Value::String("Li2".into()));
@@ -11624,8 +11557,6 @@ mod tests {
 
     #[test]
     fn test_func_except_explicit_domain_raw_slot_recovers_value_shape_after_metadata_drop() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let p2 = pool.add_value(Value::ModelValue(Rp::from("p2")));
         let li2 = pool.add_value(Value::String("Li2".into()));
@@ -11786,8 +11717,6 @@ mod tests {
     #[test]
     fn test_func_apply_nested_model_value_function_raw_subslot_recovers_domain_after_metadata_drop()
     {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let p2 = pool.add_value(Value::ModelValue(Rp::from("p2")));
         let expected = pool.add_value(Value::String("OK".into()));
@@ -11872,8 +11801,6 @@ mod tests {
     #[test]
     fn test_func_apply_record_field_nested_model_value_function_raw_subslot_recovers_domain_after_metadata_drop(
     ) {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let p2 = pool.add_value(Value::ModelValue(Rp::from("p2")));
         let expected = pool.add_value(Value::String("OK".into()));
@@ -11957,8 +11884,6 @@ mod tests {
 
     #[test]
     fn test_func_apply_sequence_element_nested_model_value_function_raw_subslot_tracks_domain() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let p2 = pool.add_value(Value::ModelValue(Rp::from("p2")));
         let expected = pool.add_value(Value::String("OK".into()));
@@ -12039,8 +11964,6 @@ mod tests {
     #[test]
     fn test_func_except_nested_model_value_function_raw_subslot_recovers_domain_after_metadata_drop(
     ) {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let p2 = pool.add_value(Value::ModelValue(Rp::from("p2")));
         let replacement = pool.add_value(Value::String("patched".into()));
@@ -12138,8 +12061,6 @@ mod tests {
 
     #[test]
     fn test_func_except_model_value_keyed_scalar_slot_materializes_set_replacement() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let procs = pool.add_value(Value::set([
             Value::ModelValue(Rp::from("p1")),
@@ -12213,8 +12134,6 @@ mod tests {
 
     #[test]
     fn test_func_except_tagged_scalar_or_set_materializes_model_value_scalar_replacement() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let p2 = pool.add_value(Value::ModelValue(Rp::from("p2")));
 
@@ -12265,8 +12184,6 @@ mod tests {
 
     #[test]
     fn test_func_except_tagged_scalar_or_set_materializes_bounded_set_replacement() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let procs = pool.add_value(Value::set([
             Value::ModelValue(Rp::from("p1")),
@@ -12332,8 +12249,6 @@ mod tests {
 
     #[test]
     fn test_func_except_tagged_scalar_or_set_materializes_exact_scalar_set_replacement() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let p1 = pool.add_value(Value::ModelValue(Rp::from("p1")));
         let p2 = pool.add_value(Value::ModelValue(Rp::from("p2")));
@@ -12388,8 +12303,6 @@ mod tests {
 
     #[test]
     fn test_store_var_func_except_model_value_setbitmask_into_scalar_function_slot() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let _procs = pool.add_value(Value::set([
             Value::ModelValue(Rp::from("p1")),
@@ -12459,8 +12372,6 @@ mod tests {
 
     #[test]
     fn test_store_var_func_except_scalar_into_model_value_setbitmask_function_slot() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let _procs = pool.add_value(Value::set([
             Value::ModelValue(Rp::from("p1")),
@@ -12580,8 +12491,6 @@ mod tests {
 
     #[test]
     fn test_func_except_model_value_keyed_raw_compact_state_function_from_compact_path() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let _procs = pool.add_value(Value::set([
             Value::ModelValue(Rp::from("p1")),
@@ -12644,8 +12553,6 @@ mod tests {
 
     #[test]
     fn test_func_except_model_value_replacement_materializes_into_string_value_slot() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let p1 = pool.add_value(Value::ModelValue(Rp::from("p1")));
         let p2 = pool.add_value(Value::ModelValue(Rp::from("p2")));
@@ -12689,8 +12596,6 @@ mod tests {
 
     #[test]
     fn test_func_except_model_value_keyed_raw_compact_state_function_lowers_natively() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let _procs = pool.add_value(Value::set([
             Value::ModelValue(Rp::from("p1")),
@@ -12751,8 +12656,6 @@ mod tests {
     #[test]
     fn test_func_except_model_value_keyed_raw_compact_state_function_from_compact_path_lowers_natively(
     ) {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let _procs = pool.add_value(Value::set([
             Value::ModelValue(Rp::from("p1")),
@@ -12820,8 +12723,6 @@ mod tests {
 
     #[test]
     fn test_func_except_model_value_keyed_raw_compact_state_function_out_of_domain_is_identity() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let _procs = pool.add_value(Value::set([
             Value::ModelValue(Rp::from("p1")),
@@ -12892,8 +12793,6 @@ mod tests {
 
     #[test]
     fn test_func_except_model_value_keyed_single_entry_domain_lowers_natively() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let _procs = pool.add_value(Value::set([Value::ModelValue(Rp::from("p1"))]));
         let p1 = pool.add_value(Value::ModelValue(Rp::from("p1")));
@@ -12951,8 +12850,6 @@ mod tests {
 
     #[test]
     fn test_func_except_model_value_keyed_sequence_value_copies_compact_slots() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let _procs = pool.add_value(Value::set([
             Value::ModelValue(Rp::from("p1")),
@@ -13021,8 +12918,6 @@ mod tests {
 
     #[test]
     fn test_func_except_model_value_keyed_sequence_value_from_dynamic_path_selects_slots() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let _procs = pool.add_value(Value::set([
             Value::ModelValue(Rp::from("p1")),
@@ -14436,8 +14331,6 @@ mod tests {
 
     #[test]
     fn test_lower_symbolic_int_union_with_exact_integer_set_preserves_lazy_domain() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let int_domain = pool.add_value(Value::ModelValue(Rp::from("Int")));
 
@@ -15027,8 +14920,6 @@ mod tests {
 
     #[test]
     fn test_const_shape_tracks_exact_model_value_set() {
-        use std::sync::Arc;
-
         let shape = const_shape_and_scalar(&Value::set([
             Value::ModelValue(Rp::from("p1")),
             Value::ModelValue(Rp::from("p3")),
@@ -15049,8 +14940,6 @@ mod tests {
 
     #[test]
     fn test_store_var_load_const_exact_model_value_set_to_setbitmask_writes_mask_not_pointer() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let proc_set = pool.add_value(Value::set([
             Value::ModelValue(Rp::from("p1")),
@@ -15089,8 +14978,6 @@ mod tests {
 
     #[test]
     fn test_store_var_set_enum_exact_model_value_set_to_setbitmask_writes_mask_not_pointer() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let p2 = pool.add_value(Value::ModelValue(Rp::from("p2")));
         let p4 = pool.add_value(Value::ModelValue(Rp::from("p4")));
@@ -15257,7 +15144,6 @@ mod tests {
     #[test]
     fn test_store_var_const_interval_to_setbitmask_layout_writes_mask_not_pointer() {
         use num_bigint::BigInt;
-        use std::sync::Arc;
         use tla_value::IntervalValue;
 
         let mut pool = ConstantPool::new();
@@ -15326,8 +15212,6 @@ mod tests {
 
     #[test]
     fn test_store_var_const_exact_model_value_set_to_setbitmask_layout_writes_mask_not_pointer() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let set_idx = pool.add_value(Value::set([
             Value::ModelValue(Rp::from("r1")),
@@ -15461,7 +15345,6 @@ mod tests {
     #[test]
     fn test_store_var_empty_const_sets_to_non_integer_setbitmask_store_zero() {
         use num_bigint::BigInt;
-        use std::sync::Arc;
         use tla_value::IntervalValue;
 
         for (name, value) in [
@@ -15928,8 +15811,6 @@ mod tests {
 
     #[test]
     fn test_lower_tagged_scalar_or_set_eq_finite_model_value_set_decodes_set_branch() {
-        use std::sync::Arc;
-
         let p1 = tla_core::intern_name("p1");
         let p2 = tla_core::intern_name("p2");
         let universe = vec![
@@ -15998,8 +15879,6 @@ mod tests {
 
     #[test]
     fn test_lower_exact_scalar_set_equality_uses_synthesized_bitmask() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let left_set = pool.add_value(Value::set([
             Value::ModelValue(Rp::from("p1")),
@@ -16057,8 +15936,6 @@ mod tests {
 
     #[test]
     fn test_lower_exact_scalar_set_inequality_uses_synthesized_bitmask() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let left_set = pool.add_value(Value::set([
             Value::String(Rp::from("red")),
@@ -16898,7 +16775,6 @@ mod tests {
     /// (`Nat`) must natively fold to the constant boolean `false` (i64 `0`).
     #[test]
     fn test_lower_is_finite_set_symbolic_domain_folds_false() {
-        use std::sync::Arc;
         use tla_tir::bytecode::BuiltinOp;
         let mut pool = ConstantPool::new();
         let nat_idx = pool.add_value(Value::ModelValue(Rp::from("Nat")));
@@ -17964,7 +17840,6 @@ mod tests {
     #[test]
     fn test_lower_seq_head_propagates_mcl_message_record_shape() {
         use num_bigint::BigInt;
-        use std::sync::Arc;
         use tla_tir::bytecode::BuiltinOp;
         use tla_value::IntervalValue;
 
@@ -18100,7 +17975,6 @@ mod tests {
     fn test_called_parameterized_condmove_append_retains_seq_record_shape_for_func_set_membership()
     {
         use num_bigint::BigInt;
-        use std::sync::Arc;
         use tla_tir::bytecode::BuiltinOp;
         use tla_value::IntervalValue;
 
@@ -19087,21 +18961,11 @@ mod tests {
 
     #[test]
     fn test_called_model_value_set_return_uses_caller_owned_return_buffer() {
-        use std::sync::Arc;
-
         let mut chunk = BytecodeChunk::new();
-        let p1 = chunk
-            .constants
-            .add_value(Value::ModelValue(Rp::from("p1")));
-        let p2 = chunk
-            .constants
-            .add_value(Value::ModelValue(Rp::from("p2")));
-        let p3 = chunk
-            .constants
-            .add_value(Value::ModelValue(Rp::from("p3")));
-        let p4 = chunk
-            .constants
-            .add_value(Value::ModelValue(Rp::from("p4")));
+        let p1 = chunk.constants.add_value(Value::ModelValue(Rp::from("p1")));
+        let p2 = chunk.constants.add_value(Value::ModelValue(Rp::from("p2")));
+        let p3 = chunk.constants.add_value(Value::ModelValue(Rp::from("p3")));
+        let p4 = chunk.constants.add_value(Value::ModelValue(Rp::from("p4")));
 
         let mut domain = BytecodeFunction::new("ModelValueSetDomain".to_string(), 0);
         domain.emit(Opcode::LoadConst { rd: 0, idx: p1 });
@@ -19155,8 +19019,6 @@ mod tests {
 
     #[test]
     fn test_called_model_value_setdiff_return_compacts_for_setbitmask_store() {
-        use std::sync::Arc;
-
         let mut chunk = BytecodeChunk::new();
         let procs = chunk.constants.add_value(Value::set([
             Value::ModelValue(Rp::from("p1")),
@@ -19164,9 +19026,7 @@ mod tests {
             Value::ModelValue(Rp::from("p3")),
             Value::ModelValue(Rp::from("p4")),
         ]));
-        let p2 = chunk
-            .constants
-            .add_value(Value::ModelValue(Rp::from("p2")));
+        let p2 = chunk.constants.add_value(Value::ModelValue(Rp::from("p2")));
 
         let mut helper = BytecodeFunction::new("OtherProc".to_string(), 1);
         helper.emit(Opcode::LoadConst { rd: 1, idx: procs });
@@ -19225,8 +19085,6 @@ mod tests {
 
     #[test]
     fn test_called_compacted_setbitmask_return_materializes_for_generic_set_helper_arg() {
-        use std::sync::Arc;
-
         let mut chunk = BytecodeChunk::new();
         let procs = chunk.constants.add_value(Value::set([
             Value::ModelValue(Rp::from("p1")),
@@ -19234,9 +19092,7 @@ mod tests {
             Value::ModelValue(Rp::from("p3")),
             Value::ModelValue(Rp::from("p4")),
         ]));
-        let p2 = chunk
-            .constants
-            .add_value(Value::ModelValue(Rp::from("p2")));
+        let p2 = chunk.constants.add_value(Value::ModelValue(Rp::from("p2")));
 
         let mut other_proc = BytecodeFunction::new("OtherProc".to_string(), 1);
         other_proc.emit(Opcode::LoadConst { rd: 1, idx: procs });
@@ -20111,7 +19967,6 @@ mod tests {
     /// Test CallBuiltin(FoldFunctionOnSetSum): sums f[x] over a tracked set S.
     #[test]
     fn test_lower_fold_function_on_set_sum() {
-        use std::sync::Arc;
         use tla_tir::bytecode::BuiltinOp;
         use tla_value::FuncValue;
 
@@ -20176,7 +20031,6 @@ mod tests {
     /// FoldFunctionOnSetSum should reject non-tracked/lazy domains explicitly.
     #[test]
     fn test_lower_fold_function_on_set_sum_rejects_untracked_set() {
-        use std::sync::Arc;
         use tla_tir::bytecode::BuiltinOp;
         use tla_value::FuncValue;
 
@@ -20216,7 +20070,6 @@ mod tests {
 
     #[test]
     fn test_lower_fold_function_on_set_sum_accepts_shape_swapped_args() {
-        use std::sync::Arc;
         use tla_tir::bytecode::BuiltinOp;
         use tla_value::FuncValue;
 
@@ -20300,8 +20153,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "deferred: native lowering of FoldFunctionOnSetSum over a state function whose shape is only inferred (no StateLayout / generic callee formals) is not yet provably a materialized aggregate pointer; the interpreter fallback handles it correctly (sound). Tracked with the materialized-pointer-provenance work."]
-    fn test_lower_fold_function_on_set_sum_accepts_state_function_without_layout() {
+    fn test_lower_fold_function_on_set_sum_requires_layout_for_state_function_pointer() {
         use tla_tir::bytecode::BuiltinOp;
 
         let mut func = BytecodeFunction::new("fold_sum_swapped_state_func".to_string(), 0);
@@ -20323,12 +20175,18 @@ mod tests {
         });
         func.emit(Opcode::Ret { rs: 6 });
 
-        lower_invariant(
+        let err = lower_invariant(
             &func,
             "fold_sum_swapped_state_func_no_layout",
             LoweringOptions::new(),
         )
-        .expect("FoldFunctionOnSetSum should infer state-loaded function shape from finite set");
+        .expect_err(
+            "shape inference alone must not bless a state scalar as a materialized function pointer",
+        );
+        assert!(
+            format!("{err}").contains("not a materialized aggregate pointer"),
+            "the fail-closed error should identify missing pointer provenance: {err}"
+        );
 
         let pool = ConstantPool::new();
         let layout = StateLayout::new(vec![VarLayout::Compound(CompoundLayout::Function {
@@ -21034,12 +20892,8 @@ mod tests {
 
     #[test]
     fn test_helper_callee_consumes_compact_explicit_domain_function_arg_in_abi_layout() {
-        use std::sync::Arc;
-
         let mut chunk = BytecodeChunk::new();
-        let p2 = chunk
-            .constants
-            .add_value(Value::ModelValue(Rp::from("p2")));
+        let p2 = chunk.constants.add_value(Value::ModelValue(Rp::from("p2")));
 
         let mut apply_proc = BytecodeFunction::new("ApplyProc".to_string(), 1);
         apply_proc.emit(Opcode::LoadConst { rd: 1, idx: p2 });
@@ -21090,12 +20944,8 @@ mod tests {
 
     #[test]
     fn test_called_compact_explicit_domain_function_return_keeps_domain_for_funcexcept_store() {
-        use std::sync::Arc;
-
         let mut chunk = BytecodeChunk::new();
-        let p2 = chunk
-            .constants
-            .add_value(Value::ModelValue(Rp::from("p2")));
+        let p2 = chunk.constants.add_value(Value::ModelValue(Rp::from("p2")));
 
         let mut identity = BytecodeFunction::new("IdentityProcFunction".to_string(), 1);
         identity.emit(Opcode::Ret { rs: 0 });
@@ -22058,8 +21908,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "deferred: native lowering of FoldFunctionOnSetSum over a state function whose shape is only inferred (no StateLayout / generic callee formals) is not yet provably a materialized aggregate pointer; the interpreter fallback handles it correctly (sound). Tracked with the materialized-pointer-provenance work."]
-    fn test_lower_fold_function_on_set_sum_allows_generic_callee_formals() {
+    fn test_lower_fold_function_on_set_sum_generic_callee_formals_without_layout_fail_closed() {
         use tla_tir::bytecode::BuiltinOp;
 
         let mut chunk = BytecodeChunk::new();
@@ -22094,13 +21943,19 @@ mod tests {
         inv.emit(Opcode::Ret { rs: 6 });
         let entry_idx = chunk.add_function(inv);
 
-        lower_module_invariant(
+        let err = lower_module_invariant(
             &chunk,
             entry_idx,
             "fold_sum_generic_callee",
             LoweringOptions::new(),
         )
-        .expect("generic Sum(f, S) callees should lower FoldFunctionOnSetSum dynamically");
+        .expect_err(
+            "generic formal shape inference must not manufacture aggregate-pointer provenance",
+        );
+        assert!(
+            format!("{err}").contains("not a materialized aggregate pointer"),
+            "the fail-closed error should identify missing pointer provenance: {err}"
+        );
     }
 
     /// Test unsupported builtin returns error.
@@ -23405,7 +23260,6 @@ mod tests {
 
     #[test]
     fn test_function_lowerers_clear_compact_provenance_when_overwriting_rd() {
-        use std::sync::Arc;
         use tla_tir::bytecode::BuiltinOp;
         use tla_value::FuncValue;
 
@@ -23982,7 +23836,6 @@ mod tests {
 
     #[test]
     fn test_store_var_domain_const_function_to_setbitmask_writes_mask() {
-        use std::sync::Arc;
         use tla_value::FuncValue;
 
         let mut pool = ConstantPool::new();
@@ -24600,7 +24453,6 @@ mod tests {
 
     #[test]
     fn test_load_const_scalar_record_materializes_aggregate() {
-        use std::sync::Arc;
         use tla_value::RecordValue;
 
         let mut pool = ConstantPool::new();
@@ -24770,8 +24622,6 @@ mod tests {
     /// representation in serialized state buffers.
     #[test]
     fn test_load_const_string_lowers_to_name_id() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let idx = pool.add_value(Value::String(Rp::from("Hot")));
 
@@ -24810,8 +24660,6 @@ mod tests {
     /// Value::String — model values are interned strings at runtime.
     #[test]
     fn test_load_const_model_value_lowers_to_name_id() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let idx = pool.add_value(Value::ModelValue(Rp::from("alpha")));
 
@@ -24853,7 +24701,6 @@ mod tests {
     #[test]
     fn test_load_const_interval_materializes_aggregate() {
         use num_bigint::BigInt;
-        use std::sync::Arc;
         use tla_value::IntervalValue;
         let mut pool = ConstantPool::new();
         let iv = Value::Interval(Rp::new(IntervalValue::new(
@@ -24927,7 +24774,6 @@ mod tests {
     #[test]
     fn test_load_const_empty_interval_materializes_length_zero() {
         use num_bigint::BigInt;
-        use std::sync::Arc;
         use tla_value::IntervalValue;
         let mut pool = ConstantPool::new();
         // `5..3` is empty.
@@ -24971,7 +24817,6 @@ mod tests {
     #[test]
     fn test_load_const_interval_too_large_returns_error() {
         use num_bigint::BigInt;
-        use std::sync::Arc;
         use tla_value::IntervalValue;
         let mut pool = ConstantPool::new();
         // 0..128 has 129 elements, which exceeds `MAX_INTERVAL_MATERIALIZE` (64).
@@ -25003,7 +24848,6 @@ mod tests {
     #[test]
     fn test_load_const_record_set_large_interval_domains_lowers_membership() {
         use num_bigint::BigInt;
-        use std::sync::Arc;
         use tla_value::IntervalValue;
 
         let mut pool = ConstantPool::new();
@@ -25077,8 +24921,6 @@ mod tests {
 
     #[test]
     fn test_record_set_opcode_lowers_membership_without_materializing_product() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let black_field = pool.add_value(Value::String(Rp::from("black")));
         let _white_field = pool.add_value(Value::String(Rp::from("white")));
@@ -25147,8 +24989,6 @@ mod tests {
 
     #[test]
     fn test_record_set_opcode_exact_int_domain_lowers_membership() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let node_field = pool.add_value(Value::String(Rp::from("node")));
 
@@ -25204,8 +25044,6 @@ mod tests {
 
     #[test]
     fn test_called_record_set_opcode_retains_shape_for_membership() {
-        use std::sync::Arc;
-
         let mut chunk = BytecodeChunk::new();
         let _dummy = chunk.constants.add_value(Value::String(Rp::from("dummy")));
         let black_field = chunk.constants.add_value(Value::String(Rp::from("black")));
@@ -25294,8 +25132,6 @@ mod tests {
 
     #[test]
     fn test_helper_callee_consumes_compact_record_set_arg_in_abi_layout() {
-        use std::sync::Arc;
-
         let mut chunk = BytecodeChunk::new();
         let _dummy = chunk.constants.add_value(Value::String(Rp::from("dummy")));
         let black_field = chunk.constants.add_value(Value::String(Rp::from("black")));
@@ -25363,8 +25199,6 @@ mod tests {
 
     #[test]
     fn test_called_record_new_opcode_retains_shape_for_record_set_membership() {
-        use std::sync::Arc;
-
         let mut chunk = BytecodeChunk::new();
         let _dummy = chunk.constants.add_value(Value::String(Rp::from("dummy")));
         let black_field = chunk.constants.add_value(Value::String(Rp::from("black")));
@@ -25447,7 +25281,6 @@ mod tests {
     #[test]
     fn test_load_const_record_set_state_loaded_record_lowers_membership() {
         use num_bigint::BigInt;
-        use std::sync::Arc;
         use tla_value::IntervalValue;
 
         let mut pool = ConstantPool::new();
@@ -25532,8 +25365,6 @@ mod tests {
 
     #[test]
     fn test_load_const_record_set_finite_domain_lowers_membership() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let kind_field = pool.add_value(Value::String(Rp::from("kind")));
         let value_a = pool.add_value(Value::String(Rp::from("a")));
@@ -25589,8 +25420,6 @@ mod tests {
 
     #[test]
     fn test_load_const_record_set_symbolic_numeric_domains_lowers_membership() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let int_field = pool.add_value(Value::String(Rp::from("i")));
         let _nat_field = pool.add_value(Value::String(Rp::from("n")));
@@ -25663,7 +25492,6 @@ mod tests {
     #[test]
     fn test_ewd998_token_typeok_symbolic_int_domain_uses_fixed_layout() {
         use num_bigint::BigInt;
-        use std::sync::Arc;
         use tla_value::IntervalValue;
 
         let mut pool = ConstantPool::new();
@@ -25720,8 +25548,6 @@ mod tests {
 
     #[test]
     fn test_called_record_set_symbolic_numeric_domains_zero_return_payloads() {
-        use std::sync::Arc;
-
         let mut chunk = BytecodeChunk::new();
         let int_field = chunk.constants.add_value(Value::String(Rp::from("i")));
         let _nat_field = chunk.constants.add_value(Value::String(Rp::from("n")));
@@ -26627,9 +26453,11 @@ mod tests {
         let left = wp20_union_shape("TypeOK");
         let mut other_universe = wp20_union_universe();
         other_universe.push(SetBitmaskElement::Int(4));
-        let right =
-            tagged_scalar_union_shape_from_carrier(&other_universe, tla_core::intern_name("TypeOK"))
-                .expect("nonempty universe");
+        let right = tagged_scalar_union_shape_from_carrier(
+            &other_universe,
+            tla_core::intern_name("TypeOK"),
+        )
+        .expect("nonempty universe");
         assert_eq!(merge_compatible_shapes(Some(&left), Some(&right)), None);
     }
 
@@ -28653,8 +28481,6 @@ mod tests {
 
     #[test]
     fn test_lower_powerset_membership_accepts_compact_setbitmask_for_const_exact_model_set_base() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let base_idx = pool.add_value(Value::set([
             Value::ModelValue(Rp::from("r1")),
@@ -29029,8 +28855,6 @@ mod tests {
 
     #[test]
     fn test_duplicate_model_value_powerset_submask_universe_dedupes_base() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let p1 = pool.add_value(Value::ModelValue(Rp::from("p1")));
         let p2 = pool.add_value(Value::ModelValue(Rp::from("p2")));
@@ -29085,8 +28909,6 @@ mod tests {
 
     #[test]
     fn test_choose_subset_result_shape_reaches_helper_arg_prepass() {
-        use std::sync::Arc;
-
         let mut chunk = BytecodeChunk::new();
         let mut pool = ConstantPool::new();
         let p2 = pool.add_value(Value::ModelValue(Rp::from("p2")));
@@ -29152,8 +28974,6 @@ mod tests {
 
     #[test]
     fn test_exists_over_lazy_powerset_of_model_value_set_uses_submask_iteration() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let p1 = pool.add_value(Value::ModelValue(Rp::from("p1")));
         let p2 = pool.add_value(Value::ModelValue(Rp::from("p2")));
@@ -29212,8 +29032,6 @@ mod tests {
 
     #[test]
     fn test_exists_over_const_model_value_powerset_binding_reenters_lazy_subset_membership() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let resources = pool.add_value(Value::set([
             Value::ModelValue(Rp::from("p1")),
@@ -29270,8 +29088,6 @@ mod tests {
 
     #[test]
     fn test_forall_over_const_model_value_powerset_uses_submask_iteration() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let resources = pool.add_value(Value::set([
             Value::ModelValue(Rp::from("p1")),
@@ -29328,8 +29144,6 @@ mod tests {
 
     #[test]
     fn test_choose_over_const_model_value_powerset_preserves_result_setbitmask_shape() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let p2 = pool.add_value(Value::ModelValue(Rp::from("p2")));
         let resources = pool.add_value(Value::set([
@@ -29389,8 +29203,6 @@ mod tests {
 
     #[test]
     fn test_set_filter_over_const_model_value_powerset_uses_submask_iteration() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let p2 = pool.add_value(Value::ModelValue(Rp::from("p2")));
         let resources = pool.add_value(Value::set([
@@ -29473,8 +29285,6 @@ mod tests {
 
     #[test]
     fn test_set_builder_over_const_model_value_powerset_preserves_setbitmask_elements() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let p2 = pool.add_value(Value::ModelValue(Rp::from("p2")));
         let resources = pool.add_value(Value::set([
@@ -29611,8 +29421,6 @@ mod tests {
 
     #[test]
     fn test_lower_func_set_powerset_range_preserves_exact_setunion_universe() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let p1 = pool.add_value(Value::ModelValue(Rp::from("p1")));
         let p2 = pool.add_value(Value::ModelValue(Rp::from("p2")));
@@ -29894,7 +29702,6 @@ mod tests {
     #[test]
     fn test_lower_func_set_membership_with_seq_record_range() {
         use num_bigint::BigInt;
-        use std::sync::Arc;
         use tla_tir::bytecode::BuiltinOp;
         use tla_value::IntervalValue;
 
@@ -29981,7 +29788,6 @@ mod tests {
 
     #[test]
     fn test_lower_seq_membership_with_finite_record_message_set_emits_loop_equality_evidence() {
-        use std::sync::Arc;
         use tla_tir::bytecode::BuiltinOp;
 
         let mut pool = ConstantPool::new();
@@ -30563,7 +30369,6 @@ mod tests {
     #[test]
     fn test_lower_func_set_membership_accepts_nested_sequence_state_for_seq_record_range() {
         use num_bigint::BigInt;
-        use std::sync::Arc;
         use tla_tir::bytecode::BuiltinOp;
         use tla_value::IntervalValue;
 
@@ -31859,7 +31664,6 @@ mod tests {
     #[test]
     fn test_set_diff_interval_const_lhs_has_no_nonconst_alloca_count() {
         use num_bigint::BigInt;
-        use std::sync::Arc;
         use tla_value::IntervalValue;
 
         let mut pool = ConstantPool::new();
@@ -31901,7 +31705,6 @@ mod tests {
     #[test]
     fn test_exists_over_interval_diff_plain_scalar_singleton_stays_materialized() {
         use num_bigint::BigInt;
-        use std::sync::Arc;
         use tla_value::IntervalValue;
 
         let mut pool = ConstantPool::new();
@@ -31970,7 +31773,6 @@ mod tests {
     #[test]
     fn test_exists_over_interval_diff_proc_binding_singleton_uses_compact_bitmask() {
         use num_bigint::BigInt;
-        use std::sync::Arc;
         use tla_value::IntervalValue;
 
         let mut pool = ConstantPool::new();
@@ -32607,8 +32409,8 @@ mod tests {
 
         let externs = host_extern_names(&module);
         for irreducible in [
-            "tla_handle_from_state_slot",  // no Value-free read of an unknown universe
-            "tla_set_union",               // no bit index to OR into
+            "tla_handle_from_state_slot", // no Value-free read of an unknown universe
+            "tla_set_union",              // no bit index to OR into
             "tla_handle_store_to_scratch", // no flat encoding to commit
         ] {
             assert!(
@@ -32833,7 +32635,9 @@ mod tests {
         for (site, symbols) in SANCTIONED_HANDLE_EXTERN_SITES {
             for symbol in *symbols {
                 ctx.check_sanctioned_handle_extern_site(*site, symbol)
-                    .unwrap_or_else(|e| panic!("{symbol} at its own site {site:?} must pass: {e:?}"));
+                    .unwrap_or_else(|e| {
+                        panic!("{symbol} at its own site {site:?} must pass: {e:?}")
+                    });
             }
         }
     }
@@ -33011,8 +32815,6 @@ mod tests {
     /// to a scalar — must lower as flat-slot loads, no boxed kernels.
     #[test]
     fn no_boxing_compact_function_read_is_value_free() {
-        use std::sync::Arc;
-
         let mut pool = ConstantPool::new();
         let p2 = pool.add_value(Value::ModelValue(Rp::from("p2")));
         let li0 = pool.add_value(Value::String("Li0".into()));
@@ -34224,8 +34026,9 @@ mod tests {
         ])
     }
 
-    /// `\E m \in msgs : x' = 1` — a single-`StoreVar` body over a proven-closed
-    /// RecordSetBitmask state var, the canonical NextStateLoop shape.
+    /// `\E m \in msgs : x' = 1` — a single-`StoreVar` body with the compiler's
+    /// explicit trailing TRUE result over a proven-closed RecordSetBitmask
+    /// state var, the canonical NextStateLoop shape.
     fn record_set_native_func() -> BytecodeFunction {
         let mut f = BytecodeFunction::new("nsl_action".to_string(), 0);
         f.emit(Opcode::LoadVar { rd: 2, var_idx: 1 }); // pc0: r2 = msgs
@@ -34233,17 +34036,18 @@ mod tests {
             rd: 3,
             r_binding: 4,
             r_domain: 2,
-            loop_end: 4,
+            loop_end: 5,
         }); // pc1
         f.emit(Opcode::LoadImm { rd: 5, value: 1 }); // pc2: body
         f.emit(Opcode::StoreVar { var_idx: 0, rs: 5 }); // pc3: x' = 1
+        f.emit(Opcode::LoadBool { rd: 3, value: true }); // pc4: body result
         f.emit(Opcode::ExistsNext {
             rd: 3,
             r_binding: 4,
             r_body: 3,
-            loop_begin: -2,
-        }); // pc4
-        f.emit(Opcode::Ret { rs: 3 }); // pc5
+            loop_begin: -3,
+        }); // pc5
+        f.emit(Opcode::Ret { rs: 3 }); // pc6
         f
     }
 
@@ -34258,6 +34062,269 @@ mod tests {
                 block.id
             );
         }
+    }
+
+    /// `\E k \in 1..hi : x' = x + k` with state-backed `hi`: the canonical
+    /// direct runtime-range NextStateLoop shape.
+    fn runtime_range_native_func() -> BytecodeFunction {
+        let mut f = BytecodeFunction::new("nsl_runtime_range".to_string(), 0);
+        f.emit(Opcode::LoadImm { rd: 0, value: 1 }); // pc0: lo
+        f.emit(Opcode::LoadVar { rd: 1, var_idx: 0 }); // pc1: runtime hi
+        f.emit(Opcode::Range {
+            rd: 2,
+            lo: 0,
+            hi: 1,
+        }); // pc2
+        f.emit(Opcode::ExistsBegin {
+            rd: 3,
+            r_binding: 4,
+            r_domain: 2,
+            loop_end: 6,
+        }); // pc3
+        f.emit(Opcode::LoadVar { rd: 5, var_idx: 1 }); // pc4
+        f.emit(Opcode::AddInt {
+            rd: 6,
+            r1: 5,
+            r2: 4,
+        }); // pc5
+        f.emit(Opcode::StoreVar { var_idx: 1, rs: 6 }); // pc6
+        f.emit(Opcode::LoadBool { rd: 3, value: true }); // pc7
+        f.emit(Opcode::ExistsNext {
+            rd: 3,
+            r_binding: 4,
+            r_body: 3,
+            loop_begin: -4,
+        }); // pc8 -> pc4
+        f.emit(Opcode::Ret { rs: 3 }); // pc9
+        f
+    }
+
+    #[test]
+    fn nsl_runtime_range_lowers_without_record_set_gate() {
+        let _guard = RecordSetNativeEnvGuard::disabled();
+        let func = runtime_range_native_func();
+        let layout = StateLayout::new(vec![VarLayout::ScalarInt, VarLayout::ScalarInt]);
+        let pool = ConstantPool::new();
+
+        let module = lower_next_state_loop_scaffold(&func, "nsl_range", Some(&pool), Some(&layout))
+            .expect("a direct runtime integer range must lower without the record-set gate");
+        assert_all_blocks_terminated(&module, 0);
+
+        let cond_brs = count_insts(&module, |inst| matches!(inst, Inst::CondBr { .. }));
+        assert!(
+            cond_brs >= 5,
+            "expected range, reservation, copy, body-guard, and advance branches; got {cond_brs}"
+        );
+    }
+
+    #[test]
+    fn nsl_runtime_range_nonterminal_successor_fails_closed() {
+        let _guard = RecordSetNativeEnvGuard::disabled();
+        let mut func = runtime_range_native_func();
+        let ret = func.instructions.pop().expect("Ret");
+        func.emit(Opcode::LoadImm { rd: 7, value: 0 });
+        func.emit(Opcode::StoreVar { var_idx: 1, rs: 7 });
+        func.emit(ret);
+        let layout = StateLayout::new(vec![VarLayout::ScalarInt, VarLayout::ScalarInt]);
+        let pool = ConstantPool::new();
+
+        let result = lower_next_state_loop_scaffold(&func, "nsl_range", Some(&pool), Some(&layout));
+        assert!(
+            matches!(&result, Err(TrustIrError::UnsupportedOpcode(message)) if message.contains("terminal")),
+            "a successor-producing postfix must fail closed, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn nsl_runtime_range_postfix_must_return_exists_result() {
+        let _guard = RecordSetNativeEnvGuard::disabled();
+        let mut func = runtime_range_native_func();
+        // A valid prefix value that stays TRUE even when the existential is
+        // false. Ignoring this Ret operand would emit successors for an action
+        // whose bytecode result is unrelated to the EXISTS result.
+        func.instructions
+            .insert(0, Opcode::LoadBool { rd: 7, value: true });
+        *func.instructions.last_mut().expect("Ret") = Opcode::Ret { rs: 7 };
+
+        let layout = StateLayout::new(vec![VarLayout::ScalarInt, VarLayout::ScalarInt]);
+        let pool = ConstantPool::new();
+        let result = lower_next_state_loop_scaffold(&func, "nsl_range", Some(&pool), Some(&layout));
+        assert!(
+            matches!(&result, Err(TrustIrError::UnsupportedOpcode(message)) if message.contains("returned exactly")),
+            "a postfix Ret unrelated to the EXISTS result must fail closed, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn nsl_runtime_range_prefix_false_tail_must_return_guard() {
+        let _guard = RecordSetNativeEnvGuard::disabled();
+        let mut func = runtime_range_native_func();
+        func.instructions
+            .insert(0, Opcode::LoadBool { rd: 7, value: true });
+        func.instructions.insert(
+            1,
+            Opcode::LoadBool {
+                rd: 8,
+                value: false,
+            },
+        );
+        func.instructions
+            .insert(2, Opcode::JumpFalse { rs: 8, offset: 11 }); // pc2 -> final Ret at pc13
+        func.instructions.insert(12, Opcode::Move { rd: 7, rs: 3 });
+
+        // Normal fall-through returns the EXISTS through r7, but the false
+        // prefix edge skips that move and returns stale TRUE. The native route
+        // maps every accepted prefix failure to "no successors", so it may do
+        // so only when the bytecode false tail provably returns that guard.
+        let layout = StateLayout::new(vec![VarLayout::ScalarInt, VarLayout::ScalarInt]);
+        let pool = ConstantPool::new();
+        let result = lower_next_state_loop_scaffold(&func, "nsl_range", Some(&pool), Some(&layout));
+        assert!(
+            matches!(&result, Err(TrustIrError::UnsupportedOpcode(message)) if message.contains("false tail")),
+            "a prefix rejection tail returning stale TRUE must fail closed, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn nsl_runtime_range_body_must_write_success_result() {
+        let _guard = RecordSetNativeEnvGuard::disabled();
+        let mut func = runtime_range_native_func();
+        func.instructions.remove(7); // remove trailing LoadBool TRUE into r_body
+        let Opcode::ExistsBegin { loop_end, .. } = &mut func.instructions[3] else {
+            panic!("ExistsBegin");
+        };
+        *loop_end = 5;
+        let Opcode::ExistsNext { loop_begin, .. } = &mut func.instructions[7] else {
+            panic!("ExistsNext");
+        };
+        *loop_begin = -3;
+
+        let layout = StateLayout::new(vec![VarLayout::ScalarInt, VarLayout::ScalarInt]);
+        let pool = ConstantPool::new();
+        let result = lower_next_state_loop_scaffold(&func, "nsl_range", Some(&pool), Some(&layout));
+        assert!(
+            matches!(&result, Err(TrustIrError::UnsupportedOpcode(message)) if message.contains("success value")),
+            "a body with no proven all-guards-pass result must fail closed, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn nsl_runtime_range_guard_false_must_reach_exists_result() {
+        let _guard = RecordSetNativeEnvGuard::disabled();
+        let mut func = runtime_range_native_func();
+        // First guard stages TRUE in r_body and passes. The second guard is
+        // FALSE in a different register and jumps directly to ExistsNext.
+        // The interpreter therefore observes stale TRUE in r_body and emits a
+        // successor; a native kernel that merely skipped the binding would
+        // under-approximate the action relation.
+        func.instructions
+            .insert(8, Opcode::JumpFalse { rs: 3, offset: 3 });
+        func.instructions.insert(
+            9,
+            Opcode::LoadBool {
+                rd: 7,
+                value: false,
+            },
+        );
+        func.instructions
+            .insert(10, Opcode::JumpFalse { rs: 7, offset: 1 });
+        let Opcode::ExistsBegin { loop_end, .. } = &mut func.instructions[3] else {
+            panic!("ExistsBegin");
+        };
+        *loop_end = 9;
+        let Opcode::ExistsNext { loop_begin, .. } = &mut func.instructions[11] else {
+            panic!("ExistsNext");
+        };
+        *loop_begin = -7;
+
+        let layout = StateLayout::new(vec![VarLayout::ScalarInt, VarLayout::ScalarInt]);
+        let pool = ConstantPool::new();
+        let result = lower_next_state_loop_scaffold(&func, "nsl_range", Some(&pool), Some(&layout));
+        assert!(
+            matches!(&result, Err(TrustIrError::UnsupportedOpcode(message)) if message.contains("propagates the failing guard")),
+            "a false guard not carried into r_body must fail closed, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn nsl_exists_begin_next_register_pair_must_match() {
+        // Enable the record route so a rejected runtime-range shape reports the
+        // pair-recovery error instead of stopping at the record feature gate.
+        let _guard = RecordSetNativeEnvGuard::enabled();
+        let mut func = runtime_range_native_func();
+        let Opcode::ExistsNext { r_binding, .. } = &mut func.instructions[8] else {
+            panic!("ExistsNext");
+        };
+        *r_binding = 9;
+
+        let layout = StateLayout::new(vec![VarLayout::ScalarInt, VarLayout::ScalarInt]);
+        let pool = ConstantPool::new();
+        let result = lower_next_state_loop_scaffold(&func, "nsl_pair", Some(&pool), Some(&layout));
+        assert!(
+            matches!(&result, Err(TrustIrError::UnsupportedOpcode(message)) if message.contains("well-formed inner EXISTS")),
+            "mismatched ExistsBegin/ExistsNext registers must fail closed, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn nsl_runtime_range_unchanged_tracks_transitive_callee_stores() {
+        let _guard = RecordSetNativeEnvGuard::disabled();
+        let mut chunk = BytecodeChunk::new();
+        let unchanged_var = chunk.constants.add_value(Value::SmallInt(0));
+
+        let mut helper = BytecodeFunction::new("writes_x".to_string(), 0);
+        helper.emit(Opcode::LoadImm { rd: 0, value: 1 });
+        helper.emit(Opcode::StoreVar { var_idx: 0, rs: 0 });
+        helper.emit(Opcode::LoadBool { rd: 1, value: true });
+        helper.emit(Opcode::Ret { rs: 1 });
+        let helper_idx = chunk.add_function(helper);
+
+        let mut func = BytecodeFunction::new("nsl_transitive_unchanged".to_string(), 0);
+        func.emit(Opcode::Call {
+            rd: 0,
+            op_idx: helper_idx,
+            args_start: 0,
+            argc: 0,
+        }); // pc0: transitively writes x
+        func.emit(Opcode::LoadImm { rd: 1, value: 1 }); // pc1: lo
+        func.emit(Opcode::LoadVar { rd: 2, var_idx: 0 }); // pc2: hi
+        func.emit(Opcode::Range {
+            rd: 3,
+            lo: 1,
+            hi: 2,
+        }); // pc3
+        func.emit(Opcode::ExistsBegin {
+            rd: 4,
+            r_binding: 5,
+            r_domain: 3,
+            loop_end: 4,
+        }); // pc4 -> pc8
+        func.emit(Opcode::StoreVar { var_idx: 1, rs: 5 }); // pc5
+        func.emit(Opcode::Unchanged {
+            rd: 4,
+            start: unchanged_var,
+            count: 1,
+        }); // pc6: not true after helper wrote x
+        func.emit(Opcode::ExistsNext {
+            rd: 4,
+            r_binding: 5,
+            r_body: 4,
+            loop_begin: -2,
+        }); // pc7 -> pc5
+        func.emit(Opcode::Ret { rs: 4 }); // pc8
+
+        let layout = StateLayout::new(vec![VarLayout::ScalarInt, VarLayout::ScalarInt]);
+        let result = lower_next_state_loop_with_chunk(
+            &func,
+            &chunk,
+            "nsl_transitive_unchanged",
+            Some(&layout),
+            None,
+        );
+        assert!(
+            matches!(&result, Err(TrustIrError::UnsupportedOpcode(message)) if message.contains("body Unchanged")),
+            "UNCHANGED over a transitively stored variable must fail closed, got {result:?}"
+        );
     }
 
     #[test]
@@ -34298,6 +34365,53 @@ mod tests {
         assert!(
             returns >= 2,
             "expected success + overflow returns, got {returns}"
+        );
+    }
+
+    #[test]
+    fn nsl_record_set_outer_guard_prefix_fails_closed() {
+        let _guard = RecordSetNativeEnvGuard::enabled();
+        let mut func = record_set_native_func();
+        func.instructions
+            .insert(0, Opcode::LoadBool { rd: 7, value: true });
+        func.instructions.insert(
+            1,
+            Opcode::LoadBool {
+                rd: 8,
+                value: false,
+            },
+        );
+        func.instructions
+            .insert(2, Opcode::JumpFalse { rs: 8, offset: 8 }); // pc2 -> final Ret at pc10
+        func.instructions.insert(9, Opcode::Move { rd: 7, rs: 3 });
+
+        // The normal postfix returns the EXISTS, while the false prefix edge
+        // skips it and returns stale TRUE. Route B skips the entire prefix, so
+        // it must reject this outer control-flow shape.
+        let layout = record_set_native_layout(true);
+        let pool = ConstantPool::new();
+        let result = lower_next_state_loop_scaffold(&func, "nsl", Some(&pool), Some(&layout));
+        assert!(
+            matches!(&result, Err(TrustIrError::UnsupportedOpcode(message)) if message.contains("record-set prefix")),
+            "record-set lowering must not ignore an outer guard, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn nsl_record_set_postfix_state_write_fails_closed() {
+        let _guard = RecordSetNativeEnvGuard::enabled();
+        let mut func = record_set_native_func();
+        func.instructions.pop().expect("Ret");
+        func.emit(Opcode::LoadImm { rd: 7, value: 0 });
+        func.emit(Opcode::StoreVar { var_idx: 0, rs: 7 });
+        func.emit(Opcode::Ret { rs: 3 });
+
+        let layout = record_set_native_layout(true);
+        let pool = ConstantPool::new();
+        let result = lower_next_state_loop_scaffold(&func, "nsl", Some(&pool), Some(&layout));
+        assert!(
+            matches!(&result, Err(TrustIrError::UnsupportedOpcode(message)) if message.contains("terminal")),
+            "record-set lowering must not ignore a postfix state write, got {result:?}"
         );
     }
 
@@ -34619,7 +34733,6 @@ mod tests {
     /// Constant pool with idx0 = {p1,p2,p3} (model values), idx1 = {dIV},
     /// idx2 = {{}} (the singleton empty set, for NonEmptyPowerset).
     fn lazy_union_proc_pool() -> (ConstantPool, u16, u16, u16) {
-        use std::sync::Arc;
         let mut pool = ConstantPool::new();
         let procs = pool.add_value(Value::set([
             Value::ModelValue(Rp::from("p1")),
@@ -34969,7 +35082,6 @@ mod tests {
     /// must fail closed instead.
     #[test]
     fn test_funcset_domain_key_mismatch_fails_closed() {
-        use std::sync::Arc;
         let mut pool = ConstantPool::new();
         let qs = pool.add_value(Value::set([
             Value::ModelValue(Rp::from("q1")),
@@ -35020,7 +35132,6 @@ mod tests {
     /// H2 positive control: identical key sets keep lowering natively.
     #[test]
     fn test_funcset_domain_key_match_lowers() {
-        use std::sync::Arc;
         let mut pool = ConstantPool::new();
         let ps = pool.add_value(Value::set([
             Value::ModelValue(Rp::from("p1")),
@@ -35089,10 +35200,7 @@ mod tests {
             static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
             let lock = LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
             let prev = std::env::var_os("TY_HYBRID_COMPOUND_READ");
-            raw_env_write(
-                "TY_HYBRID_COMPOUND_READ",
-                value.map(std::ffi::OsStr::new),
-            );
+            raw_env_write("TY_HYBRID_COMPOUND_READ", value.map(std::ffi::OsStr::new));
             Self { _lock: lock, prev }
         }
     }
@@ -35344,8 +35452,9 @@ mod tests {
                 "an M1 compound read must never reach a boxed handle-mode kernel ({boxed})"
             );
         }
-        assert!(SANCTIONED_COMPOUND_READ_CALLOUT_EXTERNS
-            .contains(&"tla_hybrid_compound_apply1_i64"));
+        assert!(
+            SANCTIONED_COMPOUND_READ_CALLOUT_EXTERNS.contains(&"tla_hybrid_compound_apply1_i64")
+        );
     }
 
     /// Default-OFF proof: the identical bytecode declines exactly as it did
@@ -35428,7 +35537,10 @@ mod tests {
                 .with_layout(&layout),
         )
         .expect_err("storing a placeholder var whole must decline");
-        assert!(format!("{err}").contains("placeholder (Dynamic) var v1"), "{err}");
+        assert!(
+            format!("{err}").contains("placeholder (Dynamic) var v1"),
+            "{err}"
+        );
     }
 
     /// The soundness boundary, case 3: the compound value is compared AS A
@@ -35457,7 +35569,10 @@ mod tests {
                 .with_layout(&layout),
         )
         .expect_err("comparing a placeholder var as a whole must decline");
-        assert!(format!("{err}").contains("placeholder (Dynamic) var v1"), "{err}");
+        assert!(
+            format!("{err}").contains("placeholder (Dynamic) var v1"),
+            "{err}"
+        );
     }
 
     /// The soundness boundary, case 4: the compound value is ITERATED
@@ -35498,7 +35613,10 @@ mod tests {
             "one whole-aggregate use forfeits every read of that variable — a \
              partially lowered compound read would be silently wrong",
         );
-        assert!(format!("{err}").contains("placeholder (Dynamic) var v1"), "{err}");
+        assert!(
+            format!("{err}").contains("placeholder (Dynamic) var v1"),
+            "{err}"
+        );
     }
 
     /// M1 is READ-ONLY by construction: writing a placeholder var stays a hard
@@ -35604,7 +35722,10 @@ mod tests {
                 .with_layout(&layout),
         )
         .expect_err("only the top-level entry is admitted for compound reads");
-        assert!(format!("{err}").contains("placeholder (Dynamic) var v1"), "{err}");
+        assert!(
+            format!("{err}").contains("placeholder (Dynamic) var v1"),
+            "{err}"
+        );
     }
 
     /// The declared footprint ty checks is derived from this same analysis, so
@@ -35809,6 +35930,7 @@ mod tests {
     fn test_wp18_nested_if_merge_keeps_provenance() {
         let mut func = BytecodeFunction::new("NestedIf".to_string(), 0);
         wp18_emit_guard(&mut func, 17); // pc4 -> outer else (pc21)
+
         // THEN arm: inner IF x = 1.
         func.emit(Opcode::LoadImm { rd: 4, value: 1 }); // pc5
         func.emit(Opcode::Eq {
@@ -35877,10 +35999,7 @@ mod tests {
 
         let mut func = BytecodeFunction::new("RetLike".to_string(), 0);
         wp18_emit_guard(&mut func, 4); // pc4 -> else (pc8)
-        func.emit(Opcode::LoadConst {
-            rd: 4,
-            idx: ok_idx,
-        }); // pc5 THEN: "ok"
+        func.emit(Opcode::LoadConst { rd: 4, idx: ok_idx }); // pc5 THEN: "ok"
         func.emit(Opcode::Move { rd: 6, rs: 4 }); // pc6
         func.emit(Opcode::Jump { offset: 3 }); // pc7 -> merge (pc10)
         func.emit(Opcode::LoadConst {
@@ -36273,10 +36392,7 @@ mod tests {
             func: 4,
             arg: 3,
         }); // pc5: payload[Find(root)] — THE function-key consumer
-        entry.emit(Opcode::StoreVar {
-            var_idx: 5,
-            rs: 5,
-        }); // pc6
+        entry.emit(Opcode::StoreVar { var_idx: 5, rs: 5 }); // pc6
         entry.emit(Opcode::Move { rd: 0, rs: 9 }); // pc7
         entry.emit(Opcode::Ret { rs: 0 }); // pc8
 
@@ -36352,8 +36468,7 @@ mod tests {
         .expect_err("an unproven call-result convention must fail closed");
         let message = format!("{err}");
         assert!(
-            message.contains("untracked callee return")
-                || message.contains("physical convention"),
+            message.contains("untracked callee return") || message.contains("physical convention"),
             "unexpected decline reason: {message}"
         );
     }

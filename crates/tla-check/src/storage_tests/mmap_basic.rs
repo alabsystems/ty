@@ -746,8 +746,31 @@ fn test_fingerprint_storage_in_memory_stats_report_memory_counts() {
 
 #[cfg_attr(test, ntest::timeout(10000))]
 #[test]
+fn test_fingerprint_storage_releases_terminal_entries() {
+    let mut storage = FingerprintStorage::in_memory_with_capacity(1024);
+    assert_eq!(storage.insert_checked(fp(12345)), InsertOutcome::Inserted);
+    assert_eq!(storage.insert_checked(fp(67890)), InsertOutcome::Inserted);
+    let before = storage.stats();
+
+    assert_eq!(
+        FingerprintSet::release_terminal_entries(&mut storage),
+        Some(2)
+    );
+    assert_eq!(storage.len(), 0);
+    assert!(!storage.has_errors());
+    assert_eq!(storage.dropped_count(), 0);
+    let after = storage.stats();
+    assert_eq!(after.memory_count, 0);
+    assert!(
+        after.memory_bytes < before.memory_bytes,
+        "terminal release must discard reserved membership capacity"
+    );
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
 fn test_fingerprint_storage_mmap() {
-    let storage = FingerprintStorage::mmap(1000, None).unwrap();
+    let mut storage = FingerprintStorage::mmap(1000, None).unwrap();
 
     assert!(storage.is_empty());
     assert_eq!(storage.insert_checked(fp(12345)), InsertOutcome::Inserted);
@@ -756,6 +779,12 @@ fn test_fingerprint_storage_mmap() {
         InsertOutcome::AlreadyPresent
     ); // duplicate
     assert_eq!(storage.contains_checked(fp(12345)), LookupOutcome::Present);
+    assert_eq!(storage.len(), 1);
+    assert_eq!(
+        FingerprintSet::release_terminal_entries(&mut storage),
+        None,
+        "mmap storage must retain membership unless it opts into terminal release"
+    );
     assert_eq!(storage.len(), 1);
 }
 

@@ -52,6 +52,7 @@ pub(super) struct WorkerBfsCtx<'a, 'inv> {
     pub(super) work_remaining: &'a AtomicUsize,
     pub(super) max_depth_atomic: &'a AtomicUsize,
     pub(super) total_transitions: &'a AtomicUsize,
+    pub(super) total_raw_successors_generated: &'a AtomicUsize,
     pub(super) successors_cache: &'a Option<Arc<FxDashMap<Fingerprint, Vec<Fingerprint>>>>,
     /// Part of #3011: Concrete successor witness states for symmetry liveness.
     pub(super) successor_witnesses_cache: &'a Option<Arc<super::super::SuccessorWitnessDashMap>>,
@@ -119,7 +120,10 @@ where
             return ControlFlow::Break(());
         }
 
-        self.count += 1;
+        self.count = self
+            .count
+            .checked_add(1)
+            .expect("raw successor generation count overflowed usize");
         let t_process = timing_start();
         // Part of #3278: constrained streaming enumerates and reduces on the
         // same EvalCtx. Guard the reducer's temporary bindings so constraint
@@ -165,6 +169,25 @@ fn constrained_streaming_enum_ns(total_ns: u64, inline_processing_ns: u64) -> u6
 }
 
 impl<'a, 'inv> WorkerBfsCtx<'a, 'inv> {
+    /// Record one authoritative parent's pre-constraint successor yield.
+    ///
+    /// Enumeration probes that are discarded for parity/fallback must not call
+    /// this method. The worker-local field is used for terminal snapshots and
+    /// aggregation; the atomic supplies live/periodic global statistics.
+    #[inline]
+    pub(super) fn record_raw_successors_generated(&mut self, count: usize) {
+        self.stats.raw_successors_generated = self
+            .stats
+            .raw_successors_generated
+            .checked_add(count)
+            .expect("worker raw successor generation count overflowed usize");
+        crate::parallel::checked_atomic_add_usize(
+            self.total_raw_successors_generated,
+            count,
+            "parallel raw successor generation count",
+        );
+    }
+
     /// Enumerate successors for a state and process them through the shared
     /// CoreStepAdapter pipeline.
     ///
@@ -223,6 +246,7 @@ impl<'a, 'inv> WorkerBfsCtx<'a, 'inv> {
                 }
             };
         accum_ns(&mut self.stats.enum_ns, t_enum);
+        self.record_raw_successors_generated(diffs.len());
         let had_raw_successors = !diffs.is_empty();
 
         drop(_state_guard);
@@ -312,6 +336,7 @@ impl<'a, 'inv> WorkerBfsCtx<'a, 'inv> {
         let has_constraints = !self.inv_ctx.config.constraints.is_empty()
             || !self.inv_ctx.config.action_constraints.is_empty();
         let mut had_raw_successors = false;
+        let mut raw_successor_count = 0usize;
         let mut per_action_diffs: Vec<(usize, Vec<DiffSuccessor>)> =
             Vec::with_capacity(actions.len());
 
@@ -342,6 +367,9 @@ impl<'a, 'inv> WorkerBfsCtx<'a, 'inv> {
                 }
             };
             accum_ns(&mut self.stats.enum_ns, t_enum);
+            raw_successor_count = raw_successor_count
+                .checked_add(diffs.len())
+                .expect("raw successor generation count overflowed usize");
 
             if !diffs.is_empty() {
                 had_raw_successors = true;
@@ -423,6 +451,7 @@ impl<'a, 'inv> WorkerBfsCtx<'a, 'inv> {
 
         drop(_state_guard);
         drop(_scope_guard);
+        self.record_raw_successors_generated(raw_successor_count);
 
         let selected_diffs = if per_action_diffs.len() > 1 {
             let enabled_indices: Vec<usize> =
@@ -726,6 +755,16 @@ impl<'a, 'inv> WorkerBfsCtx<'a, 'inv> {
 
         match enum_result {
             Ok(()) => {
+                spc.stats.raw_successors_generated = spc
+                    .stats
+                    .raw_successors_generated
+                    .checked_add(total_count)
+                    .expect("worker raw successor generation count overflowed usize");
+                crate::parallel::checked_atomic_add_usize(
+                    self.total_raw_successors_generated,
+                    total_count,
+                    "parallel raw successor generation count",
+                );
                 if stopped {
                     return true;
                 }

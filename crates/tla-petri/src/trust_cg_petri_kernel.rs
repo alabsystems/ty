@@ -77,14 +77,14 @@ const TRUST_CG_PETRI_NATIVE_FEATURE: &str = "trust-cg-petri-native";
 const TRUST_IR_NATIVE_VERIFICATION_BUNDLE_REQUIRED_REV: &str =
     "222785e293636ac6c63b20525151aef2ccd586c1";
 const TRUST_IR_NATIVE_VERIFICATION_BUNDLE_CURRENT_REV: &str =
-    "9de13453d69f84f24556bd75636bf020206f33c9";
+    "3fafb62434db0a5b2bd4027a988a7fed74bd8679";
 const TRUST_IR_NATIVE_VERIFICATION_BUNDLE_DEPENDENCY_BLOCKER: &str = "tla-petri was built without the trust-cg-petri-native feature, so the trust-ir transport identity type is not linked";
 const TRUST_IR_NATIVE_VERIFICATION_BUNDLE_ABSENT_BLOCKER: &str =
     "NativeVerificationBundle was not supplied to the Petri native capability report";
 const TRUST_IR_NATIVE_VERIFICATION_EXPECTED_FIELDS: &str =
     "transport,source,module,bundle,target_abi_digest";
-const TRUST_IR_NATIVE_TRANSPORT_IDENTITY_SCHEMA: &str = "trust_ir.native.transport_identity.v1";
-const TRUST_IR_NATIVE_TRANSPORT_IDENTITY_SCHEMA_VERSION: u32 = 1;
+const TRUST_IR_NATIVE_TRANSPORT_IDENTITY_SCHEMA: &str = "trust_ir.native.transport_identity.v2";
+const TRUST_IR_NATIVE_TRANSPORT_IDENTITY_SCHEMA_VERSION: u32 = 2;
 const TRUST_IR_NATIVE_TRANSPORT_IDENTITY_PRODUCER_CONTRACT_SCHEMA: &str =
     "ty.petri.native_transport_identity.producer_contract.v1";
 const TRUST_IR_NATIVE_TRANSPORT_IDENTITY_PRODUCER_CONTRACT_SCHEMA_VERSION: u32 = 1;
@@ -177,12 +177,12 @@ const AY_TRUST_MC_NATIVE_VERIFICATION_BUNDLE_FACADE_CONSUMER_ACCEPTANCE_API: &st
 const AY_TRUST_MC_NATIVE_VERIFICATION_BUNDLE_FACADE_REQUIRED_AY_REV: &str = "7fe72a4d";
 #[cfg(feature = "trust-cg-petri-native")]
 const AY_TRUST_MC_NATIVE_VERIFICATION_BUNDLE_FACADE_CURRENT_AY_REV: &str =
-    "0adeaab4d66b1414a95ab5cee4ec64078c9dbd97";
+    "035e84f25ffe983f4c1a0d8f2cb1d5f945d3bdee";
 #[cfg(feature = "trust-cg-petri-native")]
 const TRUST_CG_PETRI_NATIVE_SEMANTIC_BRIDGE_REQUIRED_TRUST_CG_REV: &str = "dd0d5338";
 #[cfg(feature = "trust-cg-petri-native")]
 const TRUST_CG_PETRI_NATIVE_SEMANTIC_BRIDGE_CURRENT_TRUST_CG_REV: &str =
-    "7005df3c00a3e1b4042cc49a6608feb1aaa1bfec";
+    "98e3ffb6ae59b803a93a3f09f72dd497810ac5b4";
 const TRUST_CG_PETRI_NATIVE_ADMISSION_KIND: &str = "petri_successor";
 const TRUST_CG_PETRI_NATIVE_ADMISSION_SURFACE: &str = "native_successor";
 const TRUST_CG_PETRI_NATIVE_ADMISSION_API: &str =
@@ -192,7 +192,7 @@ const TRUST_CG_PETRI_NATIVE_ADMISSION_BUNDLE_API: &str =
 const TRUST_CG_PETRI_NATIVE_ADMISSION_MISSING_TRANSPORT_REASON: &str =
     "missing_trust_ir_transport_identity";
 const TRUST_CG_PETRI_NATIVE_EXECUTION_PLAN_SCHEMA: &str =
-    "trust_cg.petri.native_successor.execution_plan.v1";
+    "trust-cg.petri.native_successor.execution_plan.v1";
 const TRUST_CG_PETRI_NATIVE_EXECUTION_PLAN_SCHEMA_VERSION: u32 = 1;
 const TRUST_CG_PETRI_NATIVE_EXECUTION_PLAN_API: &str =
     "trust-cg::petri_native_successor_execution_plan_from_trust_ir_bundle";
@@ -213,11 +213,11 @@ const TRUST_CG_PETRI_NATIVE_CALLABLE_HANDOFF_API: &str =
 const TRUST_CG_PETRI_NATIVE_CALLABLE_POINTER_TYPE: &str = "PetriNativeSuccessorCallablePointer";
 const TRUST_CG_PETRI_NATIVE_CALL_PACKET_TYPE: &str = "PetriNativeSuccessorCallPacket";
 const TRUST_CG_PETRI_NATIVE_CALL_PACKET_SCHEMA: &str =
-    "trust_cg.petri.native_successor.call_packet.v1";
+    "trust-cg.petri.native_successor.call_packet.v1";
 const TRUST_CG_PETRI_NATIVE_CALL_PACKET_SCHEMA_VERSION: u32 = 1;
 const TRUST_CG_PETRI_NATIVE_CALL_PACKET_REQUIRED_TRUST_CG_REV: &str = "2d31fd8b";
 const TRUST_CG_PETRI_NATIVE_CALL_PACKET_CURRENT_TRUST_CG_REV: &str =
-    "7005df3c00a3e1b4042cc49a6608feb1aaa1bfec";
+    "98e3ffb6ae59b803a93a3f09f72dd497810ac5b4";
 const TRUST_CG_PETRI_NATIVE_CALL_PACKET_DESCRIPTOR_DEPENDENCY: &str =
     "trust-cg::petri_native_successor_downstream_contract_descriptor.call_packet";
 const TRUST_CG_PETRI_NATIVE_CALL_PACKET_DESCRIPTOR_UPSTREAM_ASK: &str =
@@ -351,15 +351,15 @@ const TRUST_CG_PETRI_NATIVE_RUNTIME_READINESS_INSTALLED_ARTIFACT_REQUIRED_TRUST_
 const TRUST_CG_PETRI_NATIVE_RUNTIME_READINESS_PACKET_TYPE: &str =
     "PetriNativeSuccessorRuntimeReadinessPacket";
 const TRUST_CG_PETRI_NATIVE_RUNTIME_READINESS_PACKET_SCHEMA: &str =
-    "trust_cg.petri.native_successor.runtime_readiness_packet.v1";
+    "trust-cg.petri.native_successor.runtime_readiness_packet.v1";
 const TRUST_CG_PETRI_NATIVE_RUNTIME_READINESS_PACKET_SCHEMA_VERSION: u32 = 1;
 const TRUST_CG_PETRI_NATIVE_RUNTIME_READINESS_REQUIRED_TRUST_CG_REV: &str = "502f8928";
 const TRUST_CG_PETRI_NATIVE_RUNTIME_READINESS_CURRENT_TRUST_CG_REV: &str =
-    "7005df3c00a3e1b4042cc49a6608feb1aaa1bfec";
+    "98e3ffb6ae59b803a93a3f09f72dd497810ac5b4";
 const TRUST_CG_PETRI_NATIVE_MOCK_EXECUTABLE_CALL_API: &str =
     "trust-cg::petri_native_successor_mock_executable_call_dry_run";
 const TRUST_CG_PETRI_NATIVE_MOCK_EXECUTABLE_CALL_SCHEMA: &str =
-    "trust_cg.petri.native_successor.mock_executable_call.v1";
+    "trust-cg.petri.native_successor.mock_executable_call.v1";
 const TRUST_CG_PETRI_NATIVE_MOCK_EXECUTABLE_CALL_SCHEMA_VERSION: u32 = 1;
 const TRUST_CG_PETRI_NATIVE_MOCK_EXECUTABLE_CALL_ROLE: &str = "test_diagnostic_only";
 const TRUST_CG_PETRI_NATIVE_COMPILE_ARTIFACT_HANDOFF_API: &str =
@@ -372,7 +372,7 @@ const TRUST_CG_PETRI_NATIVE_COMPILE_ARTIFACT_HANDOFF_BLOCKER_TYPE: &str =
     "PetriNativeSuccessorCompileArtifactHandoffBlocker";
 const TRUST_CG_PETRI_NATIVE_COMPILE_ARTIFACT_HANDOFF_REQUIRED_TRUST_CG_REV: &str = "df133c3f";
 const TRUST_CG_PETRI_NATIVE_COMPILE_ARTIFACT_HANDOFF_CURRENT_TRUST_CG_REV: &str =
-    "7005df3c00a3e1b4042cc49a6608feb1aaa1bfec";
+    "98e3ffb6ae59b803a93a3f09f72dd497810ac5b4";
 const TRUST_CG_PETRI_NATIVE_COMPILE_ARTIFACT_INSTALLED_ARTIFACT_API: &str =
     "InstalledArtifact::petri_native_successor_compile_artifact_handoff_evidence";
 const TRUST_CG_PETRI_NATIVE_COMPILE_ARTIFACT_INSTALLED_ARTIFACT_TYPE: &str = "InstalledArtifact";
@@ -457,11 +457,11 @@ const TRUST_CG_PETRI_NATIVE_COMPILE_ARTIFACT_BLOCKER_MISSING_CURRENT_GENERATION:
 const TRUST_CG_PETRI_NATIVE_DOWNSTREAM_CONTRACT_API: &str =
     "trust-cg::petri_native_successor_downstream_contract_descriptor";
 const TRUST_CG_PETRI_NATIVE_DOWNSTREAM_CONTRACT_SCHEMA: &str =
-    "trust_cg.petri.native_successor.downstream_contract.v1";
+    "trust-cg.petri.native_successor.downstream_contract.v1";
 const TRUST_CG_PETRI_NATIVE_DOWNSTREAM_CONTRACT_SCHEMA_VERSION: u32 = 1;
 const TRUST_CG_PETRI_NATIVE_DOWNSTREAM_CONTRACT_REQUIRED_TRUST_CG_REV: &str = "50cf1169";
 const TRUST_CG_PETRI_NATIVE_DOWNSTREAM_CONTRACT_CURRENT_TRUST_CG_REV: &str =
-    "7005df3c00a3e1b4042cc49a6608feb1aaa1bfec";
+    "98e3ffb6ae59b803a93a3f09f72dd497810ac5b4";
 const TRUST_CG_PETRI_NATIVE_TRUST_IR_BUNDLE_IDENTITY_API: &str =
     "trust-cg::petri_native_successor_trust_ir_bundle_identity_descriptor";
 const TRUST_CG_PETRI_NATIVE_TRUST_IR_BUNDLE_IDENTITY_REQUIRED_TRUST_CG_REV: &str = "497f4540";
@@ -3304,7 +3304,7 @@ fn add_trust_cg_native_admission_blocker_for_missing_transport(
     blocker: &str,
 ) {
     report.add_evidence(format!(
-        "trust-cg trust_cg_admission_blocker source=NativeInstallGateAdmissionSummary source_package=trust_cg-codegen package=trust_cg-codegen schema=trust_cg.phase6.native_install_gate.admission_summary.v1 schema_version=1 consumer=mcc consumer_mode=petri_successor kind=petri_native_successor surface=mcc_replay disposition=rejected status_code=rejected rejection_code={} reason_code={} requested_authority=active_callable install_authority=none cargo_dependency={} trust_ir_transport_identity_available=false trust_ir_bundle_consumed=false admission_api={} blocker=\"{}\" production_selected=false fail_closed=true",
+        "trust-cg trust_cg_admission_blocker source=NativeInstallGateAdmissionSummary source_package=trust-cg-codegen package=trust-cg-codegen schema=trust-cg.phase6.native_install_gate.admission_summary.v1 schema_version=1 consumer=mcc consumer_mode=petri_successor kind=petri_native_successor surface=mcc_replay disposition=rejected status_code=rejected rejection_code={} reason_code={} requested_authority=active_callable install_authority=none cargo_dependency={} trust_ir_transport_identity_available=false trust_ir_bundle_consumed=false admission_api={} blocker=\"{}\" production_selected=false fail_closed=true",
         reason_code,
         reason_code,
         cargo_dependency,
@@ -12188,7 +12188,6 @@ mod tests {
 
     #[cfg(feature = "trust-cg-petri-native")]
     #[test]
-    #[ignore = "pre-existing upstream trust-ir/ay evidence-descriptor drift; asserts stale descriptor strings, unrelated to native successor parity (verified). Re-enable after evidence-descriptor re-sync."]
     fn native_successor_execution_plan_sources_production_selection_decision() {
         let net = all_transition_net();
         let report = petri_native_successor_capability_report(&net);
@@ -12408,7 +12407,7 @@ mod tests {
                 && evidence_field(row.as_str(), "row_value") == Some(selected_for_native_execution)
         }));
         assert!(selection_rows.iter().any(|row| {
-            evidence_field(row.as_str(), "row_key") == Some("trust_cg.vector_constant_lowering.schema")
+            evidence_field(row.as_str(), "row_key") == Some("trust-cg.vector_constant_lowering.schema")
                 && evidence_field(row.as_str(), "row_value")
                     == Some(
                         tla_trust_cg::PETRI_NATIVE_SUCCESSOR_VECTOR_CONSTANT_LOWERING_EVIDENCE_SCHEMA,
@@ -12534,29 +12533,30 @@ mod tests {
                     && execution_plan
                         .contains("compile_artifact_handoff_missing_trust_cg_artifact_field=none")
                     && execution_plan.contains("compile_artifact_handoff_missing_artifact_blocker=none")
-                    && execution_plan
-                        .contains("native_successor_next_production_source=parity_gate")
                     && execution_plan.contains(
-                        "native_successor_next_production_api=TY_MCC_TRUST_CG_PETRI_PARITY"
+                        "native_successor_next_production_source=semantic_successor_bridge"
                     )
                     && execution_plan.contains(
-                        "native_successor_next_production_input=TY_MCC_TRUST_CG_PETRI_PARITY"
+                        "native_successor_next_production_api=trust-cg::petri_native_successor_semantic_bridge_evidence_from_trust_ir_bundle"
                     )
                     && execution_plan.contains(
-                        "native_successor_next_production_evidence=exact_successor_parity_trace,native_vs_explicit_state_replay_receipt"
+                        "native_successor_next_production_input=ty.petri.native.successor.plan_cache_equivalence.v1"
                     )
                     && execution_plan.contains(
-                        "native_successor_next_production_reason_code=parity_evidence_required"
+                        "native_successor_next_production_evidence=ty.petri.native.successor.plan_cache_equivalence.v1"
+                    )
+                    && execution_plan.contains(
+                        "native_successor_next_production_reason_code=missing_semantic_successor_obligation"
                     )
                     && execution_plan
                         .contains("native_successor_next_production_status_code=blocked")
                     && execution_plan.contains(
-                        "native_successor_next_production_blocker_stage=parity_gate"
+                        "native_successor_next_production_blocker_stage=semantic_successor_bridge"
                     )
                     && execution_plan.contains(
-                        "native_successor_next_production_blocker_code=parity_evidence_required"
+                        "native_successor_next_production_blocker_code=missing_semantic_successor_obligation"
                     ),
-                "produced Petri native execution plan should move past semantic bridge and stop at the explicit parity gate: {execution_plan}"
+                "produced Petri native execution plan must stop at the unadmitted semantic bridge: {execution_plan}"
             );
         } else {
             assert!(
@@ -12579,24 +12579,27 @@ mod tests {
                     )
                     && execution_plan.contains("compile_artifact_handoff_ready=false")
                     && execution_plan.contains("compile_artifact_handoff_status_code=blocked")
-                    && execution_plan
-                        .contains("compile_artifact_handoff_reason_code=missing_callable_pointer")
-                    && execution_plan
-                        .contains("compile_artifact_handoff_blocker_code=missing_callable_pointer")
                     && execution_plan.contains(
-                        "compile_artifact_handoff_required_field=compiled_artifact.callable_pointer"
+                        "compile_artifact_handoff_reason_code=missing_native_payload_sha256"
+                    )
+                    && execution_plan.contains(
+                        "compile_artifact_handoff_blocker_code=missing_native_payload_sha256"
+                    )
+                    && execution_plan.contains(
+                        "compile_artifact_handoff_required_field=compiled_artifact.native_payload_sha256"
                     )
                     && execution_plan.contains(
                         "compile_artifact_handoff_required_evidence=trust-cg.petri.native_successor.compile_artifact_handoff.v1"
                     )
-                    && execution_plan.contains("compile_artifact_handoff_real_artifact_source=callable_contract")
+                    && execution_plan
+                        .contains("compile_artifact_handoff_real_artifact_source=none")
                     && execution_plan.contains(
-                        "compile_artifact_handoff_entry_symbol_source=callable_contract.entry_function"
+                        "compile_artifact_handoff_entry_symbol_source=petri_successor_entry_symbol"
                     )
                     && execution_plan
-                        .contains("compile_artifact_handoff_native_payload_present=true")
+                        .contains("compile_artifact_handoff_native_payload_present=false")
                     && execution_plan
-                        .contains("compile_artifact_handoff_native_payload_source=callable_contract.native_payload_sha256")
+                        .contains("compile_artifact_handoff_native_payload_source=unavailable")
                     && execution_plan
                         .contains("compile_artifact_handoff_callable_pointer_present=false")
                     && execution_plan
@@ -12634,7 +12637,7 @@ mod tests {
                         "native_successor_next_production_blocker_stage=compile_artifact_handoff"
                     )
                     && execution_plan.contains(
-                        "native_successor_next_production_blocker_code=missing_callable_pointer"
+                        "native_successor_next_production_blocker_code=missing_native_payload_sha256"
                     ),
                 "external bundle execution plan should remain fail-closed without a TY InstalledArtifact: {execution_plan}"
             );
@@ -12702,10 +12705,7 @@ mod tests {
             );
         }
         assert!(
-            lock_has_exact_source(
-                "trust-ir",
-                TRUST_IR_NATIVE_VERIFICATION_BUNDLE_CURRENT_REV
-            ),
+            lock_has_exact_source("trust-ir", TRUST_IR_NATIVE_VERIFICATION_BUNDLE_CURRENT_REV),
             "Cargo.lock must resolve the exact TrustIR source identity"
         );
         assert!(
@@ -12717,15 +12717,12 @@ mod tests {
         );
         for repo in ["trust-ir", "trust-cg"] {
             assert!(
-                !workspace_cargo.contains(&format!(
-                    "alabsystems/{repo}.git\", branch = \"main\""
-                )),
+                !workspace_cargo
+                    .contains(&format!("alabsystems/{repo}.git\", branch = \"main\"")),
                 "workspace dependencies must not use a moving `{repo}` branch"
             );
             assert!(
-                !workspace_lock.contains(&format!(
-                    "alabsystems/{repo}.git?branch=main"
-                )),
+                !workspace_lock.contains(&format!("alabsystems/{repo}.git?branch=main")),
                 "Cargo.lock must not retain a moving `{repo}` source"
             );
         }
@@ -13148,7 +13145,6 @@ mod tests {
     // gated to that feature so the assertion set stays sound.
     #[cfg(feature = "trust-cg-petri-native")]
     #[test]
-    #[ignore = "pre-existing upstream trust-ir/ay evidence-descriptor drift; asserts stale descriptor strings, unrelated to native successor parity (verified). Re-enable after evidence-descriptor re-sync."]
     fn native_successor_capability_report_is_validation_disabled_by_default() {
         let net = all_transition_net();
 
@@ -13503,7 +13499,7 @@ mod tests {
             .expect("native report should expose fail-closed route selection evidence");
         assert!(route_selection_row.contains("selected_lane=explicit_state"));
         assert!(route_selection_row.contains("status_code=fail_closed"));
-        assert!(route_selection_row.contains("reason_code=parity_evidence_required"));
+        assert!(route_selection_row.contains("reason_code=producer_admission_not_installable"));
         assert!(route_selection_row.contains("parity_required=true"));
         assert!(route_selection_row.contains("parity_enabled=false"));
         assert!(route_selection_row.contains("parity_receipt_required=true"));
@@ -13517,18 +13513,25 @@ mod tests {
         assert!(route_selection_row.contains(
             "parity_receipt_required_evidence=exact_successor_parity_trace,native_vs_explicit_state_replay_receipt"
         ));
-        assert!(route_selection_row.contains("producer_admission=true"));
-        assert!(route_selection_row.contains("producer_admission_reason_code=none"));
-        assert!(route_selection_row.contains("producer_execution_authority=true"));
-        assert!(route_selection_row.contains("producer_execution_authority_reason_code=none"));
-        assert!(route_selection_row.contains("producer_production_selection=true"));
-        assert!(route_selection_row.contains("producer_production_selection_reason_code=none"));
+        assert!(route_selection_row.contains("producer_admission=false"));
+        assert!(route_selection_row
+            .contains("producer_admission_reason_code=missing_semantic_successor_obligation"));
+        assert!(route_selection_row.contains("producer_execution_authority=false"));
+        assert!(route_selection_row.contains(
+            "producer_execution_authority_reason_code=missing_native_install_gate_packet"
+        ));
+        assert!(route_selection_row.contains("producer_production_selection=false"));
+        assert!(route_selection_row.contains(
+            "producer_production_selection_reason_code=missing_semantic_successor_obligation"
+        ));
         assert!(route_selection_row.contains("validation_receipt_available=true"));
         assert!(route_selection_row.contains("validation_receipt_reason_code=available"));
-        assert!(route_selection_row.contains("callable_receipt_available=true"));
-        assert!(route_selection_row.contains("callable_receipt_reason_code=available"));
+        assert!(route_selection_row.contains("callable_receipt_available=false"));
+        assert!(route_selection_row
+            .contains("callable_receipt_reason_code=missing_native_install_gate_packet"));
         assert!(route_selection_row.contains("native_runtime_callable_impl_available=true"));
-        assert!(route_selection_row.contains("runtime_readiness_reason_code=none"));
+        assert!(route_selection_row
+            .contains("runtime_readiness_reason_code=missing_native_install_gate_packet"));
         assert!(route_selection_row.contains("production_selected=false"));
         assert!(route_selection_row.contains("fail_closed=true"));
         assert!(report.evidence.iter().any(|evidence| evidence.contains(
@@ -13538,7 +13541,7 @@ mod tests {
             "consumer=ty entry_symbol=ty_petri_all_transition_successors signature_abi=extern_c params=9 returns=1 required_manifest_metadata=ty.successor_kernel.evidence adopted=false adoption=deferred artifact_checksums=deferred"
         )));
         let expected_fail_closed_gate_reason = if cfg!(feature = "trust-cg-petri-native") {
-            PETRI_NATIVE_ROUTE_SELECTION_REASON_PARITY
+            PETRI_NATIVE_ROUTE_SELECTION_REASON_PRODUCER_ADMISSION
         } else {
             PETRI_NATIVE_ROUTE_SELECTION_REASON_MISSING_TRANSPORT
         };
@@ -13558,8 +13561,9 @@ mod tests {
                 && evidence.contains("validation_receipt_available=true")
                 && evidence.contains("validation_receipt_status_code=accepted")
                 && evidence.contains("validation_receipt_reason_code=available")
-                && evidence.contains("callable_receipt_available=true")
-                && evidence.contains("callable_receipt_reason_code=available")
+                && evidence.contains("callable_receipt_available=false")
+                && evidence
+                    .contains("callable_receipt_reason_code=missing_native_install_gate_packet")
                 && evidence.contains("production_selected=false")
                 && evidence.contains("fail_closed=true")
                 && evidence.contains(expected_fail_closed_gate_reason.as_str())
@@ -13680,7 +13684,7 @@ mod tests {
             TRUST_CG_PETRI_NATIVE_ADMISSION_MISSING_TRANSPORT_REASON
         };
         let expected_execution_plan_rejection_reason = if cfg!(feature = "trust-cg-petri-native") {
-            "none"
+            "missing_native_install_gate_packet"
         } else {
             expected_admission_reason
         };
@@ -13703,32 +13707,32 @@ mod tests {
         };
         let expected_runtime_readiness_packet_available = cfg!(feature = "trust-cg-petri-native");
         let expected_runtime_readiness_status = if cfg!(feature = "trust-cg-petri-native") {
-            "ready_for_runtime_call"
+            "blocked"
         } else {
             "unavailable"
         };
         let expected_runtime_readiness_reason = if cfg!(feature = "trust-cg-petri-native") {
-            "none"
+            "missing_native_install_gate_packet"
         } else {
             expected_admission_reason
         };
         let expected_runtime_readiness_blocker_stage = if cfg!(feature = "trust-cg-petri-native") {
-            "none"
+            "manifest_identity"
         } else {
             "trust_ir_transport_identity"
         };
         let expected_call_packet_reason = if cfg!(feature = "trust-cg-petri-native") {
-            TRUST_CG_PETRI_NATIVE_REASON_AVAILABLE
+            "missing_native_install_gate_packet"
         } else {
             expected_admission_reason
         };
         let expected_callable_pointer_reason = if cfg!(feature = "trust-cg-petri-native") {
-            TRUST_CG_PETRI_NATIVE_REASON_AVAILABLE
+            "missing_native_install_gate_packet"
         } else {
             TRUST_CG_PETRI_NATIVE_MISSING_CALLABLE_POINTER_HANDOFF_REASON
         };
         let expected_callable_authorized_reason = if cfg!(feature = "trust-cg-petri-native") {
-            TRUST_CG_PETRI_NATIVE_REASON_AVAILABLE
+            "missing_native_install_gate_packet"
         } else {
             expected_admission_reason
         };
@@ -13739,42 +13743,38 @@ mod tests {
             TRUST_CG_PETRI_NATIVE_MISSING_CALLABLE_POINTER_HANDOFF_REASON
         };
         let expected_callable_handoff_blocker = if expected_callable_handoff_available {
-            "none"
+            "missing_native_install_gate_packet"
         } else {
             TRUST_CG_PETRI_NATIVE_MISSING_CALLABLE_POINTER_HANDOFF_REASON
         };
         let expected_install_packet_reason = if cfg!(feature = "trust-cg-petri-native") {
-            TRUST_CG_PETRI_NATIVE_REASON_AVAILABLE
+            "missing_native_install_gate_packet"
         } else {
             expected_admission_reason
         };
         let expected_call_packet_readiness_blocker = if cfg!(feature = "trust-cg-petri-native") {
-            "none"
+            "missing_native_install_gate_packet"
         } else {
             expected_callable_handoff_blocker
         };
-        let expected_trampoline_contract_available = cfg!(feature = "trust-cg-petri-native");
-        let expected_install_packet_available = cfg!(feature = "trust-cg-petri-native");
+        let expected_trampoline_contract_available = false;
+        let expected_install_packet_available = false;
         let expected_install_packet_status = if expected_install_packet_available {
             TrustCgPetriNativeReadinessStatus::Available
         } else {
             TrustCgPetriNativeReadinessStatus::Missing
         };
-        let expected_call_packet_available = cfg!(feature = "trust-cg-petri-native");
-        let expected_callable_pointer_available = cfg!(feature = "trust-cg-petri-native");
-        let expected_concrete_callable_status = if cfg!(feature = "trust-cg-petri-native") {
-            TrustCgPetriNativeReadinessStatus::Available
-        } else {
-            TrustCgPetriNativeReadinessStatus::Missing
-        };
-        let expected_callable_authorized = cfg!(feature = "trust-cg-petri-native");
+        let expected_call_packet_available = false;
+        let expected_callable_pointer_available = false;
+        let expected_concrete_callable_status = TrustCgPetriNativeReadinessStatus::Missing;
+        let expected_callable_authorized = false;
         if cfg!(feature = "trust-cg-petri-native") {
             assert!(
                 admission_blocker.contains("source=NativeInstallGateAdmissionSummary")
-                    && admission_blocker.contains("source_package=trust_cg-codegen")
-                    && admission_blocker.contains("package=trust_cg-codegen")
+                    && admission_blocker.contains("source_package=trust-cg-codegen")
+                    && admission_blocker.contains("package=trust-cg-codegen")
                     && admission_blocker
-                        .contains("schema=trust_cg.phase6.native_install_gate.admission_summary.v1")
+                        .contains("schema=trust-cg.phase6.native_install_gate.admission_summary.v1")
                     && admission_blocker.contains("schema_version=1")
                     && admission_blocker.contains("consumer=mcc")
                     && admission_blocker.contains("consumer_mode=petri_successor")
@@ -13824,9 +13824,9 @@ mod tests {
         } else {
             assert!(
                 admission_blocker.contains("source=NativeInstallGateAdmissionSummary")
-                    && admission_blocker.contains("source_package=trust_cg-codegen")
+                    && admission_blocker.contains("source_package=trust-cg-codegen")
                     && admission_blocker
-                        .contains("schema=trust_cg.phase6.native_install_gate.admission_summary.v1")
+                        .contains("schema=trust-cg.phase6.native_install_gate.admission_summary.v1")
                     && admission_blocker.contains("schema_version=1")
                     && admission_blocker.contains("consumer=mcc")
                     && admission_blocker.contains("consumer_mode=petri_successor")
@@ -14012,7 +14012,7 @@ mod tests {
             assert!(
                 execution_plan.contains("source=PetriNativeSuccessorExecutionPlan")
                     && execution_plan
-                        .contains("schema=trust_cg.petri.native_successor.execution_plan.v1")
+                        .contains("schema=trust-cg.petri.native_successor.execution_plan.v1")
                     && execution_plan.contains("trust_ir_transport_identity_available=true")
                     && execution_plan.contains("trust_ir_bundle_consumed=true")
                     && execution_plan.contains(TRUST_CG_PETRI_NATIVE_DOWNSTREAM_CONTRACT_API)
@@ -14023,9 +14023,10 @@ mod tests {
                     && execution_plan.contains(
                         "downstream_trust_ir_bundle_identity_schema=trust_ir.native.bundle_identity_contract.v1"
                     )
-                    && execution_plan.contains(
-                        "downstream_trust_ir_transport_identity_schema=trust_ir.native.transport_identity.v1"
-                    )
+                    && execution_plan.contains(&format!(
+                        "downstream_trust_ir_transport_identity_schema={}",
+                        trust_ir::NATIVE_TRANSPORT_IDENTITY_SCHEMA
+                    ))
                     && execution_plan.contains(
                         "downstream_compile_artifact_handoff_required_fields=compiled_artifact.native_payload_sha256,compiled_artifact.entry_symbol,compiled_artifact.callable_pointer,compiled_artifact.executable_region_sha256,compiled_artifact.lifetime_owner,compiled_artifact.current_generation"
                     )
@@ -14036,17 +14037,25 @@ mod tests {
                         "downstream_mock_executable_call_required_fields=runtime_readiness_packet,call_packet,mock_executable_call_gate,input_state,output_state"
                     )
                     && execution_plan.contains("runtime_readiness_status_in_downstream_contract=true")
-                    && execution_plan.contains("runtime_readiness_blocker_code=none")
-                    && execution_plan.contains("runtime_readiness_blocker_in_downstream_contract=true")
-                    && execution_plan.contains("callable_handoff_required_evidence=none")
-                    && execution_plan
-                        .contains("actions_expose_callable_blocked_by_runtime_readiness=false")
-                    && execution_plan.contains("actions_expose_callable_reason_code=available")
                     && execution_plan.contains(
-                        "actions_ty_native_activate_blocked_by_runtime_readiness=false"
+                        "runtime_readiness_blocker_code=missing_native_install_gate_packet"
                     )
-                    && execution_plan.contains("actions_ty_native_activate_reason_code=none")
-                    && execution_plan.contains("plan_fail_closed=false"),
+                    && execution_plan.contains("runtime_readiness_blocker_in_downstream_contract=true")
+                    && execution_plan.contains(
+                        "callable_handoff_required_evidence=trust-cg.phase6.native_install_gate.v1"
+                    )
+                    && execution_plan
+                        .contains("actions_expose_callable_blocked_by_runtime_readiness=true")
+                    && execution_plan.contains(
+                        "actions_expose_callable_reason_code=missing_native_install_gate_packet"
+                    )
+                    && execution_plan.contains(
+                        "actions_ty_native_activate_blocked_by_runtime_readiness=true"
+                    )
+                    && execution_plan.contains(
+                        "actions_ty_native_activate_reason_code=missing_native_install_gate_packet"
+                    )
+                    && execution_plan.contains("plan_fail_closed=true"),
                 "linked Petri native execution plan should use trust-cg's typed plan: {execution_plan}"
             );
             assert_execution_plan_exposes_compile_artifact_handoff(execution_plan, true);
@@ -14165,7 +14174,6 @@ mod tests {
 
     #[cfg(feature = "trust-cg-petri-native")]
     #[test]
-    #[ignore = "pre-existing upstream trust-ir/ay evidence-descriptor drift; asserts stale descriptor strings, unrelated to native successor parity (verified). Re-enable after evidence-descriptor re-sync."]
     fn native_successor_capability_report_records_produced_bundle_admission_blocker() {
         let net = all_transition_net();
 
@@ -14194,7 +14202,7 @@ mod tests {
             .find(|evidence| evidence.contains("Petri native_jit semantic_successor_bridge"))
             .expect("native JIT semantic successor bridge evidence should be emitted");
         assert!(
-            semantic_bridge.contains("schema=trust_cg.petri.native_successor.semantic_bridge.v1")
+            semantic_bridge.contains("schema=trust-cg.petri.native_successor.semantic_bridge.v1")
                 && semantic_bridge.contains("schema_version=1")
                 && semantic_bridge.contains(
                     "api=trust-cg::petri_native_successor_semantic_bridge_evidence_from_trust_ir_bundle"
@@ -14235,24 +14243,28 @@ mod tests {
                 && semantic_bridge.contains("plan_count=3")
                 && semantic_bridge.contains("plan_cache_digest=")
                 && semantic_bridge.contains("trust_ir_successor_body_status=lowered_all_transition_successors")
-                && semantic_bridge.contains("successor_relation_represented=true")
-                && semantic_bridge.contains("semantic_successor_authority=true")
-                && semantic_bridge.contains("semantic_bridge_status_code=ready")
-                && semantic_bridge.contains("reason_code=none")
+                && semantic_bridge.contains("successor_relation_represented=false")
+                && semantic_bridge.contains("semantic_successor_authority=false")
+                && semantic_bridge.contains("semantic_bridge_status_code=blocked")
+                && semantic_bridge.contains("reason_code=missing_semantic_successor_obligation")
                 && semantic_bridge
-                    .contains("trust_cg_schema=trust_cg.petri.native_successor.semantic_bridge.v1")
-                && semantic_bridge.contains("trust_cg_status_code=ready")
-                && semantic_bridge.contains("trust_cg_reason_code=none")
-                && semantic_bridge.contains("trust_cg_required_field=none")
-                && semantic_bridge.contains("trust_cg_required_evidence=none")
+                    .contains("trust_cg_schema=trust-cg.petri.native_successor.semantic_bridge.v1")
+                && semantic_bridge.contains("trust_cg_status_code=blocked")
+                && semantic_bridge
+                    .contains("trust_cg_reason_code=missing_semantic_successor_obligation")
+                && semantic_bridge
+                    .contains("trust_cg_required_field=semantic_successor_obligation")
+                && semantic_bridge.contains(
+                    "trust_cg_required_evidence=ty.petri.native.successor.plan_cache_equivalence.v1"
+                )
                 && semantic_bridge.contains("trust_cg_semantic_obligation_count=1")
                 && semantic_bridge.contains("trust_cg_semantic_evidence_entry_count=1")
-                && semantic_bridge.contains("trust_ir_semantic_bridge_schema=trust_ir.native.semantic_bridge.v1")
-                && semantic_bridge.contains("trust_ir_semantic_bridge_status_code=represented")
-                && semantic_bridge.contains("trust_ir_semantic_bridge_reason_code=represented")
-                && semantic_bridge.contains("trust_ir_semantic_bridge_evidence_status=present")
-                && semantic_bridge.contains("trust_ir_semantic_bridge_proof_identity_schema=trust_ir.native.semantic_bridge.proof_identity.v1")
-                && semantic_bridge.contains("trust_ir_semantic_bridge_proof_identity_schema_version=1")
+                && semantic_bridge.contains("trust_ir_semantic_bridge_schema=trust_ir.native.semantic_bridge.v2")
+                && semantic_bridge.contains("trust_ir_semantic_bridge_status_code=blocked")
+                && semantic_bridge.contains("trust_ir_semantic_bridge_reason_code=trusted_proof_not_admitted")
+                && semantic_bridge.contains("trust_ir_semantic_bridge_evidence_status=missing")
+                && semantic_bridge.contains("trust_ir_semantic_bridge_proof_identity_schema=trust_ir.native.semantic_bridge.proof_identity.v2")
+                && semantic_bridge.contains("trust_ir_semantic_bridge_proof_identity_schema_version=2")
                 && semantic_bridge.contains("trust_ir_semantic_bridge_proof_identity_digest=sha256:")
                 && semantic_bridge.contains("trust_ir_semantic_bridge_proof_admission_api=NativeVerificationBundle::petri_successor_semantic_bridge_proof_admission_report()")
                 && semantic_bridge.contains("trust_ir_semantic_bridge_proof_admission_schema=trust_ir.native.petri_successor.semantic_bridge_proof_admission.v1")
@@ -14269,8 +14281,8 @@ mod tests {
                 && semantic_bridge.contains("trust_ir_semantic_bridge_proof_admission_blocked_artifact_kind=none")
                 && semantic_bridge.contains("trust_ir_semantic_bridge_proof_admission_blocked_artifact_reason_code=none")
                 && semantic_bridge.contains("trust_ir_semantic_bridge_proof_admission_proof_handoff_status_code=blocked")
-                && semantic_bridge.contains("trust_ir_semantic_bridge_proof_admission_proof_handoff_reason_code=replay_transcript_digest_mismatch")
-                && semantic_bridge.contains("trust_ir_semantic_bridge_fail_closed=false")
+                && semantic_bridge.contains("trust_ir_semantic_bridge_proof_admission_proof_handoff_reason_code=binding_blocked")
+                && semantic_bridge.contains("trust_ir_semantic_bridge_fail_closed=true")
                 && semantic_bridge.contains("trust_ir_semantic_bridge_proof_status=discharged")
                 && semantic_bridge.contains("production_selected=false")
                 && semantic_bridge.contains("fail_closed=true"),
@@ -14292,10 +14304,12 @@ mod tests {
                 && ay_facade.contains("scope=trust_mc_native_chc")
                 && ay_facade
                     .contains("api=ay_trust_mc_native_bundle::solve_trust_mc_petri_successor_native_verification_bundle")
-                && ay_facade.contains("required_ay_rev=dd4d625b")
-                && ay_facade.contains(
-                    "current_ay_rev=dd4d625bc1947a2471d1e54a53bba0bca9b8c4cc"
-                )
+                && ay_facade.contains(&format!(
+                    "required_ay_rev={AY_TRUST_MC_NATIVE_VERIFICATION_BUNDLE_FACADE_REQUIRED_AY_REV}"
+                ))
+                && ay_facade.contains(&format!(
+                    "current_ay_rev={AY_TRUST_MC_NATIVE_VERIFICATION_BUNDLE_FACADE_CURRENT_AY_REV}"
+                ))
                 && ay_facade.contains("bundle_source=petri_native_production_path")
                 && ay_facade.contains("bundle_validated=true")
                 && ay_facade.contains(
@@ -14310,29 +14324,28 @@ mod tests {
                 && ay_facade.contains("accepted_for_consumer=false")
                 && ay_facade.contains("fail_closed=true")
                 && ay_facade.contains("consumer_rejection_fail_closed=true")
-                && ay_facade.contains("consumer_rejection_ready_for_trust_mc_chc_handoff=true")
+                && ay_facade.contains("consumer_rejection_ready_for_trust_mc_chc_handoff=false")
                 && ay_facade.contains("model_validated=false")
-                && ay_facade.contains("verification_level_code=none")
-                && ay_facade.contains("proof_replay_status_code=not_run")
-                && ay_facade.contains("ready_for_trust_mc_chc_handoff=true")
-                && ay_facade.contains("trust_mc_request_count=1")
-                && ay_facade.contains("trust_mc_evidence_count=1")
+                && ay_facade.contains("verification_level_code=typed_handoff")
+                && ay_facade.contains("proof_replay_status_code=blocked")
+                && ay_facade.contains("ready_for_trust_mc_chc_handoff=false")
+                && ay_facade.contains("trust_mc_request_count=0")
+                && ay_facade.contains("trust_mc_evidence_count=0")
                 && ay_facade.contains("native_evidence_entry_count=1")
-                && ay_facade.contains("matched_trust_mc_request_count=1")
-                && ay_facade.contains("matched_trust_mc_chc_request_count=1")
-                && ay_facade.contains("matched_trust_mc_evidence_count=1")
-                && ay_facade.contains("matched_trust_mc_artifact_count=3")
-                && ay_facade
-                    .contains("matched_trust_mc_artifact_kind_codes=trust_mc_horn_clauses|replay_transcript|trust_mc_model")
-                && ay_facade.contains("matched_trust_mc_request_ids=0")
-                && ay_facade.contains("matched_trust_mc_request_mode_codes=chc")
-                && ay_facade.contains("semantic_bridge_status_code=represented")
-                && ay_facade.contains("semantic_bridge_reason_code=represented")
-                && ay_facade.contains("semantic_bridge_evidence_status_code=present")
-                && ay_facade.contains("semantic_bridge_proof_identity_schema=trust_ir.native.semantic_bridge.proof_identity.v1")
-                && ay_facade.contains("semantic_bridge_proof_identity_schema_version=1")
+                && ay_facade.contains("matched_trust_mc_request_count=0")
+                && ay_facade.contains("matched_trust_mc_chc_request_count=0")
+                && ay_facade.contains("matched_trust_mc_evidence_count=0")
+                && ay_facade.contains("matched_trust_mc_artifact_count=0")
+                && ay_facade.contains("matched_trust_mc_artifact_kind_codes=none")
+                && ay_facade.contains("matched_trust_mc_request_ids=none")
+                && ay_facade.contains("matched_trust_mc_request_mode_codes=none")
+                && ay_facade.contains("semantic_bridge_status_code=blocked")
+                && ay_facade.contains("semantic_bridge_reason_code=trusted_proof_not_admitted")
+                && ay_facade.contains("semantic_bridge_evidence_status_code=missing")
+                && ay_facade.contains("semantic_bridge_proof_identity_schema=trust_ir.native.semantic_bridge.proof_identity.v2")
+                && ay_facade.contains("semantic_bridge_proof_identity_schema_version=2")
                 && ay_facade.contains("semantic_bridge_proof_identity_digest=sha256:")
-                && ay_facade.contains("semantic_bridge_fail_closed=false")
+                && ay_facade.contains("semantic_bridge_fail_closed=true")
                 && ay_facade.contains("semantic_bridge_relation_code=petri_successor")
                 && ay_facade.contains("semantic_bridge_function_index=0")
                 && ay_facade.contains(
@@ -14351,9 +14364,9 @@ mod tests {
             .expect("native JIT admission blocker evidence should be emitted");
         assert!(
             admission_blocker.contains("source=NativeInstallGateAdmissionSummary")
-                && admission_blocker.contains("source_package=trust_cg-codegen")
-                && admission_blocker.contains("package=trust_cg-codegen")
-                && admission_blocker.contains("schema=trust_cg.phase6.native_install_gate.admission_summary.v1")
+                && admission_blocker.contains("source_package=trust-cg-codegen")
+                && admission_blocker.contains("package=trust-cg-codegen")
+                && admission_blocker.contains("schema=trust-cg.phase6.native_install_gate.admission_summary.v1")
                 && admission_blocker.contains("schema_version=1")
                 && admission_blocker.contains("consumer=mcc")
                 && admission_blocker.contains("consumer_mode=petri_successor")
@@ -14408,17 +14421,16 @@ mod tests {
             .expect("native JIT execution-plan evidence should be emitted");
         assert!(
             execution_plan.contains("source=PetriNativeSuccessorExecutionPlan")
-                && execution_plan.contains("schema=trust_cg.petri.native_successor.execution_plan.v1")
+                && execution_plan.contains("schema=trust-cg.petri.native_successor.execution_plan.v1")
                 && execution_plan.contains("consumer=mcc")
                 && execution_plan.contains("consumer_mode=ty_petri_native_jit")
                 && execution_plan.contains("kind=petri_successor")
                 && execution_plan.contains("surface=native_successor")
-                && execution_plan.contains("status_code=installable")
-                && execution_plan.contains("rejection_code=none")
-                && execution_plan.contains("reason_code=none")
+                && execution_plan.contains("status_code=rejected")
+                && execution_plan.contains("rejection_code=missing_native_install_gate_packet")
+                && execution_plan.contains("reason_code=missing_native_install_gate_packet")
                 && execution_plan.contains("requested_authority=canary_callable")
-                && (execution_plan.contains("install_authority=canary_callable")
-                    || execution_plan.contains("install_authority=none"))
+                && execution_plan.contains("install_authority=none")
                 && execution_plan.contains(
                     "execution_plan_api=trust-cg::petri_native_successor_execution_plan_from_trust_ir_bundle"
                 )
@@ -14461,23 +14473,25 @@ mod tests {
                 && execution_plan
                     .contains("native_evidence_metadata_module_digest=sha256:")
                 && execution_plan.contains("native_evidence_metadata_artifact_digests=none")
-                && execution_plan.contains("callable_contract_available=true")
-                && execution_plan.contains("trampoline_contract_available=true")
-                && execution_plan.contains("install_packet_available=true")
-                && execution_plan.contains("install_packet_status_code=available")
-                && execution_plan.contains("install_packet_reason_code=available")
+                && execution_plan.contains("callable_contract_available=false")
+                && execution_plan.contains("trampoline_contract_available=false")
+                && execution_plan.contains("install_packet_available=false")
+                && execution_plan.contains("install_packet_status_code=missing")
+                && execution_plan
+                    .contains("install_packet_reason_code=missing_native_install_gate_packet")
                 && execution_plan.contains(
                     "downstream_contract_api=trust-cg::petri_native_successor_downstream_contract_descriptor"
                 )
                 && execution_plan.contains(
-                    "downstream_contract_schema=trust_cg.petri.native_successor.downstream_contract.v1"
+                    "downstream_contract_schema=trust-cg.petri.native_successor.downstream_contract.v1"
                 )
                 && execution_plan.contains(
                     "downstream_trust_ir_bundle_identity_schema=trust_ir.native.bundle_identity_contract.v1"
                 )
-                && execution_plan.contains(
-                    "downstream_trust_ir_transport_identity_schema=trust_ir.native.transport_identity.v1"
-                )
+                && execution_plan.contains(&format!(
+                    "downstream_trust_ir_transport_identity_schema={}",
+                    trust_ir::NATIVE_TRANSPORT_IDENTITY_SCHEMA
+                ))
                 && execution_plan.contains(
                     "downstream_runtime_readiness_required_fields=call_packet,native_install_gate_packet,trampoline_contract,callable_lifetime_proof,runtime_abi_proof,current_generation"
                 )
@@ -14494,22 +14508,24 @@ mod tests {
                 )
                 && execution_plan.contains("runtime_readiness_installed_artifact_available=true")
                 && execution_plan
-                    .contains("runtime_readiness_schema=trust_cg.petri.native_successor.runtime_readiness_packet.v1")
+                    .contains("runtime_readiness_schema=trust-cg.petri.native_successor.runtime_readiness_packet.v1")
                 && execution_plan.contains("runtime_readiness_packet_available=true")
-                && execution_plan.contains("runtime_readiness_status_code=ready_for_runtime_call")
-                && execution_plan.contains("runtime_readiness_reason_code=none")
+                && execution_plan.contains("runtime_readiness_status_code=blocked")
+                && execution_plan
+                    .contains("runtime_readiness_reason_code=missing_native_install_gate_packet")
                 && execution_plan.contains("runtime_readiness_status_in_downstream_contract=true")
-                && execution_plan.contains("runtime_readiness_blocker_code=none")
+                && execution_plan
+                    .contains("runtime_readiness_blocker_code=missing_native_install_gate_packet")
                 && execution_plan.contains("runtime_readiness_blocker_in_downstream_contract=true")
-                && execution_plan.contains("runtime_readiness_blocker_stage=none")
-                && execution_plan.contains("runtime_readiness_ready_for_runtime_call=true")
+                && execution_plan.contains("runtime_readiness_blocker_stage=manifest_identity")
+                && execution_plan.contains("runtime_readiness_ready_for_runtime_call=false")
                 && execution_plan.contains("mock_executable_call_role=test_diagnostic_only")
                 && execution_plan.contains("mock_executable_call_production_enabled=false")
                 && execution_plan.contains(
                     "call_packet_api=trust-cg::petri_native_successor_call_packet_from_trust_ir_bundle"
                 )
                 && execution_plan
-                    .contains("call_packet_schema=trust_cg.petri.native_successor.call_packet.v1")
+                    .contains("call_packet_schema=trust-cg.petri.native_successor.call_packet.v1")
                 && execution_plan.contains("call_packet_type=PetriNativeSuccessorCallPacket")
                 && execution_plan
                     .contains("callable_pointer_type=PetriNativeSuccessorCallablePointer")
@@ -14522,35 +14538,43 @@ mod tests {
                 && execution_plan.contains("call_packet_api_status_code=available")
                 && execution_plan.contains("call_packet_type_available=true")
                 && execution_plan.contains("callable_pointer_type_available=true")
-                && execution_plan.contains("call_packet_available=true call_packet_reason_code=available")
                 && execution_plan.contains(
-                    "callable_pointer_available=true callable_pointer_reason_code=available"
+                    "call_packet_available=false call_packet_reason_code=missing_native_install_gate_packet"
+                )
+                && execution_plan.contains(
+                    "callable_pointer_available=false callable_pointer_reason_code=missing_native_install_gate_packet"
                 )
                 && execution_plan.contains("concrete_callable_pointer_required=true")
-                && execution_plan.contains("concrete_callable_pointer_available=true")
-                && execution_plan.contains("concrete_callable_pointer_status_code=available")
+                && execution_plan.contains("concrete_callable_pointer_available=false")
+                && execution_plan.contains("concrete_callable_pointer_status_code=missing")
                 && execution_plan.contains("concrete_callable_packet_required=true")
-                && execution_plan.contains("concrete_callable_packet_available=true")
-                && execution_plan.contains("concrete_callable_packet_status_code=available")
-                && execution_plan.contains("call_packet_readiness_status_code=ready_for_runtime_call")
-                && execution_plan.contains("call_packet_readiness_blocker=none")
-                && execution_plan.contains("callable_authorized=true")
-                && execution_plan.contains("callable_authorized_reason_code=available")
+                && execution_plan.contains("concrete_callable_packet_available=false")
+                && execution_plan.contains("concrete_callable_packet_status_code=missing")
+                && execution_plan.contains("call_packet_readiness_status_code=blocked")
+                && execution_plan
+                    .contains("call_packet_readiness_blocker=missing_native_install_gate_packet")
+                && execution_plan.contains("callable_authorized=false")
+                && execution_plan
+                    .contains("callable_authorized_reason_code=missing_native_install_gate_packet")
                 && execution_plan.contains("callable_handoff_available=true")
                 && execution_plan.contains("callable_handoff_reason_code=available")
-                && execution_plan.contains("callable_handoff_blocker=none")
-                && execution_plan.contains("callable_handoff_required_evidence=none")
+                && execution_plan
+                    .contains("callable_handoff_blocker=missing_native_install_gate_packet")
+                && execution_plan
+                    .contains("callable_handoff_required_evidence=trust-cg.phase6.native_install_gate.v1")
                 && execution_plan.contains(
                     "callable_handoff_upstream_ask=provide_runtime_callable_pointer_and_accepted_install_packet"
                 )
-                && execution_plan.contains("plan_fail_closed=false")
-                && execution_plan.contains("actions_expose_callable=true")
-                && execution_plan.contains("actions_expose_callable_blocked_by_runtime_readiness=false")
-                && execution_plan.contains("actions_expose_callable_reason_code=available")
+                && execution_plan.contains("plan_fail_closed=true")
+                && execution_plan.contains("actions_expose_callable=false")
+                && execution_plan.contains("actions_expose_callable_blocked_by_runtime_readiness=true")
+                && execution_plan
+                    .contains("actions_expose_callable_reason_code=missing_native_install_gate_packet")
                 && execution_plan.contains("actions_ty_native_activate=false")
                 && execution_plan
-                    .contains("actions_ty_native_activate_blocked_by_runtime_readiness=false")
-                && execution_plan.contains("actions_ty_native_activate_reason_code=none")
+                    .contains("actions_ty_native_activate_blocked_by_runtime_readiness=true")
+                && execution_plan
+                    .contains("actions_ty_native_activate_reason_code=missing_native_install_gate_packet")
                 && execution_plan.contains(
                     "ay_native_bundle_facade_api=ay_trust_mc_native_bundle::solve_trust_mc_petri_successor_native_verification_bundle"
                 )
@@ -14574,46 +14598,47 @@ mod tests {
                 && execution_plan
                     .contains("ay_native_bundle_facade_consumer_rejection_fail_closed=true")
                 && execution_plan.contains(
-                    "ay_native_bundle_facade_consumer_rejection_ready_for_trust_mc_chc_handoff=true"
+                    "ay_native_bundle_facade_consumer_rejection_ready_for_trust_mc_chc_handoff=false"
                 )
                 && execution_plan.contains("ay_native_bundle_facade_model_validated=false")
                 && execution_plan
-                    .contains("ay_native_bundle_facade_verification_level_code=none")
-                && execution_plan.contains("ay_native_bundle_facade_proof_replay_status_code=not_run")
+                    .contains("ay_native_bundle_facade_verification_level_code=typed_handoff")
                 && execution_plan
-                    .contains("ay_native_bundle_facade_ready_for_trust_mc_chc_handoff=true")
+                    .contains("ay_native_bundle_facade_proof_replay_status_code=blocked")
+                && execution_plan
+                    .contains("ay_native_bundle_facade_ready_for_trust_mc_chc_handoff=false")
                 && execution_plan.contains(
-                    "ay_native_bundle_facade_semantic_bridge_proof_identity_schema=trust_ir.native.semantic_bridge.proof_identity.v1"
+                    "ay_native_bundle_facade_semantic_bridge_proof_identity_schema=trust_ir.native.semantic_bridge.proof_identity.v2"
                 )
                 && execution_plan.contains(
-                    "ay_native_bundle_facade_semantic_bridge_proof_identity_schema_version=1"
+                    "ay_native_bundle_facade_semantic_bridge_proof_identity_schema_version=2"
                 )
                 && execution_plan.contains(
                     "ay_native_bundle_facade_semantic_bridge_proof_identity_digest=sha256:"
                 )
                 && execution_plan
-                    .contains("ay_native_bundle_facade_semantic_bridge_fail_closed=false")
+                    .contains("ay_native_bundle_facade_semantic_bridge_fail_closed=true")
                 && execution_plan
-                    .contains("ay_native_bundle_facade_semantic_bridge_status_code=represented")
+                    .contains("ay_native_bundle_facade_semantic_bridge_status_code=blocked")
                 && execution_plan
-                    .contains("ay_native_bundle_facade_semantic_bridge_reason_code=represented")
+                    .contains("ay_native_bundle_facade_semantic_bridge_reason_code=trusted_proof_not_admitted")
                 && execution_plan.contains(
-                    "ay_native_bundle_facade_semantic_bridge_evidence_status_code=present"
+                    "ay_native_bundle_facade_semantic_bridge_evidence_status_code=missing"
                 )
                 && execution_plan
-                    .contains("ay_native_bundle_facade_matched_trust_mc_request_count=1")
+                    .contains("ay_native_bundle_facade_matched_trust_mc_request_count=0")
                 && execution_plan
-                    .contains("ay_native_bundle_facade_matched_trust_mc_chc_request_count=1")
+                    .contains("ay_native_bundle_facade_matched_trust_mc_chc_request_count=0")
                 && execution_plan
-                    .contains("ay_native_bundle_facade_matched_trust_mc_evidence_count=1")
+                    .contains("ay_native_bundle_facade_matched_trust_mc_evidence_count=0")
                 && execution_plan
-                    .contains("ay_native_bundle_facade_matched_trust_mc_artifact_count=3")
+                    .contains("ay_native_bundle_facade_matched_trust_mc_artifact_count=0")
                 && execution_plan
                     .contains("ay_native_bundle_facade_accepted_for_native_production=false")
                 && execution_plan.contains("production_selected=false")
                 && execution_plan.contains("fail_closed=true")
-                && execution_plan.contains("native_successor_runtime_status_code=ready_for_runtime_call"),
-            "trust-cg execution plan should expose a callable native path while default production remains parity-gated: {execution_plan}"
+                && execution_plan.contains("native_successor_runtime_status_code=blocked"),
+            "trust-cg execution plan must preserve the native-install and semantic-proof blockers: {execution_plan}"
         );
         assert_execution_plan_exposes_compile_artifact_handoff(execution_plan, true);
 
@@ -14908,6 +14933,8 @@ mod tests {
         let row_count = evidence_field_usize(readiness, "identity_row_count");
         let replay_health_row_count =
             evidence_field_usize(readiness, "identity_replay_component_health_row_count");
+        let proof_identity_schema_version =
+            trust_ir::NATIVE_SEMANTIC_BRIDGE_PROOF_IDENTITY_SCHEMA_VERSION.to_string();
 
         assert_eq!(manifest_rows.len(), row_count);
         assert_eq!(replay_health_rows.len(), replay_health_row_count);
@@ -14916,7 +14943,10 @@ mod tests {
             evidence_field(readiness, "schema"),
             Some(trust_ir::NATIVE_SEMANTIC_BRIDGE_PROOF_IDENTITY_SCHEMA)
         );
-        assert_eq!(evidence_field(readiness, "schema_version"), Some("1"));
+        assert_eq!(
+            evidence_field(readiness, "schema_version"),
+            Some(proof_identity_schema_version.as_str())
+        );
         assert_eq!(
             evidence_field(readiness, "identity_schema"),
             Some(trust_ir::NATIVE_SEMANTIC_BRIDGE_PROOF_IDENTITY_SCHEMA)
@@ -15030,7 +15060,6 @@ mod tests {
 
     #[cfg(feature = "trust-cg-petri-native")]
     #[test]
-    #[ignore = "pre-existing upstream trust-ir/ay evidence-descriptor drift; asserts stale descriptor strings, unrelated to native successor parity (verified). Re-enable after evidence-descriptor re-sync."]
     fn ay_facade_rejects_represented_chc_handoff_until_lowering_available() {
         let net = all_transition_net();
         let bundle = semantic_evidence_native_verification_bundle_fixture(&net);
@@ -15064,7 +15093,7 @@ mod tests {
             .find(|evidence| evidence.contains("AY trust_mc_native_verification_bundle_facade"))
             .expect("AY native bundle facade evidence should be emitted");
         assert!(
-            ay_facade_evidence.ready_for_trust_mc_chc_handoff
+            !ay_facade_evidence.ready_for_trust_mc_chc_handoff
                 && !ay_facade_evidence.accepted_for_consumer
                 && !ay_facade_evidence.is_accepted_for_native_production()
                 && ay_facade_evidence.consumer_rejection_code
@@ -15089,16 +15118,16 @@ mod tests {
                     .contains("consumer_rejection_code=chc_problem_lowering_unavailable")
                 && ay_facade.contains("accepted_for_consumer=false")
                 && ay_facade.contains("consumer_rejection_fail_closed=true")
-                && ay_facade.contains("ready_for_trust_mc_chc_handoff=true")
-                && ay_facade.contains("consumer_rejection_ready_for_trust_mc_chc_handoff=true")
-                && ay_facade.contains("semantic_bridge_status_code=represented")
-                && ay_facade.contains("semantic_bridge_reason_code=represented")
-                && ay_facade.contains("semantic_bridge_evidence_status_code=present")
-                && ay_facade.contains("semantic_bridge_fail_closed=false")
-                && ay_facade.contains("matched_trust_mc_chc_request_count=1")
-                && ay_facade.contains("matched_trust_mc_evidence_count=1")
-                && ay_facade.contains("matched_trust_mc_artifact_count=3"),
-            "AY should own the fail-closed consumer rejection after represented CHC handoff: {ay_facade}"
+                && ay_facade.contains("ready_for_trust_mc_chc_handoff=false")
+                && ay_facade.contains("consumer_rejection_ready_for_trust_mc_chc_handoff=false")
+                && ay_facade.contains("semantic_bridge_status_code=blocked")
+                && ay_facade.contains("semantic_bridge_reason_code=trusted_proof_not_admitted")
+                && ay_facade.contains("semantic_bridge_evidence_status_code=missing")
+                && ay_facade.contains("semantic_bridge_fail_closed=true")
+                && ay_facade.contains("matched_trust_mc_chc_request_count=0")
+                && ay_facade.contains("matched_trust_mc_evidence_count=0")
+                && ay_facade.contains("matched_trust_mc_artifact_count=0"),
+            "AY must preserve the fail-closed consumer rejection for an unadmitted semantic proof: {ay_facade}"
         );
         let ay_route_admission = report
             .evidence
@@ -15157,12 +15186,12 @@ mod tests {
         let trust_ir_native_bundle_identity = downstream_contract.trust_ir_native_bundle_identity;
         assert!(
             ay_model_acceptance
-                .contains("schema=ay.chc.trust_mc_petri_successor_chc_model_acceptance.v1")
+                .contains("schema=ay.chc.trust_mc_petri_successor_model_acceptance.v1")
                 && ay_model_acceptance.contains("schema_version=1")
                 && ay_model_acceptance.contains(
                     "api=ay::chc::trust_mc_petri_successor_chc_model_acceptance_report"
                 )
-                && ay_model_acceptance.contains("consumer_acceptance_api=ay::chc::trust_mcPetriSuccessorChcModelAcceptanceReport::accept_for_consumer")
+                && ay_model_acceptance.contains("consumer_acceptance_api=ay::chc::TrustMcPetriSuccessorChcModelAcceptanceReport::accept_for_consumer")
                 && ay_model_acceptance.contains("status_code=rejected")
                 && ay_model_acceptance.contains("reason_code=proof_handoff_blocked")
                 && ay_model_acceptance.contains("accepted_for_consumer=false")
@@ -15177,7 +15206,7 @@ mod tests {
                 && ay_model_acceptance
                     .contains("trust_mc_chc_proof_handoff_status_code=blocked")
                 && ay_model_acceptance.contains(
-                    "trust_mc_chc_proof_handoff_reason_code=replay_transcript_digest_mismatch"
+                    "trust_mc_chc_proof_handoff_reason_code=binding_blocked"
                 )
                 && ay_model_acceptance
                     .contains("trust_mc_chc_model_validation_status_code=blocked")
@@ -15211,7 +15240,7 @@ mod tests {
                     "trust_ir_contract_model_acceptance_report_api_name=ay::chc::trust_mc_petri_successor_chc_model_acceptance_report"
                 )
                 && ay_model_acceptance.contains(
-                    "trust_ir_contract_consumer_acceptance_api_name=ay::chc::trust_mcPetriSuccessorChcModelAcceptanceReport::accept_for_consumer"
+                    "trust_ir_contract_consumer_acceptance_api_name=ay::chc::TrustMcPetriSuccessorChcModelAcceptanceReport::accept_for_consumer"
                 )
                 && ay_model_acceptance.contains("trust_ir_contract_production_acceptance_owner_suite=ay")
                 && ay_model_acceptance
@@ -15283,7 +15312,7 @@ mod tests {
                     "trust_ir_shared_primitive_model_acceptance_report_api_name=ay::chc::trust_mc_petri_successor_chc_model_acceptance_report"
                 )
                 && ay_model_acceptance.contains(
-                    "trust_ir_shared_primitive_consumer_acceptance_api_name=ay::chc::trust_mcPetriSuccessorChcModelAcceptanceReport::accept_for_consumer"
+                    "trust_ir_shared_primitive_consumer_acceptance_api_name=ay::chc::TrustMcPetriSuccessorChcModelAcceptanceReport::accept_for_consumer"
                 )
                 && ay_model_acceptance
                     .contains("trust_ir_shared_primitive_production_acceptance_owner_suite=ay")
@@ -15779,7 +15808,6 @@ mod tests {
 
     #[cfg(feature = "trust-cg-petri-native")]
     #[test]
-    #[ignore = "pre-existing upstream trust-ir/ay evidence-descriptor drift; asserts stale descriptor strings, unrelated to native successor parity (verified). Re-enable after evidence-descriptor re-sync."]
     fn execution_plan_routes_represented_chc_rejection_as_advisory_before_parity_gate() {
         let net = all_transition_net();
         let bundle = semantic_evidence_native_verification_bundle_fixture(&net);
@@ -15815,31 +15843,33 @@ mod tests {
         assert!(
             execution_plan.contains("bundle_source=represented_trust_mc_fixture")
                 && execution_plan.contains("bundle_validated=true")
-                && execution_plan.contains("status_code=installable")
-                && execution_plan.contains("rejection_code=none")
-                && execution_plan.contains("reason_code=none")
+                && execution_plan.contains("status_code=rejected")
+                && execution_plan.contains("rejection_code=missing_native_install_gate_packet")
+                && execution_plan.contains("reason_code=missing_native_install_gate_packet")
                 && execution_plan.contains("compile_artifact_handoff_ready=true")
-                && execution_plan.contains("callable_contract_available=true")
-                && execution_plan.contains("trampoline_contract_available=true")
-                && execution_plan.contains("install_packet_available=true")
-                && execution_plan.contains("install_packet_status_code=available")
-                && execution_plan.contains("call_packet_available=true")
-                && execution_plan.contains("call_packet_reason_code=available")
-                && execution_plan.contains("callable_pointer_available=true")
-                && execution_plan.contains("runtime_readiness_status_code=ready_for_runtime_call")
-                && execution_plan.contains("runtime_readiness_ready_for_runtime_call=true")
-                && execution_plan.contains("runtime_readiness_reason_code=none")
-                && execution_plan.contains("runtime_readiness_blocker_code=none")
-                && execution_plan.contains("runtime_readiness_ready_for_runtime_call=true")
-                && execution_plan.contains("execution_authority_authorized_for_execution=true")
+                && execution_plan.contains("callable_contract_available=false")
+                && execution_plan.contains("trampoline_contract_available=false")
+                && execution_plan.contains("install_packet_available=false")
+                && execution_plan.contains("install_packet_status_code=missing")
+                && execution_plan.contains("call_packet_available=false")
+                && execution_plan
+                    .contains("call_packet_reason_code=missing_native_install_gate_packet")
+                && execution_plan.contains("callable_pointer_available=false")
+                && execution_plan.contains("runtime_readiness_status_code=blocked")
+                && execution_plan.contains("runtime_readiness_ready_for_runtime_call=false")
+                && execution_plan
+                    .contains("runtime_readiness_reason_code=missing_native_install_gate_packet")
+                && execution_plan
+                    .contains("runtime_readiness_blocker_code=missing_native_install_gate_packet")
+                && execution_plan.contains("execution_authority_authorized_for_execution=false")
                 && execution_plan.contains(
-                    "production_selection_is_selected_for_native_execution=true"
+                    "production_selection_is_selected_for_native_execution=false"
                 )
-                && execution_plan.contains("callable_authorized=true")
-                && execution_plan.contains("callable_authorized_reason_code=available")
-                && execution_plan.contains("plan_fail_closed=false")
-                && execution_plan.contains("actions_expose_callable=true")
-                && !execution_plan.contains("missing_native_install_gate_packet")
+                && execution_plan.contains("callable_authorized=false")
+                && execution_plan
+                    .contains("callable_authorized_reason_code=missing_native_install_gate_packet")
+                && execution_plan.contains("plan_fail_closed=true")
+                && execution_plan.contains("actions_expose_callable=false")
                 && execution_plan.contains("ay_native_bundle_facade_status_code=blocked")
                 && execution_plan.contains(
                     "ay_native_bundle_facade_reason_code=chc_problem_lowering_unavailable"
@@ -15847,12 +15877,12 @@ mod tests {
                 && execution_plan.contains(
                     "ay_native_bundle_facade_consumer_rejection_code=chc_problem_lowering_unavailable"
                 )
-                && execution_plan.contains("ay_native_bundle_facade_ready_for_trust_mc_chc_handoff=true")
+                && execution_plan.contains("ay_native_bundle_facade_ready_for_trust_mc_chc_handoff=false")
                 && execution_plan.contains(
-                    "ay_native_bundle_facade_semantic_bridge_status_code=represented"
+                    "ay_native_bundle_facade_semantic_bridge_status_code=blocked"
                 )
                 && execution_plan.contains(
-                    "ay_native_bundle_facade_semantic_bridge_evidence_status_code=present"
+                    "ay_native_bundle_facade_semantic_bridge_evidence_status_code=missing"
                 )
                 && execution_plan
                     .contains("ay_native_bundle_facade_accepted_for_native_production=false")
@@ -15860,10 +15890,10 @@ mod tests {
                     "ay_model_acceptance_api=ay::chc::trust_mc_petri_successor_chc_model_acceptance_report"
                 )
                 && execution_plan.contains(
-                    "ay_model_acceptance_consumer_acceptance_api=ay::chc::trust_mcPetriSuccessorChcModelAcceptanceReport::accept_for_consumer"
+                    "ay_model_acceptance_consumer_acceptance_api=ay::chc::TrustMcPetriSuccessorChcModelAcceptanceReport::accept_for_consumer"
                 )
                 && execution_plan.contains(
-                    "ay_model_acceptance_schema=ay.chc.trust_mc_petri_successor_chc_model_acceptance.v1"
+                    "ay_model_acceptance_schema=ay.chc.trust_mc_petri_successor_model_acceptance.v1"
                 )
                 && execution_plan.contains("ay_model_acceptance_status_code=rejected")
                 && execution_plan.contains("ay_model_acceptance_reason_code=proof_handoff_blocked")
@@ -15878,7 +15908,7 @@ mod tests {
                 && execution_plan
                     .contains("ay_model_acceptance_ready_for_solver_validation=false")
                 && execution_plan.contains(
-                    "ay_model_acceptance_trust_mc_chc_proof_handoff_reason_code=replay_transcript_digest_mismatch"
+                    "ay_model_acceptance_trust_mc_chc_proof_handoff_reason_code=binding_blocked"
                 )
                 && execution_plan
                     .contains("ay_model_acceptance_solver_artifact_bytes_validated=false")
@@ -15911,10 +15941,10 @@ mod tests {
                 && execution_plan
                     .contains("ay_model_acceptance_trust_mc_chc_proof_handoff_fail_closed=true")
                 && execution_plan.contains(
-                    "ay_model_acceptance_trust_mc_chc_proof_handoff_replay_artifact_kind_code=replay_transcript"
+                    "ay_model_acceptance_trust_mc_chc_proof_handoff_replay_artifact_kind_code=none"
                 )
                 && execution_plan.contains(
-                    "ay_model_acceptance_trust_mc_chc_proof_handoff_model_artifact_kind_code=trust_mc_model"
+                    "ay_model_acceptance_trust_mc_chc_proof_handoff_model_artifact_kind_code=none"
                 )
                 && execution_plan.contains(
                     "ay_model_acceptance_trust_mc_chc_model_validation_schema=trust_ir.native.petri_successor.trust_mc_chc_model_validation_readiness.v1"
@@ -15925,31 +15955,30 @@ mod tests {
                     "ay_model_acceptance_trust_mc_chc_model_validation_model_artifact_kind_code=none"
                 )
                 && execution_plan
-                    .contains("native_successor_next_production_source=parity_gate")
+                    .contains("native_successor_next_production_source=semantic_successor_bridge")
                 && execution_plan.contains(
-                    "native_successor_next_production_api=TY_MCC_TRUST_CG_PETRI_PARITY"
+                    "native_successor_next_production_api=trust-cg::petri_native_successor_semantic_bridge_evidence_from_trust_ir_bundle"
                 )
                 && execution_plan.contains(
-                    "native_successor_next_production_input=TY_MCC_TRUST_CG_PETRI_PARITY"
+                    "native_successor_next_production_input=ty.petri.native.successor.plan_cache_equivalence.v1"
                 )
                 && execution_plan.contains(
-                    "native_successor_next_production_reason_code=parity_evidence_required"
+                    "native_successor_next_production_reason_code=missing_semantic_successor_obligation"
                 )
                 && execution_plan.contains(
                     "native_successor_next_production_status_code=blocked"
                 )
                 && execution_plan.contains(
-                    "native_successor_next_production_blocker_code=parity_evidence_required"
+                    "native_successor_next_production_blocker_code=missing_semantic_successor_obligation"
                 )
                 && execution_plan.contains("production_selected=false")
                 && execution_plan.contains("fail_closed=true"),
-            "represented CHC handoff must stay advisory while production fail-closes at the parity gate: {execution_plan}"
+            "unadmitted semantic proof must block before the parity gate: {execution_plan}"
         );
     }
 
     #[cfg(feature = "trust-cg-petri-native")]
     #[test]
-    #[ignore = "pre-existing upstream trust-ir/ay evidence-descriptor drift; asserts stale descriptor strings, unrelated to native successor parity (verified). Re-enable after evidence-descriptor re-sync."]
     fn native_successor_capability_report_consumes_trust_ir_transport_identity_bundle() {
         let net = all_transition_net();
         let bundle = native_verification_bundle_fixture(&net);
@@ -16052,14 +16081,14 @@ mod tests {
                     "bundle_digest={}",
                     expected_identity.bundle_digest
                 ))
-                && semantic_bridge.contains("successor_relation_represented=true")
-                && semantic_bridge.contains("semantic_successor_authority=true")
-                && semantic_bridge.contains("semantic_bridge_status_code=ready")
-                && semantic_bridge.contains("reason_code=none")
-                && semantic_bridge.contains("trust_cg_status_code=ready")
-                && semantic_bridge.contains("trust_ir_semantic_bridge_status_code=represented")
-                && semantic_bridge.contains("trust_ir_semantic_bridge_evidence_status=present")
-                && semantic_bridge.contains("trust_ir_semantic_bridge_fail_closed=false")
+                && semantic_bridge.contains("successor_relation_represented=false")
+                && semantic_bridge.contains("semantic_successor_authority=false")
+                && semantic_bridge.contains("semantic_bridge_status_code=blocked")
+                && semantic_bridge.contains("reason_code=missing_semantic_successor_obligation")
+                && semantic_bridge.contains("trust_cg_status_code=blocked")
+                && semantic_bridge.contains("trust_ir_semantic_bridge_status_code=blocked")
+                && semantic_bridge.contains("trust_ir_semantic_bridge_evidence_status=missing")
+                && semantic_bridge.contains("trust_ir_semantic_bridge_fail_closed=true")
                 && semantic_bridge.contains("production_selected=false")
                 && semantic_bridge.contains("fail_closed=true"),
             "external bundle should expose the semantic successor bridge without native promotion: {semantic_bridge}"
@@ -16091,29 +16120,28 @@ mod tests {
                 && ay_facade.contains("accepted_for_consumer=false")
                 && ay_facade.contains("fail_closed=true")
                 && ay_facade.contains("consumer_rejection_fail_closed=true")
-                && ay_facade.contains("consumer_rejection_ready_for_trust_mc_chc_handoff=true")
+                && ay_facade.contains("consumer_rejection_ready_for_trust_mc_chc_handoff=false")
                 && ay_facade.contains("model_validated=false")
-                && ay_facade.contains("verification_level_code=none")
-                && ay_facade.contains("proof_replay_status_code=not_run")
-                && ay_facade.contains("ready_for_trust_mc_chc_handoff=true")
-                && ay_facade.contains("trust_mc_request_count=1")
-                && ay_facade.contains("trust_mc_evidence_count=1")
+                && ay_facade.contains("verification_level_code=typed_handoff")
+                && ay_facade.contains("proof_replay_status_code=blocked")
+                && ay_facade.contains("ready_for_trust_mc_chc_handoff=false")
+                && ay_facade.contains("trust_mc_request_count=0")
+                && ay_facade.contains("trust_mc_evidence_count=0")
                 && ay_facade.contains("native_evidence_entry_count=1")
-                && ay_facade.contains("matched_trust_mc_request_count=1")
-                && ay_facade.contains("matched_trust_mc_chc_request_count=1")
-                && ay_facade.contains("matched_trust_mc_evidence_count=1")
-                && ay_facade.contains("matched_trust_mc_artifact_count=3")
-                && ay_facade
-                    .contains("matched_trust_mc_artifact_kind_codes=trust_mc_horn_clauses|replay_transcript|trust_mc_model")
-                && ay_facade.contains("matched_trust_mc_request_ids=0")
-                && ay_facade.contains("matched_trust_mc_request_mode_codes=chc")
-                && ay_facade.contains("semantic_bridge_status_code=represented")
-                && ay_facade.contains("semantic_bridge_reason_code=represented")
-                && ay_facade.contains("semantic_bridge_evidence_status_code=present")
-                && ay_facade.contains("semantic_bridge_fail_closed=false")
+                && ay_facade.contains("matched_trust_mc_request_count=0")
+                && ay_facade.contains("matched_trust_mc_chc_request_count=0")
+                && ay_facade.contains("matched_trust_mc_evidence_count=0")
+                && ay_facade.contains("matched_trust_mc_artifact_count=0")
+                && ay_facade.contains("matched_trust_mc_artifact_kind_codes=none")
+                && ay_facade.contains("matched_trust_mc_request_ids=none")
+                && ay_facade.contains("matched_trust_mc_request_mode_codes=none")
+                && ay_facade.contains("semantic_bridge_status_code=blocked")
+                && ay_facade.contains("semantic_bridge_reason_code=trusted_proof_not_admitted")
+                && ay_facade.contains("semantic_bridge_evidence_status_code=missing")
+                && ay_facade.contains("semantic_bridge_fail_closed=true")
                 && ay_facade.contains("semantic_bridge_proof_status_code=discharged")
                 && ay_facade.contains("production_selected=false"),
-            "external bundle should expose represented AY evidence as advisory until lowering exists: {ay_facade}"
+            "external bundle must preserve unadmitted semantic proof evidence as fail-closed: {ay_facade}"
         );
         let admission_blocker = report
             .evidence
@@ -16152,9 +16180,9 @@ mod tests {
                 && execution_plan.contains("native_evidence_native_execution_artifacts=0")
                 && execution_plan.contains("native_evidence_semantic_proof_available=true")
                 && execution_plan.contains("native_evidence_native_execution_artifact_available=false")
-                && execution_plan.contains("status_code=installable")
-                && execution_plan.contains("rejection_code=none")
-                && execution_plan.contains("reason_code=none")
+                && execution_plan.contains("status_code=rejected")
+                && execution_plan.contains("rejection_code=missing_native_install_gate_packet")
+                && execution_plan.contains("reason_code=missing_native_install_gate_packet")
                 && execution_plan.contains(
                     "execution_plan_api=trust-cg::petri_native_successor_execution_plan_from_trust_ir_bundle"
                 )
@@ -16176,23 +16204,25 @@ mod tests {
                 && execution_plan.contains("execution_plan_available=true")
                 && execution_plan.contains("execution_plan_status_code=available")
                 && execution_plan.contains("execution_plan_reason_code=available")
-                && execution_plan.contains("callable_contract_available=true")
-                && execution_plan.contains("trampoline_contract_available=true")
-                && execution_plan.contains("install_packet_available=true")
-                && execution_plan.contains("install_packet_status_code=available")
-                && execution_plan.contains("install_packet_reason_code=available")
+                && execution_plan.contains("callable_contract_available=false")
+                && execution_plan.contains("trampoline_contract_available=false")
+                && execution_plan.contains("install_packet_available=false")
+                && execution_plan.contains("install_packet_status_code=missing")
+                && execution_plan
+                    .contains("install_packet_reason_code=missing_native_install_gate_packet")
                 && execution_plan.contains(
                     "downstream_contract_api=trust-cg::petri_native_successor_downstream_contract_descriptor"
                 )
                 && execution_plan.contains(
-                    "downstream_contract_schema=trust_cg.petri.native_successor.downstream_contract.v1"
+                    "downstream_contract_schema=trust-cg.petri.native_successor.downstream_contract.v1"
                 )
                 && execution_plan.contains(
                     "downstream_trust_ir_bundle_identity_schema=trust_ir.native.bundle_identity_contract.v1"
                 )
-                && execution_plan.contains(
-                    "downstream_trust_ir_transport_identity_schema=trust_ir.native.transport_identity.v1"
-                )
+                && execution_plan.contains(&format!(
+                    "downstream_trust_ir_transport_identity_schema={}",
+                    trust_ir::NATIVE_TRANSPORT_IDENTITY_SCHEMA
+                ))
                 && execution_plan.contains(
                     "downstream_runtime_readiness_required_fields=call_packet,native_install_gate_packet,trampoline_contract,callable_lifetime_proof,runtime_abi_proof,current_generation"
                 )
@@ -16209,14 +16239,16 @@ mod tests {
                 )
                 && execution_plan.contains("runtime_readiness_installed_artifact_available=false")
                 && execution_plan
-                    .contains("runtime_readiness_schema=trust_cg.petri.native_successor.runtime_readiness_packet.v1")
+                    .contains("runtime_readiness_schema=trust-cg.petri.native_successor.runtime_readiness_packet.v1")
                 && execution_plan.contains("runtime_readiness_packet_available=true")
                 && execution_plan.contains("runtime_readiness_status_code=blocked")
-                && execution_plan.contains("runtime_readiness_reason_code=missing_callable_pointer")
+                && execution_plan
+                    .contains("runtime_readiness_reason_code=missing_native_install_gate_packet")
                 && execution_plan.contains("runtime_readiness_status_in_downstream_contract=true")
-                && execution_plan.contains("runtime_readiness_blocker_code=missing_callable_pointer")
+                && execution_plan
+                    .contains("runtime_readiness_blocker_code=missing_native_install_gate_packet")
                 && execution_plan.contains("runtime_readiness_blocker_in_downstream_contract=true")
-                && execution_plan.contains("runtime_readiness_blocker_stage=call_packet")
+                && execution_plan.contains("runtime_readiness_blocker_stage=manifest_identity")
                 && execution_plan.contains("runtime_readiness_ready_for_runtime_call=false")
                 && execution_plan.contains("mock_executable_call_role=test_diagnostic_only")
                 && execution_plan.contains("mock_executable_call_production_enabled=false")
@@ -16224,7 +16256,7 @@ mod tests {
                     "call_packet_api=trust-cg::petri_native_successor_call_packet_from_trust_ir_bundle"
                 )
                 && execution_plan
-                    .contains("call_packet_schema=trust_cg.petri.native_successor.call_packet.v1")
+                    .contains("call_packet_schema=trust-cg.petri.native_successor.call_packet.v1")
                 && execution_plan.contains("call_packet_type=PetriNativeSuccessorCallPacket")
                 && execution_plan
                     .contains("callable_pointer_type=PetriNativeSuccessorCallablePointer")
@@ -16238,10 +16270,10 @@ mod tests {
                 && execution_plan.contains("call_packet_type_available=true")
                 && execution_plan.contains("callable_pointer_type_available=true")
                 && execution_plan.contains(
-                    "call_packet_available=false call_packet_reason_code=missing_callable_pointer"
+                    "call_packet_available=false call_packet_reason_code=missing_native_install_gate_packet"
                 )
                 && execution_plan.contains(
-                    "callable_pointer_available=false callable_pointer_reason_code=missing_callable_pointer"
+                    "callable_pointer_available=false callable_pointer_reason_code=missing_native_install_gate_packet"
                 )
                 && execution_plan.contains("concrete_callable_pointer_required=true")
                 && execution_plan.contains("concrete_callable_pointer_available=false")
@@ -16250,25 +16282,29 @@ mod tests {
                 && execution_plan.contains("concrete_callable_packet_available=false")
                 && execution_plan.contains("concrete_callable_packet_status_code=missing")
                 && execution_plan.contains("call_packet_readiness_status_code=blocked")
-                && execution_plan.contains("call_packet_readiness_blocker=missing_callable_pointer")
-                && execution_plan.contains("callable_authorized=true")
-                && execution_plan.contains("callable_authorized_reason_code=available")
+                && execution_plan
+                    .contains("call_packet_readiness_blocker=missing_native_install_gate_packet")
+                && execution_plan.contains("callable_authorized=false")
+                && execution_plan
+                    .contains("callable_authorized_reason_code=missing_native_install_gate_packet")
                 && execution_plan.contains("callable_handoff_available=true")
                 && execution_plan.contains("callable_handoff_reason_code=available")
-                && execution_plan.contains("callable_handoff_blocker=missing_callable_pointer")
                 && execution_plan
-                    .contains("callable_handoff_required_evidence=trust_cg.petri.native_successor.call_packet.v1")
+                    .contains("callable_handoff_blocker=missing_native_install_gate_packet")
+                && execution_plan
+                    .contains("callable_handoff_required_evidence=trust-cg.phase6.native_install_gate.v1")
                 && execution_plan.contains(
                     "callable_handoff_upstream_ask=provide_runtime_callable_pointer_and_accepted_install_packet"
                 )
-                && execution_plan.contains("plan_fail_closed=false")
-                && execution_plan.contains("actions_expose_callable=true")
+                && execution_plan.contains("plan_fail_closed=true")
+                && execution_plan.contains("actions_expose_callable=false")
                 && execution_plan.contains("actions_expose_callable_blocked_by_runtime_readiness=true")
-                && execution_plan.contains("actions_expose_callable_reason_code=available")
+                && execution_plan
+                    .contains("actions_expose_callable_reason_code=missing_native_install_gate_packet")
                 && execution_plan
                     .contains("actions_ty_native_activate_blocked_by_runtime_readiness=true")
                 && execution_plan
-                    .contains("actions_ty_native_activate_reason_code=missing_callable_pointer")
+                    .contains("actions_ty_native_activate_reason_code=missing_native_install_gate_packet")
                 && execution_plan.contains("production_selected=false")
                 && execution_plan.contains("fail_closed=true")
                 && execution_plan.contains("native_successor_runtime_status_code=blocked"),
@@ -17647,13 +17683,21 @@ mod tests {
     fn assert_focused_trust_ir_component_lines(
         rows: &[&str],
         schema: &str,
+        schema_version: u32,
         expected_lines: &[String],
     ) {
+        let schema_version = schema_version.to_string();
         assert_eq!(rows.len(), expected_lines.len());
         for (row, expected_line) in rows.iter().zip(expected_lines) {
             assert_eq!(evidence_field(row, "schema"), Some(schema));
-            assert_eq!(evidence_field(row, "schema_version"), Some("1"));
-            assert_eq!(evidence_field(row, "source_package"), Some("trust_ir"));
+            assert_eq!(
+                evidence_field(row, "schema_version"),
+                Some(schema_version.as_str())
+            );
+            assert_eq!(
+                evidence_field(row, "source_package"),
+                Some(trust_ir::PETRI_NATIVE_VERIFICATION_BUNDLE_HANDOFF_SOURCE_PACKAGE)
+            );
             assert_eq!(evidence_field(row, "source_project"), Some("trust-ir"));
             assert_eq!(evidence_field(row, "project"), Some("trust-ir"));
             assert_eq!(focused_manifest_line(row), Some(expected_line.as_str()));
@@ -17662,7 +17706,6 @@ mod tests {
 
     #[cfg(feature = "trust-cg-petri-native")]
     #[test]
-    #[ignore = "pre-existing upstream trust-ir/ay evidence-descriptor drift; asserts stale descriptor strings, unrelated to native successor parity (verified). Re-enable after evidence-descriptor re-sync."]
     fn focused_trust_ir_ty_mcc_shared_primitive_manifest_rows_match_producer() {
         let net = all_transition_net();
         let report = petri_native_successor_capability_report(&net);
@@ -17675,26 +17718,26 @@ mod tests {
         assert_focused_trust_ir_component_lines(
             &rows,
             trust_ir::TY_SHARED_PRIMITIVE_MANIFEST_SCHEMA,
+            trust_ir::TY_SHARED_PRIMITIVE_MANIFEST_SCHEMA_VERSION,
             &expected_lines,
         );
         assert!(rows.iter().any(|row| {
-            focused_manifest_line(row) == Some("ty_mcc_shared_primitive_manifest.status=available")
+            focused_manifest_line(row) == Some("ty_shared_primitive_manifest.status=available")
         }));
         assert!(rows.iter().any(|row| {
             focused_manifest_line(row).is_some_and(|line| {
-                line == "ty_mcc_shared_primitive_manifest.component.2.rows_api=chc_x86_hardware_vector_contract_manifest_rows()"
+                line == "ty_shared_primitive_manifest.component.2.rows_api=chc_x86_hardware_vector_contract_manifest_rows()"
             })
         }));
         assert!(rows.iter().any(|row| {
             focused_manifest_line(row).is_some_and(|line| {
-                line == "ty_mcc_shared_primitive_manifest.hardware_vector_contract_row.0.key=hardware_vector_contract_set.manifest.schema"
+                line == "ty_shared_primitive_manifest.hardware_vector_contract_row.0.key=hardware_vector_contract_set.manifest.schema"
             })
         }));
     }
 
     #[cfg(feature = "trust-cg-petri-native")]
     #[test]
-    #[ignore = "pre-existing upstream trust-ir/ay evidence-descriptor drift; asserts stale descriptor strings, unrelated to native successor parity (verified). Re-enable after evidence-descriptor re-sync."]
     fn focused_trust_ir_hardware_vector_contract_rows_match_producer() {
         let net = all_transition_net();
         let report = petri_native_successor_capability_report(&net);
@@ -17707,11 +17750,12 @@ mod tests {
         assert_focused_trust_ir_component_lines(
             &rows,
             trust_ir::HARDWARE_VECTOR_CONTRACT_MANIFEST_SCHEMA,
+            trust_ir::HARDWARE_VECTOR_CONTRACT_MANIFEST_SCHEMA_VERSION,
             &expected_lines,
         );
         assert!(rows.iter().any(|row| {
             focused_manifest_line(row)
-                == Some("hardware_vector_contract_set.source.package=trust_ir")
+                == Some("hardware_vector_contract_set.source.package=trust-ir")
         }));
         assert!(rows.iter().any(|row| {
             focused_manifest_line(row)
@@ -17785,7 +17829,6 @@ mod tests {
 
     #[cfg(feature = "trust-cg-petri-native")]
     #[test]
-    #[ignore = "pre-existing upstream trust-ir/ay evidence-descriptor drift; asserts stale descriptor strings, unrelated to native successor parity (verified). Re-enable after evidence-descriptor re-sync."]
     fn focused_trust_cg_host_jit_pgo_rows_match_producer_descriptor() {
         let net = all_transition_net();
         let report = petri_native_successor_capability_report(&net);
@@ -17925,7 +17968,6 @@ mod tests {
 
     #[cfg(feature = "trust-cg-petri-native")]
     #[test]
-    #[ignore = "pre-existing upstream trust-ir/ay evidence-descriptor drift; asserts stale descriptor strings, unrelated to native successor parity (verified). Re-enable after evidence-descriptor re-sync."]
     fn focused_trust_ir_semantic_bridge_proof_identity_rows_match_producer() {
         let net = all_transition_net();
         let bundle = native_verification_bundle_fixture(&net);
@@ -17957,6 +17999,7 @@ mod tests {
         assert_focused_trust_ir_component_lines(
             &rows,
             trust_ir::NATIVE_SEMANTIC_BRIDGE_PROOF_IDENTITY_SCHEMA,
+            trust_ir::NATIVE_SEMANTIC_BRIDGE_PROOF_IDENTITY_SCHEMA_VERSION,
             &expected_lines,
         );
         assert_eq!(
@@ -18037,7 +18080,6 @@ mod tests {
 
     #[cfg(feature = "trust-cg-petri-native")]
     #[test]
-    #[ignore = "pre-existing upstream trust-ir/ay evidence-descriptor drift; asserts stale descriptor strings, unrelated to native successor parity (verified). Re-enable after evidence-descriptor re-sync."]
     fn focused_trust_ir_trust_mc_chc_proof_evidence_identity_rows_match_producer() {
         let net = all_transition_net();
         let bundle = semantic_evidence_native_verification_bundle_fixture(&net);
@@ -18084,6 +18126,7 @@ mod tests {
         assert_focused_trust_ir_component_lines(
             &rows,
             trust_ir::PETRI_SUCCESSOR_TRUST_MC_CHC_PROOF_EVIDENCE_IDENTITY_SCHEMA,
+            trust_ir::PETRI_SUCCESSOR_TRUST_MC_CHC_PROOF_EVIDENCE_IDENTITY_SCHEMA_VERSION,
             &expected_lines,
         );
         assert_eq!(

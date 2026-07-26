@@ -15,9 +15,9 @@ mod ordering;
 
 use super::functions::FP_UNSET;
 use super::Value;
+use crate::rp::Rp as Arc;
 use num_traits::ToPrimitive;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use crate::rp::Rp as Arc;
 /// Array-backed function for small integer interval domains.
 ///
 /// This is a performance optimization for functions with domain `a..b` (integer interval).
@@ -110,6 +110,21 @@ impl IntIntervalFunc {
     #[inline]
     pub fn values_refcount(&self) -> usize {
         Arc::strong_count(&self.values)
+    }
+
+    /// Mutable access to `f[key]`, ONLY when the value array is uniquely
+    /// owned (never copies). Returns `None` when shared or out of domain.
+    ///
+    /// CONTRACT (record canonicalization walk): callers must only replace
+    /// the value with a structurally EQUAL one — the cached additive
+    /// fingerprint is NOT invalidated by this accessor.
+    #[inline]
+    pub(crate) fn value_mut_unique(&mut self, key: i64) -> Option<&mut Value> {
+        let offset = key.checked_sub(self.min)?;
+        if offset < 0 {
+            return None;
+        }
+        Arc::get_mut(&mut self.values)?.get_mut(offset as usize)
     }
 
     /// Apply the function to an argument. Returns None if out of bounds.

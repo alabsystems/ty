@@ -23,6 +23,14 @@ pub(crate) trait PermLookup {
     /// Returns `Some(permuted_value)` if the value changes, `None` if unchanged.
     fn apply_to_model_value(&self, name: &Arc<str>) -> Option<Value>;
 
+    /// Process-unique serial identifying this permutation's content for the
+    /// permutation memo, or `None` if this lookup type does not participate
+    /// in memoization. Default: no memoization.
+    #[inline]
+    fn memo_serial(&self) -> Option<u32> {
+        None
+    }
+
     /// Compare the permuted model value `name` against `other`:
     /// exactly `permute(ModelValue(name)).cmp(other)`. The default
     /// materializes via `apply_to_model_value`; `MVPerm` overrides with an
@@ -56,6 +64,13 @@ impl PermLookup for MVPerm {
             .map(|permuted_name| Value::ModelValue(Rp::clone(permuted_name)))
     }
 
+    /// MVPerm participates in permutation memoization (value-canon): its
+    /// serial is process-unique and content-stable (see `MVPerm::memo_serial`).
+    #[inline]
+    fn memo_serial(&self) -> Option<u32> {
+        Some(MVPerm::memo_serial(self))
+    }
+
     /// Allocation-free override: `apply` returns the permuted name by
     /// reference (`None` = identity), so no `Value`/`Arc` is constructed.
     fn permute_cmp_model_value(&self, name: &Arc<str>, other: &Value) -> std::cmp::Ordering {
@@ -77,6 +92,7 @@ impl Value {
     /// change the value. This avoids allocating new collections when most values
     /// are unchanged by a permutation.
     pub fn permute(&self, perm: &FuncValue) -> Value {
+        crate::churn_stats::churn_count(crate::churn_stats::ChurnSite::PermuteMaterialize);
         match self.permute_impl(perm) {
             Some(v) => v,         // Changed - return new value
             None => self.clone(), // Unchanged - cheap Arc bump
@@ -88,6 +104,7 @@ impl Value {
     /// This is 10x faster than `permute()` for specs with many model values
     /// because it uses array indexing instead of binary search.
     pub fn permute_fast(&self, perm: &MVPerm) -> Value {
+        crate::churn_stats::churn_count(crate::churn_stats::ChurnSite::PermuteMaterialize);
         match self.permute_impl(perm) {
             Some(v) => v,         // Changed - return new value
             None => self.clone(), // Unchanged - cheap Arc bump
@@ -99,7 +116,12 @@ impl Value {
     ///
     /// Visible within `crate::value` so the lazy permute-compare
     /// (`permute_cmp.rs`) can share the exact same permutation semantics.
-    pub(in crate::value) fn permute_impl<P: PermLookup>(&self, perm: &P) -> Option<Value> {
+    ///
+    /// UNCACHED oracle: the memoized wrapper `Value::permute_impl` (in
+    /// `permute_memo.rs`) delegates here on miss. Recursive calls below go
+    /// through the MEMOIZED `permute_impl`, so nested compound values are
+    /// memoized individually.
+    pub(in crate::value) fn permute_impl_uncached<P: PermLookup>(&self, perm: &P) -> Option<Value> {
         match self {
             // Primitive values never change
             Value::Bool(_) | Value::SmallInt(_) | Value::Int(_) | Value::String(_) => None,

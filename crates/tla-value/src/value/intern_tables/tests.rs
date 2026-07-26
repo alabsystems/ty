@@ -15,10 +15,10 @@
 //! coverage is preserved without global state.
 
 use super::shared::{record_counted_insert, reset_counted_table};
+use crate::rp::Rp as Arc;
 use crate::value::Value;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use crate::rp::Rp as Arc;
 
 fn insert_counted(table: &DashMap<u64, Arc<[Value]>>, count: &AtomicUsize, cap: usize, key: u64) {
     let value: Arc<[Value]> = Arc::from(vec![Value::SmallInt(key as i64)]);

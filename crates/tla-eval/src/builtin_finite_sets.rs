@@ -7,9 +7,8 @@ use super::{
     EvalError, EvalResult, Expr, FuncValue, KSubsetValue, Span, Spanned, Value,
 };
 use num_bigint::BigInt;
-use tla_value::Rp;
 use num_traits::{One, ToPrimitive, Zero};
-use std::sync::Arc;
+use tla_value::Rp;
 
 pub(super) fn eval_builtin_finite_sets(
     ctx: &EvalCtx,

@@ -9,10 +9,9 @@
 //! Part of #1371.
 
 use tla_check::Value;
-use tla_value::SortedSet;
+use tla_value::{Rp, SortedSet};
 
 use super::helpers::eval_str;
-use std::sync::Arc;
 
 #[cfg_attr(test, ntest::timeout(10000))]
 #[test]
@@ -37,7 +36,7 @@ fn test_random_subset_full_set() {
 fn test_random_subset_empty() {
     // RandomSubset(0, {1, 2, 3}) returns empty set
     let result = eval_str(r#"RandomSubset(0, {1, 2, 3})"#).unwrap();
-    assert_eq!(result, Value::Set(Arc::new(SortedSet::new())));
+    assert_eq!(result, Value::Set(Rp::new(SortedSet::new())));
 }
 
 #[cfg_attr(test, ntest::timeout(10000))]

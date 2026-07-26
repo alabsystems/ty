@@ -12,9 +12,31 @@ use crate::liveness::test_helpers::{
     empty_successors, make_checker, make_checker_with_vars, spanned,
 };
 use crate::liveness::LiveExpr;
+use crate::test_support::parse_module;
 use crate::Value;
 use std::sync::Arc;
 use tla_core::ast::Expr;
+
+const ACTION_STATE_BOUNDARY_SPEC: &str = r#"
+---- MODULE ActionStateBoundary ----
+EXTENDS Integers
+VARIABLE x
+Step == LET Current == x IN x' = Current + 1
+====
+"#;
+
+fn parsed_op_body(module: &tla_core::ast::Module, name: &str) -> Arc<tla_core::Spanned<Expr>> {
+    module
+        .units
+        .iter()
+        .find_map(|unit| match &unit.node {
+            tla_core::ast::Unit::Operator(def) if def.name.node == name => {
+                Some(Arc::new(def.body.clone()))
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("missing operator {name}"))
+}
 
 /// Test that the batched eval path produces identical results to the fallback path.
 ///
@@ -88,6 +110,102 @@ fn test_batched_vs_fallback_produce_identical_masks() {
     assert_eq!(
         fb_n1.action_check_masks, bt_n1.action_check_masks,
         "action masks for n1 must be identical between fallback and batched paths"
+    );
+}
+
+/// The array-native action evaluator uses `eval_entry_inline`, so its caller
+/// must establish a fresh current-state cache boundary once per source node.
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_batched_action_leaf_clears_state_dependent_let_cache_per_source() {
+    crate::eval::clear_for_test_reset();
+    crate::liveness::clear_leaf_result_cache();
+
+    let module = parse_module(ACTION_STATE_BOUNDARY_SPEC);
+    let formula = LiveExpr::always(LiveExpr::Bool(true));
+    let check_action = vec![LiveExpr::action_pred(parsed_op_body(&module, "Step"), 9040)];
+    let action_used = vec![true];
+    let s0 = State::from_pairs([("x", Value::int(0))]);
+    let s1 = State::from_pairs([("x", Value::int(1))]);
+
+    let (bt_n0, bt_n1) = {
+        let mut checker = make_checker_with_vars(formula, &["x"]);
+        let mut get_successors = empty_successors;
+        let n0 = checker
+            .add_initial_state(&s0, &mut get_successors, None)
+            .unwrap()[0];
+        let n1 = checker
+            .add_successors(n0, std::slice::from_ref(&s1), &mut get_successors, None)
+            .unwrap()[0];
+        checker
+            .add_successors(n1, std::slice::from_ref(&s1), &mut get_successors, None)
+            .unwrap();
+        checker
+            .populate_node_check_masks(&check_action, &[], &action_used, &[], 0)
+            .unwrap();
+        (
+            checker.graph().get_node_info(&n0).unwrap().into_owned(),
+            checker.graph().get_node_info(&n1).unwrap().into_owned(),
+        )
+    };
+
+    assert!(
+        bt_n0.action_check_masks.get(0).unwrap().get(0),
+        "0 -> 1 satisfies Step"
+    );
+    assert!(
+        !bt_n1.action_check_masks.get(0).unwrap().get(0),
+        "1 -> 1 does not satisfy Step"
+    );
+}
+
+/// Evaluation deduplicates identical fingerprint pairs, but the installed mask
+/// vector must still match the graph's successor multiplicity and order.
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_batched_action_masks_preserve_duplicate_successor_order() {
+    let formula = LiveExpr::always(LiveExpr::Bool(true));
+    let check_action = vec![action_pred_xprime_eq_x_plus_1(9050)];
+    let action_used = vec![true];
+    let s0 = State::from_pairs([("x", Value::int(0))]);
+    let s1 = State::from_pairs([("x", Value::int(1))]);
+
+    let mut checker = make_checker_with_vars(formula, &["x"]);
+    let mut get_successors = empty_successors;
+    let n0 = checker
+        .add_initial_state(&s0, &mut get_successors, None)
+        .unwrap()[0];
+    checker
+        .add_successors(
+            n0,
+            &[s1.clone(), s0.clone(), s1.clone()],
+            &mut get_successors,
+            None,
+        )
+        .unwrap();
+    checker
+        .populate_node_check_masks(&check_action, &[], &action_used, &[], 0)
+        .unwrap();
+
+    let info = checker.graph().get_node_info(&n0).unwrap();
+    let successor_fps: Vec<_> = info.successors().iter().map(|node| node.state_fp).collect();
+    assert_eq!(
+        successor_fps,
+        vec![s1.fingerprint(), s0.fingerprint(), s1.fingerprint()],
+        "graph successor order and duplicates must be retained"
+    );
+    assert_eq!(info.action_check_masks.len(), info.successors().len());
+    assert_eq!(
+        info.action_check_masks
+            .iter()
+            .map(|mask| mask.get(0))
+            .collect::<Vec<_>>(),
+        vec![true, false, true],
+        "deduplicated pair results must be expanded back onto every graph edge"
+    );
+    assert_eq!(
+        info.action_check_masks.get(0).unwrap(),
+        info.action_check_masks.get(2).unwrap()
     );
 }
 
@@ -201,7 +319,8 @@ fn test_batched_vs_fallback_multi_check_masks() {
         "n0 should have 2 successors (n1 and self-loop)"
     );
     assert_ne!(
-        fb_n0.action_check_masks[0], fb_n0.action_check_masks[1],
+        fb_n0.action_check_masks.get(0).unwrap(),
+        fb_n0.action_check_masks.get(1).unwrap(),
         "n0's two successor edges should have different action masks (bit 0 vs bit 1)"
     );
 }
@@ -354,27 +473,27 @@ fn test_composite_action_checks_batched_leaf_reconstruction_matches_fallback() {
     assert_eq!(n0.len(), 2, "n0 should have 2 successor edges");
     // s0 -> s1: Inc holds and x changes.
     assert!(
-        n0[0].get(0),
+        n0.get(0).unwrap().get(0),
         "check[0] (== Inc) must hold on the Inc step s0->s1"
     );
     assert!(
-        n0[0].get(1),
+        n0.get(0).unwrap().get(1),
         "check[1] (changed /\\ Inc) must hold on the Inc step s0->s1"
     );
     assert!(
-        !n0[0].get(2),
+        !n0.get(0).unwrap().get(2),
         "check[2] (~ENABLED Inc /\\ changed) must be false: Inc is ENABLED at s0"
     );
     // s0 -> s0 self-loop: Inc fails and x does not change.
     assert!(
-        !n0[1].get(0) && !n0[1].get(1) && !n0[1].get(2),
+        !n0.get(1).unwrap().get(0) && !n0.get(1).unwrap().get(1) && !n0.get(1).unwrap().get(2),
         "all three checks must be false on the s0->s0 stutter edge"
     );
 
     // n1 has one successor edge s1->s0: a non-Inc step while Inc is ENABLED at s1.
     assert_eq!(n1.len(), 1, "n1 should have 1 successor edge");
     assert!(
-        !n1[0].get(0) && !n1[0].get(1) && !n1[0].get(2),
+        !n1.get(0).unwrap().get(0) && !n1.get(0).unwrap().get(1) && !n1.get(0).unwrap().get(2),
         "all three checks must be false on the non-Inc s1->s0 step (Inc is ENABLED at s1, \
          so ~ENABLED Inc is false and the step is not an Inc step)"
     );

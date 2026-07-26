@@ -27,9 +27,9 @@ use crate::config::Config;
 use crate::constants::bind_constants_from_config;
 use crate::coverage::detect_actions;
 use crate::enumerate::{
-    enumerate_constraints_to_bulk, enumerate_states_from_constraint_branches,
-    extract_conjunction_remainder, extract_init_constraints, find_unconstrained_vars,
-    print_enum_profile_stats,
+    enumerate_constraints_to_bulk_with_stats,
+    enumerate_states_from_constraint_branches_with_multiplicity, extract_conjunction_remainder,
+    extract_init_constraints, find_unconstrained_vars, print_enum_profile_stats,
 };
 use crate::eval::{EvalCtx, TlcConfig};
 use crate::intern::HandleState;
@@ -63,6 +63,7 @@ mod check_lifecycle;
 mod checker_tests;
 mod config_env;
 mod construction;
+mod engine_provenance;
 mod finalize;
 #[cfg(test)]
 mod finalize_tests;
@@ -675,14 +676,19 @@ impl ParallelChecker {
             }
         };
 
-        let result = self.finalize_check(
-            runtime,
-            detected_actions,
-            detected_action_ids,
-            &mut prep.ctx,
-            promoted_properties,
-            state_property_violation_names,
-        );
+        // Worker spawning is the admission boundary for this engine: only now
+        // can we honestly report that parallel BFS actually ran.
+        self.emit_execution_tier();
+        let result = self
+            .finalize_check(
+                runtime,
+                detected_actions,
+                detected_action_ids,
+                &mut prep.ctx,
+                promoted_properties,
+                state_property_violation_names,
+            )
+            .with_engine_provenance(Some(self.engine_provenance_json()));
 
         // Guard drop unfreezes interners now that all workers are done
         // and finalize_check() has consumed the remaining results.

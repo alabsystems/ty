@@ -17,7 +17,10 @@ fn test_evict_guard_resets_flag_on_drop() {
         condvar: parking_lot::Condvar::new(),
     };
     {
-        let _guard = EvictGuard { barrier: &barrier };
+        let _guard = EvictGuard {
+            barrier: &barrier,
+            leader_epoch: 0,
+        };
         assert!(
             barrier.state.lock().evicting,
             "evicting should be true while guard is alive"
@@ -42,13 +45,45 @@ fn test_evict_guard_resets_flag_on_panic() {
         condvar: parking_lot::Condvar::new(),
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _guard = EvictGuard { barrier: &barrier };
+        let _guard = EvictGuard {
+            barrier: &barrier,
+            leader_epoch: 0,
+        };
         panic!("simulated do_evict panic");
     }));
     assert!(result.is_err(), "panic should propagate");
     assert!(
         !barrier.state.lock().evicting,
         "evicting must be cleared after panic unwind — without this, waiting threads block forever"
+    );
+}
+
+/// Regression for an old completed leader dropping its guard after the next
+/// leader has already claimed the barrier.
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_completed_leader_guard_does_not_clear_successor_leader() {
+    let barrier = EvictionBarrier {
+        state: parking_lot::Mutex::new(EvictionState {
+            evicting: true,
+            epoch: 1,
+            status: EVICTION_STATUS_SUCCESS,
+        }),
+        condvar: parking_lot::Condvar::new(),
+    };
+
+    {
+        // This guard belonged to the eviction that started at epoch 0. The
+        // current state represents its published epoch 1 plus a new leader.
+        let _stale_guard = EvictGuard {
+            barrier: &barrier,
+            leader_epoch: 0,
+        };
+    }
+
+    assert!(
+        barrier.state.lock().evicting,
+        "a stale guard must not clear the successor leader's eviction flag"
     );
 }
 

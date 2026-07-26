@@ -73,7 +73,7 @@ pub(super) fn is_trivial_scc_in_graph(scc: &Scc, graph: &BehaviorGraph) -> EvalR
             ),
             span: None,
         })?;
-    Ok(!info.successors.contains(node))
+    Ok(!info.successors().contains(node))
 }
 
 /// Statistics for SCC detection (test-only: not read in production)

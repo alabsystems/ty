@@ -11,7 +11,7 @@
 //!
 //! # Usage
 //!
-//! ```ignore
+//! ```text
 //! let simplified = simplify_properties_with_aliases(&net, &properties, &aliases);
 //! ```
 

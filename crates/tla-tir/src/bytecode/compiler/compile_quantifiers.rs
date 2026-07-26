@@ -491,6 +491,29 @@ impl<'a> FnCompileState<'a> {
             .as_ref()
             .ok_or_else(|| CompileError::Unsupported("SetFilter without domain".to_string()))?;
 
+        // VM-only whole-comprehension fusion: replace the entire domain loop
+        // with one `EdgeFilter` opcode that range-scans the sorted edge set for
+        // the `<<outer, *>>` prefix. Reuses the projection-hoist proof (same
+        // `{c \in D : <<outer, c>> \in S(arg)}`, `S(p) == p[k]` shape) and
+        // preserves the historical evaluation order: the domain is compiled
+        // first (exactly as below), and the `E == arg[k]` projection is deferred
+        // into the opcode so it is never evaluated for an empty domain (matching
+        // the `SetFilterBegin` preheader skip).
+        if self.edge_filter {
+            if let Some(hoist) = projection_hoist {
+                let r_domain = self.compile_expr(domain_expr)?;
+                let rd = self.alloc_reg()?;
+                self.func.emit(Opcode::EdgeFilter {
+                    rd,
+                    first: hoist.r_outer,
+                    arg: hoist.r_arg,
+                    domain: r_domain,
+                    projection_index: hoist.projection_index,
+                });
+                return Ok(rd);
+            }
+        }
+
         let r_domain = self.compile_expr(domain_expr)?;
         let rd = self.alloc_reg()?;
         let r_binding = self.alloc_reg()?;

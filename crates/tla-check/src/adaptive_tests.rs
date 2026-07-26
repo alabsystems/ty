@@ -11,6 +11,203 @@ use crate::test_support::parse_module;
 use crate::EvalCheckError;
 use crate::LivenessCheckError;
 
+#[test]
+fn test_auto_fingerprint_storage_plan_bounds_single_worker_capacity() {
+    let acp_shaped = PilotAnalysis {
+        initial_states: 4,
+        avg_branching_factor: 7.0,
+        estimated_states: 23_059_204,
+        strategy: Strategy::Parallel(1),
+        states_sampled: 4,
+    };
+
+    assert_eq!(
+        auto_fingerprint_storage_plan(&acp_shaped),
+        (1, 4),
+        "a defensive Parallel(1) plan must not reserve the geometric estimate"
+    );
+
+    let sequential = PilotAnalysis {
+        strategy: Strategy::Sequential,
+        ..acp_shaped.clone()
+    };
+    assert_eq!(
+        auto_fingerprint_storage_plan(&sequential),
+        (1, 4),
+        "sequential storage should start from the exact initial-state count"
+    );
+
+    let parallel = PilotAnalysis {
+        strategy: Strategy::Parallel(2),
+        ..acp_shaped
+    };
+    assert_eq!(
+        auto_fingerprint_storage_plan(&parallel),
+        (2, 23_059_204),
+        "multi-worker Auto storage must retain the estimate for disk selection"
+    );
+}
+
+fn pilot_limit_regression_module() -> (Module, Config) {
+    let src = r#"
+---- MODULE PilotLimitRegression ----
+EXTENDS Integers
+VARIABLE x
+Init == x = 0
+Next == (1 \div 0 = 0) /\ x' = x
+Valid == TRUE
+====
+"#;
+    let module = parse_module(src);
+    let config = Config {
+        init: Some("Init".to_string()),
+        next: Some("Next".to_string()),
+        invariants: vec!["Valid".to_string()],
+        ..Default::default()
+    };
+    (module, config)
+}
+
+#[cfg_attr(test, ntest::timeout(10_000))]
+#[test]
+fn test_tiny_seq_pilot_does_not_evaluate_next_past_depth_limit() {
+    let _serial = crate::test_utils::acquire_interner_lock();
+    let (module, config) = pilot_limit_regression_module();
+    let mut checker = AdaptiveChecker::new(&module, &config);
+    checker.set_max_depth(0);
+
+    let analysis = checker
+        .run_pilot()
+        .expect("depth-zero pilot must not evaluate the invalid Next relation");
+    assert_eq!(analysis.initial_states, 1);
+    assert_eq!(analysis.states_sampled, 0);
+    assert!(
+        analysis.estimated_states > 1,
+        "a depth-limited pilot must leave routing on the heuristic path",
+    );
+}
+
+#[cfg_attr(test, ntest::timeout(10_000))]
+#[test]
+fn test_tiny_seq_pilot_does_not_evaluate_next_after_state_limit() {
+    let _serial = crate::test_utils::acquire_interner_lock();
+    let (module, config) = pilot_limit_regression_module();
+    let mut checker = AdaptiveChecker::new(&module, &config);
+    checker.set_max_states(1);
+
+    let analysis = checker
+        .run_pilot()
+        .expect("state-capped pilot must not evaluate the invalid Next relation");
+    assert_eq!(analysis.initial_states, 1);
+    assert_eq!(analysis.states_sampled, 0);
+    assert!(
+        analysis.estimated_states > 1,
+        "a state-limited pilot must leave routing on the heuristic path",
+    );
+}
+
+#[cfg_attr(test, ntest::timeout(10_000))]
+#[test]
+fn test_tiny_seq_pilot_honors_elapsed_deadline() {
+    let _serial = crate::test_utils::acquire_interner_lock();
+    let (module, config) = pilot_limit_regression_module();
+    let mut checker = AdaptiveChecker::new(&module, &config);
+    checker.set_deadline(std::time::Instant::now());
+
+    let analysis = checker
+        .run_pilot()
+        .expect("elapsed-deadline pilot must decline optional Next evaluation");
+    assert_eq!(analysis.initial_states, 1);
+    assert_eq!(analysis.states_sampled, 0);
+    assert!(
+        analysis.estimated_states > 1,
+        "a deadline-limited pilot must leave routing on the heuristic path",
+    );
+}
+
+#[cfg_attr(test, ntest::timeout(10_000))]
+#[test]
+fn test_tiny_seq_pilot_exact_count_is_collision_mode_independent() {
+    let _serial = crate::test_utils::acquire_interner_lock();
+    let src = r#"
+---- MODULE PilotExactCount ----
+EXTENDS Integers
+VARIABLE x
+Init == x = 0
+Next == x' = (x + 1) % 4
+Valid == x \in 0..3
+====
+"#;
+    let module = parse_module(src);
+    let config = Config {
+        init: Some("Init".to_string()),
+        next: Some("Next".to_string()),
+        invariants: vec!["Valid".to_string()],
+        ..Default::default()
+    };
+    let mut checker = AdaptiveChecker::new(&module, &config);
+    checker.set_collision_check_mode(crate::collision_detection::CollisionCheckMode::Full);
+
+    let analysis = checker.run_pilot().expect("exact pilot should finish");
+    assert_eq!(analysis.initial_states, 1);
+    assert_eq!(
+        analysis.estimated_states, 4,
+        "routing cardinality must come from exact state values, independent of fingerprint mode",
+    );
+    assert_eq!(analysis.strategy, Strategy::Sequential);
+}
+
+#[cfg_attr(test, ntest::timeout(60_000))]
+#[test]
+fn test_adaptive_one_core_avoids_geometric_fingerprint_reservation() {
+    let _serial = crate::test_utils::acquire_interner_lock();
+    // Four initial states with four raw successors each produce a 262,144-state
+    // geometric estimate, while the actual reachable set contains only four
+    // states. This exercises the same estimate inflation shape as ACP_NB_TLC
+    // without making a regression allocate hundreds of MiB in the test process.
+    let src = r#"
+---- MODULE OneCoreInflatedEstimate ----
+VARIABLE x
+Init == x \in 0..3
+Next == x' \in 0..3
+Valid == x \in 0..3
+====
+"#;
+    let module = parse_module(src);
+    let config = Config {
+        init: Some("Init".to_string()),
+        next: Some("Next".to_string()),
+        invariants: vec!["Valid".to_string()],
+        ..Default::default()
+    };
+
+    let mut checker = AdaptiveChecker::new(&module, &config);
+    checker.available_cores = 1;
+    checker.set_deadlock_check(false);
+
+    let (result, analysis) = checker.check();
+    let analysis = analysis.expect("adaptive check should return pilot analysis");
+    assert_eq!(analysis.initial_states, 4);
+    assert_eq!(analysis.avg_branching_factor, 4.0);
+    assert_eq!(
+        analysis.estimated_states, 4,
+        "the bounded pilot should replace the inflated heuristic with the exact reachable count"
+    );
+    assert_eq!(analysis.strategy, Strategy::Sequential);
+
+    let stats = match result {
+        CheckResult::Success(stats) => stats,
+        other => panic!("expected successful one-core check, got {other:?}"),
+    };
+    assert_eq!(stats.states_found, 4);
+    assert!(
+        stats.storage_stats.memory_bytes < 1024 * 1024,
+        "single-worker fingerprint storage must grow from observed states, not \
+         reserve the geometric estimate; reserved {} bytes",
+        stats.storage_stats.memory_bytes
+    );
+}
+
 #[cfg_attr(test, ntest::timeout(60_000))]
 #[test]
 fn test_adaptive_pilot_applies_cfg_module_assignments() {
@@ -106,16 +303,13 @@ InRange == x >= 1 /\ x <= 100
 #[test]
 fn test_adaptive_larger_spec_uses_parallel() {
     let _serial = crate::test_utils::acquire_interner_lock();
-    // Spec with many initial states should use parallel
+    // More initial states than the tiny-spec proof cap must retain the
+    // heuristic parallel route while remaining cheap to execute.
     let src = r#"
 ---- MODULE LargerSpec ----
-VARIABLE x, y, z
-Init == x \in {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}
-     /\ y \in {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}
-     /\ z \in {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}
-Next == x' \in {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}
-     /\ y' \in {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}
-     /\ z' \in {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}
+VARIABLE x
+Init == x \in 0..5000
+Next == UNCHANGED x
 Valid == TRUE
 ====
 "#;
@@ -129,19 +323,25 @@ Valid == TRUE
     };
 
     let mut checker = AdaptiveChecker::new(&module, &config);
+    checker.available_cores = 2;
     checker.set_deadlock_check(false);
-    checker.set_max_states(100); // Limit to avoid long test
 
-    let (_result, analysis) = checker.check();
+    let (result, analysis) = checker.check();
 
     let analysis = analysis.unwrap();
-    // 10 * 10 * 10 = 1000 initial states
-    assert_eq!(analysis.initial_states, 1000);
-    // Large initial state count with high branching should use parallel
-    assert!(
-        matches!(analysis.strategy, Strategy::Parallel(_)),
-        "Expected Parallel for large spec, got {:?}",
-        analysis.strategy
+    assert_eq!(analysis.initial_states, 5001);
+    // Large initial state count with linear growth should use parallel.
+    let workers = match analysis.strategy {
+        Strategy::Parallel(workers) => workers,
+        strategy => panic!("Expected Parallel for large spec, got {strategy:?}"),
+    };
+    assert_eq!(
+        result.stats().engine_provenance,
+        Some(serde_json::json!({
+            "tier": "parallel BFS",
+            "workers": workers,
+        })),
+        "adaptive parallel execution must retain ParallelChecker provenance"
     );
 }
 
@@ -239,9 +439,9 @@ fn test_adaptive_no_trace_propagates_to_parallel_checker() {
     let src = r#"
 ---- MODULE NoTraceParallel ----
 VARIABLE x
-Init == x \in 0 .. 999
-Next == x' \in 0 .. 1000
-Safe == x < 1000
+Init == x \in 0 .. 5000
+Next == x' = 5001
+Safe == x < 5001
 ====
 "#;
     let module = parse_module(src);
@@ -254,6 +454,7 @@ Safe == x < 1000
     };
 
     let mut checker = AdaptiveChecker::new(&module, &config);
+    checker.available_cores = 2;
     checker.set_deadlock_check(false);
     checker.set_store_states(false);
     checker.set_max_depth(1);
@@ -284,14 +485,13 @@ fn test_adaptive_parallel_preserves_invariant_eval_error() {
     //
     // TLC errors when attempting to enumerate a non-enumerable function set.
     //
-    // NOTE: This is a b≈1 spec (stuttering Next). The adaptive heuristic treats b<1.5 as
-    // potentially very deep (linear growth), so it should select parallel mode even though
-    // the reachable state space here is tiny.
+    // More than the bounded-pilot cap of initial states makes this a real
+    // parallel-route test. The invalid invariant still fails immediately.
     let src = r#"
 ---- MODULE FuncSetEmptyEquality ----
 EXTENDS Naturals
 VARIABLE x
-Init == x = 0
+Init == x \in 0..5000
 Next == x' = x
 Inv == [Nat -> Nat] = {}
 ====
@@ -306,6 +506,7 @@ Inv == [Nat -> Nat] = {}
     };
 
     let mut checker = AdaptiveChecker::new(&module, &config);
+    checker.available_cores = 2;
     checker.set_deadlock_check(false);
     checker.set_max_depth(0);
 

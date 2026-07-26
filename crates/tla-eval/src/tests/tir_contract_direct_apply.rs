@@ -3,7 +3,6 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::*;
-use tla_value::Rp;
 use crate::tir::eval_tir;
 use crate::StateEnvRef;
 use num_bigint::BigInt;
@@ -12,6 +11,7 @@ use tla_core::name_intern::intern_name;
 use tla_core::{lower, parse_to_syntax_tree, FileId, Span, Spanned};
 use tla_tir::{lower_expr, TirExpr, TirNameKind, TirNameRef, TirOperatorRef, TirType};
 use tla_value::CompactValue;
+use tla_value::Rp;
 
 const DIRECT_PARAMETERIZED_MODULE: &str = r#"
 ---- MODULE TirDirectApplyContract ----

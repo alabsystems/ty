@@ -3,7 +3,6 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::*;
-use tla_value::Rp;
 use crate::eval_cache_lifecycle::force_lazy_thunk_if_needed;
 use crate::helpers::apply_closure_with_values;
 use crate::helpers::function_values::apply_resolved_func_value;
@@ -15,6 +14,7 @@ use std::sync::Arc;
 use tla_core::ast::{BoundVar, Expr};
 use tla_core::kani_types::HashMap;
 use tla_core::{Span, Spanned};
+use tla_value::Rp;
 
 #[derive(Clone)]
 struct MockCapturedChain {

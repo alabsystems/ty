@@ -2176,63 +2176,6 @@ fn mcl_request_1_1_native_fixture() -> (tla_tir::bytecode::BytecodeChunk, u16, S
     (chunk, entry_idx, layout)
 }
 
-fn mcl_typeok_native_module() -> tla_core::ast::Module {
-    parse_module(
-        r#"
----- MODULE TrustCgMclFullTypeOkNativeCanary ----
-EXTENDS Sequences
-
-Proc == 1..3
-NatOverride == 0..7
-Clock == NatOverride \ {0}
-
-VARIABLE ack, clock, crit, network, req
-
-AckMessage == [clock |-> 0, type |-> "ack"]
-RelMessage == [clock |-> 0, type |-> "rel"]
-ReqMessage(c) == [clock |-> c, type |-> "req"]
-Message == {AckMessage, RelMessage, ReqMessage(1), ReqMessage(2), ReqMessage(3),
-            ReqMessage(4), ReqMessage(5), ReqMessage(6), ReqMessage(7)}
-
-Init == /\ ack = <<{}, {}, {}>>
-        /\ clock = <<1, 1, 1>>
-        /\ crit = {}
-        /\ network = << <<<<>>, <<>>, <<>>>>,
-                       <<<<>>, <<>>, <<>>>>,
-                       <<<<>>, <<>>, <<>>>> >>
-        /\ req = << <<0, 0, 0>>, <<0, 0, 0>>, <<0, 0, 0>> >>
-
-Next == /\ ack' = ack
-        /\ clock' = clock
-        /\ crit' = crit
-        /\ network' = network
-        /\ req' = req
-
-ClockLookup1OK == clock[1] = 1
-ProcQuantifierValuesOK == \A p \in Proc : p \in 1..3
-ProcInlineQuantifierValuesOK == \A p \in 1..3 : p \in 1..3
-ClockInNatOverride == \A p \in Proc : clock[p] \in NatOverride
-ClockInNatOverrideInlineProc == \A p \in 1..3 : clock[p] \in NatOverride
-ClockInInlineNatOverride == \A p \in Proc : clock[p] \in 0..7
-ClockInFullyInlineRange == \A p \in 1..3 : clock[p] \in 0..7
-ClockNonZero == \A p \in Proc : clock[p] # 0
-ClockInClock1 == clock[1] \in Clock
-ClockTypeOK == \A p \in Proc : clock[p] \in Clock
-ReqTypeOK == \A p \in Proc : \A q \in Proc : req[p][q] \in NatOverride
-AckTypeOK == \A p \in Proc : ack[p] \in SUBSET Proc
-NetworkTypeOK == \A p \in Proc : \A q \in Proc : network[p][q] \in Seq(Message)
-CritTypeOK == crit \in SUBSET Proc
-
-TypeOK == /\ ClockTypeOK
-          /\ ReqTypeOK
-          /\ AckTypeOK
-          /\ NetworkTypeOK
-          /\ CritTypeOK
-====
-"#,
-    )
-}
-
 fn clear_tla_runtime_arenas_for_native_canary() {
     tla_trust_cg::runtime_abi::tla_ops::clear_tla_iter_arena();
     tla_trust_cg::runtime_abi::tla_ops::clear_tla_arena();
@@ -4267,10 +4210,10 @@ fn test_native_callout_compile_jobs_env_values() {
         let _env = EnvVarGuard::unset(TRUST_CG_NATIVE_CALLOUT_COMPILE_JOBS_ENV);
         assert_eq!(trust_cg_native_callout_compile_jobs(0), 0);
         assert_eq!(trust_cg_native_callout_compile_jobs(1), 1);
-        let default_jobs = trust_cg_native_callout_compile_jobs(4);
-        assert!(
-            (1..=4).contains(&default_jobs),
-            "default compile jobs must be bounded by task count"
+        assert_eq!(
+            trust_cg_native_callout_compile_jobs(4),
+            1,
+            "production-default native compilation must remain single-job"
         );
     }
     {
@@ -8243,9 +8186,7 @@ fn test_trust_cg_runtime_inner_exists_rejects_scalar_valued_function_domain() {
         Value::ModelValue(Rp::from("p3")),
         Value::ModelValue(Rp::from("p4")),
     ]));
-    let p1 = chunk
-        .constants
-        .add_value(Value::ModelValue(Rp::from("p1")));
+    let p1 = chunk.constants.add_value(Value::ModelValue(Rp::from("p1")));
 
     let mut func = BytecodeFunction::new("ScalarFunctionDomain".to_string(), 0);
     func.emit(Opcode::LoadVar { rd: 2, var_idx: 0 }); // PC 0: f
@@ -8824,9 +8765,7 @@ fn action_local_temp_func_fixture() -> (
         Value::ModelValue(Rp::from("p3")),
         Value::ModelValue(Rp::from("p4")),
     ]));
-    let p1_const = chunk
-        .constants
-        .add_value(Value::ModelValue(Rp::from("p1")));
+    let p1_const = chunk.constants.add_value(Value::ModelValue(Rp::from("p1")));
     let li4b_const = chunk.constants.add_value(Value::String("Li4b".into()));
 
     let mut func = BytecodeFunction::new("ActionLocalTemp".to_string(), 0);
@@ -9083,9 +9022,7 @@ fn dijkstra_li4b_outer_guard_fixture() -> (
 
     let mut chunk = BytecodeChunk::new();
     let li4b_const = chunk.constants.add_value(Value::String("Li4b".into()));
-    let p1_const = chunk
-        .constants
-        .add_value(Value::ModelValue(Rp::from("p1")));
+    let p1_const = chunk.constants.add_value(Value::ModelValue(Rp::from("p1")));
 
     let mut func = BytecodeFunction::new("Li4bDijkstraOuterGuard".to_string(), 0);
     func.emit(Opcode::LoadBool {
@@ -9244,9 +9181,7 @@ fn func_apply_quantifier_fixture(
         Value::ModelValue(Rp::from("p1")),
         Value::ModelValue(Rp::from("p2")),
     ]));
-    let p1_const = chunk
-        .constants
-        .add_value(Value::ModelValue(Rp::from("p1")));
+    let p1_const = chunk.constants.add_value(Value::ModelValue(Rp::from("p1")));
 
     let mut func = BytecodeFunction::new(name.to_string(), 0);
     func.emit(Opcode::LoadVar { rd: 0, var_idx: 0 });
@@ -9830,7 +9765,7 @@ fn test_trust_cg_sequence_domain_inner_exists_expands_to_specialized_action_keys
 
 /// The `anneal`-shaped runtime-domain inner EXISTS — `\E k \in 1..hi`
 /// where `hi` is a runtime `Call` result — must be recognized as the
-/// NextStateLoop ABI target (and remain fail-closed: `NotYetSupported`).
+/// supported NextStateLoop ABI target.
 #[test]
 fn test_classify_runtime_domain_next_state_loop_recognizes_runtime_range() {
     use tla_tir::bytecode::{BytecodeFunction, Opcode};
@@ -9873,8 +9808,45 @@ fn test_classify_runtime_domain_next_state_loop_recognizes_runtime_range() {
 
     assert_eq!(
         TrustCgNativeCache::classify_runtime_domain_next_state_loop(&func),
-        Some(tla_jit_abi::NextStateLoopSupport::NotYetSupported),
-        "runtime-bound Range inner EXISTS must be recognized as the NextStateLoop target"
+        Some(tla_jit_abi::NextStateLoopSupport::Supported),
+        "direct runtime-bound Range inner EXISTS must use the native NextStateLoop target"
+    );
+}
+
+/// A runtime Range hidden behind a Move is still recognized for diagnostics,
+/// but remains fail-closed until the lowering can prove that no other consumer
+/// requires the materialized domain set.
+#[test]
+fn test_classify_runtime_domain_next_state_loop_keeps_range_alias_fail_closed() {
+    use tla_tir::bytecode::{BytecodeFunction, Opcode};
+
+    let mut func = BytecodeFunction::new("runtime_range_alias".to_string(), 0);
+    func.emit(Opcode::LoadImm { rd: 0, value: 1 });
+    func.emit(Opcode::LoadVar { rd: 1, var_idx: 0 });
+    func.emit(Opcode::Range {
+        rd: 2,
+        lo: 0,
+        hi: 1,
+    });
+    func.emit(Opcode::Move { rd: 3, rs: 2 });
+    func.emit(Opcode::ExistsBegin {
+        rd: 4,
+        r_binding: 5,
+        r_domain: 3,
+        loop_end: 3,
+    });
+    func.emit(Opcode::LoadBool { rd: 4, value: true });
+    func.emit(Opcode::ExistsNext {
+        rd: 4,
+        r_binding: 5,
+        r_body: 4,
+        loop_begin: -1,
+    });
+    func.emit(Opcode::Ret { rs: 4 });
+
+    assert_eq!(
+        TrustCgNativeCache::classify_runtime_domain_next_state_loop(&func),
+        Some(tla_jit_abi::NextStateLoopSupport::NotYetSupported)
     );
 }
 

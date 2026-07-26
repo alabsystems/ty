@@ -7,11 +7,10 @@
 #![cfg(feature = "native")]
 
 use std::ffi::c_void;
-use std::sync::Arc;
 
 use tla_jit_abi::{CompoundLayout, JitCallOut, JitNextStateFn, JitStatus, StateLayout, VarLayout};
 use tla_tir::bytecode::{BytecodeFunction, ConstantPool, Opcode};
-use tla_value::Value;
+use tla_value::{Rp, Value};
 
 const SYMBOL: &str = "compact_model_value_func_except_native";
 
@@ -31,12 +30,12 @@ fn layout() -> StateLayout {
 fn constants() -> (ConstantPool, u16, u16) {
     let mut pool = ConstantPool::new();
     let _procs = pool.add_value(Value::set([
-        Value::ModelValue(Arc::from("p1")),
-        Value::ModelValue(Arc::from("p2")),
-        Value::ModelValue(Arc::from("p3")),
-        Value::ModelValue(Arc::from("p4")),
+        Value::ModelValue(Rp::from("p1")),
+        Value::ModelValue(Rp::from("p2")),
+        Value::ModelValue(Rp::from("p3")),
+        Value::ModelValue(Rp::from("p4")),
     ]));
-    let p2 = pool.add_value(Value::ModelValue(Arc::from("p2")));
+    let p2 = pool.add_value(Value::ModelValue(Rp::from("p2")));
     let li0 = pool.add_value(Value::String("Li0".into()));
     (pool, p2, li0)
 }

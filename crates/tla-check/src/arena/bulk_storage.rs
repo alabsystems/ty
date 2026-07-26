@@ -26,7 +26,7 @@ use crate::Value;
 ///
 /// # Usage
 ///
-/// ```rust,ignore
+/// ```text
 /// use tla_check::arena::BulkStateStorage; // crate-internal path
 /// use tla_check::Value;
 ///
@@ -46,7 +46,12 @@ pub(crate) struct BulkStateStorage {
     vars_per_state: usize,
     /// Number of states currently stored
     pub(crate) num_states: usize,
-    /// Cached fingerprints (fingerprint, combined_xor) per state
+    /// Cached fingerprints used by the legacy storage unit tests.
+    ///
+    /// Production callers carry fingerprints in `BulkStateHandle` and never
+    /// read this cache. Keeping it out of release builds avoids retaining an
+    /// otherwise dead 24-byte slot for every bulk initial state.
+    #[cfg(test)]
     fingerprints: Vec<Option<(Fingerprint, u64)>>,
 }
 
@@ -81,6 +86,7 @@ impl BulkStateStorage {
             values: Vec::with_capacity(total_values),
             vars_per_state,
             num_states: 0,
+            #[cfg(test)]
             fingerprints: Vec::with_capacity(capacity),
         }
     }
@@ -97,6 +103,7 @@ impl BulkStateStorage {
             values: Vec::new(),
             vars_per_state,
             num_states: 0,
+            #[cfg(test)]
             fingerprints: Vec::new(),
         }
     }
@@ -118,6 +125,7 @@ impl BulkStateStorage {
 
         let idx = self.next_state_index_u32();
         self.values.extend(values.iter().cloned());
+        #[cfg(test)]
         self.fingerprints.push(None);
         self.num_states += 1;
         idx
@@ -139,6 +147,7 @@ impl BulkStateStorage {
             self.vars_per_state, added
         );
 
+        #[cfg(test)]
         self.fingerprints.push(None);
         self.num_states += 1;
         idx
@@ -206,9 +215,12 @@ impl BulkStateStorage {
     pub(crate) fn memory_usage(&self) -> usize {
         // Vec<Value> capacity
         let values_mem = self.values.capacity() * std::mem::size_of::<Value>();
-        // Vec fingerprints
+        // The legacy fingerprint cache exists only in unit-test builds.
+        #[cfg(test)]
         let fp_mem =
             self.fingerprints.capacity() * std::mem::size_of::<Option<(Fingerprint, u64)>>();
+        #[cfg(not(test))]
+        let fp_mem = 0;
         values_mem + fp_mem
     }
 }
@@ -286,6 +298,7 @@ impl BulkStateStorage {
 
         // Push all values - they're already in registry order
         self.values.extend_from_slice(values);
+        #[cfg(test)]
         self.fingerprints.push(None);
         self.num_states += 1;
         idx
@@ -323,6 +336,7 @@ impl BulkStateStorage {
             self.values.push(value);
         }
 
+        #[cfg(test)]
         self.fingerprints.push(None);
         self.num_states += 1;
         idx

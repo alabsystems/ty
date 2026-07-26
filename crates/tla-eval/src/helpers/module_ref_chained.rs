@@ -16,8 +16,7 @@ use super::module_ref::{
 use super::module_ref_cache::{chained_ref_cache_key, ChainedRefCacheEntry, MODULE_REF_CACHES};
 use super::module_ref_chained_label::try_eval_label_from_base_module_ref;
 use super::module_ref_instance::{
-    build_lazy_subst_bindings_with_local_ops, inherit_substitutions,
-    qualify_instance_expr_substitutions,
+    build_lazy_subst_bindings_memoized, inherit_substitutions, qualify_instance_expr_substitutions,
 };
 use super::module_ref_operator::ResolvedModuleRefOperator;
 use crate::binding_chain::BindingValue;
@@ -239,13 +238,68 @@ pub(super) fn resolve_chained_module_ref_operator(
     // Resolve the chain once per context/scope and cache the merged scope.
     let chain_entry = if let Some(chain_key) = module_ref_compound_key(base_target, intermediate_op)
     {
-        let cache_key = chained_ref_cache_key(ctx, chain_key);
+        let cache_key = chained_ref_cache_key(ctx, chain_key.clone());
         if let Some(cached) =
             MODULE_REF_CACHES.with(|c| c.borrow().chained_ref.get(&cache_key).cloned())
         {
             cached
         } else {
-            let entry = build_chained_ref_cache_entry(ctx, base_target, intermediate_op, span)?;
+            // #3447/#4170 epoch policy: the per-state pointer-keyed cache
+            // above keeps its exact clear lifecycle; on a miss (boundary
+            // clears wipe it per state), consult the RUN-lifetime
+            // producer-identity memo before re-resolving the whole chain
+            // (which re-runs CES at every chain level).
+            let fps = super::module_ref_cache::run_scope_memo_ambient_ids(ctx);
+            let entry = if let Some((inst_subs_ptr, local_ops_ptr)) = fps {
+                let run_key = super::module_ref_cache::RunChainedScopeKey {
+                    shared_ptr: Arc::as_ptr(&ctx.shared) as usize,
+                    chain_key,
+                    inst_subs_ptr,
+                    local_ops_ptr,
+                };
+                if let Some(entry) = super::module_ref_cache::run_chained_scope_memo_get(&run_key) {
+                    // Producer-determinism contract (debug-verified on every
+                    // hit): same (shared, chain site, ambient content) must
+                    // re-resolve to the same structural entry.
+                    #[cfg(debug_assertions)]
+                    {
+                        let rebuilt =
+                            build_chained_ref_cache_entry(ctx, base_target, intermediate_op, span);
+                        match rebuilt {
+                            Ok(rebuilt) => debug_assert!(
+                                rebuilt.instance_info.module_name
+                                    == entry.instance_info.module_name
+                                    && rebuilt.instance_info.substitutions
+                                        == entry.instance_info.substitutions
+                                    && *rebuilt.instance_subs_arc == *entry.instance_subs_arc
+                                    && *rebuilt.merged_local_ops == *entry.merged_local_ops,
+                                "run scope memo: producer-determinism contract violated \
+                                 for chained INSTANCE ref (same key, different entry)"
+                            ),
+                            Err(_) => debug_assert!(
+                                false,
+                                "run scope memo: chained rebuild failed on a key that \
+                                 previously built successfully"
+                            ),
+                        }
+                    }
+                    crate::cache::subst_chain_memo::count_scope_memo_hit();
+                    entry
+                } else {
+                    let entry =
+                        build_chained_ref_cache_entry(ctx, base_target, intermediate_op, span)?;
+                    crate::cache::subst_chain_memo::count_scope_memo_build();
+                    super::module_ref_cache::run_chained_scope_memo_insert(
+                        run_key,
+                        entry.clone(),
+                        &ctx.shared,
+                    );
+                    entry
+                }
+            } else {
+                crate::cache::subst_chain_memo::count_scope_memo_bail();
+                build_chained_ref_cache_entry(ctx, base_target, intermediate_op, span)?
+            };
             MODULE_REF_CACHES.with(|c| {
                 c.borrow_mut().chained_ref.insert(cache_key, entry.clone());
             });
@@ -301,11 +355,27 @@ pub(super) fn resolve_chained_module_ref_operator(
 
     if !chain_entry.instance_subs_arc.is_empty() {
         new_ctx.stable_mut().eager_subst_bindings = Some(Arc::clone(&EMPTY_EAGER_SUBST));
-        new_ctx.bindings = build_lazy_subst_bindings_with_local_ops(
-            &ctx.bindings,
-            ctx.local_ops.clone(),
-            &chain_entry.instance_subs_arc,
-        );
+        // Site identity for the memo: the compound chain key (run-stable
+        // string shape). Non-compound chains fall back to the raw builder.
+        new_ctx.bindings = match module_ref_compound_key(base_target, intermediate_op) {
+            Some(chain_key) => {
+                let mut h = rustc_hash::FxHasher::default();
+                chain_key.hash(&mut h);
+                build_lazy_subst_bindings_memoized(
+                    ctx,
+                    &ctx.bindings,
+                    ctx.local_ops.clone(),
+                    &chain_entry.instance_subs_arc,
+                    crate::cache::subst_chain_memo::SITE_CHAINED_MODULE_REF,
+                    h.finish(),
+                )
+            }
+            None => crate::helpers::build_lazy_subst_bindings_with_local_ops(
+                &ctx.bindings,
+                ctx.local_ops.clone(),
+                &chain_entry.instance_subs_arc,
+            ),
+        };
         for (name_id, value) in saved_param_bindings.iter().rev() {
             new_ctx.bindings = new_ctx.bindings.cons_local(
                 *name_id,

@@ -45,16 +45,17 @@
 //!
 //! # Fast vs slow split
 //!
-//! * [`corpus_sweep_core_free_set_no_regression`] (non-`#[ignore]`, per-PR):
+//! * [`corpus_sweep_core_free_set_no_regression`] (per-PR):
 //!   sweeps a small curated allowlist of known enumerator-free specs
 //!   (HourClock, AsynchInterface, ABCorrectness, Lock, TCommit — all < 15 s even
 //!   in this debug build) with a generous timeout and the SAME regression guard.
 //!   Catches a capability regression on the core free set quickly.
-//! * [`corpus_sweep_full_no_regression`] (`#[ignore]`, nightly/on-demand): the
-//!   whole 181-cfg sweep — the actual "continuous measurement" run. It is
-//!   ~15 min in a debug build so it is gated out of per-PR CI:
-//!   `cargo test -p tla-cli --features "ay clean-cic" \
-//!        --test corpus_sweep_regression -- --ignored --nocapture`
+//! * [`corpus_sweep_full_no_regression`] (nightly/on-demand): the whole 181-cfg
+//!   sweep — the actual "continuous measurement" run. It is ~15 min in a debug
+//!   build, so it requires explicit resource authorization:
+//!   `TY_RUN_FULL_CORPUS_SWEEP=1 cargo test -p tla-cli \
+//!        --features "ay clean-cic" --test corpus_sweep_regression \
+//!        corpus_sweep_full_no_regression -- --nocapture`
 //!   Override params with `CORPUS_SWEEP_TIMEOUT` (secs, default 45) and
 //!   `CORPUS_SWEEP_JOBS` (default = available parallelism).
 //!
@@ -512,7 +513,7 @@ fn report_and_assert(g: &GuardReport, context: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// FAST variant — curated core enumerator-free set, runs per-PR (not ignored)
+// FAST variant — curated core enumerator-free set, runs per-PR
 // ---------------------------------------------------------------------------
 
 /// The core enumerator-free specs, by exact corpus-relative `.cfg` path (each
@@ -528,7 +529,7 @@ const CORE_FREE_SPECS: [&str; 5] = [
 ];
 
 /// Per-PR guard: sweep only the curated core free set and assert no capability
-/// regression on it. Fast (~30 s) and non-ignored so every PR catches a
+/// regression on it. Fast (~30 s), so every PR catches a
 /// regression on the specs the north star most cares about.
 #[test]
 fn corpus_sweep_core_free_set_no_regression() {
@@ -576,22 +577,30 @@ fn corpus_sweep_core_free_set_no_regression() {
 }
 
 // ---------------------------------------------------------------------------
-// SLOW variant — the whole corpus. Ignored: it IS the continuous-measurement
-// run (nightly / on-demand), ~15 min in a debug build.
+// SLOW variant — the whole corpus. It IS the continuous-measurement run
+// (nightly / on-demand), ~15 min in a debug build, so the test explicitly
+// qualifies the resource-intensive campaign through an environment variable.
 // ---------------------------------------------------------------------------
 
 /// The full continuous-measurement run. Re-sweeps all 181 cfgs, prints the
 /// baseline-vs-fresh tally, and guards every spec against a capability
-/// regression (tolerating timeouts). `#[ignore]` so it does not gate every PR;
-/// run it as the nightly/on-demand north-star measurement:
+/// regression (tolerating timeouts). Run it as the nightly/on-demand
+/// north-star measurement:
 ///
 /// ```text
-/// cargo test -p tla-cli --features "ay clean-cic" \
-///     --test corpus_sweep_regression -- --ignored --nocapture
+/// TY_RUN_FULL_CORPUS_SWEEP=1 cargo test -p tla-cli \
+///     --features "ay clean-cic" --test corpus_sweep_regression \
+///     corpus_sweep_full_no_regression -- --nocapture
 /// ```
 #[test]
-#[ignore = "full 181-cfg sweep (~15min debug) — the nightly/on-demand continuous-measurement run"]
 fn corpus_sweep_full_no_regression() {
+    if !std::env::var_os("TY_RUN_FULL_CORPUS_SWEEP").is_some_and(|value| value == "1") {
+        eprintln!(
+            "SKIP corpus_sweep_full_no_regression: set TY_RUN_FULL_CORPUS_SWEEP=1 \
+             to authorize the ~15-minute, 181-config campaign"
+        );
+        return;
+    }
     if corpus_or_skip("corpus_sweep_full_no_regression").is_none() {
         return;
     }

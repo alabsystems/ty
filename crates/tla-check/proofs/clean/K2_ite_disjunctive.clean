@@ -8,15 +8,15 @@
 -- reduction through instDecidableEqBool / Bool.decEq / Decidable.casesOn. The two directions are
 -- proved as the lemmas K2_ite_disjunctive_mp / _mpr and then combined into the full ↔ by Iff.intro.
 --   * forward (_mp): pick the matching disjunct; the residual value equation `v = a` / `v = b` is
---     discharged against `h : v = (if …)` via the kernel's defeq check (the `?_` hole + `exact h`).
+--     discharged against `h : v = (if …)` via the kernel's defeq check.
 --   * backward (_mpr): case-split the disjunction; return the value equation, and refute the
 --     impossible `false = true` / `true = false` disjunct with Bool.noConfusion.
 
 theorem K2_ite_disjunctive_mp (c : Bool) (a b v : Nat) :
     (v = (if c then a else b)) → ((c = true ∧ v = a) ∨ (c = false ∧ v = b)) := by
   cases c with
-  | false => intro h; refine Or.inr (And.intro (@Eq.refl Bool Bool.false) ?_); exact h
-  | true => intro h; refine Or.inl (And.intro (@Eq.refl Bool Bool.true) ?_); exact h
+  | false => intro h; exact Or.inr (And.intro (@Eq.refl Bool Bool.false) h)
+  | true => intro h; exact Or.inl (And.intro (@Eq.refl Bool Bool.true) h)
 
 theorem K2_ite_disjunctive_mpr (c : Bool) (a b v : Nat) :
     ((c = true ∧ v = a) ∨ (c = false ∧ v = b)) → (v = (if c then a else b)) := by

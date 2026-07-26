@@ -6,7 +6,7 @@
 
 use super::super::{eval, EvalCtx, EvalError, EvalResult, InstanceInfo, OpEnv};
 use super::module_ref_cache::{ModuleRefScopeEntry, ModuleRefScopeKey, MODULE_REF_CACHES};
-use super::module_ref_instance::build_lazy_subst_bindings_with_local_ops;
+use super::module_ref_instance::build_lazy_subst_bindings_memoized;
 use crate::binding_chain::BindingValue;
 use crate::eval_dispatch::EMPTY_EAGER_SUBST;
 use crate::value::Value;
@@ -73,14 +73,16 @@ pub(crate) fn try_resolve_module_ref_operator(
             .map_or(0, |ops| Arc::as_ptr(ops) as usize),
     };
 
-    let effective_substitutions = ctx.compute_effective_instance_substitutions(
-        &instance_info.module_name,
-        &instance_info.substitutions,
-    );
-
     let scope_entry = MODULE_REF_CACHES
         .with(|c| c.borrow().module_ref_scope.get(&scope_key).cloned())
         .unwrap_or_else(|| {
+            // Deferred to the miss path: on a scope-cache hit the effective
+            // substitutions are already in the cached entry, and recomputing
+            // them per call was pure waste on the hot M!Op path.
+            let effective_substitutions = ctx.compute_effective_instance_substitutions(
+                &instance_info.module_name,
+                &instance_info.substitutions,
+            );
             let mut instance_local_ops: OpEnv = ctx
                 .shared
                 .instance_ops
@@ -97,7 +99,7 @@ pub(crate) fn try_resolve_module_ref_operator(
             }
 
             let entry = ModuleRefScopeEntry {
-                effective_subs_arc: Arc::new(effective_substitutions.clone()),
+                effective_subs_arc: Arc::new(effective_substitutions),
                 local_ops_arc: Arc::new(instance_local_ops),
             };
             MODULE_REF_CACHES.with(|c| {
@@ -135,10 +137,13 @@ pub(crate) fn try_resolve_module_ref_operator(
 
     if has_effective_substitutions {
         new_ctx.stable_mut().eager_subst_bindings = Some(Arc::clone(&EMPTY_EAGER_SUBST));
-        new_ctx.bindings = build_lazy_subst_bindings_with_local_ops(
+        new_ctx.bindings = build_lazy_subst_bindings_memoized(
+            ctx,
             &ctx.bindings,
             ctx.local_ops.clone(),
             &scope_entry.effective_subs_arc,
+            crate::cache::subst_chain_memo::SITE_RESOLVED_MODULE_REF,
+            u64::from(intern_name(instance_name).0),
         );
         for (name_id, value) in saved_param_bindings.iter().rev() {
             new_ctx.bindings = new_ctx.bindings.cons_local(

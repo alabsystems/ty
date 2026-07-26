@@ -265,9 +265,7 @@ pub(crate) fn eval_quantifier_single<
         let mut first_iter = true;
         // Part of #3364: Use inline iterator to avoid Box<dyn Iterator> heap allocation.
         for elem in eval_iter_set_tlc_normalized_inline(ctx, domain, var.domain_span())? {
-            tla_value::churn_stats::churn_count(
-                tla_value::churn_stats::ChurnSite::QuantIterations,
-            );
+            tla_value::churn_stats::churn_count(tla_value::churn_stats::ChurnSite::QuantIterations);
             if first_iter {
                 var.push_binding_owned(ctx, elem, span)?;
                 first_iter = false;
@@ -286,9 +284,7 @@ pub(crate) fn eval_quantifier_single<
         ctx.pop_to_mark(&mark);
     } else {
         for elem in eval_iter_set_tlc_normalized_inline(ctx, domain, var.domain_span())? {
-            tla_value::churn_stats::churn_count(
-                tla_value::churn_stats::ChurnSite::QuantIterations,
-            );
+            tla_value::churn_stats::churn_count(tla_value::churn_stats::ChurnSite::QuantIterations);
             var.push_binding(ctx, &elem, span)?;
             let result = eval_body(ctx)?;
             ctx.pop_to_mark(&mark);
@@ -374,9 +370,7 @@ pub(crate) fn eval_choose_single<B: BoundVarOps, E: FnMut(&mut EvalCtx) -> EvalR
         let mut first_iter = true;
         // Part of #3364: Use inline iterator to avoid Box<dyn Iterator> heap allocation.
         for elem in eval_iter_set_tlc_normalized_inline(ctx, domain, var.domain_span())? {
-            tla_value::churn_stats::churn_count(
-                tla_value::churn_stats::ChurnSite::QuantIterations,
-            );
+            tla_value::churn_stats::churn_count(tla_value::churn_stats::ChurnSite::QuantIterations);
             if first_iter {
                 var.push_binding(ctx, &elem, span)?;
                 first_iter = false;
@@ -395,9 +389,7 @@ pub(crate) fn eval_choose_single<B: BoundVarOps, E: FnMut(&mut EvalCtx) -> EvalR
         ctx.pop_to_mark(&mark);
     } else {
         for elem in eval_iter_set_tlc_normalized_inline(ctx, domain, var.domain_span())? {
-            tla_value::churn_stats::churn_count(
-                tla_value::churn_stats::ChurnSite::QuantIterations,
-            );
+            tla_value::churn_stats::churn_count(tla_value::churn_stats::ChurnSite::QuantIterations);
             var.push_binding(ctx, &elem, span)?;
             let result = eval_body(ctx)?;
             ctx.pop_to_mark(&mark);
@@ -525,6 +517,38 @@ pub(crate) fn eval_exists(
 ///   only on domain).
 ///
 /// Both tiers are cleared at every state boundary by `clear_state_boundary_core_impl`.
+///
+/// Part of #ewd998-refine-fix: propagate CHOOSE state-dependence on a cache HIT
+/// during ENABLED scope.
+///
+/// The CHOOSE caches store only `(key -> value)`, NOT the dependency set the
+/// CHOOSE read. A cache hit therefore records NO state read into the enclosing
+/// operator's dep-tracking frame. Outside ENABLED this is harmless: the
+/// operator's FIRST evaluation in each state is a cache MISS that captures the
+/// real state deps and stores a state-partition entry, which shadows any stale
+/// persistent entry. Inside ENABLED, however, `store_primary` (Fix #3109) refuses
+/// to write state-partition entries — only entries classified *persistent*
+/// (empty deps) are stored. So an operator whose value flows through a CHOOSE
+/// cache hit is recorded with empty deps, misclassified as a constant, and
+/// written to the PERSISTENT partition, which survives every state-boundary
+/// clear and is then served STALE to a later state. This is exactly how
+/// EWD998Chan's refinement mapping `tpos == CHOOSE i \in Node : ... inbox[i] ...`
+/// leaked node 2 (s1's token position) into a state whose token sits at node 1,
+/// yielding a spurious "CHOOSE failed" while checking `WF_EWD998!vars(...)`.
+///
+/// Fix: on a CHOOSE cache hit taken inside ENABLED scope, mark the enclosing
+/// frame with `mark_instance_lazy_read` (the "do not store in the persistent
+/// partition" signal). This is conservative — it can only make caching stricter,
+/// never change a value — so it cannot introduce a wrong verdict. It is gated on
+/// ENABLED scope so the common (non-ENABLED) path keeps caching CHOOSE-derived
+/// constants persistently.
+#[inline]
+fn mark_choose_cache_hit_state_dependent(ctx: &EvalCtx) {
+    if crate::cache::lifecycle::in_enabled_scope_ctx(ctx) {
+        crate::cache::dep_tracking::mark_instance_lazy_read(ctx);
+    }
+}
+
 pub(crate) fn eval_choose(
     ctx: &EvalCtx,
     bound: &BoundVar,
@@ -546,6 +570,7 @@ pub(crate) fn eval_choose(
         if let Some(cached) =
             crate::cache::choose_cache_lookup(expr_ptr, instance_subs_id, state_identity)
         {
+            mark_choose_cache_hit_state_dependent(ctx);
             return Ok(cached);
         }
     }
@@ -616,6 +641,7 @@ pub(crate) fn eval_choose(
             state_identity,
         };
         if let Some(cached) = crate::cache::choose_deep_cache_lookup(&key) {
+            mark_choose_cache_hit_state_dependent(ctx);
             return Ok(cached);
         }
         Some(key)

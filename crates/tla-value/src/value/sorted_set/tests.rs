@@ -20,7 +20,6 @@ use num_bigint::BigInt;
 use proptest::prelude::*;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
 
 fn hash_sorted_set(set: &SortedSet) -> u64 {
     let mut hasher = DefaultHasher::new();
@@ -56,7 +55,6 @@ fn from_iter_defers_normalization_until_ordered_observation() {
         }
         SetStorage::Normalized(_) => panic!("from_iter should not eagerly normalize"),
     }
-
     assert!(set.contains(&Value::int(2)));
 
     match &set.storage {
@@ -635,5 +633,314 @@ proptest! {
         let reference_fp = crate::dedup_fingerprint::compute_set_additive_fp(&reference).unwrap();
         prop_assert_eq!(recomputed, reference_fp);
         prop_assert_eq!(result.get_additive_fp(), Some(recomputed));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Differential coverage for the clone-free 2-tuple membership fast path
+// (`contains_tuple2_refs` / `Value::try_set_contains_tuple2_refs`), which
+// answers `<<a,b>> \in S` without materializing `[a.clone(), b.clone()]`.
+// Every result must be byte-identical to the owned-tuple path it replaces.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+fn pair(a: Value, b: Value) -> Value {
+    Value::Tuple(vec![a, b].into())
+}
+
+#[test]
+fn tuple2_refs_membership_matches_owned_path() {
+    // Set of vertex-pairs `<<v, c>>` where v,c are themselves 2-tuples — the
+    // exact `es` shape driving Sailfish's TypeOK `<<v,c>> \in es`.
+    let members: Vec<Value> = vec![
+        pair(
+            pair(Value::int(1), Value::int(1)),
+            pair(Value::int(0), Value::int(0)),
+        ),
+        pair(
+            pair(Value::int(1), Value::int(2)),
+            pair(Value::int(1), Value::int(1)),
+        ),
+        pair(
+            pair(Value::int(2), Value::int(2)),
+            pair(Value::int(1), Value::int(1)),
+        ),
+        pair(Value::int(3), Value::int(4)), // flat int-pair, different shape
+    ];
+    // Build both Normalized (from_sorted-ish via from_iter->normalize) and a
+    // deliberately Unnormalized copy so both storage arms are exercised.
+    let normalized = SortedSet::from_iter(members.clone());
+    let _ = normalized.as_slice(); // force normalization
+    let unnormalized = SortedSet::from_iter(members.clone());
+
+    // Candidate (first, second) pairs: hits, near-misses, wrong types/arities.
+    let candidates: Vec<(Value, Value)> = vec![
+        // exact members
+        (
+            pair(Value::int(1), Value::int(1)),
+            pair(Value::int(0), Value::int(0)),
+        ),
+        (
+            pair(Value::int(1), Value::int(2)),
+            pair(Value::int(1), Value::int(1)),
+        ),
+        (Value::int(3), Value::int(4)),
+        // non-members
+        (
+            pair(Value::int(9), Value::int(9)),
+            pair(Value::int(9), Value::int(9)),
+        ),
+        (
+            pair(Value::int(1), Value::int(1)),
+            pair(Value::int(0), Value::int(1)),
+        ),
+        (Value::int(3), Value::int(5)),
+        (Value::int(1), pair(Value::int(1), Value::int(1))),
+        (Value::string("x"), Value::int(1)),
+        (Value::bool(true), Value::bool(false)),
+    ];
+
+    for set in [&normalized, &unnormalized] {
+        for (first, second) in &candidates {
+            let refs = set.contains_tuple2_refs(first, second);
+            let owned = set.contains_tuple_elements(&[first.clone(), second.clone()]);
+            assert_eq!(
+                refs, owned,
+                "contains_tuple2_refs disagreed with owned path for <<{first:?},{second:?}>>"
+            );
+            // And against the fully materialized candidate + generic membership.
+            let materialized = Value::Tuple(vec![first.clone(), second.clone()].into());
+            assert_eq!(refs, set.contains(&materialized));
+        }
+    }
+}
+
+#[test]
+fn value_try_set_contains_tuple2_refs_matches_owned() {
+    let members = vec![
+        pair(Value::int(1), Value::int(2)),
+        pair(Value::int(3), Value::int(4)),
+    ];
+    let set = Value::Set(Rp::new(SortedSet::from_iter(members)));
+    let cases: Vec<(Value, Value)> = vec![
+        (Value::int(1), Value::int(2)), // member
+        (Value::int(3), Value::int(4)), // member
+        (Value::int(1), Value::int(3)), // non-member
+        (Value::int(5), Value::int(6)), // non-member
+    ];
+    for (a, b) in &cases {
+        let owned = set.try_set_contains_tuple_elements(&[a.clone(), b.clone()]);
+        let refs = set.try_set_contains_tuple2_refs(a, b);
+        assert_eq!(refs, owned);
+    }
+    // Trivial-arm parity: Nat/Int/StringSet/AnySet and a non-set (None).
+    for special in [
+        Value::try_model_value("Nat").unwrap(),
+        Value::try_model_value("Int").unwrap(),
+        Value::StringSet,
+        Value::AnySet,
+        Value::int(7),
+    ] {
+        let a = Value::int(1);
+        let b = Value::int(2);
+        assert_eq!(
+            special.try_set_contains_tuple2_refs(&a, &b),
+            special.try_set_contains_tuple_elements(&[a.clone(), b.clone()]),
+            "trivial-arm disagreement for {special:?}"
+        );
+    }
+}
+
+// ===================================================================
+// EdgeFilter fast path: `{c \in domain : <<v, c>> \in edges}`
+// ===================================================================
+
+/// Vertex `<<node, round>>` — the element type of the real dag-consensus
+/// edge set, where edges are 2-tuples of vertices.
+fn vertex(node: &str, round: i64) -> Value {
+    Value::Tuple(vec![Value::string(node), Value::int(round)].into())
+}
+
+fn edge(from: Value, to: Value) -> Value {
+    Value::Tuple(vec![from, to].into())
+}
+
+/// Naive reference identical to the VM's fallback: iterate the domain in
+/// sorted order, keep `c` where `<<v, c>>` is a member of `edges`.
+fn naive_edge_children(v: &Value, edges: &SortedSet, domain: &SortedSet) -> Vec<Value> {
+    domain
+        .iter()
+        .filter(|c| edges.contains_tuple2_refs(v, c))
+        .cloned()
+        .collect()
+}
+
+/// `edge_children` composed with its documented abort → naive fallback,
+/// exactly as the VM opcode uses it.
+fn fused_edge_children(v: &Value, edges: &SortedSet, domain: &SortedSet) -> Vec<Value> {
+    match edges.edge_children(v, domain) {
+        Some(children) => children,
+        None => naive_edge_children(v, edges, domain),
+    }
+}
+
+fn assert_fused_matches_naive(v: &Value, edges: &SortedSet, domain: &SortedSet) {
+    let naive = naive_edge_children(v, edges, domain);
+    let fused = fused_edge_children(v, edges, domain);
+    // Both are strictly-ascending subsets of the domain; compare directly.
+    assert_eq!(
+        fused, naive,
+        "edge_children (with fallback) diverged from naive for v={v:?}"
+    );
+}
+
+#[test]
+fn edge_children_pure_tuple_edges_take_fast_path_and_match_naive() {
+    let v1 = vertex("n1", 1);
+    let v2 = vertex("n2", 1);
+    let v3 = vertex("n3", 1);
+    let g = vertex("", 0);
+    let domain = SortedSet::from_iter(vec![
+        v1.clone(),
+        v2.clone(),
+        v3.clone(),
+        g.clone(),
+        vertex("n2", 2),
+    ]);
+    // v2's out-edges: v2 -> v1, v2 -> g ; plus unrelated edges.
+    let edges = SortedSet::from_iter(vec![
+        edge(v2.clone(), v1.clone()),
+        edge(v2.clone(), g.clone()),
+        edge(v1.clone(), g.clone()),
+        edge(v3.clone(), v1.clone()),
+        edge(vertex("n2", 2), v2.clone()),
+    ]);
+    // Fast path must apply (pure tuples).
+    assert!(edges.edge_children(&v2, &domain).is_some());
+    let children = edges.edge_children(&v2, &domain).unwrap();
+    let mut expected = vec![v1.clone(), g.clone()];
+    expected.sort();
+    let mut got = children.clone();
+    got.sort();
+    assert_eq!(got, expected);
+    for v in [&v1, &v2, &v3, &g, &vertex("n2", 2), &vertex("nX", 9)] {
+        assert_fused_matches_naive(v, &edges, &domain);
+    }
+}
+
+#[test]
+fn edge_children_excludes_second_component_outside_domain() {
+    // An edge `<<v, c>>` whose `c` is NOT in the domain must be excluded,
+    // matching `Children == {c \in vs : <<v,c>> \in es}`.
+    let v = vertex("n1", 2);
+    let in_dom = vertex("n2", 1);
+    let out_dom = vertex("n9", 1); // present in edges, absent from domain
+    let domain = SortedSet::from_iter(vec![v.clone(), in_dom.clone()]);
+    let edges = SortedSet::from_iter(vec![
+        edge(v.clone(), in_dom.clone()),
+        edge(v.clone(), out_dom.clone()),
+    ]);
+    let children = edges.edge_children(&v, &domain).expect("fast path");
+    assert_eq!(children, vec![in_dom.clone()], "c \\notin domain must drop");
+    assert_fused_matches_naive(&v, &edges, &domain);
+}
+
+#[test]
+fn edge_children_skips_wrong_arity_and_scalars_in_edge_set() {
+    let v = Value::int(5);
+    let domain = SortedSet::from_iter(vec![Value::int(1), Value::int(2), Value::int(3)]);
+    let edges = SortedSet::from_iter(vec![
+        edge(Value::int(5), Value::int(1)),       // match -> c=1
+        edge(Value::int(5), Value::int(2)),       // match -> c=2
+        Value::Tuple(vec![Value::int(5)].into()), // 1-tuple <<5>> : skip
+        Value::Tuple(vec![Value::int(5), Value::int(3), Value::int(9)].into()), // 3-tuple: skip
+        Value::int(5),                            // bare scalar: skip
+        Value::string("zzz"),                     // scalar: skip
+        edge(Value::int(4), Value::int(1)),       // first != v: skip
+        edge(Value::int(6), Value::int(1)),       // first != v: skip
+    ]);
+    let children = edges.edge_children(&v, &domain).expect("fast path");
+    assert_eq!(children, vec![Value::int(1), Value::int(2)]);
+    assert_fused_matches_naive(&v, &edges, &domain);
+}
+
+#[test]
+fn edge_children_handles_seq_edges_on_the_fast_path() {
+    // A Seq is a physical sequence rep the fast path extracts directly.
+    let v = Value::int(2);
+    let domain = SortedSet::from_iter(vec![Value::int(1), Value::int(7)]);
+    let edges = SortedSet::from_iter(vec![
+        Value::seq(vec![Value::int(2), Value::int(1)]), // <<2,1>> as Seq
+        Value::seq(vec![Value::int(2), Value::int(7)]), // <<2,7>> as Seq
+        Value::seq(vec![Value::int(3), Value::int(1)]), // first != v
+    ]);
+    let children = fused_edge_children(&v, &edges, &domain);
+    let mut got = children;
+    got.sort();
+    assert_eq!(got, vec![Value::int(1), Value::int(7)]);
+    assert_fused_matches_naive(&v, &edges, &domain);
+}
+
+#[test]
+fn edge_children_aborts_on_funclike_edges_but_fallback_matches_naive() {
+    // A Func representing `<<v, c>>` is a tuple-equivalent the fast path
+    // refuses (abort). The naive fallback must still find the edge.
+    let v = Value::int(1);
+    let c = Value::int(20);
+    let domain = SortedSet::from_iter(vec![Value::int(10), c.clone()]);
+    let mut fb = FuncBuilder::new();
+    fb.insert(Value::int(1), v.clone()); // <<v, c>> as a function 1->v, 2->c
+    fb.insert(Value::int(2), c.clone());
+    let func_edge = Value::Func(Rp::new(fb.build()));
+    let edges = SortedSet::from_iter(vec![
+        edge(Value::int(1), Value::int(10)), // ordinary tuple edge
+        func_edge,
+    ]);
+    // The Func edge is <<1,20>>, a real member -> fast path must abort.
+    assert!(
+        edges.edge_children(&v, &domain).is_none(),
+        "funclike edge in the v-block must abort to the naive fallback"
+    );
+    // Fallback recovers both children (10 via tuple, 20 via func).
+    let mut got = fused_edge_children(&v, &edges, &domain);
+    got.sort();
+    assert_eq!(got, vec![Value::int(10), Value::int(20)]);
+    assert_fused_matches_naive(&v, &edges, &domain);
+}
+
+#[test]
+fn edge_children_empty_edges_and_empty_domain() {
+    let v = Value::int(1);
+    let empty = SortedSet::new();
+    let domain = SortedSet::from_iter(vec![Value::int(1), Value::int(2)]);
+    let edges = SortedSet::from_iter(vec![edge(Value::int(1), Value::int(2))]);
+    assert_eq!(edges.edge_children(&v, &empty), Some(vec![]));
+    assert_eq!(empty.edge_children(&v, &domain), Some(vec![]));
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(400))]
+
+    /// Random pure-tuple edge sets and domains over a small vertex universe:
+    /// the fast path (with fallback) must match the naive comprehension for
+    /// every candidate first component.
+    #[test]
+    fn edge_children_matches_naive_over_random_tuple_edges(
+        edge_pairs in prop::collection::vec((0i64..6, 0i64..6), 0..24),
+        domain_ids in prop::collection::vec(0i64..6, 0..7),
+    ) {
+        let node = |i: i64| vertex(if i % 2 == 0 { "a" } else { "b" }, i / 2);
+        let edges = SortedSet::from_iter(
+            edge_pairs.iter().map(|(a, b)| edge(node(*a), node(*b))),
+        );
+        let domain = SortedSet::from_iter(domain_ids.iter().map(|i| node(*i)));
+        for i in 0..6 {
+            let v = node(i);
+            // Pure tuples -> fast path must apply (never abort).
+            prop_assert!(edges.edge_children(&v, &domain).is_some());
+            let fused = fused_edge_children(&v, &edges, &domain);
+            let naive = naive_edge_children(&v, &edges, &domain);
+            prop_assert_eq!(fused, naive);
+        }
     }
 }

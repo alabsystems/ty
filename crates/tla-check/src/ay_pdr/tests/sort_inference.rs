@@ -9,7 +9,6 @@
 use super::helpers::*;
 use super::*;
 use crate::ay_shared::{check_init_assignment, check_membership_constraint};
-use num_bigint::BigInt;
 use tla_core::ast::Expr;
 use tla_core::Spanned;
 

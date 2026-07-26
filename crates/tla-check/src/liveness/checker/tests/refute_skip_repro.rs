@@ -148,14 +148,8 @@ fn poisoned_mask_on_wrong_node_misses_genuine_violation_in_same_scc() {
     );
 }
 
-fn build_owned_two_node_scc() -> (
-    LivenessChecker,
-    Scc,
-    BehaviorGraphNode,
-    BehaviorGraphNode,
-) {
-    let mut checker =
-        make_checker_with_vars(LiveExpr::always(LiveExpr::Bool(true)), &["x"]);
+fn build_owned_two_node_scc() -> (LivenessChecker, Scc, BehaviorGraphNode, BehaviorGraphNode) {
+    let mut checker = make_checker_with_vars(LiveExpr::always(LiveExpr::Bool(true)), &["x"]);
     checker.enable_owned_behavior_graph_state_cache();
     let mut get_successors = empty_successors;
     let s0 = State::from_pairs([("x", Value::int(0))]);
@@ -170,12 +164,14 @@ fn build_owned_two_node_scc() -> (
     checker
         .add_successors(n1, std::slice::from_ref(&s0), &mut get_successors, None)
         .expect("owned 1->0 successor");
-    checker
-        .state_successor_fps
-        .insert(s0.fingerprint(), std::sync::Arc::new(vec![s1.fingerprint()]));
-    checker
-        .state_successor_fps
-        .insert(s1.fingerprint(), std::sync::Arc::new(vec![s0.fingerprint()]));
+    checker.state_successor_fps.insert(
+        s0.fingerprint(),
+        std::sync::Arc::new(vec![s1.fingerprint()]),
+    );
+    checker.state_successor_fps.insert(
+        s1.fingerprint(),
+        std::sync::Arc::new(vec![s0.fingerprint()]),
+    );
 
     (checker, Scc::new(vec![n0, n1]), n0, n1)
 }

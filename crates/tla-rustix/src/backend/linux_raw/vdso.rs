@@ -64,10 +64,22 @@ fn elf_hash(name: &CStr) -> u32 {
 fn init_from_sysinfo_ehdr() -> Option<Vdso> {
     // SAFETY: The auxv initialization code does extensive checks to ensure
     // that the value we get really is an `AT_SYSINFO_EHDR` value from the
-    // kernel.
-    unsafe {
-        let hdr = super::param::auxv::sysinfo_ehdr();
+    // kernel. `init_from_sysinfo_ehdr_at` only reads within the kernel-provided
+    // ELF image after validating its pointer arithmetic.
+    unsafe { init_from_sysinfo_ehdr_at(super::param::auxv::sysinfo_ehdr()) }
+}
 
+/// Parse a candidate vDSO ELF image.
+///
+/// # Safety
+///
+/// `hdr` must be null or point to a readable ELF image whose program headers
+/// and referenced tables remain live for the returned `Vdso`.
+unsafe fn init_from_sysinfo_ehdr_at(hdr: *const Elf_Ehdr) -> Option<Vdso> {
+    // SAFETY: The caller guarantees the candidate image remains readable.
+    // Every derived address is overflow- and alignment-checked before it is
+    // dereferenced, and prohibited user-ELF layouts are rejected fail-closed.
+    unsafe {
         // If the platform doesn't provide a `AT_SYSINFO_EHDR`, we can't locate
         // the vDSO.
         if hdr.is_null() {
@@ -324,11 +336,180 @@ impl Vdso {
     }
 }
 
-#[cfg(linux_raw)]
+#[cfg(all(linux_raw, test))]
+#[repr(C)]
+struct VdsoFixture {
+    ehdr: Elf_Ehdr,
+    phdrs: [Elf_Phdr; 3],
+    dynamic: [Elf_Dyn; 5],
+    symtab: [Elf_Sym; 1],
+    hash: [ElfHashEntry; 4],
+    strings: [u8; 1],
+}
+
+#[cfg(all(linux_raw, test))]
+fn vdso_fixture(extra_segment_type: u32) -> VdsoFixture {
+    let mut ident = [0; EI_NIDENT];
+    ident[..SELFMAG].copy_from_slice(&ELFMAG);
+    ident[EI_CLASS] = ELFCLASS;
+    ident[EI_DATA] = ELFDATA;
+    ident[EI_VERSION] = EV_CURRENT;
+    ident[EI_OSABI] = ELFOSABI_LINUX;
+    ident[EI_ABIVERSION] = ELFABIVERSION;
+
+    let mut fixture = VdsoFixture {
+        ehdr: Elf_Ehdr {
+            e_ident: ident,
+            e_type: ET_DYN,
+            e_machine: EM_CURRENT,
+            e_version: u32::from(EV_CURRENT),
+            e_entry: 0,
+            e_phoff: 0,
+            e_shoff: 0,
+            e_flags: 0,
+            e_ehsize: size_of::<Elf_Ehdr>() as u16,
+            e_phentsize: size_of::<Elf_Phdr>() as u16,
+            e_phnum: 3,
+            e_shentsize: 0,
+            e_shnum: 0,
+            e_shstrndx: 0,
+        },
+        phdrs: [
+            Elf_Phdr {
+                p_type: PT_LOAD,
+                p_flags: PF_R | PF_X,
+                p_offset: 0,
+                p_vaddr: 0,
+                p_paddr: 0,
+                p_filesz: size_of::<VdsoFixture>(),
+                p_memsz: size_of::<VdsoFixture>(),
+                p_align: core::mem::align_of::<VdsoFixture>(),
+            },
+            Elf_Phdr {
+                p_type: PT_DYNAMIC,
+                p_flags: PF_R,
+                p_offset: 0,
+                p_vaddr: 0,
+                p_paddr: 0,
+                p_filesz: size_of::<[Elf_Dyn; 5]>(),
+                p_memsz: size_of::<[Elf_Dyn; 5]>(),
+                p_align: core::mem::align_of::<Elf_Dyn>(),
+            },
+            Elf_Phdr {
+                p_type: extra_segment_type,
+                p_flags: PF_R,
+                p_offset: 0,
+                p_vaddr: 0,
+                p_paddr: 0,
+                p_filesz: size_of::<[Elf_Phdr; 3]>(),
+                p_memsz: size_of::<[Elf_Phdr; 3]>(),
+                p_align: core::mem::align_of::<Elf_Phdr>(),
+            },
+        ],
+        dynamic: [
+            Elf_Dyn {
+                d_tag: DT_STRTAB,
+                d_un: Elf_Dyn_Union { d_ptr: 0 },
+            },
+            Elf_Dyn {
+                d_tag: DT_SYMTAB,
+                d_un: Elf_Dyn_Union { d_ptr: 0 },
+            },
+            Elf_Dyn {
+                d_tag: DT_HASH,
+                d_un: Elf_Dyn_Union { d_ptr: 0 },
+            },
+            Elf_Dyn {
+                d_tag: DT_SYMENT,
+                d_un: Elf_Dyn_Union {
+                    d_ptr: size_of::<Elf_Sym>(),
+                },
+            },
+            Elf_Dyn {
+                d_tag: DT_NULL,
+                d_un: Elf_Dyn_Union { d_ptr: 0 },
+            },
+        ],
+        symtab: [Elf_Sym {
+            st_name: 0,
+            st_info: 0,
+            st_other: 0,
+            st_shndx: SHN_UNDEF,
+            st_value: 0,
+            st_size: 0,
+        }],
+        // One bucket and one chain, both pointing at the undefined symbol.
+        hash: [
+            1,
+            1,
+            ElfHashEntry::from(STN_UNDEF),
+            ElfHashEntry::from(STN_UNDEF),
+        ],
+        strings: [0],
+    };
+    let ehdr_addr = core::ptr::addr_of!(fixture.ehdr) as usize;
+    let offset_from_ehdr = |address: usize| {
+        address
+            .checked_sub(ehdr_addr)
+            .expect("fixture field follows its ELF header")
+    };
+    let phdrs_offset = offset_from_ehdr(core::ptr::addr_of!(fixture.phdrs) as usize);
+    let dynamic_offset = offset_from_ehdr(core::ptr::addr_of!(fixture.dynamic) as usize);
+    let symtab_offset = offset_from_ehdr(core::ptr::addr_of!(fixture.symtab) as usize);
+    let hash_offset = offset_from_ehdr(core::ptr::addr_of!(fixture.hash) as usize);
+    let strings_offset = offset_from_ehdr(core::ptr::addr_of!(fixture.strings) as usize);
+
+    fixture.ehdr.e_phoff = phdrs_offset;
+    fixture.phdrs[1].p_offset = dynamic_offset;
+    fixture.phdrs[1].p_vaddr = dynamic_offset;
+    fixture.phdrs[2].p_offset = phdrs_offset;
+    fixture.phdrs[2].p_vaddr = phdrs_offset;
+    fixture.dynamic[0].d_un = Elf_Dyn_Union {
+        d_ptr: strings_offset,
+    };
+    fixture.dynamic[1].d_un = Elf_Dyn_Union {
+        d_ptr: symtab_offset,
+    };
+    fixture.dynamic[2].d_un = Elf_Dyn_Union { d_ptr: hash_offset };
+    fixture
+}
+
+#[cfg(all(linux_raw, test))]
 #[test]
-#[ignore] // Until rustix is updated to the new vDSO format.
+fn rejects_relro_user_elf_layout_fail_closed() {
+    let control = vdso_fixture(PT_PHDR);
+    // SAFETY: `control` owns the complete ELF image and every table referenced
+    // by it. Its fields remain live until after the returned parser state is
+    // dropped.
+    let control_parsed = unsafe { init_from_sysinfo_ehdr_at(core::ptr::addr_of!(control.ehdr)) };
+    assert!(
+        control_parsed.is_some(),
+        "the complete control fixture must reach successful vDSO admission"
+    );
+
+    let fixture = vdso_fixture(PT_GNU_RELRO);
+    // SAFETY: `fixture` owns the same complete ELF image as the admitted
+    // control, plus the prohibited RELRO program header. It outlives this call.
+    let relro_parsed = unsafe { init_from_sysinfo_ehdr_at(core::ptr::addr_of!(fixture.ehdr)) };
+    assert!(
+        relro_parsed.is_none(),
+        "a RELRO-bearing user ELF layout must never be admitted as a kernel vDSO"
+    );
+}
+
+#[cfg(all(linux_raw, feature = "time"))]
+#[test]
 fn test_vdso() {
-    let vdso = Vdso::new().unwrap();
+    let Some(vdso) = Vdso::new() else {
+        // A rejected or unavailable vDSO must leave the production clock
+        // wrapper on its syscall fallback, and that fallback must be callable.
+        let timestamp = super::vdso_wrappers::clock_gettime(crate::clockid::ClockId::Monotonic);
+        assert!(
+            (0..1_000_000_000).contains(&timestamp.tv_nsec),
+            "syscall fallback returned an invalid nanosecond field"
+        );
+        return;
+    };
     assert!(!vdso.symtab.is_null());
     assert!(!vdso.symstrings.is_null());
 

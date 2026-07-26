@@ -1168,7 +1168,9 @@ pub(crate) fn verify_multicase_bundle(
         a.sort();
         b.sort();
         if a != b {
-            return Err(format!("{what} case proof does not match its re-translation"));
+            return Err(format!(
+                "{what} case proof does not match its re-translation"
+            ));
         }
     }
     Ok(())

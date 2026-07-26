@@ -5,8 +5,8 @@
 //! Tests for JSON value/output/suggestion/result serialization.
 
 use super::*;
-use tla_value::Rp;
 use crate::{CheckResult, CheckStats};
+use tla_value::Rp;
 
 #[cfg_attr(test, ntest::timeout(10000))]
 #[test]
@@ -40,7 +40,6 @@ fn test_json_output_basic() {
 #[cfg_attr(test, ntest::timeout(10000))]
 #[test]
 fn test_value_to_json() {
-    use std::sync::Arc;
     assert!(matches!(
         value_to_json(&Value::Bool(true)),
         JsonValue::Bool(true)
@@ -192,6 +191,28 @@ fn test_json_output_roundtrip_preserves_distinct_action_ids() {
     assert_eq!(deserialized.actions_detected[0].name, "Send");
     assert_eq!(deserialized.actions_detected[1].name, "Send");
     assert_eq!(deserialized.actions_detected[2].name, "Recv");
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_json_statistics_separate_raw_generation_from_admitted_work() {
+    let stats = CheckStats {
+        states_found: 9,
+        initial_states: 2,
+        raw_initial_states_generated: 5,
+        transitions: 3,
+        raw_successors_generated: 7,
+        ..Default::default()
+    };
+
+    let output = JsonOutput::new(Path::new("/tmp/test.tla"), None, "Test", 1)
+        .with_check_result(&CheckResult::Success(stats), Duration::from_secs(1));
+
+    assert_eq!(output.statistics.states_initial, 2);
+    assert_eq!(output.statistics.raw_initial_states_generated, 5);
+    assert_eq!(output.statistics.transitions, 3);
+    assert_eq!(output.statistics.raw_successors_generated, 7);
+    assert_eq!(output.statistics.states_generated, 12);
 }
 
 #[cfg_attr(test, ntest::timeout(10000))]

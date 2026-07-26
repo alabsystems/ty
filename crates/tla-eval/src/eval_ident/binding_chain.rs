@@ -9,10 +9,50 @@
 
 use crate::{
     current_state_lookup_mode, force_lazy_binding, force_lazy_thunk_if_needed,
-    is_dep_tracking_active, is_subst_guarded, lazy_binding_cache_hit_deps, propagate_cached_deps,
-    record_local_read, EvalCtx, EvalResult, Value,
+    is_dep_tracking_active, is_subst_guarded, propagate_cached_deps, record_local_read, EvalCtx,
+    EvalResult, Value,
 };
 use tla_core::name_intern::NameId;
+
+/// Borrow an eager heap-backed binding without materializing an owned `Value`.
+///
+/// This mirrors the eager portion of [`resolve_binding_chain`] exactly:
+/// substitution guards select the same chain entry, dependency metadata is
+/// propagated/recorded, and zero-argument closure thunks are rejected so the
+/// caller falls back to the forcing path. The returned reference is rooted in
+/// the binding chain owned by `ctx` and is therefore valid for the evaluation.
+#[inline]
+pub(crate) fn try_borrow_eager_binding<'a>(
+    ctx: &'a EvalCtx,
+    lookup_id: NameId,
+) -> Option<&'a Value> {
+    let binding = if is_subst_guarded(lookup_id) {
+        ctx.bindings.lookup_skip_instance(lookup_id)
+    } else {
+        ctx.bindings.lookup(lookup_id)
+    };
+    let (crate::binding_chain::BindingValueRef::Eager(cv), source) = binding? else {
+        return None;
+    };
+    if !cv.is_heap() || cv.is_zero_arg_closure() {
+        return None;
+    }
+
+    let value = cv.as_heap_value();
+    match source {
+        crate::binding_chain::BindingSourceRef::Instance(deps) => {
+            if is_dep_tracking_active(ctx) {
+                propagate_cached_deps(ctx, deps);
+            }
+        }
+        crate::binding_chain::BindingSourceRef::Local(stack_idx)
+        | crate::binding_chain::BindingSourceRef::Liveness(stack_idx) => {
+            record_local_read(ctx, stack_idx, lookup_id, value);
+        }
+        crate::binding_chain::BindingSourceRef::None => {}
+    }
+    Some(value)
+}
 
 /// Resolve an identifier via BindingChain lookup, handling dep tracking and lazy thunks.
 ///
@@ -121,14 +161,34 @@ fn resolve_binding_chain_slow(
     };
 
     if let crate::binding_chain::BindingSourceRef::Instance(_) = source {
-        let lazy_ptr = lazy as *const crate::binding_chain::LazyBinding as usize;
-        if let Some(cached) =
-            crate::cache::small_caches::instance_lazy_cache_get(lazy_ptr, mode as u8)
-        {
-            lazy_binding_cache_hit_deps(ctx, lazy, source, &cached, lookup_id, mode);
+        if let Some(cached) = crate::instance_lazy_cache_hit(ctx, lazy, mode) {
             return Ok(Some(cached));
         }
     }
 
     force_lazy_binding(ctx, lazy, source, lookup_id, mode).map(Some)
+}
+
+#[cfg(test)]
+mod borrowed_tests {
+    use super::*;
+
+    #[test]
+    fn eager_heap_binding_can_be_borrowed_without_clone() {
+        let name_id = tla_core::intern_name("message");
+        let expected = Value::Record(vec![("type".to_string(), Value::string("Prepare"))].into());
+        let ctx = EvalCtx::new().bind_local("message", expected.clone());
+
+        let borrowed = try_borrow_eager_binding(&ctx, name_id)
+            .expect("heap-backed eager binding should be borrowable");
+        assert_eq!(borrowed, &expected);
+        assert!(borrowed.ptr_eq(&expected));
+    }
+
+    #[test]
+    fn inline_binding_falls_back_to_owned_resolution() {
+        let name_id = tla_core::intern_name("index");
+        let ctx = EvalCtx::new().bind_local("index", Value::int(3));
+        assert!(try_borrow_eager_binding(&ctx, name_id).is_none());
+    }
 }

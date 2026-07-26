@@ -247,6 +247,10 @@ pub(super) struct TlcModeSummary {
     pub(super) consistent_states: bool,
     pub(super) generated_state_values: Vec<u64>,
     pub(super) consistent_generated_states: bool,
+    pub(super) raw_initial_state_values: Vec<u64>,
+    pub(super) consistent_raw_initial_states: bool,
+    pub(super) raw_successor_values: Vec<u64>,
+    pub(super) consistent_raw_successors: bool,
     pub(super) expected_states: Option<u64>,
     pub(super) expected_states_match: Option<bool>,
     pub(super) all_ok: bool,
@@ -262,6 +266,12 @@ impl TlcModeSummary {
         let state_values = sorted_known_values(runs.iter().filter_map(|run| run.states_found));
         let generated_state_values =
             sorted_known_values(runs.iter().filter_map(|run| run.states_generated));
+        let raw_initial_state_values = sorted_known_values(
+            runs.iter()
+                .filter_map(|run| run.raw_initial_states_generated),
+        );
+        let raw_successor_values =
+            sorted_known_values(runs.iter().filter_map(|run| run.raw_successors_generated));
         let expected_states_match = expected_states
             .map(|expected| runs.iter().all(|run| run.states_found == Some(expected)));
         Self {
@@ -269,8 +279,12 @@ impl TlcModeSummary {
             median_peak_rss_bytes: median_u64(runs.iter().filter_map(|run| run.peak_rss_bytes)),
             consistent_states: state_values.len() <= 1,
             consistent_generated_states: generated_state_values.len() <= 1,
+            consistent_raw_initial_states: raw_initial_state_values.len() <= 1,
+            consistent_raw_successors: raw_successor_values.len() <= 1,
             state_values,
             generated_state_values,
+            raw_initial_state_values,
+            raw_successor_values,
             expected_states,
             expected_states_match,
             all_ok: runs.iter().all(TlcRunResult::ok),
@@ -286,6 +300,12 @@ pub(super) struct TyModeSummary {
     pub(super) median_peak_rss_bytes: Option<u64>,
     pub(super) state_values: Vec<u64>,
     pub(super) consistent_states: bool,
+    pub(super) generated_state_values: Vec<u64>,
+    pub(super) consistent_generated_states: bool,
+    pub(super) raw_initial_state_values: Vec<u64>,
+    pub(super) consistent_raw_initial_states: bool,
+    pub(super) raw_successor_values: Vec<u64>,
+    pub(super) consistent_raw_successors: bool,
     pub(super) all_ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) telemetry: Option<TrustCgTelemetryAggregate>,
@@ -315,6 +335,14 @@ impl TyModeSummary {
             .collect::<Vec<_>>();
         let phase_median_seconds = TrustCgPhaseMedianSeconds::from_runs(&runs);
         let state_values = sorted_known_values(runs.iter().filter_map(|run| run.states_found));
+        let generated_state_values =
+            sorted_known_values(runs.iter().filter_map(|run| run.states_generated));
+        let raw_initial_state_values = sorted_known_values(
+            runs.iter()
+                .filter_map(|run| run.raw_initial_states_generated),
+        );
+        let raw_successor_values =
+            sorted_known_values(runs.iter().filter_map(|run| run.raw_successors_generated));
         let telemetry = TrustCgTelemetryAggregate::from_run_telemetry(
             runs.iter()
                 .filter(|run| run.ok())
@@ -326,7 +354,13 @@ impl TyModeSummary {
             median_seconds: median(&elapsed),
             median_peak_rss_bytes: median_u64(runs.iter().filter_map(|run| run.peak_rss_bytes)),
             consistent_states: state_values.len() <= 1,
+            consistent_generated_states: generated_state_values.len() <= 1,
+            consistent_raw_initial_states: raw_initial_state_values.len() <= 1,
+            consistent_raw_successors: raw_successor_values.len() <= 1,
             state_values,
+            generated_state_values,
+            raw_initial_state_values,
+            raw_successor_values,
             all_ok: runs.iter().all(TyRunResult::ok),
             telemetry,
             execution_median_seconds: if execution_times.is_empty() {
@@ -439,6 +473,8 @@ pub(super) struct TlcRunResult {
     pub(super) states_found: Option<u64>,
     pub(super) distinct_states: Option<u64>,
     pub(super) transitions: Option<u64>,
+    pub(super) raw_initial_states_generated: Option<u64>,
+    pub(super) raw_successors_generated: Option<u64>,
     pub(super) states_generated: Option<u64>,
     pub(super) returncode: i32,
     pub(super) error: Option<String>,
@@ -461,6 +497,9 @@ pub(super) struct TyRunResult {
     pub(super) peak_rss_bytes: Option<u64>,
     pub(super) states_found: Option<u64>,
     pub(super) transitions: Option<u64>,
+    pub(super) raw_initial_states_generated: Option<u64>,
+    pub(super) raw_successors_generated: Option<u64>,
+    pub(super) states_generated: Option<u64>,
     pub(super) returncode: i32,
     pub(super) error: Option<String>,
     pub(super) artifact_dir: Option<String>,
@@ -1112,8 +1151,23 @@ fn parity_vs_tlc(tlc: &TlcModeSummary, mode: &TyModeSummary) -> bool {
     let Some(tlc_state_value) = only_value(&tlc.state_values) else {
         return false;
     };
+    let Some(tlc_generated_value) = only_value(&tlc.generated_state_values) else {
+        return false;
+    };
+    let Some(tlc_raw_initial_value) = only_value(&tlc.raw_initial_state_values) else {
+        return false;
+    };
+    let Some(tlc_raw_successor_value) = only_value(&tlc.raw_successor_values) else {
+        return false;
+    };
     mode.consistent_states
         && only_value(&mode.state_values) == Some(tlc_state_value)
+        && mode.consistent_generated_states
+        && only_value(&mode.generated_state_values) == Some(tlc_generated_value)
+        && mode.consistent_raw_initial_states
+        && only_value(&mode.raw_initial_state_values) == Some(tlc_raw_initial_value)
+        && mode.consistent_raw_successors
+        && only_value(&mode.raw_successor_values) == Some(tlc_raw_successor_value)
         && tlc.expected_states_match != Some(false)
         && mode.expected_states_match != Some(false)
 }
@@ -1382,6 +1436,8 @@ mod tests {
             states_found: Some(10),
             distinct_states: Some(10),
             transitions: None,
+            raw_initial_states_generated: Some(1),
+            raw_successors_generated: Some(19),
             states_generated: Some(20),
             returncode: 0,
             error: None,
@@ -1404,6 +1460,9 @@ mod tests {
             peak_rss_bytes: Some(4 * 1024 * 1024),
             states_found: Some(10),
             transitions: Some(20),
+            raw_initial_states_generated: Some(1),
+            raw_successors_generated: Some(19),
+            states_generated: Some(20),
             returncode: 0,
             error: None,
             artifact_dir: Some(format!("Spec/{mode}-run{index}")),
@@ -1531,8 +1590,21 @@ mod tests {
 
         let value = serde_json::to_value(&row).unwrap();
         assert_eq!(value["tlc"]["runs"][0]["states_generated"], json!(20));
+        assert_eq!(
+            value["tlc"]["runs"][0]["raw_initial_states_generated"],
+            json!(1)
+        );
+        assert_eq!(
+            value["tlc"]["runs"][0]["raw_successors_generated"],
+            json!(19)
+        );
         assert_eq!(value["tlc"]["runs"][0]["transitions"], json!(None::<u64>));
         assert_eq!(value["interp"]["runs"][0]["transitions"], json!(20));
+        assert_eq!(value["interp"]["runs"][0]["states_generated"], json!(20));
+        assert_eq!(
+            value["interp"]["runs"][0]["raw_successors_generated"],
+            json!(19)
+        );
         assert!(value["interp"].get("telemetry").is_none());
         assert_eq!(value["trust_cg"]["execution_median_seconds"], json!(2.0));
         assert_eq!(value["trust_cg_outcome"], json!("trust-cg cold start wins"));
@@ -1865,7 +1937,7 @@ mod tests {
                     ("TY_trust_cg".to_string(), "1".to_string()),
                     (
                         "TY_TRUST_CG_NATIVE_CALLOUT_COMPILE_JOBS".to_string(),
-                        "27".to_string(),
+                        "1".to_string(),
                     ),
                     ("TY_DISABLE_ARTIFACT_CACHE".to_string(), "1".to_string()),
                     ("TY_CACHE_DIR".to_string(), "reports/cache".to_string()),
@@ -1892,7 +1964,7 @@ mod tests {
                         workers: 1,
                         cache_dir: Some("reports/cache".to_string()),
                         artifact_cache_disabled_env: Some("1".to_string()),
-                        native_callout_compile_jobs: Some("27".to_string()),
+                        native_callout_compile_jobs: Some("1".to_string()),
                     },
                 },
             },
@@ -1921,7 +1993,7 @@ mod tests {
         );
         assert_eq!(
             value["launch_controls"]["ty"]["trust_cg"]["native_callout_compile_jobs"],
-            json!("27")
+            json!("1")
         );
         assert_eq!(
             value["gate_flags"]["require_trust_cg_compiled_actions"],

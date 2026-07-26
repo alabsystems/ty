@@ -4,7 +4,6 @@
 
 extern crate autocfg;
 
-
 mod support;
 
 /// Tests that autocfg uses the RUSTFLAGS or CARGO_ENCODED_RUSTFLAGS

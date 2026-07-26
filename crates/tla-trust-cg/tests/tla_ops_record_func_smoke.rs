@@ -24,6 +24,7 @@ use tla_trust_cg::runtime_abi::tla_ops::{
     clear_tla_arena, handle_from_value, handle_to_value, TlaHandle, NIL_HANDLE,
 };
 use tla_value::value::{FuncBuilder, RecordValue, SeqValue, Value};
+use tla_value::Rp;
 
 /// Resolve a helper by name and transmute it to the given function type.
 ///
@@ -53,7 +54,7 @@ fn func_from_pairs(pairs: Vec<(Value, Value)>) -> Value {
     for (k, v) in pairs {
         b.insert(k, v);
     }
-    Value::Func(Arc::new(b.build()))
+    Value::Func(Rp::new(b.build()))
 }
 
 #[test]
@@ -106,7 +107,7 @@ fn smoke_tla_func_apply_on_seq_uses_one_based_indexing() {
     clear_tla_arena();
     type FnApply = unsafe extern "C" fn(TlaHandle, TlaHandle) -> TlaHandle;
     let f: FnApply = unsafe { lookup("tla_func_apply") };
-    let seq = Value::Seq(Arc::new(SeqValue::from_vec(vec![
+    let seq = Value::Seq(Rp::new(SeqValue::from_vec(vec![
         Value::SmallInt(100),
         Value::SmallInt(200),
         Value::SmallInt(300),
@@ -129,7 +130,7 @@ fn smoke_tla_func_apply_on_record_with_string_key() {
     type FnApply = unsafe extern "C" fn(TlaHandle, TlaHandle) -> TlaHandle;
     let f: FnApply = unsafe { lookup("tla_func_apply") };
     let rh = handle_from_value(&record_ab());
-    let key = handle_from_value(&Value::String(Arc::from("a")));
+    let key = handle_from_value(&Value::String(Rp::from("a")));
     assert_eq!(handle_to_value(unsafe { f(rh, key) }), Value::SmallInt(1));
 }
 
@@ -165,7 +166,7 @@ fn smoke_tla_domain_of_seq_is_one_through_len() {
     clear_tla_arena();
     type FnDom = unsafe extern "C" fn(TlaHandle) -> TlaHandle;
     let f: FnDom = unsafe { lookup("tla_domain") };
-    let seq = Value::Seq(Arc::new(SeqValue::from_vec(vec![
+    let seq = Value::Seq(Rp::new(SeqValue::from_vec(vec![
         Value::SmallInt(10),
         Value::SmallInt(20),
         Value::SmallInt(30),

@@ -40,13 +40,6 @@ struct GraphRun {
     trust_cg_action_dispatch_stats: Option<(usize, usize, usize)>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SummaryRun {
-    summary: RunSummary,
-    trust_cg_action_coverage: Option<(usize, usize)>,
-    trust_cg_action_dispatch_stats: Option<(usize, usize, usize)>,
-}
-
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -125,7 +118,8 @@ struct FixtureOptions {
 }
 
 fn run_graph(fixture: &LoadedFixture, trust_cg: bool, options: FixtureOptions) -> GraphRun {
-    let _trust_cg = EnvVarGuard::set("TY_trust_cg", trust_cg.then_some("1"));
+    let _trust_cg = EnvVarGuard::set("TY_TRUST_CG", trust_cg.then_some("1"));
+    let _legacy_trust_cg = EnvVarGuard::remove("TY_trust_cg");
     let _trust_cg_bfs = EnvVarGuard::remove("TY_TRUST_CG_BFS");
     let _no_compiled = EnvVarGuard::remove("TY_NO_COMPILED_BFS");
     let _entry_counter_gate = EnvVarGuard::set(
@@ -173,43 +167,6 @@ fn run_graph(fixture: &LoadedFixture, trust_cg: bool, options: FixtureOptions) -
     }
 }
 
-fn run_summary(fixture: &LoadedFixture, trust_cg: bool, options: FixtureOptions) -> SummaryRun {
-    let _trust_cg = EnvVarGuard::set("TY_TRUST_CG", trust_cg.then_some("1"));
-    let _trust_cg_bfs = EnvVarGuard::remove("TY_TRUST_CG_BFS");
-    let _no_compiled = EnvVarGuard::remove("TY_NO_COMPILED_BFS");
-    let _entry_counter_gate = EnvVarGuard::set(
-        "TY_TRUST_CG_ENTRY_COUNTER_GATE",
-        (trust_cg && options.require_trust_cg_dispatch).then_some("1000000"),
-    );
-    let _no_flat = EnvVarGuard::set("TY_NO_FLAT_BFS", options.disable_flat_bfs.then_some("1"));
-    let _auto_por = EnvVarGuard::set("TY_AUTO_POR", Some("0"));
-
-    tla_eval::clear_for_test_reset();
-    let mut config = fixture.config.clone();
-    config.use_compiled_bfs = Some(options.use_compiled_bfs);
-    let checker_modules = fixture.checker_modules.iter().collect::<Vec<_>>();
-    let mut checker = ModelChecker::new_with_extends(&fixture.module, &checker_modules, &config);
-    checker.set_store_states(false);
-    checker.set_collect_coverage(options.require_trust_cg_dispatch);
-    checker.set_fairness(fixture.fairness.clone());
-    checker.set_stuttering_allowed(fixture.stuttering_allowed);
-
-    let stats = match checker.check() {
-        CheckResult::Success(stats) => stats,
-        other => panic!("expected successful model check, got {other:?}"),
-    };
-
-    SummaryRun {
-        summary: RunSummary {
-            states_found: stats.states_found,
-            initial_states: stats.initial_states,
-            transitions: stats.transitions,
-        },
-        trust_cg_action_coverage: checker.trust_cg_action_coverage_for_testing(),
-        trust_cg_action_dispatch_stats: checker.trust_cg_action_dispatch_stats_for_testing(),
-    }
-}
-
 fn assert_fixture_parity(spec_name: &str, cfg_name: &str, options: FixtureOptions) -> RunSummary {
     let fixture = load_fixture(spec_name, cfg_name);
     let baseline = run_graph(&fixture, false, options);
@@ -252,7 +209,7 @@ fn assert_fixture_parity(spec_name: &str, cfg_name: &str, options: FixtureOption
     baseline.summary
 }
 
-fn assert_ignored_dynamic_range_regression(
+fn assert_dynamic_range_regression(
     spec_name: &str,
     cfg_name: &str,
     expected_summary: RunSummary,
@@ -265,12 +222,16 @@ fn assert_ignored_dynamic_range_regression(
         disable_flat_bfs: true,
         use_compiled_bfs: false,
     };
-    let baseline = run_summary(&fixture, false, options);
-    let trust_cg = run_summary(&fixture, true, options);
+    let baseline = run_graph(&fixture, false, options);
+    let trust_cg = run_graph(&fixture, true, options);
 
     assert_eq!(
         trust_cg.summary, baseline.summary,
         "{spec_name}: Trust-CG must match default backend summary"
+    );
+    assert_eq!(
+        trust_cg.graph, baseline.graph,
+        "{spec_name}: Trust-CG must match the default backend's exact reachable state graph"
     );
     assert_eq!(
         baseline.summary, expected_summary,
@@ -347,9 +308,8 @@ fn trust_cg_state_graph_matches_default_backend_for_add_two_record_sequence_and_
 
 #[cfg_attr(test, ntest::timeout(30000))]
 #[test]
-#[ignore = "known Trust-CG mismatch: InsertNewline-style range FuncDef with guarded sequence indexing violates TypeOK"]
 fn trust_cg_matches_default_backend_for_insert_newline_range_function() {
-    assert_ignored_dynamic_range_regression(
+    assert_dynamic_range_regression(
         "InsertNewlineRangeFunc.tla",
         "InsertNewlineRangeFunc.cfg",
         RunSummary {
@@ -357,15 +317,14 @@ fn trust_cg_matches_default_backend_for_insert_newline_range_function() {
             initial_states: 3,
             transitions: 9,
         },
-        (1, 2),
+        (2, 2),
     );
 }
 
 #[cfg_attr(test, ntest::timeout(30000))]
 #[test]
-#[ignore = "known Trust-CG mismatch: dynamic range FuncDef assigned into compact sequence storage"]
 fn trust_cg_matches_default_backend_for_dynamic_range_func_compact_sequence() {
-    assert_ignored_dynamic_range_regression(
+    assert_dynamic_range_regression(
         "DynamicRangeFuncCompactSeq.tla",
         "DynamicRangeFuncCompactSeq.cfg",
         RunSummary {
@@ -373,6 +332,6 @@ fn trust_cg_matches_default_backend_for_dynamic_range_func_compact_sequence() {
             initial_states: 2,
             transitions: 6,
         },
-        (1, 2),
+        (2, 2),
     );
 }

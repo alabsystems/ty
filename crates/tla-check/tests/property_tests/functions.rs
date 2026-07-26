@@ -11,10 +11,9 @@
 
 use tla_check::Value;
 use tla_core::{lower, parse_to_syntax_tree, FileId};
-use tla_value::SortedSet;
+use tla_value::{Rp, SortedSet};
 
 use super::helpers::int_set;
-use std::sync::Arc;
 
 /// Helper to evaluate with Functions module
 fn eval_functions_str(src: &str) -> Result<Value, String> {
@@ -319,7 +318,7 @@ fn test_injection_set() {
 fn test_injection_too_large_source() {
     // Injection({1, 2, 3}, {a, b}) should be empty (no injection possible)
     let result = eval_functions_str(r#"Injection({1, 2, 3}, {"a", "b"})"#).unwrap();
-    assert_eq!(result, Value::Set(Arc::new(SortedSet::new())));
+    assert_eq!(result, Value::Set(Rp::new(SortedSet::new())));
 }
 
 #[cfg_attr(test, ntest::timeout(10000))]
@@ -335,7 +334,7 @@ fn test_bijection_set() {
 fn test_bijection_different_cardinality() {
     // Bijection({1, 2}, {a, b, c}) should be empty (cardinalities differ)
     let result = eval_functions_str(r#"Bijection({1, 2}, {"a", "b", "c"})"#).unwrap();
-    assert_eq!(result, Value::Set(Arc::new(SortedSet::new())));
+    assert_eq!(result, Value::Set(Rp::new(SortedSet::new())));
 }
 
 #[cfg_attr(test, ntest::timeout(10000))]
@@ -351,7 +350,7 @@ fn test_surjection_set() {
 fn test_surjection_too_small_source() {
     // Surjection({1}, {a, b}) should be empty (no surjection possible)
     let result = eval_functions_str(r#"Surjection({1}, {"a", "b"})"#).unwrap();
-    assert_eq!(result, Value::Set(Arc::new(SortedSet::new())));
+    assert_eq!(result, Value::Set(Rp::new(SortedSet::new())));
 }
 
 #[cfg_attr(test, ntest::timeout(10000))]

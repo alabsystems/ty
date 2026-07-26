@@ -11,9 +11,9 @@
 //! - `[x \in S |-> body]` (FuncDef) pattern
 
 use super::{make_func, BytecodeChunk, BytecodeVm, ConstantPool, Opcode, Value};
-use tla_value::Rp;
 use std::sync::Arc;
 use tla_value::ClosureValue;
+use tla_value::Rp;
 
 /// Helper: build a non-capturing closure value with a bytecode_func_idx pointing
 /// to a compiled sub-function in the chunk.

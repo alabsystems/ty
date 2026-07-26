@@ -178,6 +178,21 @@ impl CheckResult {
         }
     }
 
+    /// Attach raw Init work completed before an early terminal result.
+    ///
+    /// The supplied count is additional to any checkpoint-restored baseline.
+    /// Overflow is fatal rather than silently weakening work-equivalence
+    /// evidence.
+    #[must_use]
+    pub(crate) fn with_additional_raw_initial_states_generated(mut self, generated: usize) -> Self {
+        let stats = self.stats_mut();
+        stats.raw_initial_states_generated = stats
+            .raw_initial_states_generated
+            .checked_add(generated)
+            .expect("raw initial-state generation count overflowed usize");
+        self
+    }
+
     /// Attach fingerprint-storage backend counters to this result.
     #[must_use]
     pub(crate) fn with_storage_stats(mut self, storage_stats: StorageStats) -> Self {
@@ -199,6 +214,17 @@ impl CheckResult {
         report: Option<serde_json::Value>,
     ) -> Self {
         self.stats_mut().backend_capability_report = report;
+        self
+    }
+
+    /// Attach the engine-provenance record to this result's stats.
+    ///
+    /// `pub` (not `pub(crate)`): the CLI's GPU dispatch path produces results
+    /// outside the CPU model checker and stamps its own `{"tier": "gpu", ...}`
+    /// provenance before reporting.
+    #[must_use]
+    pub fn with_engine_provenance(mut self, provenance: Option<serde_json::Value>) -> Self {
+        self.stats_mut().engine_provenance = provenance;
         self
     }
 
@@ -299,6 +325,10 @@ pub enum LimitType {
 pub(super) struct SuccessorResult<T> {
     /// The successors after filtering by state/action constraints
     pub(super) successors: T,
+    /// Number of successors produced before state/action constraints or
+    /// exploration reductions. This is the per-parent contribution to TLC's
+    /// `statesGenerated` counter.
+    pub(super) raw_successor_count: usize,
     /// True if there were any successors before constraint filtering.
     /// Used for deadlock detection: deadlock only if this is false AND successors is empty.
     pub(super) had_raw_successors: bool,
@@ -472,6 +502,26 @@ mod check_result_stats_tests {
         }
         .with_suppressed_guard_errors(2);
         assert_eq!(result.suppressed_guard_errors(), 2);
+    }
+
+    #[test]
+    fn with_additional_raw_initial_work_preserves_baseline() {
+        let result = CheckResult::Success(CheckStats {
+            raw_initial_states_generated: 5,
+            ..Default::default()
+        })
+        .with_additional_raw_initial_states_generated(3);
+        assert_eq!(result.stats().raw_initial_states_generated, 8);
+    }
+
+    #[test]
+    #[should_panic(expected = "raw initial-state generation count overflowed usize")]
+    fn with_additional_raw_initial_work_fails_closed_on_overflow() {
+        let _ = CheckResult::Success(CheckStats {
+            raw_initial_states_generated: usize::MAX,
+            ..Default::default()
+        })
+        .with_additional_raw_initial_states_generated(1);
     }
 }
 

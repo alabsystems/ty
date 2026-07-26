@@ -3,7 +3,6 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::{EvalRuntimeState, HashMap, OpEvalDeps};
-use tla_value::Rp;
 use crate::cache::scope_ids::EvalScopeIds;
 use crate::value::{LazyFuncValue, Value};
 use crate::var_index::VarRegistry;
@@ -13,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tla_core::ast::{OperatorDef, Substitution};
 use tla_core::name_intern::NameId;
+use tla_value::Rp;
 
 pub(super) static SHARED_CTX_NEXT_ID: AtomicU64 = AtomicU64::new(1);
 /// Evaluation environment: variable bindings

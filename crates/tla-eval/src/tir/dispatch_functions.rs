@@ -5,12 +5,12 @@
 //! TIR dispatch helpers for function-like and operator-like expressions.
 
 use super::dispatch::eval_tir;
-use tla_value::Rp;
 use super::StoredTirBody;
 use crate::core::EvalCtx;
 use crate::helpers::function_values::{
-    apply_func_value_eager, apply_resolved_except_spec, collect_resolved_except_path,
-    ResolvedExceptPathElement, TirLazyExceptHandler,
+    apply_func_value_eager, apply_resolved_except_spec, canonicalize_except_result,
+    collect_resolved_except_path, ResolvedExceptPath, ResolvedExceptPathElement,
+    TirLazyExceptHandler,
 };
 use crate::{
     apply_closure_with_values, apply_user_op_with_values_resolved, eval_domain_value,
@@ -22,7 +22,15 @@ use tla_core::ast::Expr;
 use tla_core::{Span, Spanned};
 use tla_tir::nodes::{TirExceptPathElement, TirExceptSpec, TirExpr, TirOperatorRef};
 use tla_value::error::{EvalError, EvalResult};
+use tla_value::Rp;
 use tla_value::{FuncSetValue, Value};
+
+// Kill-switch (fail-safe to the shallow one-level borrow): when set, the
+// read-only operand borrow only elides `Name` and one-level `Name[arg]` reads.
+// When unset (default), it recursively borrows arbitrarily deep read chains —
+// `f[i][j]`, `f[i].field`, `r.a.b`, etc. — so the intermediate function-apply /
+// record-access results are never cloned out only to be indexed and discarded.
+feature_flag!(pub(super) no_deep_read_chain, "TY_NO_DEEP_READ_CHAIN");
 
 pub(super) fn eval_tir_except_at(ctx: &EvalCtx, span: Option<tla_core::Span>) -> EvalResult<Value> {
     ctx.lookup("@").ok_or_else(|| EvalError::Internal {
@@ -140,6 +148,21 @@ pub(super) fn eval_tir_func_apply(
             );
             return apply_tir_func_value_to_arg_expr(ctx, func_value, arg, func.span, span);
         }
+    }
+
+    // Deep-borrow chained bases (`f[i][j]`, `r.a[j]`): the base is itself a
+    // read chain, so borrow it in place rather than materializing the
+    // intermediate function/record owned only to index and drop it. The final
+    // apply result is produced by the same `apply_tir_func_value_to_arg_expr`
+    // tail (dense-2D fast path preserved), so semantics stay byte-identical.
+    if !no_deep_read_chain()
+        && matches!(
+            &func.node,
+            TirExpr::FuncApply { .. } | TirExpr::RecordAccess { .. }
+        )
+    {
+        let base = eval_tir_operand_deep(ctx, func)?;
+        return apply_tir_func_value_to_arg_expr(ctx, base.as_value(), arg, func.span, span);
     }
 
     let func_value = eval_tir(ctx, func)?;
@@ -344,6 +367,20 @@ pub(super) fn eval_tir_operand<'a>(
     ctx: &'a EvalCtx,
     expr: &'a Spanned<TirExpr>,
 ) -> EvalResult<TirOperand<'a>> {
+    if no_deep_read_chain() {
+        eval_tir_operand_shallow(ctx, expr)
+    } else {
+        eval_tir_operand_deep(ctx, expr)
+    }
+}
+
+/// Kill-switch path (`TY_NO_DEEP_READ_CHAIN`): borrow only `Name`, `Const`, and
+/// a single-level `Name[arg]` function apply. Preserved verbatim as the
+/// fail-safe reference for the deep recursive path.
+fn eval_tir_operand_shallow<'a>(
+    ctx: &'a EvalCtx,
+    expr: &'a Spanned<TirExpr>,
+) -> EvalResult<TirOperand<'a>> {
     let span = Some(expr.span);
     match &expr.node {
         TirExpr::Name(name_ref) => {
@@ -388,8 +425,8 @@ pub(super) fn eval_tir_operand<'a>(
                         }
                     }
                     let arg_value = eval_tir(ctx, arg)?;
-                    if let Some(result) = crate::helpers::function_values::
-                        try_apply_func_value_eager_borrowed(
+                    if let Some(result) =
+                        crate::helpers::function_values::try_apply_func_value_eager_borrowed(
                             func_value,
                             &arg_value,
                             Some(arg.span),
@@ -408,6 +445,132 @@ pub(super) fn eval_tir_operand<'a>(
                         Some(func.span),
                     )
                     .map(TirOperand::Owned);
+                }
+            }
+        }
+        _ => {}
+    }
+    eval_tir(ctx, expr).map(TirOperand::Owned)
+}
+
+/// Default path: recursively borrow an arbitrarily deep read chain rooted at a
+/// borrowable base (state variable / precomputed constant / `Const` node). Each
+/// `FuncApply` and `RecordAccess` level borrows its result *from inside* the
+/// borrowed base instead of cloning an owned intermediate out, so `f[i][j]`,
+/// `f[i].field`, and `r.a.b` pay zero clones for the intermediates (and zero
+/// for the final value too, when the consumer only reads it — Eq/Neq/`\in`).
+///
+/// Soundness: the borrow roots (state array, sparse next-state overlay,
+/// precomputed-constant map, `Const` node) are all stable for the whole
+/// evaluation, and `try_borrow_tir_ident_value` bails to the owned path
+/// whenever a mutable binding could shadow the name — so no borrow outlives its
+/// backing store. Every arm falls back to `eval_tir(..).map(Owned)`, and any
+/// step that isn't eagerly borrowable (Bag / LazyFunc / type error) delegates
+/// to the exact owned resolver, making the observed value/error byte-identical
+/// to the generic owned path. Evaluation order (base before arg) matches
+/// `eval_tir_func_apply` / `eval_tir_record_access`.
+pub(super) fn eval_tir_operand_deep<'a>(
+    ctx: &'a EvalCtx,
+    expr: &'a Spanned<TirExpr>,
+) -> EvalResult<TirOperand<'a>> {
+    let span = Some(expr.span);
+    match &expr.node {
+        TirExpr::Name(name_ref) => {
+            let borrowed = match &name_ref.kind {
+                tla_tir::nodes::TirNameKind::StateVar { index } => {
+                    try_borrow_tir_state_var(ctx, *index as usize)
+                }
+                tla_tir::nodes::TirNameKind::Ident => try_borrow_tir_ident_value(ctx, name_ref),
+            };
+            if let Some(v) = borrowed {
+                tla_value::churn_stats::churn_count(
+                    tla_value::churn_stats::ChurnSite::StateVarReadElided,
+                );
+                return Ok(TirOperand::Borrowed(v));
+            }
+        }
+        TirExpr::Const { value, .. } => {
+            return Ok(TirOperand::Borrowed(value));
+        }
+        TirExpr::FuncApply { func, arg } => {
+            // Recursively borrow the base (Name / chained apply / record access).
+            let base = eval_tir_operand_deep(ctx, func)?;
+            if let TirExpr::Tuple(elems) = &arg.node {
+                if !elems.is_empty() {
+                    tla_value::churn_stats::churn_count(
+                        tla_value::churn_stats::ChurnSite::TupleKeyApplyTirBuild,
+                    );
+                    if matches!(base.as_value(), Value::Func(fv) if !fv.dense_is_dim2()) {
+                        tla_value::churn_stats::churn_count(
+                            tla_value::churn_stats::ChurnSite::TupleKeyApplyTirSparse,
+                        );
+                    }
+                }
+            }
+            let arg_value = eval_tir(ctx, arg)?;
+            match base {
+                TirOperand::Borrowed(func_value) => {
+                    if let Some(result) =
+                        crate::helpers::function_values::try_apply_func_value_eager_borrowed(
+                            func_value,
+                            &arg_value,
+                            Some(arg.span),
+                            span,
+                        )
+                    {
+                        return result.map(TirOperand::Borrowed);
+                    }
+                    // Bag / LazyFunc / type errors: owned resolver, identical
+                    // semantics to the generic FuncApply path.
+                    return apply_resolved_tir_func_value(
+                        func_value,
+                        arg_value,
+                        arg.span,
+                        span,
+                        Some(func.span),
+                    )
+                    .map(TirOperand::Owned);
+                }
+                TirOperand::Owned(func_value) => {
+                    return apply_resolved_tir_func_value(
+                        &func_value,
+                        arg_value,
+                        arg.span,
+                        span,
+                        Some(func.span),
+                    )
+                    .map(TirOperand::Owned);
+                }
+            }
+        }
+        TirExpr::RecordAccess { record, field } => {
+            let base = eval_tir_operand_deep(ctx, record)?;
+            match base {
+                TirOperand::Borrowed(rv) => {
+                    let rec = rv
+                        .as_record()
+                        .ok_or_else(|| EvalError::type_error("Record", rv, Some(record.span)))?;
+                    let f =
+                        rec.get_by_id(field.field_id)
+                            .ok_or_else(|| EvalError::NoSuchField {
+                                field: field.name.clone(),
+                                record_display: Some(format!("{rv}")),
+                                span,
+                            })?;
+                    return Ok(TirOperand::Borrowed(f));
+                }
+                TirOperand::Owned(rv) => {
+                    let rec = rv
+                        .as_record()
+                        .ok_or_else(|| EvalError::type_error("Record", &rv, Some(record.span)))?;
+                    let f = rec.get_by_id(field.field_id).cloned().ok_or_else(|| {
+                        EvalError::NoSuchField {
+                            field: field.name.clone(),
+                            record_display: Some(format!("{rv}")),
+                            span,
+                        }
+                    })?;
+                    return Ok(TirOperand::Owned(f));
                 }
             }
         }
@@ -457,9 +620,24 @@ pub(super) fn eval_tir_except(
     span: Option<tla_core::Span>,
 ) -> EvalResult<Value> {
     let mut result = eval_tir(ctx, base)?;
+    // Resolve each spec's path once, apply it, and KEEP the resolved path
+    // for the post-EXCEPT record canonicalization walk (mirrors the AST
+    // `eval_except`; see `canonicalize_except_result`).
+    let mut resolved_paths: smallvec::SmallVec<[ResolvedExceptPath; 4]> = smallvec::SmallVec::new();
     for spec in specs {
-        result = apply_tir_except_spec(ctx, result, &spec.path, &spec.value, span)?;
+        let resolved = resolve_tir_except_path(ctx, &spec.path)?;
+        let mut eval_new = |new_ctx: &EvalCtx| eval_tir(new_ctx, &spec.value);
+        result = apply_resolved_except_spec(
+            ctx,
+            result,
+            &resolved,
+            &mut eval_new,
+            &TirLazyExceptHandler,
+            span,
+        )?;
+        resolved_paths.push(resolved);
     }
+    canonicalize_except_result(&mut result, &resolved_paths);
     Ok(result)
 }
 
@@ -500,16 +678,13 @@ fn apply_resolved_tir_func_value(
     }
 }
 
-/// Part of #3251: pre-resolve TIR path elements and delegate to the shared
-/// `apply_resolved_except_spec` with a TIR-specific lazy handler.
-fn apply_tir_except_spec(
+/// Part of #3251: pre-resolve TIR path elements for the shared
+/// `apply_resolved_except_spec` dispatch.
+fn resolve_tir_except_path(
     ctx: &EvalCtx,
-    value: Value,
     path: &[TirExceptPathElement],
-    new_value_expr: &Spanned<TirExpr>,
-    span: Option<tla_core::Span>,
-) -> EvalResult<Value> {
-    let resolved = collect_resolved_except_path(path.iter().map(|p| match p {
+) -> EvalResult<ResolvedExceptPath> {
+    collect_resolved_except_path(path.iter().map(|p| match p {
         TirExceptPathElement::Index(expr) => {
             if matches!(&expr.node, TirExpr::Tuple(elems) if !elems.is_empty()) {
                 tla_value::churn_stats::churn_count(
@@ -522,16 +697,7 @@ fn apply_tir_except_spec(
             name: f.name.clone(),
             field_id: f.field_id,
         }),
-    }))?;
-    let mut eval_new = |new_ctx: &EvalCtx| eval_tir(new_ctx, new_value_expr);
-    apply_resolved_except_spec(
-        ctx,
-        value,
-        &resolved,
-        &mut eval_new,
-        &TirLazyExceptHandler,
-        span,
-    )
+    }))
 }
 
 /// Evaluate a module-qualified operator reference (`M!Op(args)`).

@@ -12,7 +12,7 @@ mod utf16;
 mod tests;
 
 pub use intern::{clear_string_intern_table, intern_string};
-pub use tokens::{clear_tlc_string_tokens, tlc_string_token};
+pub use tokens::{clear_tlc_string_tokens, lookup_tlc_string_token, tlc_string_token};
 pub use utf16::{tlc_string_len, tlc_string_subseq_utf16_offsets};
 
 pub(super) use intern::snapshot_string_intern_table;

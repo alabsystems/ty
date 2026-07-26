@@ -99,13 +99,13 @@ fn build_disk_graph_from_adj(n: usize, adj: &[bool]) -> (BehaviorGraph, Vec<Beha
     (graph, nodes)
 }
 
-/// The dense-id path (disk-backed store, `TY_TARJAN_DENSE_IDS` default ON) must
-/// produce SCCs bit-identical to the `node_to_id` path (in-memory store) on the
-/// same topology. A dense-id bug would corrupt SCC membership → a liveness
-/// verdict flip; this differential catches it. (G2 at the unit level.)
+/// Both dense-id backends must produce SCCs bit-identical to the reference
+/// oracle on the same topology. A backend-specific dense-id bug would corrupt
+/// SCC membership → a liveness verdict flip; this differential catches it.
+/// (G2 at the unit level.)
 #[cfg_attr(test, ntest::timeout(30000))]
 #[test]
-fn prop_dense_id_disk_matches_node_to_id_in_memory() {
+fn prop_dense_id_backends_match_reference() {
     let n = 5usize;
     let config = proptest::test_runner::Config {
         failure_persistence: None,
@@ -116,8 +116,9 @@ fn prop_dense_id_disk_matches_node_to_id_in_memory() {
 
     runner
         .run(&strategy, |adj| {
-            // node_to_id path (in-memory).
-            let (mem_graph, _states, mem_nodes) = build_graph_from_adj(n, &adj);
+            // Dense-id path backed by the compact in-memory reverse index.
+            let (mut mem_graph, _states, mem_nodes) = build_graph_from_adj(n, &adj);
+            prop_assert!(mem_graph.supports_dense_ids());
             let mem_result = find_sccs(&mem_graph);
             prop_assert!(
                 mem_result.errors.is_empty(),
@@ -126,7 +127,19 @@ fn prop_dense_id_disk_matches_node_to_id_in_memory() {
             );
             let mem_sccs = canonicalize_sccs(mem_result.sccs, &mem_nodes);
 
-            // dense-id path (disk-backed).
+            // The completed in-memory production path lends packed CSR rather
+            // than rebuilding an owned Tarjan arena. It must remain identical
+            // to both the raw path and the independent reference oracle.
+            mem_graph.pack_inmemory_successors().unwrap();
+            let packed_result = find_sccs(&mem_graph);
+            prop_assert!(
+                packed_result.errors.is_empty(),
+                "packed in-memory Tarjan errors: {:?}",
+                packed_result.errors
+            );
+            let packed_sccs = canonicalize_sccs(packed_result.sccs, &mem_nodes);
+
+            // Dense-id path backed by the disk store's pointer table.
             let (disk_graph, disk_nodes) = build_disk_graph_from_adj(n, &adj);
             let disk_result = find_sccs(&disk_graph);
             prop_assert!(
@@ -139,7 +152,9 @@ fn prop_dense_id_disk_matches_node_to_id_in_memory() {
             // Must be identical to each other AND to the reference oracle.
             let reference = reference_sccs(n, &adj);
             prop_assert_eq!(&mem_sccs, &reference);
+            prop_assert_eq!(&packed_sccs, &reference);
             prop_assert_eq!(&disk_sccs, &reference);
+            prop_assert_eq!(&mem_sccs, &packed_sccs);
             prop_assert_eq!(mem_sccs, disk_sccs);
             Ok(())
         })

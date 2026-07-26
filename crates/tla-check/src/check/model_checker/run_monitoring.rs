@@ -86,8 +86,9 @@ impl ModelChecker<'_> {
             usize,
         )>(queue_size);
 
-        // Part of #4080: estimate liveness cache memory (successor graph +
-        // witness cache). Previously invisible to memory pressure checks.
+        // Part of #4080: selected structural estimate for the liveness graph and
+        // witness cache. The disk graph estimate counts its O(states) offset
+        // index heuristic, but excludes direct-cache payloads and mapped pages.
         let liveness_bytes = {
             let succ_bytes = self.liveness_cache.successors.estimate_memory_bytes();
             let witness_cap = self.liveness_cache.successor_witnesses.capacity();
@@ -212,8 +213,9 @@ impl ModelChecker<'_> {
         self.emit_mem_census("progress", payload_witness_bytes);
 
         // Large-liveness memory guard: when the BFS-time liveness caches exceed
-        // `TY_LIVENESS_REGEN_BUDGET_MB`, drop them and switch the post-BFS
-        // liveness pass to on-demand successor regeneration (TLC's tradeoff).
+        // `TY_LIVENESS_REGEN_BUDGET_MB`, move ordered edge lists to disk, drop
+        // inline maps, and select retained-or-regenerated post-BFS checking.
+        // Capture continues with an O(states) index and fixed-slot read cache.
         self.maybe_trip_liveness_regen_budget();
 
         // Part of #4080: hard internal memory cap.

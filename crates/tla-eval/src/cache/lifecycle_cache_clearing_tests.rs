@@ -7,13 +7,13 @@
 //! Part of #3442: extracted from lifecycle_tests.rs.
 
 use super::{clear_for_test_reset, on_cache_event, CacheEvent};
-use tla_value::Rp;
 use crate::cache::dep_tracking::OpEvalDeps;
 use crate::cache::op_result_cache::CachedOpResult;
 use crate::cache::zero_arg_cache::ZERO_ARG_CACHES;
 use crate::var_index::VarIndex;
 use std::sync::Arc;
 use tla_core::name_intern::intern_name;
+use tla_value::Rp;
 use tla_value::{FuncValue, IntIntervalFunc, SortedSet, Value};
 
 /// Regression: run/test reset must clear zero-arg entries from both lifecycle

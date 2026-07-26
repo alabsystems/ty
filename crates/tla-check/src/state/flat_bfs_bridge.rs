@@ -39,6 +39,7 @@
 //! Part of #3986: Wire FlatState into BFS engine.
 
 use std::sync::Arc;
+#[cfg(test)]
 use tla_value::Rp;
 
 use super::array_state::ArrayState;

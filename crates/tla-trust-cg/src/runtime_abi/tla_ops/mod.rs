@@ -62,7 +62,7 @@ pub mod tuple;
 ///
 /// # Pattern established by `quantifier::tla_quantifier_runtime_error`
 ///
-/// ```ignore
+/// ```text
 /// if unreachable_invariant_violated {
 ///     ty_ffi_abort("tla_my_helper: invariant X violated");
 /// }

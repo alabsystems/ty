@@ -5,9 +5,10 @@
 //! Build script: embeds `TY_GIT_COMMIT` at compile time.
 
 fn main() {
-    // Embed git commit hash so `ty diagnose --output json` can report it.
+    // Embed the full source identity so strict evidence can attribute the
+    // exact executable rather than accepting an ambiguous short prefix.
     let commit = std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
+        .args(["rev-parse", "HEAD"])
         .output()
         .ok()
         .filter(|o| o.status.success())
@@ -17,8 +18,32 @@ fn main() {
         );
 
     println!("cargo:rustc-env=TY_GIT_COMMIT={commit}");
+    let dirty = std::process::Command::new("git")
+        .args(["status", "--porcelain=v1", "--untracked-files=no"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map_or("unknown", |output| {
+            if output.stdout.is_empty() {
+                "false"
+            } else {
+                "true"
+            }
+        });
+    println!("cargo:rustc-env=TY_GIT_DIRTY={dirty}");
 
-    // Re-run if HEAD changes (new commit).
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
-    println!("cargo:rerun-if-changed=../../.git/refs/heads/");
+    // Re-run if HEAD or the index changes. `git rev-parse --git-path` is
+    // required here because `.git` is a file in a linked worktree, while the
+    // per-worktree HEAD/index and shared refs live elsewhere.
+    for path in ["HEAD", "refs/heads", "index"] {
+        let resolved = std::process::Command::new("git")
+            .args(["rev-parse", "--git-path", path])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
+        if let Some(resolved) = resolved.filter(|path| !path.is_empty()) {
+            println!("cargo:rerun-if-changed={resolved}");
+        }
+    }
 }

@@ -1672,13 +1672,20 @@ mod tests {
         }
     }
 
-    /// MICRO-BENCHMARK (run with `--ignored --nocapture`): per-call wall time of
+    /// MICRO-BENCHMARK (run with `TY_RUN_BSGS_MICROBENCH=1` and `--nocapture`):
+    /// per-call wall time of
     /// regime-B `orbit_size` (|G|/|Stab|) vs the enumerative `orbit_size_enumerative`
     /// on a coupled Anderson-like group, to quantify the regime-B speedup. Not a
     /// correctness assertion — values are differentially checked elsewhere.
     #[test]
-    #[ignore = "timing micro-benchmark; run explicitly with --ignored --nocapture"]
     fn bench_regime_b_vs_enumerative_orbit_size() {
+        if !std::env::var_os("TY_RUN_BSGS_MICROBENCH").is_some_and(|value| value == "1") {
+            eprintln!(
+                "SKIP bench_regime_b_vs_enumerative_orbit_size: set \
+                 TY_RUN_BSGS_MICROBENCH=1 to authorize the timing campaign"
+            );
+            return;
+        }
         use std::time::Instant;
         // Coupled diagonal S4 on TWO size-4 orbits (|G|=24), several markings of
         // varied stabilizer size; an Anderson-shaped coupling.

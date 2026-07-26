@@ -96,7 +96,9 @@ impl EvalCtx {
                 if let Some(state_env) = self.state_env {
                     debug_assert!(idx.as_usize() < state_env.env_len());
                     // SAFETY: `state_env` borrows a live `[Value]` slice and `idx` is bounded above.
-                    tla_value::churn_stats::churn_count(tla_value::churn_stats::ChurnSite::StateVarReadCtxLookup);
+                    tla_value::churn_stats::churn_count(
+                        tla_value::churn_stats::ChurnSite::StateVarReadCtxLookup,
+                    );
                     let v = unsafe { state_env.get_value(idx.as_usize()) };
                     record_state_read(self, idx, &v);
                     return Some(v);

@@ -5,12 +5,12 @@
 //! Value conversion and operation helpers for the bytecode VM executor.
 
 use num_bigint::BigInt;
-use tla_value::Rp;
 use num_traits::ToPrimitive;
 use smallvec::SmallVec;
 use std::cell::Cell;
 use std::sync::Arc;
 use tla_value::error::EvalError;
+use tla_value::Rp;
 use tla_value::{SortedSet, Value};
 
 use crate::{apply_closure_with_values, core::EvalCtx, StateEnvRef};
@@ -540,7 +540,10 @@ pub(super) fn value_except(f: Value, arg: Value, val: Value) -> Result<Value, Vm
                 if rec.get_by_id(name_id).is_none() {
                     return Ok(f);
                 }
-                return Ok(Value::Record(rec.insert(name_id, val)));
+                // Record hash-consing: a one-shot record EXCEPT is complete
+                // here — canonicalize (no further in-place mutation follows,
+                // so there is no COW-cascade concern at this site).
+                return Ok(Value::Record(rec.insert(name_id, val).canonicalized()));
             }
             Err(VmError::TypeError {
                 expected: "string field name for record EXCEPT",

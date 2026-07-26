@@ -190,8 +190,14 @@ pub fn print_eval_profile_stats() {
     crate::cache::op_result_cache::print_nary_cache_stats();
     // Site-ranked Value churn instrumentation (TY_CHURN_STATS=1; no-op otherwise).
     tla_value::churn_stats::print_churn_stats();
+    // Record intern table counters (TY_INTERN_STATS=1; no-op otherwise).
+    tla_value::value::print_record_intern_stats();
+    // Recursive-operator memo redundancy counters (TY_REC_STATS=1; no-op otherwise).
+    crate::helpers::print_recursion_memo_stats();
     // OpEnv memo counters (TY_OPENV_STATS=1; no-op otherwise).
     crate::cache::openv_memo::print_openv_memo_stats();
+    // INSTANCE-subst chain memo counters (TY_SUBST_STATS=1; no-op otherwise).
+    crate::cache::subst_chain_memo::print_subst_memo_stats();
 
     if !profile_eval() {
         return;

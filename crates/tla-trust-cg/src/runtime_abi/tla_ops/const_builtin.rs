@@ -41,7 +41,6 @@
 //! Part of #4318.
 
 use std::cell::RefCell;
-use tla_value::Rp;
 
 use tla_value::intern_string;
 use tla_value::value::Value;
@@ -194,6 +193,7 @@ mod tests {
     use super::*;
     use num_bigint::BigInt;
     use tla_value::value::{SortedSet, Value};
+    use tla_value::Rp;
 
     fn small_int_set(xs: &[i64]) -> Value {
         Value::set(xs.iter().copied().map(Value::SmallInt).collect::<Vec<_>>())

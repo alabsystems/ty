@@ -526,15 +526,17 @@ impl ParallelChecker {
         // Generate initial states (streaming bulk or Vec<State> fallback)
         // Part of #2789: Route through check_error_to_result so
         // ExitRequested maps to LimitReached(Exit).
-        let initial_states: InitialStates =
+        let (initial_states, raw_initial_states_generated): (InitialStates, usize) =
             match self.generate_initial_states_to_bulk(&mut ctx, &init_name) {
-                Ok(Some(storage)) => InitialStates::Bulk(storage),
-                Ok(None) => match self.generate_initial_states(&ctx, &init_name) {
-                    Ok(states) => InitialStates::Vec(states),
+                Ok(Some((storage, generated))) => (InitialStates::Bulk(storage), generated),
+                Ok(None) => match self.generate_initial_states_with_raw_count(&ctx, &init_name) {
+                    Ok((states, generated)) => (InitialStates::Vec(states), generated),
                     Err(e) => return Err(check_error_to_result(e, &CheckStats::default())),
                 },
                 Err(e) => return Err(check_error_to_result(e, &CheckStats::default())),
             };
+        self.total_raw_initial_states_generated
+            .store(raw_initial_states_generated, Ordering::SeqCst);
 
         // Part of #3621: Compile invariant bytecode for parallel workers.
         // Mirrors sequential checker's compile_invariant_bytecode (run_prepare.rs:259).

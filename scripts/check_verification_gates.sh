@@ -40,6 +40,10 @@ gate "reproducible Git dependency pins" \
     python3 "$SCRIPT_DIR/check_reproducible_git_pins.py"
 gate "reproducible Git dependency pin regressions" \
     python3 "$SCRIPT_DIR/test_check_reproducible_git_pins.py"
+gate "first-party zero-ignore policy" \
+    python3 "$SCRIPT_DIR/check_first_party_zero_ignores.py"
+gate "first-party zero-ignore policy regressions" \
+    python3 "$SCRIPT_DIR/test_check_first_party_zero_ignores.py"
 
 # 1. Both build configurations compile (the all-verification build is not in CI;
 #    a clippy/auto-fix sweep already broke it once — d4ae86e1).
@@ -77,7 +81,7 @@ gate "cross-repo dep drift guard (unit tests)" \
 # 3b. The REAL cross-repo scan: runs the ty-mcc-drift-guard binary over the
 #     live sibling workspaces' `cargo metadata`. The --lib gate above only
 #     exercises the guard's synthetic fixtures and stays green while actual
-#     pin drift exists between ~/root/{ty,trust-ir,trust-cg,ay}; this one
+#     pin drift exists between ~/root/{ty,trust-ir,trust-cg,clean,ay}; this one
 #     fails on live drift (it self-skips when no sibling repos are present).
 gate "cross-repo dep drift guard (live sibling scan)" \
     cargo test -q -p tla-petri --test cargo_dep_drift_guard

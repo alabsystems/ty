@@ -101,8 +101,10 @@ fn test_ea_edge_check_basic() {
     graph.get_node_info_mut(&n1).unwrap().state_check_mask = CheckMask::from_u64(0u64); // bit 0 not set
 
     // Action masks: both edges pass check 0
-    graph.get_node_info_mut(&n0).unwrap().action_check_masks = vec![CheckMask::from_u64(1u64)]; // n0->n1
-    graph.get_node_info_mut(&n1).unwrap().action_check_masks = vec![CheckMask::from_u64(1u64)]; // n1->n0
+    graph.get_node_info_mut(&n0).unwrap().action_check_masks =
+        vec![CheckMask::from_u64(1u64)].into(); // n0->n1
+    graph.get_node_info_mut(&n1).unwrap().action_check_masks =
+        vec![CheckMask::from_u64(1u64)].into(); // n1->n0
 
     // PEM requires EA state check 0 — only edges where BOTH endpoints have bit 0 pass
     let ec = EaEdgeCheck::new(&[], &[0]).expect("should return Some when indices are non-empty");
@@ -146,8 +148,10 @@ fn test_ea_edge_check_action_only() {
     graph.add_successor(n1, &s0, 0).unwrap();
 
     // Action check 0 passes on n0->n1, fails on n1->n0
-    graph.get_node_info_mut(&n0).unwrap().action_check_masks = vec![CheckMask::from_u64(1u64)]; // bit 0 set
-    graph.get_node_info_mut(&n1).unwrap().action_check_masks = vec![CheckMask::from_u64(0u64)]; // bit 0 not set
+    graph.get_node_info_mut(&n0).unwrap().action_check_masks =
+        vec![CheckMask::from_u64(1u64)].into(); // bit 0 set
+    graph.get_node_info_mut(&n1).unwrap().action_check_masks =
+        vec![CheckMask::from_u64(0u64)].into(); // bit 0 not set
 
     let ec = EaEdgeCheck::new(&[0], &[]).expect("should return Some");
     assert!(
@@ -176,7 +180,8 @@ fn test_ea_edge_check_multiple_checks_and_semantics() {
     graph.add_successor(n0, &s0, 0).unwrap();
 
     // Action: check 0 passes, check 1 fails (only bit 0 set on self-loop edge)
-    graph.get_node_info_mut(&n0).unwrap().action_check_masks = vec![CheckMask::from_u64(0b01u64)];
+    graph.get_node_info_mut(&n0).unwrap().action_check_masks =
+        vec![CheckMask::from_u64(0b01u64)].into();
 
     // Require both action checks 0 and 1
     let ec = EaEdgeCheck::new(&[0, 1], &[]).expect("should return Some");
@@ -186,7 +191,8 @@ fn test_ea_edge_check_multiple_checks_and_semantics() {
     );
 
     // Now both pass
-    graph.get_node_info_mut(&n0).unwrap().action_check_masks = vec![CheckMask::from_u64(0b11u64)];
+    graph.get_node_info_mut(&n0).unwrap().action_check_masks =
+        vec![CheckMask::from_u64(0b11u64)].into();
     let ec = EaEdgeCheck::new(&[0, 1], &[]).expect("should return Some");
     assert!(
         ec.allows_edge_pair(&graph, &n0, &n0),
@@ -218,7 +224,7 @@ fn test_ea_edge_check_boundary_indices() {
 
     // Set action mask on n0's edge to n1: bits 0 and 63
     let action_mask = CheckMask::from_indices(&[0, 63]);
-    graph.get_node_info_mut(&n0).unwrap().action_check_masks = vec![action_mask.clone()];
+    graph.get_node_info_mut(&n0).unwrap().action_check_masks = vec![action_mask.clone()].into();
 
     // EA with state indices [0, 62, 63] and action indices [0, 63]
     let ec = EaEdgeCheck::new(&[0, 63], &[0, 62, 63]).expect("should produce EaEdgeCheck");

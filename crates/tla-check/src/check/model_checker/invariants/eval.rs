@@ -13,12 +13,18 @@ use super::super::{ArrayState, CheckError, Fingerprint, ModelChecker};
 use crate::checker_ops::InvariantOutcome;
 // Part of #4398: consume fail-closed compiled-backend types through tla-check's local shim.
 use crate::compiled_backend_unavailable::JitInvariantCache as JitInvariantCacheImpl;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
+#[cfg(test)]
+use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
+use tla_core::ast::Expr;
+#[cfg(test)]
 use tla_core::ast::{
-    BoundPattern, BoundVar, CaseArm, ExceptPathElement, Expr, ModuleTarget, OperatorDef,
+    BoundPattern, BoundVar, CaseArm, ExceptPathElement, ModuleTarget, OperatorDef,
 };
-use tla_core::{Spanned, VarIndex, VarRegistry};
+#[cfg(test)]
+use tla_core::VarRegistry;
+use tla_core::{Spanned, VarIndex};
 use tla_value::{CompactValue, Value};
 
 /// Default total number of exact TRUE witnesses retained by one sequential
@@ -326,9 +332,7 @@ impl StateConstraintVerdictCache {
                     .plans
                     .first()
                     .and_then(Option::as_ref)
-                    .and_then(|plan| {
-                        materialize_invariant_projection(plan, state, fingerprint)
-                    })
+                    .and_then(|plan| materialize_invariant_projection(plan, state, fingerprint))
                 else {
                     return;
                 };
@@ -554,14 +558,17 @@ impl InvariantVerdictCache {
             return;
         };
         let dropped = plan.buckets.values().map(SmallVec::len).sum::<usize>()
-            + plan.state_constraint_verdicts.as_ref().map_or(0, |entries| {
-                entries
-                    .projections
-                    .values()
-                    .map(SmallVec::len)
-                    .sum::<usize>()
-                    + entries.inline_scalars.as_ref().map_or(0, FxHashMap::len)
-            });
+            + plan
+                .state_constraint_verdicts
+                .as_ref()
+                .map_or(0, |entries| {
+                    entries
+                        .projections
+                        .values()
+                        .map(SmallVec::len)
+                        .sum::<usize>()
+                        + entries.inline_scalars.as_ref().map_or(0, FxHashMap::len)
+                });
         let activated_conjunct_plans = self
             .conjunct_plans
             .get(index)
@@ -1192,12 +1199,14 @@ fn eval_prepared_invariant_conjuncts(
 /// exact witnesses are owned by each `ModelChecker`.
 pub(crate) fn clear_invariant_dependency_caches() {}
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 enum InvariantDeps {
     Vars(FxHashSet<u16>),
     Unknown,
 }
 
+#[cfg(test)]
 impl InvariantDeps {
     fn empty() -> Self {
         Self::Vars(FxHashSet::default())
@@ -1236,12 +1245,14 @@ impl InvariantDeps {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Default)]
 struct InvariantDepEnv {
     bindings: FxHashMap<String, InvariantDeps>,
     local_ops: FxHashMap<String, OperatorDef>,
 }
 
+#[cfg(test)]
 impl InvariantDepEnv {
     fn lookup_binding(&self, name: &str) -> Option<InvariantDeps> {
         self.bindings.get(name).cloned()
@@ -1256,6 +1267,7 @@ impl InvariantDepEnv {
     }
 }
 
+#[cfg(test)]
 fn merge_expr_deps(
     acc: &mut InvariantDeps,
     expr: &Spanned<Expr>,
@@ -1267,6 +1279,7 @@ fn merge_expr_deps(
     acc.merge(collect_expr_deps(expr, registry, op_defs, env, visiting));
 }
 
+#[cfg(test)]
 fn bind_bound_var(env: &mut InvariantDepEnv, bound: &BoundVar) {
     env.bindings
         .insert(bound.name.node.clone(), InvariantDeps::empty());
@@ -1286,6 +1299,7 @@ fn bind_bound_var(env: &mut InvariantDepEnv, bound: &BoundVar) {
     }
 }
 
+#[cfg(test)]
 fn collect_bound_domains_deps(
     bounds: &[BoundVar],
     registry: &VarRegistry,
@@ -1302,6 +1316,7 @@ fn collect_bound_domains_deps(
     deps
 }
 
+#[cfg(test)]
 fn bind_operator_params(
     env: &mut InvariantDepEnv,
     def: &OperatorDef,
@@ -1330,6 +1345,7 @@ fn bind_operator_params(
     arg_deps
 }
 
+#[cfg(test)]
 fn collect_operator_body_deps(
     op_name: &str,
     def: &OperatorDef,
@@ -1357,6 +1373,7 @@ fn collect_operator_body_deps(
     deps
 }
 
+#[cfg(test)]
 fn collect_operator_call_deps(
     op_name: &str,
     args: &[Spanned<Expr>],
@@ -1382,6 +1399,7 @@ fn collect_operator_call_deps(
     deps
 }
 
+#[cfg(test)]
 fn collect_module_ref_deps(
     target: &ModuleTarget,
     name: &str,
@@ -1414,6 +1432,7 @@ fn collect_module_ref_deps(
     deps
 }
 
+#[cfg(test)]
 fn collect_let_deps(
     defs: &[OperatorDef],
     body: &Spanned<Expr>,
@@ -1435,6 +1454,7 @@ fn collect_let_deps(
     collect_expr_deps(body, registry, op_defs, &local_env, visiting)
 }
 
+#[cfg(test)]
 fn collect_expr_deps(
     expr: &Spanned<Expr>,
     registry: &VarRegistry,

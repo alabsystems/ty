@@ -13,10 +13,10 @@ mod core;
 mod string_preload;
 
 use super::*;
+use crate::rp::Rp as Arc;
 use crate::value::intern_tables::{clear_int_func_intern_table, clear_set_intern_table};
 use rustc_hash::FxHashMap;
 use std::cell::Cell;
-use crate::rp::Rp as Arc;
 /// Build a `WorkerInternState` with zeroed attribution counters.
 pub(super) fn make_worker_state(
     frozen: Arc<FrozenValueInterners>,

@@ -105,10 +105,26 @@ pub struct CheckStats {
     pub states_found: usize,
     /// Number of initial states
     pub initial_states: usize,
+    /// Number of initial states generated before state constraints and
+    /// fingerprint deduplication are applied.
+    ///
+    /// TLC increments `numberOfInitialStates` in `DoInitFunctor.addElement`
+    /// before legality/model-constraint checks. Keep this separate from
+    /// `initial_states`, whose established TY meaning is the number admitted
+    /// to the initial BFS frontier.
+    pub raw_initial_states_generated: usize,
     /// Maximum queue depth (BFS frontier)
     pub max_queue_depth: usize,
     /// Number of transitions examined
     pub transitions: usize,
+    /// Number of successors generated before state/action constraints or
+    /// exploration reductions are applied.
+    ///
+    /// TLC increments its worker `statesGenerated` counter at this boundary,
+    /// before checking `isGoodState`, state constraints, or action
+    /// constraints. Keep this separate from `transitions`, whose established
+    /// TY meaning is the post-filter transition work consumed by the checker.
+    pub raw_successors_generated: usize,
     /// Maximum BFS depth reached
     pub max_depth: usize,
     /// Detected action names from Next relation (top-level disjuncts)
@@ -156,6 +172,13 @@ pub struct CheckStats {
     /// JSON/JSONL output serializes this under `backend_capability_report`, a
     /// key consumed by the `ty-mcc-summarize-evidence` binary.
     pub backend_capability_report: Option<serde_json::Value>,
+    /// Engine-provenance record: which execution tier actually ran this check
+    /// (interpreter / trust-cg per-action callout / trust-cg native-fused /
+    /// parallel BFS / gpu), whether an AUTO tier-up hot-swap occurred mid-run, and the
+    /// value-action VM engagement summary. Benchmark harnesses consume this so
+    /// every measured row can attribute its result to the engine that produced
+    /// it; a row without provenance cannot support a supremacy claim.
+    pub engine_provenance: Option<serde_json::Value>,
     /// Default-on, non-fatal vacuity WARNINGs (V2 dead-actions, V3
     /// vacuously-true invariants). Computed unconditionally at finalize time.
     /// The CLI prints these; `--strict-vacuity` promotes them to exit 3 and
@@ -169,12 +192,14 @@ impl CheckStats {
     /// Total states generated (including duplicates), matching TLC's `getStatesGenerated()`.
     ///
     /// In TLC: `numberOfInitialStates + sum(worker.statesGenerated)`.
-    /// In TY: `initial_states + transitions` (each transition produces one successor).
+    /// In TY: `raw_initial_states_generated + raw_successors_generated`.
     ///
     /// Part of #3005.
     #[must_use]
     pub fn states_generated(&self) -> usize {
-        self.initial_states + self.transitions
+        self.raw_initial_states_generated
+            .checked_add(self.raw_successors_generated)
+            .expect("raw generated-state total overflowed usize")
     }
 
     /// Optimistic fingerprint collision probability estimate.
@@ -281,7 +306,9 @@ mod collision_probability_tests {
         let stats = CheckStats {
             states_found: 100,
             initial_states: 1,
+            raw_initial_states_generated: 1,
             transitions: 99,
+            raw_successors_generated: 99,
             ..Default::default()
         };
         // states_generated = 1 + 99 = 100, same as states_found
@@ -297,8 +324,10 @@ mod collision_probability_tests {
         let stats = CheckStats {
             states_found: 1000,
             initial_states: 1,
+            raw_initial_states_generated: 1,
             // 2000 transitions total, 999 new states + 1001 duplicate encounters
             transitions: 2000,
+            raw_successors_generated: 2000,
             ..Default::default()
         };
         // states_generated = 1 + 2000 = 2001
@@ -319,7 +348,9 @@ mod collision_probability_tests {
         let stats = CheckStats {
             states_found: 10_000_000,
             initial_states: 1,
+            raw_initial_states_generated: 1,
             transitions: 20_000_000,
+            raw_successors_generated: 20_000_000,
             ..Default::default()
         };
         // states_generated = 20_000_001, g - n = 10_000_001
@@ -334,7 +365,9 @@ mod collision_probability_tests {
         let stats = CheckStats {
             states_found: 10_000_000,
             initial_states: 1,
+            raw_initial_states_generated: 1,
             transitions: 20_000_000,
+            raw_successors_generated: 20_000_000,
             ..Default::default()
         };
         let s = stats.collision_probability_string();
@@ -342,14 +375,31 @@ mod collision_probability_tests {
         assert!(s.contains('E'), "expected scientific notation, got: {s}");
     }
 
-    /// Part of #3005: states_generated matches initial_states + transitions.
+    /// Part of #3005: states_generated matches raw initial-state plus raw
+    /// successor generation, independently of admitted initial-state and
+    /// transition accounting.
     #[test]
     fn states_generated_is_sum() {
         let stats = CheckStats {
-            initial_states: 5,
+            initial_states: 3,
+            raw_initial_states_generated: 5,
             transitions: 42,
+            raw_successors_generated: 37,
             ..Default::default()
         };
-        assert_eq!(stats.states_generated(), 47);
+        assert_eq!(stats.states_generated(), 42);
+        assert_eq!(stats.initial_states, 3);
+        assert_eq!(stats.transitions, 42);
+    }
+
+    #[test]
+    #[should_panic(expected = "raw generated-state total overflowed usize")]
+    fn states_generated_fails_closed_on_overflow() {
+        let stats = CheckStats {
+            raw_initial_states_generated: usize::MAX,
+            raw_successors_generated: 1,
+            ..Default::default()
+        };
+        let _ = stats.states_generated();
     }
 }

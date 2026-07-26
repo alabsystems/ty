@@ -101,6 +101,7 @@ fn env_flag_set(value: &std::ffi::OsStr) -> bool {
     !matches!(value.as_str(), "0" | "false" | "no" | "off")
 }
 
+#[cfg(any(feature = "native", test))]
 fn native_post_ra_opt_enabled(opt_level: OptLevel) -> bool {
     // Post-RA optimization is unconditionally on at production opt levels (O2+)
     // and skipped at O0/O1 (backend parity diagnostics). The former
@@ -289,6 +290,7 @@ enum BatchJitCompilePolicyKind {
 
 impl BatchJitCompilePolicyKind {
     #[must_use]
+    #[cfg(any(feature = "native", test))]
     fn as_str(&self) -> &'static str {
         match self {
             BatchJitCompilePolicyKind::RequestedOptLevel => "requested_opt_level",
@@ -300,6 +302,7 @@ impl BatchJitCompilePolicyKind {
     }
 
     #[must_use]
+    #[cfg(any(feature = "native", test))]
     fn reason(&self) -> &'static str {
         match self {
             BatchJitCompilePolicyKind::RequestedOptLevel => "requested_opt_level_preserved",
@@ -325,6 +328,7 @@ struct BatchJitCompilePolicy {
 
 impl BatchJitCompilePolicy {
     #[must_use]
+    #[cfg(any(feature = "native", test))]
     fn requested_opt_level(&self) -> OptLevel {
         self.requested_opt_level
     }
@@ -335,6 +339,7 @@ impl BatchJitCompilePolicy {
     }
 
     #[must_use]
+    #[cfg(any(feature = "native", test))]
     fn policy_name(&self) -> &'static str {
         self.kind.as_str()
     }
@@ -345,11 +350,13 @@ impl BatchJitCompilePolicy {
     }
 
     #[must_use]
+    #[cfg(any(feature = "native", test))]
     fn reason(&self) -> &'static str {
         self.kind.reason()
     }
 
     #[must_use]
+    #[cfg(any(feature = "native", test))]
     fn prefetch_policy(&self) -> &'static str {
         if self.skip_detection_only_prefetch {
             "skip_detection_only"
@@ -385,6 +392,7 @@ impl NativeCompileInputPlan {
     }
 
     #[must_use]
+    #[cfg(any(feature = "native", test))]
     fn for_prepared_manifest(
         manifest: &BatchJitPreparedManifest<'_>,
         compile_policy: BatchJitCompilePolicy,
@@ -442,6 +450,7 @@ impl NativeCompileInputPlan {
     }
 
     #[must_use]
+    #[cfg(any(feature = "native", test))]
     fn reuses_prepared_manifest_preflight(&self) -> bool {
         self.plan_source == TRUST_CG_NATIVE_COMPILE_INPUT_PLAN_SOURCE_PREPARED_MANIFEST_PREFLIGHT
     }
@@ -3006,6 +3015,7 @@ fn trust_cg_entry_counter_dispatch_gate_enabled() -> bool {
 // a trust-cg pin bump (origin/main is 7f7fab6d and does carry `Sampled`).
 
 #[path = "compile/telemetry.rs"]
+#[cfg(any(feature = "native", test))]
 mod telemetry;
 
 /// Legacy: locate system `llc` binary.
@@ -3972,6 +3982,7 @@ fn batch_artifact_identity_phase_metadata(
     metadata
 }
 
+#[cfg(any(feature = "native", test))]
 fn batch_compile_policy_phase_metadata(policy: BatchJitCompilePolicy) -> Vec<(String, String)> {
     vec![
         (
@@ -4689,6 +4700,7 @@ struct BatchJitPreparedManifest<'a> {
     prepared: FrontendNeutralPreparedTrustIr<'a>,
     prepared_digest_bytes: Vec<u8>,
     external_binding_discriminator_bytes: Vec<u8>,
+    #[cfg(any(feature = "native", test))]
     prefetch_plan: crate::prefetch::PrefetchPassPlan,
     shape: BatchJitModuleShape,
 }
@@ -4697,6 +4709,7 @@ impl<'a> BatchJitPreparedManifest<'a> {
     fn from_module(module: &'a Module) -> Self {
         let shape = BatchJitModuleShape::from_module(module);
         let prepared = frontend_neutral_prepared_trust_ir_module_with_reuse(module);
+        #[cfg(any(feature = "native", test))]
         let prefetch_plan = crate::prefetch::prepare_prefetch_pass(prepared.module.as_ref());
         let prepared_digest_bytes =
             prepared_frontend_neutral_module_digest_bytes(prepared.module.as_ref());
@@ -4706,6 +4719,7 @@ impl<'a> BatchJitPreparedManifest<'a> {
             prepared,
             prepared_digest_bytes,
             external_binding_discriminator_bytes,
+            #[cfg(any(feature = "native", test))]
             prefetch_plan,
             shape,
         }
@@ -4736,6 +4750,7 @@ impl<'a> BatchJitPreparedManifest<'a> {
         &self.external_binding_discriminator_bytes
     }
 
+    #[cfg(any(feature = "native", test))]
     fn prefetch_preflight(&self) -> crate::prefetch::PrefetchPreflight {
         self.prefetch_plan.preflight()
     }
@@ -5974,7 +5989,8 @@ fn register_jit_symbols(symbols: &mut HashMap<String, *const u8>) {
 #[cfg(feature = "native")]
 fn register_tla_ops_symbols(symbols: &mut HashMap<String, *const u8>) {
     use crate::runtime_abi::compound_read::{
-        tla_hybrid_compound_apply1_i64, tla_hybrid_compound_apply2_i64, tla_hybrid_compound_read_i64,
+        tla_hybrid_compound_apply1_i64, tla_hybrid_compound_apply2_i64,
+        tla_hybrid_compound_read_i64,
     };
     use crate::runtime_abi::tla_ops::{
         clear_tla_arena, clear_tla_iter_arena, tla_cardinality, tla_domain, tla_func_apply,
@@ -13311,8 +13327,8 @@ mod tests {
 
         // Poke the internal cache to retrieve the stored Arc.
         let key = native_cache_key(&module, OptLevel::O1, &NativeExternSymbolOverlay::empty());
-        let cached =
-            jit_cache_lookup(&key, true).expect("cache must contain an entry after the first compile");
+        let cached = jit_cache_lookup(&key, true)
+            .expect("cache must contain an entry after the first compile");
 
         // Both handles must point at the same buffer as the cache entry.
         assert!(

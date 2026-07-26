@@ -96,10 +96,11 @@ mod record_set_scalarize;
 pub(in crate::check) use record_set_scalarize::RecordSetScalarizeEnv;
 mod sum_fold_scalarize;
 pub(in crate::check) use config::{
-    trust_cg_dump_native_admission_failures_enabled, trust_cg_fused_invariant_min_states,
-    trust_cg_fused_level_defer_threshold, trust_cg_lazy_compile_gate_fires,
-    trust_cg_lazy_compile_threshold, trust_cg_lazy_compile_work_threshold,
-    trust_cg_runtime_telemetry_enabled, trust_cg_setup_timing_enabled,
+    trust_cg_action_compile_opt_level, trust_cg_dump_native_admission_failures_enabled,
+    trust_cg_fused_invariant_min_states, trust_cg_fused_level_defer_threshold,
+    trust_cg_lazy_compile_gate_fires, trust_cg_lazy_compile_threshold,
+    trust_cg_lazy_compile_work_threshold, trust_cg_runtime_telemetry_enabled,
+    trust_cg_setup_timing_enabled,
 };
 
 /// Whether the JIT lazy-compile WORK arm is wired in the shipping build — i.e.
@@ -301,9 +302,8 @@ thread_local! {
 /// class: union-arm reads, capacity/universe confinement, set-member
 /// not-found). `false` for any other error kind and for non-error outcomes.
 pub(in crate::check) fn last_native_action_error_was_shape_guard() -> bool {
-    LAST_ACTION_RUNTIME_ERROR_KIND.with(|kind| {
-        kind.get() == tla_jit_abi::JitRuntimeErrorKind::TypeMismatch as u8
-    })
+    LAST_ACTION_RUNTIME_ERROR_KIND
+        .with(|kind| kind.get() == tla_jit_abi::JitRuntimeErrorKind::TypeMismatch as u8)
 }
 
 #[derive(Clone)]
@@ -2204,12 +2204,11 @@ pub(in crate::check) struct TrustCgBuildStats {
     /// `TY_TRUST_CG_DUMP_NATIVE_ADMISSION_FAILURES` dump. Bounded by the action
     /// count (only failing actions push); never consulted for dispatch.
     pub per_action_failures: Vec<(String, String)>,
-    /// Number of actions recognized as the runtime-domain multi-successor
-    /// ("NextStateLoop") shape that the single-successor native ABI cannot
-    /// express. These are *counted* (included in `actions_failed`) and routed
-    /// to the interpreter today; the count makes the future
-    /// [`tla_jit_abi::NextStateLoopFn`] target observable without changing any
-    /// dispatch behavior.
+    /// Number of runtime-domain multi-successor ("NextStateLoop") actions that
+    /// were recognized but fell outside the supported direct-range/record-set
+    /// kernels. These remain included in `actions_failed` and use interpreter
+    /// fallback; supported NextStateLoop actions are compiled and do not
+    /// increment this counter.
     pub next_state_loop_recognized_unsupported: usize,
     /// Native `ProofAnnotation::BoundedLoop` facts seen in trust-ir modules lowered
     /// on the trust-codegen cache-build hot path.
@@ -5068,10 +5067,10 @@ impl TrustCgNativeCache {
 
     /// Classify whether an action that failed both inner-EXISTS expansion
     /// paths is a *runtime-domain multi-successor loop* ("NextStateLoop") — the
-    /// shape the future multi-successor native ABI
-    /// ([`tla_jit_abi::NextStateLoopFn`]) targets.
+    /// shape the multi-successor native ABI ([`tla_jit_abi::NextStateLoopFn`])
+    /// targets.
     ///
-    /// Returns `Some(NotYetSupported)` when the action has exactly one inner
+    /// Returns `Some(Supported)` when the action has exactly one inner
     /// existential whose domain register is produced by an integer `Range`
     /// whose bounds are *not* both compile-time scalars (so the static and
     /// runtime-guarded expansions both fail) — e.g.
@@ -5080,12 +5079,10 @@ impl TrustCgNativeCache {
     /// single-successor ABI ceiling: it cannot be compile-time unrolled, and a
     /// single `state_out` buffer cannot hold the one-successor-per-`k` result.
     ///
-    /// Returning `Some(..)` is purely a *recognition* signal. The selection
-    /// site still falls back to the interpreter — the variant
-    /// [`tla_jit_abi::NextStateLoopSupport::NotYetSupported`] is the explicit,
-    /// fail-closed gate. Flipping it to `Supported` (once trust-codegen emits a
-    /// sound `NextStateLoopFn` for this shape) is the remaining work to make
-    /// `anneal`-style actions run natively.
+    /// Direct `Range -> ExistsBegin` shapes are supported by the dynamic
+    /// NextStateLoop kernel. Alias/intervening-consumer shapes remain
+    /// recognized as `NotYetSupported` and fail closed because their domain
+    /// register would otherwise require materializing the runtime set.
     fn classify_runtime_domain_next_state_loop(
         func: &tla_tir::bytecode::BytecodeFunction,
     ) -> Option<tla_jit_abi::NextStateLoopSupport> {
@@ -5148,16 +5145,29 @@ impl TrustCgNativeCache {
             return None;
         }
 
-        Some(tla_jit_abi::NextStateLoopSupport::NotYetSupported)
+        let direct_range = info.begin_pc.checked_sub(1).is_some_and(|range_pc| {
+            matches!(
+                func.instructions.get(range_pc),
+                Some(tla_tir::bytecode::Opcode::Range {
+                    rd,
+                    lo: direct_lo,
+                    hi: direct_hi,
+                }) if *rd == info.r_domain && *direct_lo == lo && *direct_hi == hi
+            )
+        });
+        Some(if direct_range {
+            tla_jit_abi::NextStateLoopSupport::Supported
+        } else {
+            tla_jit_abi::NextStateLoopSupport::NotYetSupported
+        })
     }
 
     /// Classify an `\E m \in <state var> : ...` action whose domain state
     /// variable carries a *proven-closed* `RecordSetBitmask` compound layout as
     /// a native multi-successor ("NextStateLoop") record-set kernel target.
     ///
-    /// This is the record-set sibling of
-    /// [`Self::classify_runtime_domain_next_state_loop`] (which stays
-    /// `NotYetSupported` for the integer `Range` shape). When the opt-in gate
+    /// This is the record-set sibling of the supported direct-range path in
+    /// [`Self::classify_runtime_domain_next_state_loop`]. When the opt-in gate
     /// `TY_RECORD_SET_NATIVE=1` is set and the shape matches, it returns
     /// [`tla_jit_abi::NextStateLoopSupport::Supported`], signalling the planner
     /// to flag the action for the `lower_next_state_loop_scaffold` kernel and
@@ -5715,6 +5725,9 @@ impl TrustCgNativeCache {
                 start, count, set, ..
             } => *set == reg || (0..*count).any(|offset| start.saturating_add(offset) == reg),
             Opcode::RoundStepEq { child, parent, .. } => *child == reg || *parent == reg,
+            Opcode::EdgeFilter {
+                first, arg, domain, ..
+            } => *first == reg || *arg == reg || *domain == reg,
             Opcode::FuncApply { func, arg, .. } => *func == reg || *arg == reg,
             Opcode::FuncSet { domain, range, .. } => *domain == reg || *range == reg,
             Opcode::FuncExcept {
@@ -5836,8 +5849,9 @@ impl TrustCgNativeCache {
             RuntimeInnerExistsBindingValue::Scalar(tla_jit_abi::SetBitmaskElement::String(
                 name,
             )) => {
-                let idx =
-                    constants.add_value(tla_value::Value::String(tla_core::resolve_name_id(*name).into()));
+                let idx = constants.add_value(tla_value::Value::String(
+                    tla_core::resolve_name_id(*name).into(),
+                ));
                 func.emit(tla_tir::bytecode::Opcode::LoadConst { rd, idx });
             }
             RuntimeInnerExistsBindingValue::Scalar(tla_jit_abi::SetBitmaskElement::ModelValue(
@@ -5996,14 +6010,6 @@ impl TrustCgNativeCache {
             gate_witness_participation,
         )?;
         i32::try_from(i64::try_from(new_target).ok()? - i64::try_from(new_pc).ok()?).ok()
-    }
-
-    fn runtime_guarded_pc_map(
-        instruction_len: usize,
-        info: &tla_tir::bytecode::InnerExistsInfo,
-        old_pc: usize,
-    ) -> Option<usize> {
-        Self::runtime_guarded_pc_map_shifted(instruction_len, info, old_pc, false)
     }
 
     /// Old-pc -> new-pc map for the runtime-guarded rewrite.
@@ -6716,20 +6722,41 @@ impl TrustCgNativeCache {
                     }
                 }
             }
-            // Recognize the runtime-domain multi-successor ("NextStateLoop")
-            // shape that the single-successor native ABI cannot express (one
-            // parent -> N successors, where N depends on a runtime domain such
-            // as `1 .. natMin(primer, template)`). This shape is the target of
-            // the future `tla_jit_abi::NextStateLoopFn` ABI. Today the support
-            // gate is `NotYetSupported`, so we still fall back to the
-            // interpreter (fail-closed) — emitting a partial/wrong successor
-            // set would silently drop or fabricate states. The dedicated
-            // diagnostic makes the selection observable and de-risks the later
-            // codegen wiring.
+            // Route D: a direct runtime integer Range feeding the residual
+            // inner EXISTS executes through the dynamic multi-successor ABI.
+            // The lowering evaluates the outer prefix into a private template,
+            // then re-seeds and commits one complete successor per binding.
+            // Recognized alias/intervening-consumer shapes remain explicitly
+            // unsupported and preserve interpreter fallback.
             if let Some(support) = Self::classify_runtime_domain_next_state_loop(func) {
+                if support.is_supported() {
+                    let (read_vars, write_vars) =
+                        Self::action_var_access_sets(func, chunk.as_deref());
+                    action_compile_tasks.push(TrustCgActionCompileTask {
+                        action_name: action_name.to_string(),
+                        func: func.clone(),
+                        state_layout: state_layout.clone(),
+                        opt_level,
+                        const_pool: const_pool.clone(),
+                        chunk: chunk.clone(),
+                        chunk_callee_shapes: chunk_callee_shapes.cloned(),
+                        action_local_set_domain_proof: None,
+                        binding_values: binding_values.to_vec(),
+                        formal_values: formal_values.to_vec(),
+                        read_vars,
+                        write_vars,
+                        compound_read_vars: Vec::new(),
+                        next_state_loop: true,
+                    });
+                    stats.actions_failed = stats.actions_failed.saturating_sub(1);
+                    eprintln!(
+                        "[trust-cg] action '{action_name}': planning native runtime-range NextStateLoop kernel",
+                    );
+                    return;
+                }
                 debug_assert!(
                     !support.is_supported(),
-                    "NextStateLoop scaffold must remain fail-closed until sound codegen lands"
+                    "supported runtime ranges return through the native planning arm above"
                 );
                 stats.next_state_loop_recognized_unsupported += 1;
                 let reason =
@@ -7735,18 +7762,6 @@ impl TrustCgNativeCache {
             }
             Err(fallback) => Err((fallback, shard_stats)),
         }
-    }
-
-    #[cfg(test)]
-    fn compile_next_state_action_tasks(
-        tasks: Vec<TrustCgActionCompileTask>,
-        jobs: usize,
-    ) -> (
-        Vec<TrustCgActionCompileOutcome>,
-        TrustCgNativeActionCalloutBatchStats,
-    ) {
-        let caller_identity = tla_trust_cg::compile::BatchJitCallerIdentity::empty();
-        Self::compile_next_state_action_tasks_with_caller_identity(tasks, jobs, &caller_identity)
     }
 
     fn compile_next_state_action_tasks_with_caller_identity(
@@ -8813,17 +8828,27 @@ impl TrustCgNativeCache {
             eprintln!("[trust-cg] action {action_name} bytecode: {func:#?}");
         }
 
-        // Route B: multi-successor record-set kernel. This emits a real
+        // Multi-successor kernel (runtime integer range or record set). This emits a real
         // `tla_jit_abi::NextStateLoopFn` module (param#2 is a
         // `*mut NextStateLoopSink`), distinct from the single-successor
         // `lower_next_state*` lowering below.
         if next_state_loop {
-            let trust_ir_module = tla_ir::lower::lower_next_state_loop_scaffold(
-                func,
-                &safe_name,
-                const_pool,
-                state_layout,
-            )?;
+            let trust_ir_module = if let Some(chunk) = chunk {
+                tla_ir::lower::lower_next_state_loop_with_chunk(
+                    func,
+                    chunk,
+                    &safe_name,
+                    state_layout,
+                    chunk_callee_shapes,
+                )?
+            } else {
+                tla_ir::lower::lower_next_state_loop_scaffold(
+                    func,
+                    &safe_name,
+                    const_pool,
+                    state_layout,
+                )?
+            };
             let trust_ir_proof_facts =
                 tla_ir::annotations::summarize_native_proof_annotations(&trust_ir_module);
             audit_lowered_action_tla_externs(action_name, &trust_ir_module);

@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tla_ay::{
-    AYError, BmcState, BmcTranslator, SolveResult, StrictProofVerdict, TlaSort, UnknownReason,
-    UnsatProofArtifact,
+    AYError, BmcScalarSymbol, BmcState, BmcTranslator, SolveResult, StrictProofVerdict, TlaSort,
+    UnknownReason, UnsatProofArtifact,
 };
 use tla_core::ast::{Expr, Module, Unit};
 use tla_core::name_intern::NameId;
@@ -311,10 +311,26 @@ fn collect_arith_vars(expr: &Expr, acc: &mut std::collections::HashSet<String>) 
 fn walk_immediate_children(expr: &Expr, f: &mut impl FnMut(&Spanned<Expr>)) {
     use Expr::*;
     match expr {
-        And(a, b) | Or(a, b) | Implies(a, b) | Equiv(a, b) | Eq(a, b) | Neq(a, b)
-        | Lt(a, b) | Gt(a, b) | Leq(a, b) | Geq(a, b) | In(a, b) | NotIn(a, b)
-        | Add(a, b) | Sub(a, b) | Mul(a, b) | Div(a, b) | IntDiv(a, b) | Mod(a, b)
-        | Pow(a, b) | Range(a, b) => {
+        And(a, b)
+        | Or(a, b)
+        | Implies(a, b)
+        | Equiv(a, b)
+        | Eq(a, b)
+        | Neq(a, b)
+        | Lt(a, b)
+        | Gt(a, b)
+        | Leq(a, b)
+        | Geq(a, b)
+        | In(a, b)
+        | NotIn(a, b)
+        | Add(a, b)
+        | Sub(a, b)
+        | Mul(a, b)
+        | Div(a, b)
+        | IntDiv(a, b)
+        | Mod(a, b)
+        | Pow(a, b)
+        | Range(a, b) => {
             f(a);
             f(b);
         }
@@ -516,13 +532,29 @@ pub(crate) fn discharge_obligations_with_proofs(
     // bind the embedded proof to the obligation) translate byte-for-byte
     // identically — the assertion sets can never drift apart.
     let initiation = scratch_check_unsat_with_proof("initiation", var_sorts, 1, timeout, |t| {
-        build_smt_obligation(t, SmtObligation::Initiation, init, next, &not_safety, j, &not_j)
-            .map(|_| ())
+        build_smt_obligation(
+            t,
+            SmtObligation::Initiation,
+            init,
+            next,
+            &not_safety,
+            j,
+            &not_j,
+        )
+        .map(|_| ())
     })?;
 
     let consecution = scratch_check_unsat_with_proof("consecution", var_sorts, 1, timeout, |t| {
-        build_smt_obligation(t, SmtObligation::Consecution, init, next, &not_safety, j, &not_j)
-            .map(|_| ())
+        build_smt_obligation(
+            t,
+            SmtObligation::Consecution,
+            init,
+            next,
+            &not_safety,
+            j,
+            &not_j,
+        )
+        .map(|_| ())
     })?;
 
     let safety_ob = scratch_check_unsat_with_proof("safety", var_sorts, 1, timeout, |t| {
@@ -677,7 +709,10 @@ fn extract_symbolic_assume(
     let mut acc: Option<Spanned<Expr>> = None;
     for unit in &module.units {
         if let Unit::Assume(decl) = &unit.node {
-            if symbolic_constants.iter().any(|c| expr_mentions(&decl.expr.node, c)) {
+            if symbolic_constants
+                .iter()
+                .any(|c| expr_mentions(&decl.expr.node, c))
+            {
                 acc = Some(match acc {
                     None => decl.expr.clone(),
                     Some(prev) => mk_and(prev, decl.expr.clone()),
@@ -715,12 +750,13 @@ fn symbolic_constant_names(module: &Module, config: &Config) -> std::collections
 /// Desugar the EXCEPT self-reference `@` (parsed as `Ident("@")`) to the explicit
 /// OLD-VALUE expression at each spec's path: `[r EXCEPT !.a = @ + 1]` becomes
 /// `[r EXCEPT !.a = r.a + 1]`; `[f EXCEPT ![i] = @ + 1]` becomes `[f EXCEPT ![i] =
-/// f[i] + 1]`. This is the DEFINITIONAL meaning of `@` (TLA+ — `@` is the base's
-/// value at that path), so the rewrite is exact and sound. Folded BOTTOM-UP so a
-/// nested EXCEPT resolves its own `@` before an enclosing one substitutes (each
-/// `@` binds to its nearest enclosing EXCEPT). DETERMINISTIC and applied on the
-/// SHARED `rederive_obligation_inputs` path, so mint and verify desugar identically
-/// and the render-binding stays symmetric. An expr with no `@` is unchanged.
+/// f[i] + 1]`. Multiple EXCEPT specs are left-to-right nested updates, so a later
+/// spec's `@` is projected from the result of every earlier spec, not from the
+/// original base. Folded BOTTOM-UP so a nested EXCEPT resolves its own `@` before
+/// an enclosing one substitutes (each `@` binds to its nearest enclosing EXCEPT).
+/// DETERMINISTIC and applied on the SHARED `rederive_obligation_inputs` path, so
+/// mint and verify desugar identically and the render-binding stays symmetric. An
+/// expr with no `@` is unchanged.
 fn desugar_except_at(e: &Spanned<Expr>) -> Spanned<Expr> {
     use tla_core::ast::{ExceptPathElement, ExceptSpec};
     struct D;
@@ -734,30 +770,30 @@ fn desugar_except_at(e: &Spanned<Expr>) -> Spanned<Expr> {
             let Expr::Except(base, specs) = &folded.node else {
                 return folded;
             };
-            let new_specs: Vec<ExceptSpec> = specs
-                .iter()
-                .map(|sp| {
-                    // old-value = base with THIS spec's path applied (`r` + `.a` =
-                    // `r.a`; `f` + `[i]` = `f[i]`). `base` is already folded, so it
-                    // carries no unresolved `@`.
-                    let mut old = (**base).clone();
-                    for pe in &sp.path {
-                        old = match pe {
-                            ExceptPathElement::Index(ix) => Spanned::dummy(Expr::FuncApply(
-                                Box::new(old),
-                                Box::new(ix.clone()),
-                            )),
-                            ExceptPathElement::Field(f) => {
-                                Spanned::dummy(Expr::RecordAccess(Box::new(old), f.clone()))
-                            }
-                        };
-                    }
-                    ExceptSpec {
-                        path: sp.path.clone(),
-                        value: substitute_at(&sp.value, &old),
-                    }
-                })
-                .collect();
+            let mut prior = (**base).clone();
+            let mut new_specs = Vec::with_capacity(specs.len());
+            for sp in specs {
+                // old-value = the result of all PRIOR specs with THIS spec's path
+                // applied. For the first spec this is simply `base.path`; for a
+                // later overlapping spec it is `[base EXCEPT prior...].path`.
+                let mut old = prior.clone();
+                for pe in &sp.path {
+                    old = match pe {
+                        ExceptPathElement::Index(ix) => {
+                            Spanned::dummy(Expr::FuncApply(Box::new(old), Box::new(ix.clone())))
+                        }
+                        ExceptPathElement::Field(f) => {
+                            Spanned::dummy(Expr::RecordAccess(Box::new(old), f.clone()))
+                        }
+                    };
+                }
+                let rewritten = ExceptSpec {
+                    path: sp.path.clone(),
+                    value: substitute_at(&sp.value, &old),
+                };
+                new_specs.push(rewritten.clone());
+                prior = Spanned::dummy(Expr::Except(Box::new(prior), vec![rewritten]));
+            }
             Spanned {
                 node: Expr::Except(base.clone(), new_specs),
                 span: folded.span,
@@ -766,6 +802,47 @@ fn desugar_except_at(e: &Spanned<Expr>) -> Spanned<Expr> {
     }
     let mut d = D;
     tla_core::ExprFold::fold_expr(&mut d, e.clone())
+}
+
+/// Eliminate a record projection through preceding EXCEPT updates when their
+/// root fields are provably disjoint from the projected field. For example,
+/// `[r EXCEPT !.a = v].b` is exactly `r.b`. This keeps the exact left-to-right
+/// `@` desugaring while returning disjoint multi-field updates (CoffeeCan) to
+/// the record-access fragment understood by the SMT translator. Same-field,
+/// nested, and dynamic paths stay untouched and therefore fail closed if the
+/// translator cannot represent them.
+fn simplify_disjoint_except_projections(e: &Spanned<Expr>) -> Spanned<Expr> {
+    use tla_core::ast::{ExceptPathElement, RecordFieldName};
+
+    fn project(base: Spanned<Expr>, field: &RecordFieldName) -> Spanned<Expr> {
+        if let Expr::Except(inner, specs) = &base.node {
+            let disjoint = specs.iter().all(|spec| {
+                matches!(spec.path.first(), Some(ExceptPathElement::Field(other))
+                    if other.name.node != field.name.node)
+            });
+            if disjoint {
+                return project((**inner).clone(), field);
+            }
+        }
+        Spanned::dummy(Expr::RecordAccess(Box::new(base), field.clone()))
+    }
+
+    struct S;
+    impl tla_core::ExprFold for S {
+        fn fold_expr(&mut self, e: Spanned<Expr>) -> Spanned<Expr> {
+            let folded = Spanned {
+                node: self.fold_expr_inner(e.node),
+                span: e.span,
+            };
+            match folded.node {
+                Expr::RecordAccess(base, field) => project(*base, &field),
+                _ => folded,
+            }
+        }
+    }
+
+    let mut s = S;
+    tla_core::ExprFold::fold_expr(&mut s, e.clone())
 }
 
 /// Substitute every EXCEPT self-reference `@` (`Ident("@")`) by `replacement`.
@@ -790,27 +867,416 @@ fn substitute_at(e: &Spanned<Expr>, replacement: &Spanned<Expr>) -> Spanned<Expr
     tla_core::ExprFold::fold_expr(&mut s, e.clone())
 }
 
+/// Return a record constructor/set's sorted field names, rejecting duplicates.
+fn record_field_names(fields: &[(Spanned<String>, Spanned<Expr>)]) -> Option<Vec<String>> {
+    let mut names: Vec<String> = fields.iter().map(|(name, _)| name.node.clone()).collect();
+    names.sort();
+    (!names.windows(2).any(|pair| pair[0] == pair[1])).then_some(names)
+}
+
+/// Keep only record sorts whose complete canonical field sort is independently
+/// established by `Init`. Proving only the field DOMAIN is insufficient: if a
+/// candidate TypeInvariant says `[a : Int]` while `Init` constructs
+/// `[a |-> TRUE]`, selecting the candidate's Int carrier turns Init into SMT
+/// `FALSE` and makes initiation vacuous.
+fn init_proven_record_sorts(
+    var_sorts: &[(String, TlaSort)],
+    init: &Spanned<Expr>,
+    symbolic_constants: &std::collections::HashSet<String>,
+) -> std::collections::HashMap<String, TlaSort> {
+    var_sorts
+        .iter()
+        .filter_map(|(name, sort)| {
+            let TlaSort::Record { .. } = sort else {
+                return None;
+            };
+            let inferred =
+                ay_shared::infer_exact_record_sort_from_init(name, init, symbolic_constants)?;
+            (sort.clone().canonicalized() == inferred.canonicalized())
+                .then(|| (name.clone(), sort.clone().canonicalized()))
+        })
+        .collect()
+}
+
+/// Resolve the statically exact record sort of an expression. Record variables
+/// are admitted only from [`init_proven_record_sorts`]; projections then inherit
+/// nested record sorts. Constructors carry their own exact shape separately.
+fn record_sort_of_expr<'a>(
+    expr: &Spanned<Expr>,
+    record_sorts: &'a std::collections::HashMap<String, TlaSort>,
+) -> Option<&'a TlaSort> {
+    match &expr.node {
+        Expr::Ident(name, _) | Expr::StateVar(name, _, _) => record_sorts.get(name),
+        Expr::Prime(inner) | Expr::Except(inner, _) => record_sort_of_expr(inner, record_sorts),
+        Expr::Label(label) => record_sort_of_expr(&label.body, record_sorts),
+        Expr::RecordAccess(base, field) => {
+            let TlaSort::Record { field_sorts } = record_sort_of_expr(base, record_sorts)? else {
+                return None;
+            };
+            field_sorts
+                .iter()
+                .find(|(name, _)| name == &field.name.node)
+                .map(|(_, sort)| sort)
+        }
+        _ => None,
+    }
+}
+
+/// Prove an expression's exact record DOMAIN, either from its constructor or an
+/// Init-proven static record sort.
+fn exact_record_fields(
+    expr: &Spanned<Expr>,
+    record_sorts: &std::collections::HashMap<String, TlaSort>,
+) -> Option<Vec<String>> {
+    match &expr.node {
+        Expr::Record(fields) => record_field_names(fields),
+        Expr::If(_, then_expr, else_expr) => {
+            let then_fields = exact_record_fields(then_expr, record_sorts)?;
+            let else_fields = exact_record_fields(else_expr, record_sorts)?;
+            (then_fields == else_fields).then_some(then_fields)
+        }
+        Expr::RecordAccess(base, field) => {
+            if let Expr::Record(fields) = &base.node {
+                if let Some((_, value)) =
+                    fields.iter().find(|(name, _)| name.node == field.name.node)
+                {
+                    return exact_record_fields(value, record_sorts);
+                }
+            }
+            let TlaSort::Record { field_sorts } = record_sort_of_expr(expr, record_sorts)? else {
+                return None;
+            };
+            let mut names: Vec<String> = field_sorts.iter().map(|(name, _)| name.clone()).collect();
+            names.sort();
+            Some(names)
+        }
+        _ => {
+            let TlaSort::Record { field_sorts } = record_sort_of_expr(expr, record_sorts)? else {
+                return None;
+            };
+            let mut names: Vec<String> = field_sorts.iter().map(|(name, _)| name.clone()).collect();
+            names.sort();
+            Some(names)
+        }
+    }
+}
+
+/// Infer the exact value sort needed by the record-transition gate.
+///
+/// This is intentionally narrower than general TLA+ type inference: it accepts
+/// literals, Init-proven record variables/projections, typed arithmetic and
+/// Boolean expressions, equal-sort IF branches, record constructors, and
+/// EXCEPT updates whose every replacement has exactly the updated leaf's sort.
+/// Unknown identifiers, dynamic EXCEPT paths, and any ambiguous expression fail
+/// closed. In particular, merely inheriting an EXCEPT base sort without checking
+/// its replacement values would reintroduce the sort-changing transition hole.
+fn exact_record_value_sort(
+    expr: &Spanned<Expr>,
+    record_sorts: &std::collections::HashMap<String, TlaSort>,
+) -> Option<TlaSort> {
+    use tla_core::ast::ExceptPathElement;
+
+    fn same(left: TlaSort, right: TlaSort) -> Option<TlaSort> {
+        let left = left.canonicalized();
+        (left == right.canonicalized()).then_some(left)
+    }
+
+    fn path_sort<'a>(sort: &'a TlaSort, path: &[ExceptPathElement]) -> Option<&'a TlaSort> {
+        let mut current = sort;
+        for element in path {
+            match element {
+                ExceptPathElement::Field(field) => {
+                    let TlaSort::Record { field_sorts } = current else {
+                        return None;
+                    };
+                    current = field_sorts
+                        .iter()
+                        .find(|(name, _)| name == &field.name.node)
+                        .map(|(_, sort)| sort)?;
+                }
+                // Proving the value sort of a dynamic function/tuple update
+                // needs domain/index typing that this narrow gate does not own.
+                ExceptPathElement::Index(_) => return None,
+            }
+        }
+        (!path.is_empty()).then_some(current)
+    }
+
+    match &expr.node {
+        Expr::Label(label) => exact_record_value_sort(&label.body, record_sorts),
+        Expr::Bool(_) => Some(TlaSort::Bool),
+        Expr::Int(_) => Some(TlaSort::Int),
+        Expr::String(_) => Some(TlaSort::String),
+        Expr::Ident(name, _) | Expr::StateVar(name, ..) => record_sorts.get(name).cloned(),
+        Expr::Record(fields) => {
+            let names = record_field_names(fields)?;
+            if names.len() != fields.len() {
+                return None;
+            }
+            let field_sorts = fields
+                .iter()
+                .map(|(name, value)| {
+                    Some((
+                        name.node.clone(),
+                        exact_record_value_sort(value, record_sorts)?,
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some((TlaSort::Record { field_sorts }).canonicalized())
+        }
+        Expr::RecordAccess(base, field) => {
+            let TlaSort::Record { field_sorts } =
+                exact_record_value_sort(base, record_sorts)?.canonicalized()
+            else {
+                return None;
+            };
+            field_sorts
+                .into_iter()
+                .find(|(name, _)| name == &field.name.node)
+                .map(|(_, sort)| sort)
+        }
+        Expr::Except(base, specs) => {
+            let base_sort = exact_record_value_sort(base, record_sorts)?.canonicalized();
+            for spec in specs {
+                let expected = path_sort(&base_sort, &spec.path)?.clone().canonicalized();
+                let replacement =
+                    exact_record_value_sort(&spec.value, record_sorts)?.canonicalized();
+                if replacement != expected {
+                    return None;
+                }
+            }
+            Some(base_sort)
+        }
+        Expr::If(condition, then_expr, else_expr) => {
+            if exact_record_value_sort(condition, record_sorts)?.canonicalized() != TlaSort::Bool {
+                return None;
+            }
+            same(
+                exact_record_value_sort(then_expr, record_sorts)?,
+                exact_record_value_sort(else_expr, record_sorts)?,
+            )
+        }
+        Expr::Neg(value) => (exact_record_value_sort(value, record_sorts)?.canonicalized()
+            == TlaSort::Int)
+            .then_some(TlaSort::Int),
+        Expr::Add(left, right)
+        | Expr::Sub(left, right)
+        | Expr::Mul(left, right)
+        | Expr::Div(left, right)
+        | Expr::IntDiv(left, right)
+        | Expr::Mod(left, right)
+        | Expr::Pow(left, right) => {
+            let left = exact_record_value_sort(left, record_sorts)?.canonicalized();
+            let right = exact_record_value_sort(right, record_sorts)?.canonicalized();
+            (left == TlaSort::Int && right == TlaSort::Int).then_some(TlaSort::Int)
+        }
+        Expr::Not(value) => (exact_record_value_sort(value, record_sorts)?.canonicalized()
+            == TlaSort::Bool)
+            .then_some(TlaSort::Bool),
+        Expr::And(left, right)
+        | Expr::Or(left, right)
+        | Expr::Implies(left, right)
+        | Expr::Equiv(left, right) => {
+            let left = exact_record_value_sort(left, record_sorts)?.canonicalized();
+            let right = exact_record_value_sort(right, record_sorts)?.canonicalized();
+            (left == TlaSort::Bool && right == TlaSort::Bool).then_some(TlaSort::Bool)
+        }
+        Expr::Eq(left, right) | Expr::Neq(left, right) => {
+            same(
+                exact_record_value_sort(left, record_sorts)?,
+                exact_record_value_sort(right, record_sorts)?,
+            )?;
+            Some(TlaSort::Bool)
+        }
+        Expr::Lt(left, right)
+        | Expr::Leq(left, right)
+        | Expr::Gt(left, right)
+        | Expr::Geq(left, right) => {
+            let left = exact_record_value_sort(left, record_sorts)?.canonicalized();
+            let right = exact_record_value_sort(right, record_sorts)?.canonicalized();
+            (left == TlaSort::Int && right == TlaSort::Int).then_some(TlaSort::Bool)
+        }
+        Expr::Tuple(elements) => Some(TlaSort::Tuple {
+            element_sorts: elements
+                .iter()
+                .map(|element| exact_record_value_sort(element, record_sorts))
+                .collect::<Option<Vec<_>>>()?,
+        }),
+        Expr::SetEnum(elements) => {
+            let (first, rest) = elements.split_first()?;
+            let element_sort = exact_record_value_sort(first, record_sorts)?.canonicalized();
+            for element in rest {
+                if exact_record_value_sort(element, record_sorts)?.canonicalized() != element_sort {
+                    return None;
+                }
+            }
+            Some(TlaSort::Set {
+                element_sort: Box::new(element_sort),
+            })
+        }
+        Expr::Range(low, high) => {
+            let low = exact_record_value_sort(low, record_sorts)?.canonicalized();
+            let high = exact_record_value_sort(high, record_sorts)?.canonicalized();
+            (low == TlaSort::Int && high == TlaSort::Int).then_some(TlaSort::Set {
+                element_sort: Box::new(TlaSort::Int),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Return whether `expr` constrains the primed value of the named state
+/// variable. `UNCHANGED r` is a primed constraint even though its AST does not
+/// contain an explicit [`Expr::Prime`] node.
+fn contains_primed_var(expr: &Expr, var: &str) -> bool {
+    fn mentions_var(expr: &Expr, var: &str) -> bool {
+        match expr {
+            Expr::Ident(name, _) | Expr::StateVar(name, ..) => name == var,
+            _ => {
+                let mut found = false;
+                let mut child = |c: &Spanned<Expr>| {
+                    if !found {
+                        found = mentions_var(&c.node, var);
+                    }
+                };
+                walk_immediate_children(expr, &mut child);
+                found
+            }
+        }
+    }
+
+    match expr {
+        Expr::Prime(inner) | Expr::Unchanged(inner) => mentions_var(&inner.node, var),
+        _ => {
+            let mut found = false;
+            let mut child = |c: &Spanned<Expr>| {
+                if !found {
+                    found = contains_primed_var(&c.node, var);
+                }
+            };
+            walk_immediate_children(expr, &mut child);
+            found
+        }
+    }
+}
+
+/// Prove that every normalized `Next` action keeps every Init-proven record
+/// variable on exactly the same canonical record sort (DOMAIN and field sorts).
+///
+/// `tla-ay` gives a state variable one fixed SMT record sort at every time
+/// index. Inferring that sort from `Init` is sound only when `Next` preserves
+/// it: otherwise a shape-changing assignment can translate to `FALSE`, erase a
+/// real transition, and make consecution vacuous. This gate is deliberately
+/// syntactic and fail-closed. Each DNF action must assign a record variable
+/// exactly once, either with `UNCHANGED` or with a deterministic equality whose
+/// RHS has the same independently known canonical sort. Any other primed
+/// constraint, duplicate assignment, opaque action, or DNF overflow declines
+/// certification.
+fn next_preserves_record_shapes(
+    next: &Spanned<Expr>,
+    record_sorts: &std::collections::HashMap<String, TlaSort>,
+) -> bool {
+    if record_sorts.is_empty() {
+        return true;
+    }
+    let Some(actions) = normalize_enabled_disjuncts(next, DNF_CAP) else {
+        return false;
+    };
+
+    actions.iter().all(|action| {
+        let mut assigned = std::collections::HashSet::new();
+        let mut conjuncts = Vec::new();
+        flatten_and(action, &mut conjuncts);
+
+        for conjunct in conjuncts {
+            if let Expr::Eq(left, right) = &conjunct.node {
+                let assignment = primed_var_name(&left.node)
+                    .filter(|name| record_sorts.contains_key(name))
+                    .map(|name| (name, right.as_ref()))
+                    .or_else(|| {
+                        primed_var_name(&right.node)
+                            .filter(|name| record_sorts.contains_key(name))
+                            .map(|name| (name, left.as_ref()))
+                    });
+                if let Some((name, rhs)) = assignment {
+                    let expected = record_sorts[&name].clone().canonicalized();
+                    if contains_primed(&rhs.node)
+                        || exact_record_value_sort(rhs, record_sorts)
+                            .is_none_or(|actual| actual.canonicalized() != expected)
+                        || !assigned.insert(name)
+                    {
+                        return false;
+                    }
+                    continue;
+                }
+            }
+
+            if let Expr::Unchanged(arg) = &conjunct.node {
+                let Some(names) = unchanged_var_names(&arg.node) else {
+                    return false;
+                };
+                for name in names {
+                    if record_sorts.contains_key(&name) && !assigned.insert(name) {
+                        return false;
+                    }
+                }
+                continue;
+            }
+
+            if record_sorts
+                .keys()
+                .any(|name| contains_primed_var(&conjunct.node, name))
+            {
+                return false;
+            }
+        }
+
+        assigned.len() == record_sorts.len()
+    })
+}
+
 /// Expand a structural set membership `elem \in set` into an equivalent predicate
-/// the BMC translator can handle, for the two set-constructor shapes a record
-/// TypeInvariant / Init uses. Returns `None` for any other `set` (the membership
-/// is left verbatim — a range / enum / symbolic set BMC already translates).
-/// EXACT + SOUND (each is the definition of the constructor); RECURSIVE, so a
-/// record-set domain inside a filter (or a record-of-records) expands fully:
-///   * `r \in [f1 : D1, …]`      ==  `⋀ expand(r.fi ∈ Di)`   (record-set)
-///   * `x \in {c \in S : P(c)}`  ==  `expand(x ∈ S) /\ P(x)`  (set filter)
-fn expand_membership(elem: &Spanned<Expr>, set: &Spanned<Expr>) -> Option<Spanned<Expr>> {
+/// the BMC translator can handle. A record-set membership is expanded only after
+/// proving that `elem` has exactly the constructor's field DOMAIN; field-range
+/// tests alone are not equivalent when the record has missing or extra fields.
+/// Set-filter expansion is always exact.
+fn expand_membership(
+    elem: &Spanned<Expr>,
+    set: &Spanned<Expr>,
+    record_sorts: &std::collections::HashMap<String, TlaSort>,
+) -> Option<Spanned<Expr>> {
     use tla_core::ast::RecordFieldName;
     match &set.node {
         Expr::RecordSet(fields) => {
+            let expected_fields = record_field_names(fields)?;
+            if exact_record_fields(elem, record_sorts)? != expected_fields {
+                return None;
+            }
+            let expected_sort = TlaSort::Record {
+                field_sorts: fields
+                    .iter()
+                    .map(|(name, domain)| {
+                        Some((
+                            name.node.clone(),
+                            ay_shared::infer_sort_from_set_expr(domain)?,
+                        ))
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+            }
+            .canonicalized();
+            if exact_record_value_sort(elem, record_sorts)?.canonicalized() != expected_sort {
+                return None;
+            }
             let mut conj: Option<Spanned<Expr>> = None;
             for (fname, domain) in fields {
                 let access = Spanned::dummy(Expr::RecordAccess(
                     Box::new(elem.clone()),
                     RecordFieldName::new(fname.clone()),
                 ));
-                let member = expand_membership(&access, domain).unwrap_or_else(|| {
-                    Spanned::dummy(Expr::In(Box::new(access.clone()), Box::new(domain.clone())))
-                });
+                let member =
+                    expand_membership(&access, domain, record_sorts).unwrap_or_else(|| {
+                        Spanned::dummy(Expr::In(Box::new(access.clone()), Box::new(domain.clone())))
+                    });
                 conj = Some(match conj {
                     None => member,
                     Some(acc) => mk_and(acc, member),
@@ -825,8 +1291,11 @@ fn expand_membership(elem: &Spanned<Expr>, set: &Spanned<Expr>) -> Option<Spanne
                 return None;
             }
             let domain = bv.domain.as_ref()?;
-            let dom_member = expand_membership(elem, domain).unwrap_or_else(|| {
-                Spanned::dummy(Expr::In(Box::new(elem.clone()), Box::new((**domain).clone())))
+            let dom_member = expand_membership(elem, domain, record_sorts).unwrap_or_else(|| {
+                Spanned::dummy(Expr::In(
+                    Box::new(elem.clone()),
+                    Box::new((**domain).clone()),
+                ))
             });
             let pred_sub = substitute_ident(pred, &bv.name.node, elem);
             Some(mk_and(dom_member, pred_sub))
@@ -835,29 +1304,29 @@ fn expand_membership(elem: &Spanned<Expr>, set: &Spanned<Expr>) -> Option<Spanne
     }
 }
 
-/// Rewrite every structural set membership (`\in` a record-set or set-filter) in
-/// `e` via [`expand_membership`]. The BMC translator has no record-set /
-/// set-filter membership primitive but DOES translate per-field range/enum
-/// membership, so this is what lets a record TypeInvariant / Init flow through.
-/// Deterministic + on the shared `rederive_obligation_inputs` path ⇒ symmetric
-/// across mint and verify. A membership over a plain range / enum is left as-is.
-fn expand_set_membership(e: &Spanned<Expr>) -> Spanned<Expr> {
-    struct R;
-    impl tla_core::ExprFold for R {
+/// Rewrite exact structural memberships in `e` via [`expand_membership`].
+fn expand_set_membership(
+    e: &Spanned<Expr>,
+    record_sorts: &std::collections::HashMap<String, TlaSort>,
+) -> Spanned<Expr> {
+    struct R<'a> {
+        record_sorts: &'a std::collections::HashMap<String, TlaSort>,
+    }
+    impl tla_core::ExprFold for R<'_> {
         fn fold_expr(&mut self, e: Spanned<Expr>) -> Spanned<Expr> {
             let folded = Spanned {
                 node: self.fold_expr_inner(e.node),
                 span: e.span,
             };
             if let Expr::In(elem, set) = &folded.node {
-                if let Some(expanded) = expand_membership(elem, set) {
+                if let Some(expanded) = expand_membership(elem, set, self.record_sorts) {
                     return expanded;
                 }
             }
             folded
         }
     }
-    let mut r = R;
+    let mut r = R { record_sorts };
     tla_core::ExprFold::fold_expr(&mut r, e.clone())
 }
 
@@ -866,8 +1335,88 @@ fn expand_set_membership(e: &Spanned<Expr>) -> Spanned<Expr> {
 /// memberships (record-set / set-filter). Both are exact definitional rewrites;
 /// running them on the shared [`rederive_obligation_inputs`] path keeps mint and
 /// verify byte-identical.
-fn normalize_cert_expr(e: &Spanned<Expr>) -> Spanned<Expr> {
-    desugar_except_at(&expand_set_membership(e))
+fn normalize_cert_expr(
+    e: &Spanned<Expr>,
+    record_sorts: &std::collections::HashMap<String, TlaSort>,
+) -> Spanned<Expr> {
+    simplify_disjoint_except_projections(&desugar_except_at(&expand_set_membership(
+        e,
+        record_sorts,
+    )))
+}
+
+/// The certificate translator's generic record-set membership path checks field
+/// values but cannot represent a dynamic record DOMAIN. Any membership that the
+/// exact-shape normalizer could not eliminate must therefore decline before it
+/// reaches that translator.
+fn contains_record_set(e: &Spanned<Expr>) -> bool {
+    struct Contains;
+    impl ExprVisitor for Contains {
+        type Output = bool;
+
+        fn visit_node(&mut self, expr: &Expr) -> Option<bool> {
+            matches!(expr, Expr::RecordSet(_)).then_some(true)
+        }
+    }
+    tla_core::visit::walk_expr(&mut Contains, &e.node)
+}
+
+/// Replace every state-predicate `ENABLED A` by the exact guard predicate derived for `A`.
+/// AY intentionally has no primitive temporal/action `Enabled` translation; the certificate lane
+/// may lower it only when [`enabled_of_next`] proves that every disjunct is a clean total action.
+/// Any opaque/nondeterministic action makes the whole rewrite fail closed.
+fn lower_enabled_state_predicates(
+    ctx: &EvalCtx,
+    e: &Spanned<Expr>,
+    state_var_names: &[String],
+    funcsym_vars: &std::collections::HashSet<String>,
+    record_sorts: &std::collections::HashMap<String, TlaSort>,
+) -> Option<Spanned<Expr>> {
+    struct Lower<'a> {
+        ctx: &'a EvalCtx,
+        state_var_names: &'a [String],
+        funcsym_vars: &'a std::collections::HashSet<String>,
+        record_sorts: &'a std::collections::HashMap<String, TlaSort>,
+        failed: bool,
+    }
+    impl tla_core::ExprFold for Lower<'_> {
+        fn fold_expr(&mut self, e: Spanned<Expr>) -> Spanned<Expr> {
+            let folded = Spanned {
+                node: self.fold_expr_inner(e.node),
+                span: e.span,
+            };
+            let Expr::Enabled(action) = &folded.node else {
+                return folded;
+            };
+            // The surrounding expression is a state predicate and was expanded
+            // with `allow_primed = false`, so a named action such as
+            // `ENABLED Termination` deliberately remains unexpanded. Expand
+            // exactly the Enabled operand with action syntax admitted, then run
+            // the same exact cert normalization as the other liveness inputs.
+            // This does not admit primes in the surrounding state predicate.
+            let action = normalize_cert_expr(
+                &expand_operators_for_chc(self.ctx, action, true),
+                self.record_sorts,
+            );
+            match enabled_of_next(&action, self.state_var_names, self.funcsym_vars) {
+                Some(pred) => pred,
+                None => {
+                    self.failed = true;
+                    folded
+                }
+            }
+        }
+    }
+
+    let mut lower = Lower {
+        ctx,
+        state_var_names,
+        funcsym_vars,
+        record_sorts,
+        failed: false,
+    };
+    let lowered = tla_core::ExprFold::fold_expr(&mut lower, e.clone());
+    (!lower.failed).then_some(lowered)
 }
 
 pub(crate) fn rederive_obligation_inputs(
@@ -901,17 +1450,13 @@ pub(crate) fn rederive_obligation_inputs(
     let resolved = ay_shared::resolve_init_next(config, &symbolic_ctx).ok()?;
     let init_expr = ay_shared::get_operator_body(&symbolic_ctx, &resolved.init).ok()?;
     let next_expr = ay_shared::get_operator_body(&symbolic_ctx, &resolved.next).ok()?;
-    // Desugar EXCEPT `@` after operator expansion (records/functions write
-    // `!.f = @ - 1`; the BMC translator has no `@` binding — it must become the
-    // explicit old value). Definitional + deterministic; both mint and verify run
-    // this SAME path, keeping the render-binding symmetric.
-    let init_expanded = normalize_cert_expr(&expand_operators_for_chc(&symbolic_ctx, &init_expr, false));
-    let next_expanded = normalize_cert_expr(&expand_operators_for_chc(&symbolic_ctx, &next_expr, true));
+    let init_operator_expanded = expand_operators_for_chc(&symbolic_ctx, &init_expr, false);
+    let next_operator_expanded = expand_operators_for_chc(&symbolic_ctx, &next_expr, true);
     let safety_expr =
         ay_shared::build_safety_conjunction(&symbolic_ctx, &config.invariants).ok()?;
-    let safety_expanded = normalize_cert_expr(&expand_operators_for_chc(&symbolic_ctx, &safety_expr, false));
+    let safety_operator_expanded = expand_operators_for_chc(&symbolic_ctx, &safety_expr, false);
     let j_expr = ay_shared::get_operator_body(&symbolic_ctx, CERT_J_OP).ok()?;
-    let j_expanded = normalize_cert_expr(&expand_operators_for_chc(&symbolic_ctx, &j_expr, false));
+    let j_operator_expanded = expand_operators_for_chc(&symbolic_ctx, &j_expr, false);
 
     let vars = ay_shared::collect_state_vars(&module, &symbolic_ctx);
     // Symbolic (unbound) CONSTANTs: the module's declared CONSTANTs that the
@@ -922,13 +1467,39 @@ pub(crate) fn rederive_obligation_inputs(
     // range is then typed as a map-only `FunctionSym` (see
     // `infer_var_sorts_with_symbolic`).
     let symbolic_constants = symbolic_constant_names(&module, config);
+    // First normalize only rewrites that need no record-DOMAIN assumption.
+    // Keeping record-set membership intact lets sort inference and the Init
+    // shape proof inspect its exact field set before any per-field expansion.
+    let no_record_sorts = std::collections::HashMap::new();
+    let init_preliminary = normalize_cert_expr(&init_operator_expanded, &no_record_sorts);
     let var_sorts = ay_shared::infer_var_sorts_with_symbolic(
         &vars,
-        &init_expanded,
+        &init_preliminary,
         &config.invariants,
         &symbolic_ctx,
         &symbolic_constants,
     );
+    let record_sorts = init_proven_record_sorts(&var_sorts, &init_preliminary, &symbolic_constants);
+    // Desugar EXCEPT `@` and expand only record memberships whose exact DOMAIN
+    // is now independently established. Both mint and verify run this same path.
+    let init_expanded = normalize_cert_expr(&init_operator_expanded, &record_sorts);
+    let next_expanded = normalize_cert_expr(&next_operator_expanded, &record_sorts);
+    let safety_expanded = normalize_cert_expr(&safety_operator_expanded, &record_sorts);
+    let j_expanded = normalize_cert_expr(&j_operator_expanded, &record_sorts);
+    if !next_preserves_record_shapes(&next_expanded, &record_sorts) {
+        return None;
+    }
+    if [
+        &init_expanded,
+        &next_expanded,
+        &safety_expanded,
+        &j_expanded,
+    ]
+    .into_iter()
+    .any(|expr| contains_record_set(expr))
+    {
+        return None;
+    }
 
     // Re-derive Enabled(Next) for the deadlock-freedom obligation. If Next is not
     // cleanly decomposable, the certificate cannot be re-validated for
@@ -939,18 +1510,18 @@ pub(crate) fn rederive_obligation_inputs(
     // writes). Empty on non-all-N specs (no FunctionSym var) → inert.
     let funcsym_vars: std::collections::HashSet<String> =
         funcsym_domains(&var_sorts).into_keys().collect();
-    let enabled = if string_enum_deadlock_free(&init_expanded, &next_expanded, &var_sorts, &var_names)
-    {
-        // F1 structural deadlock-freedom: a STRING "clock" variable whose closed
-        // reachable literal universe is fully COVERED by unconditional-per-literal
-        // actions is deadlock-free on every reachable state (`Enabled ≡ TRUE`
-        // there), discharged structurally — the disjunctive enum `~Enabled` is
-        // outside AY's strict Farkas fragment, but the coverage+closure argument
-        // needs no solver. See [`string_enum_deadlock_free`].
-        Spanned::dummy(Expr::Bool(true))
-    } else {
-        enabled_of_next(&next_expanded, &var_names, &funcsym_vars)?
-    };
+    let enabled =
+        if string_enum_deadlock_free(&init_expanded, &next_expanded, &var_sorts, &var_names) {
+            // F1 structural deadlock-freedom: a STRING "clock" variable whose closed
+            // reachable literal universe is fully COVERED by unconditional-per-literal
+            // actions is deadlock-free on every reachable state (`Enabled ≡ TRUE`
+            // there), discharged structurally — the disjunctive enum `~Enabled` is
+            // outside AY's strict Farkas fragment, but the coverage+closure argument
+            // needs no solver. See [`string_enum_deadlock_free`].
+            Spanned::dummy(Expr::Bool(true))
+        } else {
+            enabled_of_next(&next_expanded, &var_names, &funcsym_vars)?
+        };
 
     let assume = extract_symbolic_assume(&module, &symbolic_constants);
 
@@ -967,9 +1538,9 @@ pub(crate) fn rederive_obligation_inputs(
 
 /// Re-derive JUST the `(measure, Next)` ASTs (operators expanded) for the affine descent kernel
 /// leg — independent of the `J`/`P`/`Enabled` machinery, so it succeeds even when the FULL liveness
-/// cert is blocked in the SMT layer (e.g. a record-set-membership invariant). `measure_op` is the
-/// integer-measure operator name. `None` if the spec cannot be parsed/lowered or the operators are
-/// not found.
+/// cert is outside the scalar SMT lane (e.g. its measure uses record-field projections).
+/// `measure_op` is the integer-measure operator name. `None` if the spec cannot be parsed/lowered
+/// or the operators are not found.
 pub(crate) fn rederive_measure_next(
     spec_src: &str,
     config: &Config,
@@ -991,9 +1562,16 @@ pub(crate) fn rederive_measure_next(
     let symbolic_ctx = ay_shared::symbolic_ctx_with_config(&ctx, config).ok()?;
     let resolved = ay_shared::resolve_init_next(config, &symbolic_ctx).ok()?;
     let next_expr = ay_shared::get_operator_body(&symbolic_ctx, &resolved.next).ok()?;
-    let next_expanded = expand_operators_for_chc(&symbolic_ctx, &next_expr, true);
+    let no_record_sorts = std::collections::HashMap::new();
+    let next_expanded = normalize_cert_expr(
+        &expand_operators_for_chc(&symbolic_ctx, &next_expr, true),
+        &no_record_sorts,
+    );
     let m_expr = ay_shared::get_operator_body(&symbolic_ctx, measure_op).ok()?;
-    let m_expanded = expand_operators_for_chc(&symbolic_ctx, &m_expr, false);
+    let m_expanded = normalize_cert_expr(
+        &expand_operators_for_chc(&symbolic_ctx, &m_expr, false),
+        &no_record_sorts,
+    );
     Some((m_expanded, next_expanded, vars))
 }
 
@@ -1034,21 +1612,85 @@ pub(crate) fn rederive_liveness_inputs(
     let resolved = ay_shared::resolve_init_next(config, &symbolic_ctx).ok()?;
     let init_expr = ay_shared::get_operator_body(&symbolic_ctx, &resolved.init).ok()?;
     let next_expr = ay_shared::get_operator_body(&symbolic_ctx, &resolved.next).ok()?;
-    let init_expanded = expand_operators_for_chc(&symbolic_ctx, &init_expr, false);
-    let next_expanded = expand_operators_for_chc(&symbolic_ctx, &next_expr, true);
+    let init_operator_expanded = expand_operators_for_chc(&symbolic_ctx, &init_expr, false);
+    let next_operator_expanded = expand_operators_for_chc(&symbolic_ctx, &next_expr, true);
     let j_expr = ay_shared::get_operator_body(&symbolic_ctx, J_OP).ok()?;
-    let j_expanded = expand_operators_for_chc(&symbolic_ctx, &j_expr, false);
+    let j_operator_expanded = expand_operators_for_chc(&symbolic_ctx, &j_expr, false);
     let p_expr = ay_shared::get_operator_body(&symbolic_ctx, P_OP).ok()?;
-    let p_expanded = expand_operators_for_chc(&symbolic_ctx, &p_expr, false);
+    let p_operator_expanded = expand_operators_for_chc(&symbolic_ctx, &p_expr, false);
     let m_expr = ay_shared::get_operator_body(&symbolic_ctx, M_OP).ok()?;
-    let m_expanded = expand_operators_for_chc(&symbolic_ctx, &m_expr, false);
+    let m_operator_expanded = expand_operators_for_chc(&symbolic_ctx, &m_expr, false);
 
     let vars = ay_shared::collect_state_vars(&module, &symbolic_ctx);
+    let no_record_sorts = std::collections::HashMap::new();
+    let init_preliminary = normalize_cert_expr(&init_operator_expanded, &no_record_sorts);
     let var_sorts =
-        ay_shared::infer_var_sorts(&vars, &init_expanded, &config.invariants, &symbolic_ctx);
+        ay_shared::infer_var_sorts(&vars, &init_preliminary, &config.invariants, &symbolic_ctx);
+    let no_symbolic_constants = std::collections::HashSet::new();
+    let record_sorts =
+        init_proven_record_sorts(&var_sorts, &init_preliminary, &no_symbolic_constants);
+    let init_expanded = normalize_cert_expr(&init_operator_expanded, &record_sorts);
+    let next_expanded = normalize_cert_expr(&next_operator_expanded, &record_sorts);
+    let j_expanded = normalize_cert_expr(&j_operator_expanded, &record_sorts);
+    let p_expanded = normalize_cert_expr(&p_operator_expanded, &record_sorts);
+    let m_expanded = normalize_cert_expr(&m_operator_expanded, &record_sorts);
+    if !next_preserves_record_shapes(&next_expanded, &record_sorts) {
+        return None;
+    }
+    if [
+        &init_expanded,
+        &next_expanded,
+        &j_expanded,
+        &p_expanded,
+        &m_expanded,
+    ]
+    .into_iter()
+    .any(|expr| contains_record_set(expr))
+    {
+        return None;
+    }
     let var_names: Vec<String> = vars.iter().map(|v| v.to_string()).collect();
     let funcsym_vars: std::collections::HashSet<String> =
         funcsym_domains(&var_sorts).into_keys().collect();
+    // `ENABLED A` is a state predicate, but AY has no primitive translation for it. Lower every
+    // occurrence through the same exact/fail-closed total-action analysis used for the liveness
+    // enabledness obligation. This is what makes corpus properties such as
+    // `<>(ENABLED Termination)` ordinary arithmetic predicates (`BeanCount = 1`).
+    let init_expanded = lower_enabled_state_predicates(
+        &symbolic_ctx,
+        &init_expanded,
+        &var_names,
+        &funcsym_vars,
+        &record_sorts,
+    )?;
+    let next_expanded = lower_enabled_state_predicates(
+        &symbolic_ctx,
+        &next_expanded,
+        &var_names,
+        &funcsym_vars,
+        &record_sorts,
+    )?;
+    let j_expanded = lower_enabled_state_predicates(
+        &symbolic_ctx,
+        &j_expanded,
+        &var_names,
+        &funcsym_vars,
+        &record_sorts,
+    )?;
+    let p_expanded = lower_enabled_state_predicates(
+        &symbolic_ctx,
+        &p_expanded,
+        &var_names,
+        &funcsym_vars,
+        &record_sorts,
+    )?;
+    let m_expanded = lower_enabled_state_predicates(
+        &symbolic_ctx,
+        &m_expanded,
+        &var_names,
+        &funcsym_vars,
+        &record_sorts,
+    )?;
     let enabled = enabled_of_next(&next_expanded, &var_names, &funcsym_vars)?;
 
     Some(LiveInputs {
@@ -1540,9 +2182,7 @@ fn transform_all_n_pointwise(ob: SmtObligation, inputs: &ObligationInputs) -> Po
 
     // HYPOTHESIS instantiation.
     let init = match ob {
-        SmtObligation::Initiation => {
-            instantiate_pointwise_hypothesis(&inputs.init, &fd, &indices)
-        }
+        SmtObligation::Initiation => instantiate_pointwise_hypothesis(&inputs.init, &fd, &indices),
         _ => inputs.init.clone(),
     };
     let j = match ob {
@@ -1677,7 +2317,9 @@ fn extract_pointwise_goal_read(
 
 fn conj_all(parts: Vec<Spanned<Expr>>) -> Spanned<Expr> {
     let mut it = parts.into_iter();
-    let mut acc = it.next().unwrap_or_else(|| Spanned::dummy(Expr::Bool(true)));
+    let mut acc = it
+        .next()
+        .unwrap_or_else(|| Spanned::dummy(Expr::Bool(true)));
     for p in it {
         acc = mk_and(acc, p);
     }
@@ -1831,7 +2473,10 @@ fn mccarthy_consecution_branches(
     // select is now atomic-index so its ASSUME leaf rebuilds checkably. Order
     // (write_val → not_j → j) is fixed ⇒ deterministic const naming ⇒ verify's
     // re-derivation is identical ⇒ the render-binding matches term-for-term.
-    let mut az = AtomizeReads { fd, atoms: Vec::new() };
+    let mut az = AtomizeReads {
+        fd,
+        atoms: Vec::new(),
+    };
     let write_val = tla_core::ExprFold::fold_expr(&mut az, write_val);
     let not_j = tla_core::ExprFold::fold_expr(&mut az, pt.not_j.clone());
     let j = tla_core::ExprFold::fold_expr(&mut az, pt.j.clone());
@@ -1933,14 +2578,15 @@ fn discharge_consecution_branches(
     let mut all_strict = true;
     let mut bundles: Vec<String> = Vec::new();
     for branch in branches {
-        let p = scratch_check_unsat_with_proof("consecution", &inputs.var_sorts, 1, timeout, |t| {
-            for c in rigid_consts.iter().chain(sk_consts.iter()) {
-                t.declare_rigid_const(c, TlaSort::Int)?;
-            }
-            let term = t.translate_safety_at_step(branch, 0)?;
-            t.assert(term);
-            Ok(())
-        })?;
+        let p =
+            scratch_check_unsat_with_proof("consecution", &inputs.var_sorts, 1, timeout, |t| {
+                for c in rigid_consts.iter().chain(sk_consts.iter()) {
+                    t.declare_rigid_const(c, TlaSort::Int)?;
+                }
+                let term = t.translate_safety_at_step(branch, 0)?;
+                t.assert(term);
+                Ok(())
+            })?;
         all_unsat &= p.unsat;
         all_strict &= p.strict_verified;
         if let Some(bj) = p.bundle_json {
@@ -1969,7 +2615,9 @@ fn discharge_consecution_branches(
 /// The pointwise `deadlock_freedom` obligation `J@0 ∧ ¬Enabled@0` UNSAT, with the
 /// positive universals in BOTH `J` and `¬Enabled` guard-instantiated at the
 /// indices they mention (a hypothesis weakening — sound; SAT ⇒ honest decline).
-fn transform_all_n_pointwise_deadlock(inputs: &ObligationInputs) -> (Spanned<Expr>, Spanned<Expr>, Vec<String>) {
+fn transform_all_n_pointwise_deadlock(
+    inputs: &ObligationInputs,
+) -> (Spanned<Expr>, Spanned<Expr>, Vec<String>) {
     let fd = funcsym_domains(&inputs.var_sorts);
     let not_enabled = negate_normalized(&inputs.enabled);
     let mut indices: Vec<Spanned<Expr>> = Vec::new();
@@ -2014,9 +2662,13 @@ fn discharge_all_n_pointwise(
     let consecution = {
         let fd = funcsym_domains(&inputs.var_sorts);
         match mccarthy_consecution_branches(inputs, &fd) {
-            Some((branches, sk_consts)) => {
-                discharge_consecution_branches(inputs, rigid_consts, &sk_consts, &branches, timeout)?
-            }
+            Some((branches, sk_consts)) => discharge_consecution_branches(
+                inputs,
+                rigid_consts,
+                &sk_consts,
+                &branches,
+                timeout,
+            )?,
             None => mk(SmtObligation::Consecution)?,
         }
     };
@@ -2136,8 +2788,7 @@ pub(crate) fn discharge_all_n_obligations_with_proofs(
     let mk = |ob: SmtObligation| -> Result<ObligationProof, BmcError> {
         scratch_check_unsat_with_proof(ob.name(), &inputs.var_sorts, 1, timeout, |t| {
             declare_rigid(t)?;
-            build_smt_obligation(t, ob, &init_h, &next_sk, &not_safety, &j_h, &not_j)
-                .map(|_| ())
+            build_smt_obligation(t, ob, &init_h, &next_sk, &not_safety, &j_h, &not_j).map(|_| ())
         })
     };
     let initiation = mk(SmtObligation::Initiation)?;
@@ -2230,16 +2881,8 @@ pub(crate) fn retranslate_all_n_obligation_canonical(
     // discharge_all_n_obligations_with_proofs) so the render binding is symmetric.
     let init_h = conjoin_assume(&inputs.assume, &inputs.init);
     let j_h = conjoin_assume(&inputs.assume, &inputs.j);
-    let terms = build_smt_obligation(
-        &mut t,
-        ob,
-        &init_h,
-        &next_sk,
-        &not_safety,
-        &j_h,
-        &not_j,
-    )
-    .ok()?;
+    let terms =
+        build_smt_obligation(&mut t, ob, &init_h, &next_sk, &not_safety, &j_h, &not_j).ok()?;
     // Append the definitional constraints side-asserted during translation (the
     // `\div`/`%` Euclidean linearization) so the reconstructed assertion set
     // matches the proof bundle's, which records the FULL solver stack. Empty
@@ -2367,16 +3010,22 @@ fn discharge_deadlock_dnf_cases(
     let mut all_strict = true;
     let mut bundles: Vec<String> = Vec::new();
     for clause in clauses {
-        let p = scratch_check_unsat_with_proof("deadlock_freedom", &inputs.var_sorts, 1, timeout, |t| {
-            for c in rigid_consts {
-                t.declare_rigid_const(c, TlaSort::Int)?;
-            }
-            let j0 = t.translate_safety_at_step(j_h, 0)?;
-            t.assert(j0);
-            let d0 = t.translate_safety_at_step(clause, 0)?;
-            t.assert(d0);
-            Ok(())
-        })?;
+        let p = scratch_check_unsat_with_proof(
+            "deadlock_freedom",
+            &inputs.var_sorts,
+            1,
+            timeout,
+            |t| {
+                for c in rigid_consts {
+                    t.declare_rigid_const(c, TlaSort::Int)?;
+                }
+                let j0 = t.translate_safety_at_step(j_h, 0)?;
+                t.assert(j0);
+                let d0 = t.translate_safety_at_step(clause, 0)?;
+                t.assert(d0);
+                Ok(())
+            },
+        )?;
         all_unsat &= p.unsat;
         all_strict &= p.strict_verified;
         if let Some(bj) = p.bundle_json {
@@ -2504,21 +3153,22 @@ fn discharge_consecution_disjunctive_cases(
     let mut bundles: Vec<String> = Vec::new();
     for (action, not_cj) in pairs {
         let (action_sk, skolem) = skolemize_next_antecedent(action);
-        let p = scratch_check_unsat_with_proof("consecution", &inputs.var_sorts, 1, timeout, |t| {
-            for c in rigid_consts.iter().chain(skolem.iter()) {
-                t.declare_rigid_const(c, TlaSort::Int)?;
-            }
-            build_smt_obligation(
-                t,
-                SmtObligation::Consecution,
-                init_h,
-                &action_sk,
-                not_safety,
-                j_h,
-                not_cj,
-            )
-            .map(|_| ())
-        })?;
+        let p =
+            scratch_check_unsat_with_proof("consecution", &inputs.var_sorts, 1, timeout, |t| {
+                for c in rigid_consts.iter().chain(skolem.iter()) {
+                    t.declare_rigid_const(c, TlaSort::Int)?;
+                }
+                build_smt_obligation(
+                    t,
+                    SmtObligation::Consecution,
+                    init_h,
+                    &action_sk,
+                    not_safety,
+                    j_h,
+                    not_cj,
+                )
+                .map(|_| ())
+            })?;
         all_unsat &= p.unsat;
         all_strict &= p.strict_verified;
         if let Some(bj) = p.bundle_json {
@@ -2622,9 +3272,18 @@ impl ProbeAssignment {
     }
 }
 
-/// Parse a step-indexed BmcTranslator var name `base__step` -> `(base, step)`.
-/// The step is the trailing `__<usize>`; `base` may itself contain `__`.
+/// Parse a step-indexed BMC state symbol into its source name and step.
+///
+/// Canonical symbols use [`BmcTranslator::parse_scalar_symbol`]. The raw
+/// `base__step` fallback keeps already-issued certificates verifiable.
 fn parse_step_var(name: &str) -> Option<(String, usize)> {
+    match BmcTranslator::parse_scalar_symbol(name) {
+        Some(BmcScalarSymbol::State { name, step }) => return Some((name, step)),
+        Some(BmcScalarSymbol::Rigid { .. }) => return None,
+        None => {}
+    }
+
+    // Legacy certificate compatibility.
     let (base, step_str) = name.rsplit_once("__")?;
     let step: usize = step_str.parse().ok()?;
     Some((base.to_string(), step))
@@ -2848,8 +3507,8 @@ pub(crate) fn probe_check_obligation_engine_diverse(
     ctx: &EvalCtx,
     indep: Option<&crate::cert_indep_frontend::IndepSpec>,
 ) -> Option<bool> {
-    // Scalar gate: only Int/Bool vars are probe-cross-checkable (compound sorts
-    // are multi-term-encoded and have no single `base__step` Var).
+    // Scalar gate: only Int/Bool vars are probe-cross-checkable; compound sorts
+    // use multiple SMT carriers rather than one canonical state-step symbol.
     if !inputs
         .var_sorts
         .iter()
@@ -2886,7 +3545,8 @@ pub(crate) fn probe_check_obligation_engine_diverse(
         // Run-boundary discipline: clear thread-local eval caches between probes
         // so a prior probe's state-var values cannot leak.
         crate::clear_thread_local_eval_caches();
-        let ay = ay_obligation_truth_at_probe(embedded_store, obligation_assertions, &varmap, probe)?;
+        let ay =
+            ay_obligation_truth_at_probe(embedded_store, obligation_assertions, &varmap, probe)?;
         let tla = tla_obligation_truth_at_probe(ob, inputs, ctx, probe)?;
         if ay != tla {
             return Some(false);
@@ -2897,7 +3557,8 @@ pub(crate) fn probe_check_obligation_engine_diverse(
         // means a parse/lower OR translation bug — caught by a path that shares NO
         // front end. `None` (out-of-fragment / eval issue) skips ONLY the indep gate.
         if let Some(indep) = indep {
-            if let Some(indep_truth) = indep_obligation_truth_at_probe(ob, indep, &inputs.var_sorts, probe)
+            if let Some(indep_truth) =
+                indep_obligation_truth_at_probe(ob, indep, &inputs.var_sorts, probe)
             {
                 if ay != indep_truth {
                     return Some(false);
@@ -3250,8 +3911,7 @@ fn derive_inductive_bound(
     collector.walk_expr(&next_expanded.node);
     collector.walk_expr(&safety_expanded.node);
 
-    let (Some(&g_min), Some(&g_max)) =
-        (collector.lits.iter().min(), collector.lits.iter().max())
+    let (Some(&g_min), Some(&g_max)) = (collector.lits.iter().min(), collector.lits.iter().max())
     else {
         // No integer literals to seed a bound.
         return Ok(None);
@@ -3505,7 +4165,9 @@ fn probe_deadlock_at_depth(
                 .iter()
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect();
-            succ_t.assert_concrete_state(&frontier_assignments, 0).ok()?;
+            succ_t
+                .assert_concrete_state(&frontier_assignments, 0)
+                .ok()?;
             let next_term = succ_t.translate_next(next_expanded, 0).ok()?;
             succ_t.assert(next_term);
             match succ_t.try_check_sat() {
@@ -4196,8 +4858,7 @@ fn analyze_deadlock_freedom(
     state_var_names: &[String],
     funcsym_vars: &std::collections::HashSet<String>,
 ) -> DeadlockFreedom {
-    let state_vars: std::collections::HashSet<String> =
-        state_var_names.iter().cloned().collect();
+    let state_vars: std::collections::HashSet<String> = state_var_names.iter().cloned().collect();
 
     let mut conjuncts = Vec::new();
     flatten_and(next_expanded, &mut conjuncts);
@@ -4403,10 +5064,7 @@ const DNF_CAP: usize = 64;
 /// NOT lifted (assignment-order semantics) and decline later as Opaque. Both
 /// rewrites share the fail-closed `cap`: `None` == Undecomposable, never
 /// truncate.
-fn normalize_enabled_disjuncts(
-    next: &Spanned<Expr>,
-    cap: usize,
-) -> Option<Vec<Spanned<Expr>>> {
+fn normalize_enabled_disjuncts(next: &Spanned<Expr>, cap: usize) -> Option<Vec<Spanned<Expr>>> {
     let mut work: Vec<Spanned<Expr>> = vec![next.clone()];
     loop {
         let mut changed = false;
@@ -4422,10 +5080,7 @@ fn normalize_enabled_disjuncts(
                 if let Some((g, with_then, with_else)) = lift_first_unprimed_ite(&p) {
                     changed = true;
                     let not_g = Spanned::dummy(Expr::Not(Box::new(g.clone())));
-                    out.push(Spanned::dummy(Expr::And(
-                        Box::new(g),
-                        Box::new(with_then),
-                    )));
+                    out.push(Spanned::dummy(Expr::And(Box::new(g), Box::new(with_then))));
                     out.push(Spanned::dummy(Expr::And(
                         Box::new(not_g),
                         Box::new(with_else),
@@ -4755,8 +5410,7 @@ fn derive_strengthening_candidates(
     collector.walk_expr(&init_expanded.node);
     collector.walk_expr(&next_expanded.node);
     collector.walk_expr(&safety_expanded.node);
-    let (Some(&g_min), Some(&g_max)) =
-        (collector.lits.iter().min(), collector.lits.iter().max())
+    let (Some(&g_min), Some(&g_max)) = (collector.lits.iter().min(), collector.lits.iter().max())
     else {
         return Vec::new();
     };
@@ -5093,8 +5747,13 @@ pub(crate) fn try_inductive_safety_certificate(
     state_var_names: &[Arc<str>],
     check_deadlock: bool,
 ) -> InductiveSafetyCertificate {
-    match try_inductive_safety_certificate_inner(ctx, config, state_var_names, check_deadlock, false)
-    {
+    match try_inductive_safety_certificate_inner(
+        ctx,
+        config,
+        state_var_names,
+        check_deadlock,
+        false,
+    ) {
         Ok(Some(_proof)) => InductiveSafetyCertificate::Safe,
         Ok(None) => InductiveSafetyCertificate::FallThrough,
         // Any error in setup/translation is treated as INCONCLUSIVE: fall
@@ -5263,10 +5922,7 @@ fn try_inductive_safety_certificate_inner(
         );
         let mut proven: Option<Spanned<Expr>> = None;
         for cand in candidates {
-            let j = Spanned::dummy(Expr::And(
-                Box::new(safety_expanded.clone()),
-                Box::new(cand),
-            ));
+            let j = Spanned::dummy(Expr::And(Box::new(safety_expanded.clone()), Box::new(cand)));
             if gate_is_inductive(&var_sorts, &init_expanded, &next_expanded, &j, timeout)? {
                 if debug {
                     eprintln!("[ay-cert] safety is inductive after strengthening");
@@ -5302,10 +5958,13 @@ fn try_inductive_safety_certificate_inner(
     // can deadlock.
     if for_certification {
         let names: Vec<String> = state_var_names.iter().map(|n| n.to_string()).collect();
-        let Some(enabled) = enabled_of_next(&next_expanded, &names, &std::collections::HashSet::new())
+        let Some(enabled) =
+            enabled_of_next(&next_expanded, &names, &std::collections::HashSet::new())
         else {
             if debug {
-                eprintln!("[ay-cert] cert mode: Next not decomposable for Enabled(Next); declining");
+                eprintln!(
+                    "[ay-cert] cert mode: Next not decomposable for Enabled(Next); declining"
+                );
             }
             return Ok(None);
         };
@@ -5319,7 +5978,9 @@ fn try_inductive_safety_certificate_inner(
         })?;
         if !j_implies_enabled {
             if debug {
-                eprintln!("[ay-cert] cert mode: J does not imply Enabled(Next) (can deadlock); declining");
+                eprintln!(
+                    "[ay-cert] cert mode: J does not imply Enabled(Next) (can deadlock); declining"
+                );
             }
             return Ok(None);
         }
@@ -5978,131 +6639,139 @@ pub(crate) fn check_bmc_cooperative(
     // persistently at the base translator level (outside seed push/pop
     // scopes) so they are shared across all seeds without redundant
     // re-assertion. See `assert_lemmas_persistent` below. Fixes #4003.
-    let deepen_from_seed =
-        |translator: &mut tla_ay::BmcTranslator,
-         cooperative: &crate::cooperative_state::SharedCooperativeState|
-         -> Result<Option<BmcResult>, BmcError> {
-            // Signal that a new seed is being processed.
-            cooperative.bmc_start_seed();
+    let deepen_from_seed = |translator: &mut tla_ay::BmcTranslator,
+                            cooperative: &crate::cooperative_state::SharedCooperativeState|
+     -> Result<Option<BmcResult>, BmcError> {
+        // Signal that a new seed is being processed.
+        cooperative.bmc_start_seed();
 
-            // Inner helper that does the actual deepening work. Returns
-            // `(max_unsat_depth, result)` so the outer closure can pass the
-            // accurate depth to `bmc_complete_seed` on ALL exit paths (success
-            // or error), fixing #4005. Scope-level cleanup (pop after push) is
-            // handled within this helper using a scoped-result pattern, fixing
-            // #4000.
-            let inner = |translator: &mut tla_ay::BmcTranslator|
-         -> (u64, Result<Option<BmcResult>, BmcError>) {
-            let mut max_unsat_depth: u64 = 0;
+        // Inner helper that does the actual deepening work. Returns
+        // `(max_unsat_depth, result)` so the outer closure can pass the
+        // accurate depth to `bmc_complete_seed` on ALL exit paths (success
+        // or error), fixing #4005. Scope-level cleanup (pop after push) is
+        // handled within this helper using a scoped-result pattern, fixing
+        // #4000.
+        let inner =
+            |translator: &mut tla_ay::BmcTranslator| -> (u64, Result<Option<BmcResult>, BmcError>) {
+                let mut max_unsat_depth: u64 = 0;
 
-            for depth in 0..=bmc_config.max_depth {
-                // Report live depth progress to the cooperative state.
-                cooperative.bmc_report_depth_progress(depth as u64);
+                for depth in 0..=bmc_config.max_depth {
+                    // Report live depth progress to the cooperative state.
+                    cooperative.bmc_report_depth_progress(depth as u64);
 
-                if cooperative.is_resolved() {
-                    return (max_unsat_depth, Ok(Some(BmcResult::Unknown {
-                        depth,
-                        reason: String::from("cooperative verdict resolved during BMC deepening"),
-                    })));
-                }
+                    if cooperative.is_resolved() {
+                        return (
+                            max_unsat_depth,
+                            Ok(Some(BmcResult::Unknown {
+                                depth,
+                                reason: String::from(
+                                    "cooperative verdict resolved during BMC deepening",
+                                ),
+                            })),
+                        );
+                    }
 
-                if depth > 0 {
-                    let next_term = match translator.translate_next(&next_expanded, depth - 1) {
-                        Ok(t) => t,
+                    if depth > 0 {
+                        let next_term = match translator.translate_next(&next_expanded, depth - 1) {
+                            Ok(t) => t,
+                            Err(e) => return (max_unsat_depth, Err(e.into())),
+                        };
+                        translator.assert(next_term);
+                    }
+
+                    // Push a scope for the per-depth safety negation query.
+                    // Use a scoped-result pattern: capture the result of the
+                    // push/query/check block, then ALWAYS pop before propagating
+                    // any error. This prevents scope leaks on `?` errors (#4000).
+                    match translator.push_scope() {
+                        Ok(()) => {}
                         Err(e) => return (max_unsat_depth, Err(e.into())),
-                    };
-                    translator.assert(next_term);
-                }
+                    }
+                    let scoped_result: Result<Option<BmcResult>, BmcError> = (|| {
+                        let not_safety =
+                            translator.translate_not_safety_all_steps(&safety_expanded, depth)?;
+                        translator.assert(not_safety);
 
-                // Push a scope for the per-depth safety negation query.
-                // Use a scoped-result pattern: capture the result of the
-                // push/query/check block, then ALWAYS pop before propagating
-                // any error. This prevents scope leaks on `?` errors (#4000).
-                match translator.push_scope() {
-                    Ok(()) => {}
-                    Err(e) => return (max_unsat_depth, Err(e.into())),
-                }
-                let scoped_result: Result<Option<BmcResult>, BmcError> = (|| {
-                    let not_safety =
-                        translator.translate_not_safety_all_steps(&safety_expanded, depth)?;
-                    translator.assert(not_safety);
-
-                    match translator.try_check_sat()? {
-                        tla_ay::SolveResult::Sat => {
-                            let model = translator.try_get_model()?;
-                            let trace = truncate_trace_to_depth(translator.extract_trace(&model), depth);
-                            // SOUNDNESS (fail closed): a SAT model comes from the
-                            // SMT TRANSLATION and can be spurious. Publishing
-                            // `Violated` truncates the racing BFS lane into a
-                            // result indistinguishable from a clean Success, so
-                            // it may happen ONLY after the explicit-state
-                            // evaluator has re-confirmed the counterexample. An
-                            // unconfirmed model yields Unknown (no publish) —
-                            // BFS keeps running, unharmed.
-                            let cv = crate::check::cross_validation::confirm_symbolic_cex_fail_closed(
+                        match translator.try_check_sat()? {
+                            tla_ay::SolveResult::Sat => {
+                                let model = translator.try_get_model()?;
+                                let trace = truncate_trace_to_depth(
+                                    translator.extract_trace(&model),
+                                    depth,
+                                );
+                                // SOUNDNESS (fail closed): a SAT model comes from the
+                                // SMT TRANSLATION and can be spurious. Publishing
+                                // `Violated` truncates the racing BFS lane into a
+                                // result indistinguishable from a clean Success, so
+                                // it may happen ONLY after the explicit-state
+                                // evaluator has re-confirmed the counterexample. An
+                                // unconfirmed model yields Unknown (no publish) —
+                                // BFS keeps running, unharmed.
+                                let cv = crate::check::cross_validation::confirm_symbolic_cex_fail_closed(
                                 module,
                                 config,
                                 &trace,
                                 crate::check::cross_validation::CrossValidationSource::Bmc,
                             );
-                            if cv.engine_agrees {
-                                cooperative
-                                    .verdict
-                                    .publish(crate::shared_verdict::Verdict::Violated);
-                                Ok(Some(BmcResult::Violation { depth, trace }))
-                            } else {
-                                telemetry_eprintln!(
+                                if cv.engine_agrees {
+                                    cooperative
+                                        .verdict
+                                        .publish(crate::shared_verdict::Verdict::Violated);
+                                    Ok(Some(BmcResult::Violation { depth, trace }))
+                                } else {
+                                    telemetry_eprintln!(
                                     "[ay-bmc-coop] SAT at depth {depth} but the explicit-state \
                                      evaluator did NOT confirm the counterexample ({}) — \
                                      failing closed to Unknown (no verdict published)",
                                     cv.detail
                                 );
-                                Ok(Some(BmcResult::Unknown {
-                                    depth,
-                                    reason: format!(
+                                    Ok(Some(BmcResult::Unknown {
+                                        depth,
+                                        reason: format!(
                                         "SAT at depth {depth} but the explicit-state evaluator \
                                          did not confirm the counterexample ({}) — failing closed",
                                         cv.detail
                                     ),
-                                }))
+                                    }))
+                                }
                             }
+                            tla_ay::SolveResult::Unsat(_) => Ok(None),
+                            _ => Ok(Some(BmcResult::Unknown {
+                                depth,
+                                reason: format!(
+                                    "solver returned unexpected result at depth {} (cooperative)",
+                                    depth
+                                ),
+                            })),
                         }
-                        tla_ay::SolveResult::Unsat(_) => Ok(None),
-                        _ => Ok(Some(BmcResult::Unknown {
-                            depth,
-                            reason: format!(
-                                "solver returned unexpected result at depth {} (cooperative)",
-                                depth
-                            ),
-                        })),
+                    })(
+                    );
+
+                    // ALWAYS pop the scope, regardless of whether the inner block
+                    // succeeded or failed. This is the key fix for #4000.
+                    match translator.pop_scope() {
+                        Ok(()) => {}
+                        Err(e) => return (max_unsat_depth, Err(e.into())),
                     }
-                })();
 
-                // ALWAYS pop the scope, regardless of whether the inner block
-                // succeeded or failed. This is the key fix for #4000.
-                match translator.pop_scope() {
-                    Ok(()) => {}
-                    Err(e) => return (max_unsat_depth, Err(e.into())),
-                }
-
-                match scoped_result {
-                    Ok(Some(result)) => return (max_unsat_depth, Ok(Some(result))),
-                    Ok(None) => {
-                        // Unsat at this depth — record and continue deepening.
-                        max_unsat_depth = depth as u64;
+                    match scoped_result {
+                        Ok(Some(result)) => return (max_unsat_depth, Ok(Some(result))),
+                        Ok(None) => {
+                            // Unsat at this depth — record and continue deepening.
+                            max_unsat_depth = depth as u64;
+                        }
+                        Err(e) => return (max_unsat_depth, Err(e)),
                     }
-                    Err(e) => return (max_unsat_depth, Err(e)),
                 }
-            }
-            (max_unsat_depth, Ok(None))
-        };
+                (max_unsat_depth, Ok(None))
+            };
 
-            // Run the inner helper and ensure bmc_complete_seed is called on ALL
-            // exit paths — both success and error. This fixes #4005.
-            let (max_unsat_depth, result) = inner(translator);
-            cooperative.bmc_complete_seed(max_unsat_depth);
-            result
-        };
+        // Run the inner helper and ensure bmc_complete_seed is called on ALL
+        // exit paths — both success and error. This fixes #4005.
+        let (max_unsat_depth, result) = inner(translator);
+        cooperative.bmc_complete_seed(max_unsat_depth);
+        result
+    };
 
     // Assert PDR-learned lemmas persistently at the base translator level.
     //

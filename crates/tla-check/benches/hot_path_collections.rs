@@ -5,9 +5,8 @@
 //! Collection and value benchmarks: set operations, function operations, value comparison, cloning.
 
 use criterion::{black_box, BenchmarkId, Criterion, Throughput};
-use std::sync::Arc;
 use tla_check::Value;
-use tla_value::SortedSet;
+use tla_value::{Rp, SortedSet};
 
 use crate::hot_path_fixtures::*;
 
@@ -178,15 +177,15 @@ pub fn bench_value_cmp(c: &mut Criterion) {
         let a = int_set(100);
         let b_val: Value = {
             let values: Vec<Value> = (1..101).map(Value::SmallInt).collect();
-            Value::Set(Arc::new(SortedSet::from_sorted_vec(values)))
+            Value::Set(Rp::new(SortedSet::from_sorted_vec(values)))
         };
         b.iter(|| black_box(a.cmp(black_box(&b_val))));
     });
 
     // Function comparison
     group.bench_function("func_100", |b| {
-        let a = Value::Func(Arc::new(int_func(100)));
-        let b_val = Value::Func(Arc::new(int_func(100)));
+        let a = Value::Func(Rp::new(int_func(100)));
+        let b_val = Value::Func(Rp::new(int_func(100)));
         b.iter(|| black_box(a.cmp(black_box(&b_val))));
     });
 
@@ -202,21 +201,21 @@ pub fn bench_value_clone(c: &mut Criterion) {
         b.iter(|| black_box(v.clone()));
     });
 
-    // String (Arc increment)
+    // String (Rp increment)
     group.bench_function("string", |b| {
         let v = string_val("waiting_for_critical_section");
         b.iter(|| black_box(v.clone()));
     });
 
-    // Set (Arc increment)
+    // Set (Rp increment)
     group.bench_function("set_100", |b| {
         let v = int_set(100);
         b.iter(|| black_box(v.clone()));
     });
 
-    // Function (Arc increment)
+    // Function (Rp increment)
     group.bench_function("func_100", |b| {
-        let v = Value::Func(Arc::new(int_func(100)));
+        let v = Value::Func(Rp::new(int_func(100)));
         b.iter(|| black_box(v.clone()));
     });
 

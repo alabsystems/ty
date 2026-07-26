@@ -8,7 +8,6 @@
 //! and profiling. Post-BFS finalization lives in `run_finalize.rs`.
 
 use super::super::check_error::CheckError;
-use tla_value::Rp;
 use super::{
     check_error_to_result, print_enum_profile_stats, print_eval_profile_stats, ArrayState,
     CheckResult, Fingerprint, Instant, LimitType, ModelChecker, State, VecDeque,
@@ -17,6 +16,7 @@ use crate::checker_ops::InvariantOutcome;
 use crate::state::print_symmetry_stats;
 use crate::EvalCheckError;
 use num_traits::ToPrimitive;
+use tla_value::Rp;
 // SpecializationPlan inherent query methods (int_var_count, bool_var_count,
 // specialized_var_count, has_specializable_vars) live in `tla-jit-abi` as of
 // Wave 16 Gate 1 Batch A (#4267 / #4291) — no trait import needed.
@@ -488,7 +488,7 @@ impl<'a> ModelChecker<'a> {
         current_array: &ArrayState,
     ) -> Option<Vec<(JitFlatSuccessor, Option<usize>)>> {
         // Early exit: JIT permanently disabled due to a prior runtime error.
-        if self.jit_monolithic_disabled {
+        if self.por.parity_failed || self.jit_monolithic_disabled {
             return None;
         }
 
@@ -733,7 +733,7 @@ impl<'a> ModelChecker<'a> {
             } else {
                 None
             };
-            match self.generate_successors_array_raw(current_array) {
+            match self.generate_successors_array_monolithic_raw(current_array) {
                 Ok(interp_result) => {
                     // Part of #4031: Capture interpreter timing during validation.
                     if let Some(t0) = interp_t0 {
@@ -1095,7 +1095,7 @@ impl<'a> ModelChecker<'a> {
     pub(in crate::check) fn jit_hybrid_ready(&self) -> bool {
         // Global JIT kill switch — disabled due to validation failure or other
         // catastrophic error.
-        if self.jit_monolithic_disabled {
+        if self.por.parity_failed || self.jit_monolithic_disabled {
             return false;
         }
         // Need at least one promoted action and a JIT cache installed.
@@ -1119,6 +1119,7 @@ impl<'a> ModelChecker<'a> {
     /// - POR enabled-set filtering
     /// - hybrid JIT (some actions native, some interpreted)
     /// - trust-codegen per-action native dispatch
+    /// - the standalone interpreter action router
     ///
     /// Returning `false` keeps the checker on the monolithic unified
     /// enumerator, which is still the cheaper path when none of the above are
@@ -1147,6 +1148,7 @@ impl<'a> ModelChecker<'a> {
             self.por.independence.is_some(),
             self.jit_hybrid_ready(),
             trust_cg_action_dispatch_ready,
+            self.router_active(),
         )
     }
 
@@ -2146,6 +2148,44 @@ impl<'a> ModelChecker<'a> {
             "[engine] execution tier: {}",
             self.execution_tier_label(compiled_path)
         );
+    }
+
+    /// Record the execution tier at BFS loop entry (and emit the gated stderr
+    /// line). The last record wins; an interpreter→compiled overwrite marks
+    /// the AUTO tier-up hot-swap. Always recorded — unlike the stderr line,
+    /// provenance is not debug-gated, because benchmark rows need it.
+    pub(in crate::check) fn record_engine_tier(&mut self, compiled_path: bool) {
+        if self.executed_tier_compiled == Some(false) && compiled_path {
+            self.engine_tier_hot_swapped = true;
+        }
+        self.executed_tier_compiled = Some(compiled_path);
+        self.emit_execution_tier(compiled_path);
+    }
+
+    /// Engine-provenance record for this run, attached to every terminal
+    /// result's stats by `finalize_terminal_result` and serialized under
+    /// `engine_provenance` in JSON output.
+    pub(in crate::check) fn engine_provenance_json(&self) -> Option<serde_json::Value> {
+        let Some(compiled) = self.executed_tier_compiled else {
+            // No BFS loop ever ran (e.g. an empty reachable set exits before
+            // loop entry, or a non-BFS strategy resolved the run). Rows must
+            // still carry an honest attribution — "no tier" reads as a
+            // measurement bug and fails provenance-requiring policies.
+            if crate::check::debug::engine_tier_report_enabled() {
+                eprintln!("[engine] execution tier: no-exploration");
+            }
+            return Some(serde_json::json!({ "tier": "no-exploration" }));
+        };
+        let mut record = serde_json::json!({
+            "tier": self.execution_tier_label(compiled),
+        });
+        if self.engine_tier_hot_swapped {
+            record["auto_tier_up"] = serde_json::Value::Bool(true);
+        }
+        if let Some(vm) = self.value_action_vm.provenance_json() {
+            record["value_action_vm"] = vm;
+        }
+        Some(record)
     }
 
     fn compiled_bfs_flat_frontier_state_len(&self) -> Option<usize> {
@@ -3951,7 +3991,9 @@ impl<'a> ModelChecker<'a> {
         successors: &mut Vec<FlatPrefilteredSuccessor>,
         raw_successor_count: &mut usize,
     ) -> Result<(), CheckResult> {
-        *raw_successor_count += 1;
+        *raw_successor_count = raw_successor_count
+            .checked_add(1)
+            .expect("raw successor generation count overflowed usize");
 
         let prof_t_fp = prof.now();
         let flat_buf = &self.jit_action_out_scratch[..state_var_count];
@@ -5356,9 +5398,7 @@ fn fixed_scalar_expr_value(
         }
         tla_core::ast::Expr::Bool(value) => Some(crate::Value::Bool(*value)),
         tla_core::ast::Expr::Int(value) => value.to_i64().map(crate::Value::int),
-        tla_core::ast::Expr::String(value) => {
-            Some(crate::Value::String(Rp::from(value.as_str())))
-        }
+        tla_core::ast::Expr::String(value) => Some(crate::Value::String(Rp::from(value.as_str()))),
         tla_core::ast::Expr::Ident(name, _) if !shadowed.iter().any(|s| s == name) => {
             fixed_binding_value(bindings, name).cloned()
         }
@@ -5586,9 +5626,14 @@ fn should_use_per_action_successor_dispatch(
     has_por: bool,
     jit_hybrid_ready: bool,
     trust_cg_has_compiled_action: bool,
+    router_active: bool,
 ) -> bool {
     has_detected_actions
-        && (coverage_collect || has_por || jit_hybrid_ready || trust_cg_has_compiled_action)
+        && (coverage_collect
+            || has_por
+            || jit_hybrid_ready
+            || trust_cg_has_compiled_action
+            || router_active)
 }
 
 // =============================================================================
@@ -5699,15 +5744,19 @@ impl<'a> ModelChecker<'a> {
     /// fallback. The decision is purely structural (coverage + admission); it
     /// never inspects spec/action names.
     ///
-    /// No-op unless AUTO mode is active and trust-cg actually built — so an
-    /// explicit `--backend trust-cg` (harnesses/oracle) keeps forced-native
-    /// behavior, and there is zero cost on the interpreter default.
+    /// No-op unless AUTO mode is active and trust-cg setup was attempted — so
+    /// an explicit `--backend trust-cg` (harnesses/oracle) keeps forced-native
+    /// behavior, and there is zero cost on the interpreter default. Cache
+    /// absence is still actionable when the attempted build produced no
+    /// executable native action.
     pub(in crate::check) fn auto_select_post_compile_trust_cg_gate(&mut self) {
         if !crate::check::debug::trust_cg_auto_select_enabled() {
             return;
         }
         if self.trust_cg_cache.is_none() {
-            self.value_action_vm.discard_auto_candidate();
+            if !self.try_restore_auto_route_after_absent_native_cache() {
+                self.value_action_vm.discard_auto_candidate();
+            }
             return;
         }
         // Genuine-win condition (a): an admitted native fused parent loop.
@@ -5769,6 +5818,54 @@ impl<'a> ModelChecker<'a> {
         // exact. `setup_actions_and_por` retained the run-stable Arc'd action
         // set for this case (see its `keep_for_jit` branch), satisfying the
         // pointer-keyed enumeration-cache contract (`CoverageState::actions`).
+        self.restore_default_dead_action_coverage_after_native_fallback();
+    }
+
+    /// Abandon an attempted AUTO native route that produced no executable cache.
+    ///
+    /// A safety-only AUTO run may have disabled the default dead-action route up
+    /// front because native looked structurally viable. A zero-coverage build
+    /// deliberately leaves `trust_cg_cache` as `None`, so treating cache absence
+    /// as "nothing was attempted" strands that run on monolithic whole-Next
+    /// interpretation. In particular, it bypasses the shared action routing and
+    /// its guard prechecks even though native proved that it cannot execute a
+    /// single action. Restore the exact run-stable action set before the first
+    /// BFS transition and select the certified Value plan when one is available.
+    ///
+    /// Returns `true` only when cache absence represented that attempted native
+    /// fast path. The extracted branch is also exercised directly by unit tests;
+    /// the outer selector's AUTO-mode gate remains process-global CLI policy.
+    pub(super) fn try_restore_auto_route_after_absent_native_cache(&mut self) -> bool {
+        if self.trust_cg_cache.is_some() || !self.coverage.native_fast_path_skipped {
+            return false;
+        }
+
+        let (compiled, total) = self
+            .trust_cg_build_stats
+            .as_ref()
+            .map_or((0, 0), |s| (s.actions_compiled, s.actions_total()));
+        eprintln!(
+            "engine: interpreter (native not beneficial: native action coverage {compiled}/{total} \
+             produced no executable cache; restoring default action routing)"
+        );
+        self.set_trust_cg_structural_veto();
+        self.trust_cg_lazy_pending = false;
+        self.jit_monolithic_disabled = true;
+        self.value_action_vm.select_auto_candidate();
+        self.restore_default_dead_action_coverage_after_native_fallback();
+        true
+    }
+
+    /// Restore the implicit V2 dead-action route after AUTO abandons native.
+    ///
+    /// This is shared by both native-loss shapes: a populated cache that fails
+    /// the coverage/admission gate, and a zero-action build that intentionally
+    /// installs no cache.  Both call sites run after initial-state/layout setup
+    /// but before the BFS loop, so registering every retained action starts its
+    /// counters at zero and is exact.  The retained/retired `Arc` is reused;
+    /// never redetect actions here because the enumerator's pointer-keyed
+    /// caches require the original run-stable AST allocation.
+    pub(super) fn restore_default_dead_action_coverage_after_native_fallback(&mut self) {
         if self.coverage.native_fast_path_skipped
             && !self.coverage.display
             && !self.coverage.collect
@@ -5796,6 +5893,10 @@ impl<'a> ModelChecker<'a> {
                 self.coverage.collect = true;
             }
         }
+        // `native_fast_path_skipped` is one-shot provenance consumed by this
+        // fallback.  Clearing it prevents later route setup from treating the
+        // now-vetoed native path as the owner of default coverage.
+        self.coverage.native_fast_path_skipped = false;
     }
 
     /// Whether at least one action was compiled by the trust-codegen cache.
@@ -5835,7 +5936,8 @@ impl<'a> ModelChecker<'a> {
     /// disabled whenever implied actions are present.
     #[inline]
     pub(in crate::check) fn trust_cg_action_dispatch_ready(&self) -> bool {
-        self.trust_cg_has_compiled_action()
+        !self.por.parity_failed
+            && self.trust_cg_has_compiled_action()
             && trust_cg_flat_layout_admits_action_dispatch(self.flat_state_layout.as_deref())
     }
 
@@ -5862,7 +5964,9 @@ impl<'a> ModelChecker<'a> {
         action_idx: usize,
         action_name: &str,
     ) -> Option<Result<super::trust_cg_dispatch::TrustCgActionResult, ()>> {
-        if !trust_cg_flat_layout_admits_action_dispatch(self.flat_state_layout.as_deref()) {
+        if self.por.parity_failed
+            || !trust_cg_flat_layout_admits_action_dispatch(self.flat_state_layout.as_deref())
+        {
             return None;
         }
 
@@ -6429,7 +6533,9 @@ impl<'a> ModelChecker<'a> {
         let meta = match self.compiled.split_action_meta.as_ref() {
             Some(m) if !m.is_empty() => m,
             _ => {
-                telemetry_eprintln!("[trust-cg] CompiledBfsLevel skipped: no split action metadata");
+                telemetry_eprintln!(
+                    "[trust-cg] CompiledBfsLevel skipped: no split action metadata"
+                );
                 return None;
             }
         };
@@ -6990,7 +7096,10 @@ impl<'a> ModelChecker<'a> {
                 &state_constraint_inputs.state_constraint_bytecodes,
                 state_var_count,
                 self.jit_state_layout.as_ref(),
-                tla_trust_cg::OptLevel::O3, // Use max optimization for production.
+                // Default O1 (value-preserving; skips trust-cg's costly O2+-only
+                // post-RA opt + pressure-aware scheduling that pessimize the
+                // per-action codegen); overridable via TY_TRUST_CG_ACTION_OPT_LEVEL.
+                super::trust_cg_dispatch::trust_cg_action_compile_opt_level(),
                 const_pool,
                 invariant_inputs.const_pool,
                 state_constraint_inputs.const_pool,
@@ -7218,7 +7327,7 @@ impl<'a> ModelChecker<'a> {
     /// compound (not fully flat) spec with at least one flat-admissible
     /// variable — the whole-state fully-flat path already dispatches natively
     /// and is untouched. The compile layout is
-    /// `check_layout_to_jit_layout(hybrid check layout).with_hybrid_flat_view()`,
+    /// `try_check_layout_to_jit_layout(hybrid check layout).with_hybrid_flat_view()`,
     /// so compiled slot offsets match `HybridFlatView::project`'s buffer
     /// exactly, every `Dynamic` placeholder access declines in lowering
     /// (M0-G3), and the layout marker + a dedicated cache namespace keep
@@ -7271,8 +7380,16 @@ impl<'a> ModelChecker<'a> {
             return;
         };
         let hybrid_check_layout = std::sync::Arc::clone(view.hybrid_layout());
-        let hybrid_jit_layout =
-            crate::state::check_layout_to_jit_layout(&hybrid_check_layout).with_hybrid_flat_view();
+        let Some(hybrid_jit_layout) =
+            crate::state::try_check_layout_to_jit_layout(&hybrid_check_layout)
+        else {
+            eprintln!(
+                "[hybrid] native action cache DECLINED (fail-closed): hybrid check layout has \
+                 no byte-exact, structurally compatible JIT ABI carrier"
+            );
+            return;
+        };
+        let hybrid_jit_layout = hybrid_jit_layout.with_hybrid_flat_view();
         // M0-G5: byte-exact width/offset parity between the check-side hybrid
         // encoding and the jit-abi compact geometry native code will use.
         if let Some(mismatch) = crate::state::layout_bridge::layout_geometry_mismatch(
@@ -7349,7 +7466,7 @@ impl<'a> ModelChecker<'a> {
                 &[],
                 state_var_count,
                 Some(&hybrid_jit_layout),
-                tla_trust_cg::OptLevel::O3,
+                super::trust_cg_dispatch::trust_cg_action_compile_opt_level(),
                 const_pool,
                 None,
                 None,
@@ -7386,9 +7503,11 @@ impl<'a> ModelChecker<'a> {
     /// resolution) is per action instance at dispatch time.
     #[inline]
     pub(in crate::check) fn trust_cg_hybrid_action_dispatch_ready(&self) -> bool {
-        self.trust_cg_hybrid_cache
-            .as_ref()
-            .is_some_and(super::trust_cg_dispatch::TrustCgNativeCache::has_any_compiled_action)
+        !self.por.parity_failed
+            && self
+                .trust_cg_hybrid_cache
+                .as_ref()
+                .is_some_and(super::trust_cg_dispatch::TrustCgNativeCache::has_any_compiled_action)
     }
 
     /// Resolve the executable hybrid dispatch keys for a coverage action
@@ -7406,6 +7525,9 @@ impl<'a> ModelChecker<'a> {
         &self,
         action_name: &str,
     ) -> Option<Vec<String>> {
+        if self.por.parity_failed {
+            return None;
+        }
         let cache = self.trust_cg_hybrid_cache.as_ref()?;
         let meta = self.compiled.split_action_meta.as_ref()?;
 
@@ -7453,8 +7575,8 @@ impl<'a> ModelChecker<'a> {
     /// hybrid buffers in key order.
     ///
     /// Returns:
-    /// - `Some(Ok(buffers))` — every key evaluated natively (an empty vec means
-    ///   all instances were disabled on this parent);
+    /// - `Some(Ok((slots, count)))` — every key evaluated natively into one
+    ///   contiguous slot arena (`count == 0` means all instances were disabled);
     /// - `Some(Err(()))` — a native runtime error (caller declines native for
     ///   this action instance, fail-closed);
     /// - `None` — a key was not dispatchable after all (caller declines native,
@@ -7463,9 +7585,11 @@ impl<'a> ModelChecker<'a> {
         &mut self,
         keys: &[String],
         parent_view_slots: &[i64],
-    ) -> Option<Result<Vec<Vec<i64>>, ()>> {
+    ) -> Option<Result<(Vec<i64>, usize), ()>> {
         let cache = self.trust_cg_hybrid_cache.as_ref()?;
-        let mut results = Vec::new();
+        let mut result_slots =
+            Vec::with_capacity(keys.len().saturating_mul(parent_view_slots.len()));
+        let mut result_count = 0usize;
         for key in keys {
             match cache.eval_action_with_state_len_into(
                 key,
@@ -7474,7 +7598,10 @@ impl<'a> ModelChecker<'a> {
                 &mut self.hybrid_action_out_scratch,
             ) {
                 Some(Ok(true)) => {
-                    results.push(self.hybrid_action_out_scratch.clone());
+                    result_slots.extend_from_slice(&self.hybrid_action_out_scratch);
+                    result_count = result_count
+                        .checked_add(1)
+                        .expect("hybrid successor count overflowed usize");
                 }
                 Some(Ok(false)) => {
                     // This action instance is disabled on the parent.
@@ -7483,7 +7610,7 @@ impl<'a> ModelChecker<'a> {
                 None => return None,
             }
         }
-        Some(Ok(results))
+        Some(Ok((result_slots, result_count)))
     }
 }
 
@@ -7500,15 +7627,21 @@ mod tests {
     fn engine_gap_switch_only_claims_fully_flat_non_primary_safe_layouts() {
         for gap in [false, true] {
             // Compound layouts always belonged to the hybrid engine.
-            assert!(!hybrid_action_cache_yields_to_whole_state(false, false, gap));
+            assert!(!hybrid_action_cache_yields_to_whole_state(
+                false, false, gap
+            ));
             // Flat AND primary-safe: the whole-state engine really dispatches;
             // the hybrid build must keep yielding regardless of the switch.
             assert!(hybrid_action_cache_yields_to_whole_state(true, true, gap));
         }
         // The gap. Default OFF stays byte-identical (yields, then nobody
         // dispatches); ON hands it to the hybrid engine.
-        assert!(hybrid_action_cache_yields_to_whole_state(true, false, false));
-        assert!(!hybrid_action_cache_yields_to_whole_state(true, false, true));
+        assert!(hybrid_action_cache_yields_to_whole_state(
+            true, false, false
+        ));
+        assert!(!hybrid_action_cache_yields_to_whole_state(
+            true, false, true
+        ));
     }
 
     use super::bfs_profile::bfs_profile_lines;
@@ -9506,7 +9639,7 @@ Next == Step
     #[test]
     fn per_action_dispatch_requires_detected_actions() {
         assert!(
-            !super::should_use_per_action_successor_dispatch(false, true, true, true, true),
+            !super::should_use_per_action_successor_dispatch(false, true, true, true, true, true),
             "without detected actions there is no safe split-action dispatch target",
         );
     }
@@ -9514,7 +9647,9 @@ Next == Step
     #[test]
     fn per_action_dispatch_stays_off_without_feature_pressure() {
         assert!(
-            !super::should_use_per_action_successor_dispatch(true, false, false, false, false),
+            !super::should_use_per_action_successor_dispatch(
+                true, false, false, false, false, false
+            ),
             "plain monolithic successor generation should remain on the unified path",
         );
     }
@@ -9522,7 +9657,17 @@ Next == Step
     #[test]
     fn per_action_dispatch_turns_on_for_trust_cg_compiled_actions() {
         assert!(super::should_use_per_action_successor_dispatch(
-            true, false, false, false, true
+            true, false, false, false, true, false
+        ));
+    }
+
+    #[test]
+    fn per_action_dispatch_turns_on_for_standalone_router() {
+        assert!(super::should_use_per_action_successor_dispatch(
+            true, false, false, false, false, true
+        ));
+        assert!(!super::should_use_per_action_successor_dispatch(
+            false, false, false, false, false, true
         ));
     }
 
@@ -9593,6 +9738,7 @@ Next == Step
         let _ = super::super::trust_cg_dispatch::should_use_trust_cg(false);
     }
 
+    #[test]
     fn jit_warmup_gate_ratio_math() {
         use super::JIT_SLOWDOWN_RATIO;
 

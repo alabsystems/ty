@@ -2,14 +2,14 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
+use crate::dedup_fingerprint::state_value_fingerprint;
+use crate::rp::Rp as Arc;
+use crate::rp::Rp;
+use crate::value::seq::SeqValue;
+use crate::value::Value;
 use std::cmp::Ordering;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use crate::rp::Rp as Arc;
-use crate::rp::Rp;
-use crate::dedup_fingerprint::state_value_fingerprint;
-use crate::value::seq::SeqValue;
-use crate::value::Value;
 
 fn hash_seq(seq: &SeqValue) -> u64 {
     let mut hasher = DefaultHasher::new();

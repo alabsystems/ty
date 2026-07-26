@@ -10,7 +10,8 @@
 //!
 //! ## What this enforces
 //!
-//! We have four sibling Rust workspaces at `~/root/{ty,trust-ir,trust-cg,ay}`
+//! We have five sibling Rust workspaces at
+//! `~/root/{ty,trust-ir,trust-cg,clean,ay}`
 //! that depend on each other. Each repo independently pins the others'
 //! SHAs. When two repos disagree (e.g. trust-ir pinned at `c64a435` in one
 //! workspace and `01dd363` in another), a build that pulls both gets
@@ -50,13 +51,9 @@
 //! `branch=`/`tag=` declaration has no exact commit identity left in the
 //! resolved graph and is reported fail-closed.
 //!
-//! Two documented cycle-breaking consumers intentionally do not track AY's
-//! moving main: trust-ir's adapter is frozen at 3f0ec101..., and trust-cg's
-//! optional allocator is frozen at 805725e4.... Those rows must still prove
-//! their exact active Git commit (and any path patch must pass the checkout
-//! proof above), but they are excluded from moving-main equality comparisons.
-//! A repository containing only one of these audited rows still contributes
-//! non-vacuous dependency evidence even though it has no moving-main row.
+//! There are no comparison exemptions. TY, TrustIR, TrustCG, Clean, and AY
+//! advance as one internal authority set; every AY-family row participates in
+//! equality checking after any path checkout has proved its exact Git identity.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::{OsStr, OsString};
@@ -163,22 +160,16 @@ const DEFAULT_SIBLINGS: &[&str] = &[
     "ay-z3-parity",
 ];
 
-const DEFAULT_REPOS: &[&str] = &["ty", "trust-ir", "trust-cg", "ay"];
-
-const AY_UPSTREAM: &str = "github.com/alabsystems/ay";
-const TRUST_IR_FROZEN_AY_REV: &str = "3f0ec1010813ad984e840cba29bae13e56f97673";
-const TRUST_CG_FROZEN_AY_REV: &str = "805725e47d734b0c72ea8c089bdf6245c1cbee16";
+const DEFAULT_REPOS: &[&str] = &["ty", "trust-ir", "trust-cg", "clean", "ay"];
 
 /// Command-line arguments for the `ty-mcc-drift-guard` helper.
 #[derive(Parser, Debug)]
 #[command(
     name = "ty-mcc-drift-guard",
-    about = "Proof-grade cross-repo cargo dep drift guard for ~/root/{ty,trust-ir,trust-cg,ay}.",
+    about = "Proof-grade cross-repo cargo dep drift guard for ~/root/{ty,trust-ir,trust-cg,clean,ay}.",
     long_about = "Walks `cargo metadata` for each sibling workspace and asserts \
-        that every non-exempt shared package (trust-ir, trust_cg, ay family) resolves \
-        to the same (source, version) pair across every repo. The two documented, \
-        exact AY cycle-break baselines remain visible in reports but are excluded \
-        from moving-main equality only after their source identity is proven. \
+        that every shared package (trust-ir, trust_cg, ay family) resolves \
+        to the same (source, version) pair across every repo. \
         Replaces the regex-based \
         `scripts/cargo_dep_drift_guard.sh`, which missed multiline TOML tables, \
         branch/tag pins, package renames, and URL-spelling differences."
@@ -223,9 +214,6 @@ struct Resolution {
     /// Source reported for the active resolved package (path or Git).
     resolved_source: Option<String>,
     version: String,
-    /// A documented cycle-breaking baseline that is exact-identity checked,
-    /// but intentionally does not participate in moving-main equality.
-    comparison_exempt: bool,
 }
 
 #[derive(Debug, Default)]
@@ -245,7 +233,12 @@ fn collect_resolutions(
     manifest_path: &Path,
     sibling_set: &BTreeSet<String>,
 ) -> Result<Option<CollectedResolutions>, String> {
-    collect_resolutions_with_cargo(OsStr::new("cargo"), workspace_label, manifest_path, sibling_set)
+    collect_resolutions_with_cargo(
+        OsStr::new("cargo"),
+        workspace_label,
+        manifest_path,
+        sibling_set,
+    )
 }
 
 fn collect_resolutions_with_cargo(
@@ -329,7 +322,10 @@ fn mirror_cargo_cache_without_config(destination: &Path) -> Result<(), String> {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => {
-            return Err(format!("failed to read Cargo home {}: {error}", source.display()));
+            return Err(format!(
+                "failed to read Cargo home {}: {error}",
+                source.display()
+            ));
         }
     };
     for entry in entries {
@@ -360,20 +356,26 @@ fn mirror_cargo_cache_without_config(destination: &Path) -> Result<(), String> {
 
 fn is_lower_hex_commit(value: &str) -> bool {
     value.len() == 40
-        && value.bytes().all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 fn exact_rev_source(source: &str) -> Option<&str> {
     let without_fragment = source.split('#').next()?;
     let (_, query) = without_fragment.split_once('?')?;
-    let rev = query.split('&').find_map(|field| field.strip_prefix("rev="))?;
+    let rev = query
+        .split('&')
+        .find_map(|field| field.strip_prefix("rev="))?;
     is_lower_hex_commit(rev).then_some(without_fragment)
 }
 
 fn exact_rev(source: &str) -> Option<&str> {
     let without_fragment = source.split('#').next()?;
     let (_, query) = without_fragment.split_once('?')?;
-    let rev = query.split('&').find_map(|field| field.strip_prefix("rev="))?;
+    let rev = query
+        .split('&')
+        .find_map(|field| field.strip_prefix("rev="))?;
     is_lower_hex_commit(rev).then_some(rev)
 }
 
@@ -428,8 +430,9 @@ fn canonical_git_remote(source: &str) -> String {
     let mut source = source.strip_prefix("git+").unwrap_or(source);
     source = source.split(['?', '#']).next().unwrap_or(source);
     let owned;
-    if let Some((user_host, path)) =
-        source.split_once(':').filter(|_| !source.contains("://") && source.contains('@'))
+    if let Some((user_host, path)) = source
+        .split_once(':')
+        .filter(|_| !source.contains("://") && source.contains('@'))
     {
         let host = user_host.rsplit('@').next().unwrap_or(user_host);
         owned = format!("{host}/{path}");
@@ -442,7 +445,10 @@ fn canonical_git_remote(source: &str) -> String {
             source = &owned;
         }
     }
-    source.trim_end_matches('/').trim_end_matches(".git").to_ascii_lowercase()
+    source
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .to_ascii_lowercase()
 }
 
 fn git_stdout(checkout: &Path, args: &[&str]) -> Result<String, String> {
@@ -481,7 +487,10 @@ fn verify_path_patch_authority(package_id: &str, declared_source: &str) -> Resul
             root.display()
         ));
     }
-    let status = git_stdout(&root, &["status", "--porcelain=v1", "--untracked-files=normal"])?;
+    let status = git_stdout(
+        &root,
+        &["status", "--porcelain=v1", "--untracked-files=normal"],
+    )?;
     if !status.is_empty() {
         return Err(format!("patched checkout {} is dirty", root.display()));
     }
@@ -504,25 +513,6 @@ fn verify_path_patch_authority(package_id: &str, declared_source: &str) -> Resul
 
 fn is_ay_family(package_name: &str) -> bool {
     package_name == "ay" || package_name.starts_with("ay-")
-}
-
-fn is_audited_frozen_baseline(
-    workspace: &str,
-    package_name: &str,
-    source: &Option<String>,
-) -> bool {
-    if !is_ay_family(package_name) {
-        return false;
-    }
-    let expected_rev = match workspace {
-        "trust-ir" => TRUST_IR_FROZEN_AY_REV,
-        "trust-cg" => TRUST_CG_FROZEN_AY_REV,
-        _ => return false,
-    };
-    source.as_deref().is_some_and(|source| {
-        exact_rev(source).is_some_and(|rev| rev.eq_ignore_ascii_case(expected_rev))
-            && canonical_git_remote(source) == AY_UPSTREAM
-    })
 }
 
 fn normalized_dep_name(dep: &Value) -> Option<String> {
@@ -593,8 +583,10 @@ fn parse_metadata(
         let package = packages_by_id.get(package_id).ok_or_else(|| {
             format!("{workspace_label}: active package `{package_id}` missing package metadata")
         })?;
-        let package_name =
-            package.get("name").and_then(Value::as_str).unwrap_or("<unknown-package>");
+        let package_name = package
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown-package>");
         let Some(declarations) = package.get("dependencies").and_then(Value::as_array) else {
             continue;
         };
@@ -673,8 +665,10 @@ fn parse_metadata(
         let package = packages_by_id.get(package_id).ok_or_else(|| {
             format!("{workspace_label}: active package `{package_id}` missing package metadata")
         })?;
-        let package_name =
-            package.get("name").and_then(Value::as_str).unwrap_or("<unknown-package>");
+        let package_name = package
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown-package>");
         let node = nodes_by_id.get(package_id).ok_or_else(|| {
             format!("{workspace_label}: active package `{package_id}` missing resolve node")
         })?;
@@ -742,7 +736,9 @@ fn parse_metadata(
             let declared_source =
                 declaration.and_then(|dep| dep.get("source").and_then(Value::as_str));
             let inherited_path_source = if declared_source.is_none()
-                && resolved_source.as_deref().is_some_and(|identity| identity.starts_with("path+"))
+                && resolved_source
+                    .as_deref()
+                    .is_some_and(|identity| identity.starts_with("path+"))
                 && !path_authorities.is_empty()
             {
                 git_root_for_package_id(target_id)
@@ -785,10 +781,14 @@ fn parse_metadata(
                         "{workspace_label}: {package_name} declares {target_name} with mutable Git identity `{declared}`; use an exact 40-hex rev"
                     ));
                 }
-                inherited_path_source.clone().or_else(|| resolved_source.clone())
+                inherited_path_source
+                    .clone()
+                    .or_else(|| resolved_source.clone())
             };
             if declared_source.and_then(exact_rev_source).is_none()
-                && resolved_source.as_deref().is_some_and(|identity| identity.starts_with("path+"))
+                && resolved_source
+                    .as_deref()
+                    .is_some_and(|identity| identity.starts_with("path+"))
                 && inherited_path_source.is_none()
             {
                 collected.issues.push(format!(
@@ -797,16 +797,17 @@ fn parse_metadata(
                 ));
             }
 
-            let version = target.get("version").and_then(Value::as_str).unwrap_or("?").to_string();
-            let comparison_exempt =
-                is_audited_frozen_baseline(workspace_label, target_name, &source);
+            let version = target
+                .get("version")
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .to_string();
             let resolution = Resolution {
                 workspace: workspace_label.to_string(),
                 source,
                 declared_source: declared_source.map(str::to_string),
                 resolved_source: raw_resolved_source,
                 version,
-                comparison_exempt,
             };
             match collected.resolutions.get(target_name) {
                 Some(previous)
@@ -823,7 +824,9 @@ fn parse_metadata(
                 }
                 Some(_) => {}
                 None => {
-                    collected.resolutions.insert(target_name.to_string(), resolution);
+                    collected
+                        .resolutions
+                        .insert(target_name.to_string(), resolution);
                 }
             }
         }
@@ -842,9 +845,6 @@ fn build_agreement(per_repo: &BTreeMap<String, BTreeMap<String, Resolution>>) ->
     let mut agreement: AgreementTable = BTreeMap::new();
     for (workspace, resolutions) in per_repo {
         for (pkg, res) in resolutions {
-            if res.comparison_exempt {
-                continue;
-            }
             agreement
                 .entry(pkg.clone())
                 .or_default()
@@ -860,8 +860,14 @@ fn build_agreement(per_repo: &BTreeMap<String, BTreeMap<String, Resolution>>) ->
 /// more than one distinct `(source, version)` tuple is recorded for it.
 fn find_drift(
     agreement: &AgreementTable,
-) -> Vec<(&String, &BTreeMap<(Option<String>, String), BTreeSet<String>>)> {
-    agreement.iter().filter(|(_, sources)| sources.len() > 1).collect()
+) -> Vec<(
+    &String,
+    &BTreeMap<(Option<String>, String), BTreeSet<String>>,
+)> {
+    agreement
+        .iter()
+        .filter(|(_, sources)| sources.len() > 1)
+        .collect()
 }
 
 /// Count packages observed in at least two configured repositories. Merely
@@ -871,7 +877,12 @@ fn cross_repo_coverage(agreement: &AgreementTable) -> usize {
     agreement
         .values()
         .filter(|sources| {
-            sources.values().flat_map(|repos| repos.iter()).collect::<BTreeSet<_>>().len() >= 2
+            sources
+                .values()
+                .flat_map(|repos| repos.iter())
+                .collect::<BTreeSet<_>>()
+                .len()
+                >= 2
         })
         .count()
 }
@@ -880,8 +891,10 @@ fn cross_repo_covered_repositories(agreement: &AgreementTable) -> BTreeSet<Strin
     agreement
         .values()
         .filter_map(|sources| {
-            let repos: BTreeSet<String> =
-                sources.values().flat_map(|group| group.iter().cloned()).collect();
+            let repos: BTreeSet<String> = sources
+                .values()
+                .flat_map(|group| group.iter().cloned())
+                .collect();
             (repos.len() >= 2).then_some(repos)
         })
         .flatten()
@@ -895,13 +908,10 @@ fn cross_repo_participation_issues(
     let covered = cross_repo_covered_repositories(agreement);
     per_repo
         .iter()
-        .filter(|(repo, resolutions)| {
-            !covered.contains(*repo)
-                && !resolutions.values().any(|resolution| resolution.comparison_exempt)
-        })
+        .filter(|(repo, _)| !covered.contains(*repo))
         .map(|(repo, _)| {
             format!(
-                "{repo}: zero cross-repo contribution; no sibling package from this existing repository is compared with another configured repository or retained as an audited frozen baseline"
+                "{repo}: zero cross-repo contribution; no sibling package from this existing repository is compared with another configured repository"
             )
         })
         .collect()
@@ -1023,8 +1033,11 @@ fn dispatch(cli: &Cli) -> Result<i32, String> {
                     for ((source, version), repos) in *sources {
                         let mut repos_sorted: Vec<&String> = repos.iter().collect();
                         repos_sorted.sort();
-                        let repos_joined =
-                            repos_sorted.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
+                        let repos_joined = repos_sorted
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
                         eprintln!(
                             "    [{repos_joined}] version={version} source={}",
                             fmt_source(source)
@@ -1034,21 +1047,28 @@ fn dispatch(cli: &Cli) -> Result<i32, String> {
                 eprintln!();
             }
             eprintln!(
-                "Every non-exempt sibling package must resolve to one (source, version) pair across all configured sibling repos."
+                "Every sibling package must resolve to one (source, version) pair across all configured sibling repos."
             );
             eprintln!(
-                "Bump the rev / patch / path entry in every moving workspace at once; only the two exact, audited AY cycle-break baselines are comparison-exempt. See docs/mcc-2026/qualification-1/analysis.md."
+                "Bump the rev / patch / path entry in every moving workspace at once. See docs/mcc-2026/qualification-1/analysis.md."
             );
         }
     }
 
-    if clean { Ok(0) } else { Ok(1) }
+    if clean {
+        Ok(0)
+    } else {
+        Ok(1)
+    }
 }
 
 fn emit_json(
     per_repo: &BTreeMap<String, BTreeMap<String, Resolution>>,
     agreement: &AgreementTable,
-    drift: &[(&String, &BTreeMap<(Option<String>, String), BTreeSet<String>>)],
+    drift: &[(
+        &String,
+        &BTreeMap<(Option<String>, String), BTreeSet<String>>,
+    )],
     warnings: &[String],
     issues: &[String],
     covered_pkg_count: usize,
@@ -1065,7 +1085,6 @@ fn emit_json(
                     "declared_source": res.declared_source,
                     "resolved_source": res.resolved_source,
                     "version": res.version,
-                    "comparison_exempt": res.comparison_exempt,
                 }),
             );
         }
@@ -1197,7 +1216,6 @@ mod tests {
             declared_source: source.map(str::to_string),
             resolved_source: source.map(str::to_string),
             version: version.to_string(),
-            comparison_exempt: false,
         }
     }
 
@@ -1257,50 +1275,44 @@ mod tests {
     }
 
     #[test]
-    fn only_documented_exact_ay_cycle_break_baselines_are_comparison_exempt() {
-        let ir_source =
-            format!("git+https://github.com/alabsystems/ay.git?rev={TRUST_IR_FROZEN_AY_REV}");
-        let cg_source =
-            format!("git+ssh://git@github.com/alabsystems/ay?rev={TRUST_CG_FROZEN_AY_REV}");
-        assert!(is_audited_frozen_baseline("trust-ir", "ay-core", &Some(ir_source.clone())));
-        assert!(is_audited_frozen_baseline("trust-cg", "ay-pb", &Some(cg_source)));
-        assert!(!is_audited_frozen_baseline("ty", "ay-core", &Some(ir_source.clone())));
-        assert!(!is_audited_frozen_baseline(
-            "trust-ir",
-            "ay-core",
-            &Some(format!(
-                "git+https://github.com/alabsystems/ay.git?rev={TRUST_CG_FROZEN_AY_REV}"
-            ))
-        ));
-        assert!(!is_audited_frozen_baseline("trust-ir", "trust-ir", &Some(ir_source)));
-    }
-
-    #[test]
-    fn documented_frozen_baseline_is_retained_but_not_compared_to_moving_main() {
-        let frozen_source =
-            format!("git+https://github.com/alabsystems/ay.git?rev={TRUST_IR_FROZEN_AY_REV}");
-        let moving_source = "git+https://github.com/alabsystems/ay.git?rev=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let mut frozen = syn("trust-ir", Some(&frozen_source), "0.11.0");
-        frozen.comparison_exempt =
-            is_audited_frozen_baseline("trust-ir", "ay-core", &frozen.source);
+    fn every_ay_authority_participates_in_cross_repo_agreement() {
+        let old_source =
+            "git+https://github.com/alabsystems/ay.git?rev=1111111111111111111111111111111111111111";
+        let active_source =
+            "git+https://github.com/alabsystems/ay.git?rev=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let per_repo = BTreeMap::from([
-            ("trust-ir".to_string(), BTreeMap::from([("ay-core".to_string(), frozen)])),
+            (
+                "trust-ir".to_string(),
+                BTreeMap::from([(
+                    "ay-core".to_string(),
+                    syn("trust-ir", Some(old_source), "0.2.0"),
+                )]),
+            ),
             (
                 "ty".to_string(),
-                BTreeMap::from([("ay-core".to_string(), syn("ty", Some(moving_source), "0.11.0"))]),
+                BTreeMap::from([(
+                    "ay-core".to_string(),
+                    syn("ty", Some(active_source), "0.2.0"),
+                )]),
             ),
         ]);
-        assert!(find_drift(&build_agreement(&per_repo)).is_empty());
-        assert!(per_repo["trust-ir"]["ay-core"].comparison_exempt);
+        let agreement = build_agreement(&per_repo);
+        let drift = find_drift(&agreement);
+        assert_eq!(drift.len(), 1);
+        assert_eq!(drift[0].0.as_str(), "ay-core");
     }
 
     #[test]
     fn cargo_home_mirroring_omits_configuration_but_keeps_caches() {
         assert!(!cargo_home_entry_is_safe_to_mirror(OsStr::new("config")));
-        assert!(!cargo_home_entry_is_safe_to_mirror(OsStr::new("config.toml")));
+        assert!(!cargo_home_entry_is_safe_to_mirror(OsStr::new(
+            "config.toml"
+        )));
         assert!(cargo_home_entry_is_safe_to_mirror(OsStr::new("registry")));
         assert!(cargo_home_entry_is_safe_to_mirror(OsStr::new("git")));
-        assert!(cargo_home_entry_is_safe_to_mirror(OsStr::new("credentials.toml")));
+        assert!(cargo_home_entry_is_safe_to_mirror(OsStr::new(
+            "credentials.toml"
+        )));
     }
 
     #[test]
@@ -1336,33 +1348,6 @@ mod tests {
         let issues = cross_repo_participation_issues(&per_repo, &agreement);
         assert_eq!(issues.len(), 1);
         assert!(issues[0].starts_with("repo-c:"));
-    }
-
-    #[test]
-    fn audited_frozen_baseline_is_non_vacuous_repository_evidence() {
-        let frozen_source =
-            format!("git+https://github.com/alabsystems/ay.git?rev={TRUST_IR_FROZEN_AY_REV}");
-        let mut frozen = syn("trust-ir", Some(&frozen_source), "0.11.0");
-        frozen.comparison_exempt =
-            is_audited_frozen_baseline("trust-ir", "ay-core", &frozen.source);
-        let moving_source =
-            Some("git+https://example.invalid/shared?rev=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        let per_repo = BTreeMap::from([
-            (
-                "repo-a".to_string(),
-                BTreeMap::from([("shared".to_string(), syn("repo-a", moving_source, "0.1.0"))]),
-            ),
-            (
-                "repo-b".to_string(),
-                BTreeMap::from([("shared".to_string(), syn("repo-b", moving_source, "0.1.0"))]),
-            ),
-            (
-                "trust-ir".to_string(),
-                BTreeMap::from([("ay-core".to_string(), frozen)]),
-            ),
-        ]);
-        let agreement = build_agreement(&per_repo);
-        assert!(cross_repo_participation_issues(&per_repo, &agreement).is_empty());
     }
 
     #[test]
@@ -1526,8 +1511,7 @@ mod tests {
     #[test]
     fn unrelated_external_package_is_a_traversal_boundary() {
         let rev = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let active =
-            format!("git+https://example.invalid/sibling.git?rev={rev}#{rev}");
+        let active = format!("git+https://example.invalid/sibling.git?rev={rev}#{rev}");
         let metadata = transitive_dependency_metadata_fixture(&active);
         let collected = parse_metadata(
             "repo",
@@ -1555,7 +1539,10 @@ mod tests {
         let metadata = dependency_metadata_fixture(Some(&declared), None, false);
         let siblings = BTreeSet::from(["dummy-sibling".to_string()]);
         let collected = parse_metadata("repo", &metadata, &siblings).unwrap();
-        assert!(collected.issues.iter().any(|issue| issue.contains("without checkout authority")));
+        assert!(collected
+            .issues
+            .iter()
+            .any(|issue| issue.contains("without checkout authority")));
         assert_eq!(
             collected.resolutions["dummy-sibling"].source.as_deref(),
             Some(declared.as_str())
@@ -1563,8 +1550,12 @@ mod tests {
     }
 
     fn git(checkout: &Path, args: &[&str]) -> String {
-        let output =
-            Command::new("git").arg("-C").arg(checkout).args(args).output().expect("spawn git");
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(checkout)
+            .args(args)
+            .output()
+            .expect("spawn git");
         assert!(
             output.status.success(),
             "git {} failed: {}",
@@ -1589,9 +1580,16 @@ mod tests {
             "[package]\nname='dummy-child'\nversion='0.1.0'\nedition='2021'\n",
         )
         .unwrap();
-        fs::write(checkout.path().join("child/src/lib.rs"), "pub fn child() {}\n").unwrap();
+        fs::write(
+            checkout.path().join("child/src/lib.rs"),
+            "pub fn child() {}\n",
+        )
+        .unwrap();
         git(checkout.path(), &["init", "--quiet"]);
-        git(checkout.path(), &["config", "user.email", "guard@example.invalid"]);
+        git(
+            checkout.path(),
+            &["config", "user.email", "guard@example.invalid"],
+        );
         git(checkout.path(), &["config", "user.name", "Drift Guard"]);
         git(checkout.path(), &["add", "."]);
         git(checkout.path(), &["commit", "--quiet", "-m", "fixture"]);
@@ -1624,8 +1622,10 @@ mod tests {
     fn metadata_with_transitive_checkout(declared_source: &str, checkout: &Path) -> Value {
         let member_id = "path+file:///fixture/app#0.1.0";
         let root_id = format!("path+file://{}#dummy-sibling@0.1.0", checkout.display());
-        let child_id =
-            format!("path+file://{}#dummy-child@0.1.0", checkout.join("child").display());
+        let child_id = format!(
+            "path+file://{}#dummy-child@0.1.0",
+            checkout.join("child").display()
+        );
         serde_json::json!({
             "packages": [
                 {
@@ -1674,10 +1674,17 @@ mod tests {
         let head = git(checkout.path(), &["rev-parse", "HEAD"]);
         let declared = format!("git+{upstream}?rev={head}");
         let metadata = metadata_with_target_checkout(&declared, checkout.path());
-        let collected =
-            parse_metadata("repo", &metadata, &BTreeSet::from(["dummy-sibling".to_string()]))
-                .unwrap();
-        assert!(collected.issues.is_empty(), "unexpected issues: {:?}", collected.issues);
+        let collected = parse_metadata(
+            "repo",
+            &metadata,
+            &BTreeSet::from(["dummy-sibling".to_string()]),
+        )
+        .unwrap();
+        assert!(
+            collected.issues.is_empty(),
+            "unexpected issues: {:?}",
+            collected.issues
+        );
     }
 
     #[test]
@@ -1693,18 +1700,23 @@ mod tests {
             &BTreeSet::from(["dummy-sibling".to_string(), "dummy-child".to_string()]),
         )
         .unwrap();
-        assert!(collected.issues.is_empty(), "unexpected issues: {:?}", collected.issues);
+        assert!(
+            collected.issues.is_empty(),
+            "unexpected issues: {:?}",
+            collected.issues
+        );
         assert_eq!(
             collected.resolutions["dummy-sibling"].source.as_deref(),
             Some(declared.as_str())
         );
-        assert_eq!(collected.resolutions["dummy-child"].source.as_deref(), Some(declared.as_str()));
-        assert!(
-            collected.resolutions["dummy-child"]
-                .resolved_source
-                .as_deref()
-                .is_some_and(|source| source.starts_with("path+file://"))
+        assert_eq!(
+            collected.resolutions["dummy-child"].source.as_deref(),
+            Some(declared.as_str())
         );
+        assert!(collected.resolutions["dummy-child"]
+            .resolved_source
+            .as_deref()
+            .is_some_and(|source| source.starts_with("path+file://")));
     }
 
     #[test]
@@ -1713,7 +1725,11 @@ mod tests {
         let checkout = initialized_git_sibling(upstream);
         let head = git(checkout.path(), &["rev-parse", "HEAD"]);
         let declared = format!("git+{upstream}?rev={head}");
-        fs::write(checkout.path().join("child/src/lib.rs"), "pub fn dirty() {}\n").unwrap();
+        fs::write(
+            checkout.path().join("child/src/lib.rs"),
+            "pub fn dirty() {}\n",
+        )
+        .unwrap();
         let metadata = metadata_with_transitive_checkout(&declared, checkout.path());
         let collected = parse_metadata(
             "repo",
@@ -1721,7 +1737,10 @@ mod tests {
             &BTreeSet::from(["dummy-sibling".to_string(), "dummy-child".to_string()]),
         )
         .unwrap();
-        assert!(collected.issues.iter().any(|issue| issue.contains("is dirty")));
+        assert!(collected
+            .issues
+            .iter()
+            .any(|issue| issue.contains("is dirty")));
         assert!(collected.issues.iter().any(|issue| {
             issue.contains("dummy-child") && issue.contains("external path is not proof authority")
         }));
@@ -1731,12 +1750,21 @@ mod tests {
     fn exact_path_patch_rejects_wrong_head() {
         let upstream = "https://example.invalid/sibling.git";
         let checkout = initialized_git_sibling(upstream);
-        let declared = format!("git+{upstream}?rev={}", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let declared = format!(
+            "git+{upstream}?rev={}",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
         let metadata = metadata_with_target_checkout(&declared, checkout.path());
-        let collected =
-            parse_metadata("repo", &metadata, &BTreeSet::from(["dummy-sibling".to_string()]))
-                .unwrap();
-        assert!(collected.issues.iter().any(|issue| issue.contains("has HEAD")));
+        let collected = parse_metadata(
+            "repo",
+            &metadata,
+            &BTreeSet::from(["dummy-sibling".to_string()]),
+        )
+        .unwrap();
+        assert!(collected
+            .issues
+            .iter()
+            .any(|issue| issue.contains("has HEAD")));
     }
 
     #[test]
@@ -1747,10 +1775,16 @@ mod tests {
         fs::write(checkout.path().join("src/lib.rs"), "pub fn changed() {}\n").unwrap();
         let declared = format!("git+{upstream}?rev={head}");
         let metadata = metadata_with_target_checkout(&declared, checkout.path());
-        let collected =
-            parse_metadata("repo", &metadata, &BTreeSet::from(["dummy-sibling".to_string()]))
-                .unwrap();
-        assert!(collected.issues.iter().any(|issue| issue.contains("is dirty")));
+        let collected = parse_metadata(
+            "repo",
+            &metadata,
+            &BTreeSet::from(["dummy-sibling".to_string()]),
+        )
+        .unwrap();
+        assert!(collected
+            .issues
+            .iter()
+            .any(|issue| issue.contains("is dirty")));
     }
 
     #[test]
@@ -1759,10 +1793,16 @@ mod tests {
         let head = git(checkout.path(), &["rev-parse", "HEAD"]);
         let declared = format!("git+https://example.invalid/sibling.git?rev={head}");
         let metadata = metadata_with_target_checkout(&declared, checkout.path());
-        let collected =
-            parse_metadata("repo", &metadata, &BTreeSet::from(["dummy-sibling".to_string()]))
-                .unwrap();
-        assert!(collected.issues.iter().any(|issue| issue.contains("no Git remote matching")));
+        let collected = parse_metadata(
+            "repo",
+            &metadata,
+            &BTreeSet::from(["dummy-sibling".to_string()]),
+        )
+        .unwrap();
+        assert!(collected
+            .issues
+            .iter()
+            .any(|issue| issue.contains("no Git remote matching")));
     }
 
     #[test]
@@ -1771,13 +1811,14 @@ mod tests {
         let metadata = dependency_metadata_fixture(Some(declared), None, false);
         let siblings = BTreeSet::from(["dummy-sibling".to_string()]);
         let collected = parse_metadata("repo", &metadata, &siblings).unwrap();
-        assert!(collected.issues.iter().any(|issue| issue.contains("mutable Git identity")));
-        assert!(
-            collected
-                .issues
-                .iter()
-                .any(|issue| issue.contains("external path is not proof authority"))
-        );
+        assert!(collected
+            .issues
+            .iter()
+            .any(|issue| issue.contains("mutable Git identity")));
+        assert!(collected
+            .issues
+            .iter()
+            .any(|issue| issue.contains("external path is not proof authority")));
     }
 
     #[test]
@@ -1786,13 +1827,14 @@ mod tests {
         let metadata = dependency_metadata_fixture(Some(declared), None, false);
         let siblings = BTreeSet::from(["dummy-sibling".to_string()]);
         let collected = parse_metadata("repo", &metadata, &siblings).unwrap();
-        assert!(collected.issues.iter().any(|issue| issue.contains("mutable Git identity")));
-        assert!(
-            collected
-                .issues
-                .iter()
-                .any(|issue| issue.contains("external path is not proof authority"))
-        );
+        assert!(collected
+            .issues
+            .iter()
+            .any(|issue| issue.contains("mutable Git identity")));
+        assert!(collected
+            .issues
+            .iter()
+            .any(|issue| issue.contains("external path is not proof authority")));
     }
 
     #[test]
@@ -1826,9 +1868,12 @@ mod tests {
     #[test]
     fn distinct_external_paths_do_not_collapse_to_one_identity() {
         let siblings = BTreeSet::from(["dummy-sibling".to_string()]);
-        let a =
-            parse_metadata("repo-a", &dependency_metadata_fixture(None, None, false), &siblings)
-                .unwrap();
+        let a = parse_metadata(
+            "repo-a",
+            &dependency_metadata_fixture(None, None, false),
+            &siblings,
+        )
+        .unwrap();
         let mut b_metadata = dependency_metadata_fixture(None, None, false);
         let old_id = "path+file:///fixture/dummy-sibling#0.1.0";
         let new_id = "path+file:///other/dummy-sibling#0.1.0";
@@ -1949,9 +1994,10 @@ mod tests {
         let collected = parse_metadata("repo", &metadata, &siblings).unwrap();
         assert!(collected.resolutions.contains_key("bridge"));
         assert!(collected.resolutions.contains_key("dummy-sibling"));
-        assert!(
-            collected.issues.iter().any(|issue| issue.contains("conflicting external resolutions"))
-        );
+        assert!(collected
+            .issues
+            .iter()
+            .any(|issue| issue.contains("conflicting external resolutions")));
     }
 
     #[test]
@@ -2041,8 +2087,11 @@ mod tests {
     fn metadata_spawn_failure_is_not_a_skip() {
         let tmp = tempfile::tempdir().unwrap();
         let manifest = tmp.path().join("Cargo.toml");
-        fs::write(&manifest, "[package]\nname='spawn-fixture'\nversion='0.1.0'\nedition='2021'\n")
-            .unwrap();
+        fs::write(
+            &manifest,
+            "[package]\nname='spawn-fixture'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
         let error = collect_resolutions_with_cargo(
             OsStr::new("/definitely/missing/cargo"),
             "spawn-fixture",
@@ -2108,7 +2157,10 @@ mod tests {
     #[test]
     fn relative_manifest_is_absolutized_and_metadata_keeps_lock_immutable() {
         let cwd = std::env::current_dir().unwrap();
-        let tmp = tempfile::Builder::new().prefix("drift-relative-").tempdir_in(&cwd).unwrap();
+        let tmp = tempfile::Builder::new()
+            .prefix("drift-relative-")
+            .tempdir_in(&cwd)
+            .unwrap();
         let repo = tmp.path().join("repo");
         fs::create_dir_all(repo.join("src")).unwrap();
         fs::write(
@@ -2197,17 +2249,18 @@ mod tests {
             let collected = collect_resolutions(repo, &manifest, &siblings)
                 .expect("metadata succeeds")
                 .expect("dir exists");
-            assert!(
-                collected
-                    .issues
-                    .iter()
-                    .any(|issue| issue.contains("external path is not proof authority"))
-            );
+            assert!(collected
+                .issues
+                .iter()
+                .any(|issue| issue.contains("external path is not proof authority")));
             per_repo.insert(repo.to_string(), collected.resolutions);
         }
         let agreement = build_agreement(&per_repo);
         let drift = find_drift(&agreement);
-        assert!(drift.is_empty(), "equal path identities should compare equally: {drift:?}");
+        assert!(
+            drift.is_empty(),
+            "equal path identities should compare equally: {drift:?}"
+        );
     }
 
     #[test]
@@ -2242,16 +2295,17 @@ mod tests {
         let siblings = BTreeSet::from(["dummy-sibling".to_string()]);
         let mut per_repo = BTreeMap::new();
         for repo_name in ["repoA", "repoB"] {
-            let collected =
-                collect_resolutions(repo_name, &root.join(repo_name).join("Cargo.toml"), &siblings)
-                    .unwrap()
-                    .unwrap();
-            assert!(
-                collected
-                    .issues
-                    .iter()
-                    .any(|issue| issue.contains("external path is not proof authority"))
-            );
+            let collected = collect_resolutions(
+                repo_name,
+                &root.join(repo_name).join("Cargo.toml"),
+                &siblings,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(collected
+                .issues
+                .iter()
+                .any(|issue| issue.contains("external path is not proof authority")));
             assert!(collected.resolutions.contains_key("dummy-sibling"));
             per_repo.insert(repo_name.to_string(), collected.resolutions);
         }
@@ -2311,12 +2365,10 @@ mod tests {
             let collected = collect_resolutions(repo, &manifest, &siblings)
                 .expect("metadata succeeds")
                 .expect("dir exists");
-            assert!(
-                collected
-                    .issues
-                    .iter()
-                    .any(|issue| issue.contains("external path is not proof authority"))
-            );
+            assert!(collected
+                .issues
+                .iter()
+                .any(|issue| issue.contains("external path is not proof authority")));
             per_repo.insert(repo.to_string(), collected.resolutions);
         }
         let agreement = build_agreement(&per_repo);
@@ -2329,7 +2381,10 @@ mod tests {
     #[test]
     fn fmt_source_renders_none_as_path() {
         assert_eq!(fmt_source(&None), "<path>");
-        assert_eq!(fmt_source(&Some("git+ssh://x#y".to_string())), "git+ssh://x#y");
+        assert_eq!(
+            fmt_source(&Some("git+ssh://x#y".to_string())),
+            "git+ssh://x#y"
+        );
     }
 
     /// Every DEFAULT_SIBLINGS entry must name a real package in at least

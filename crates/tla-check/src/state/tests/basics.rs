@@ -4,7 +4,6 @@
 
 use super::*;
 use tla_value::Rp;
-use std::sync::Arc;
 
 #[cfg_attr(test, ntest::timeout(10000))]
 #[test]
@@ -136,13 +135,11 @@ fn test_fingerprint_func_tuple_seq_intfunc_equivalence() {
         Value::Bool(true),
     ];
 
-    let func = Value::Func(Rp::new(crate::value::FuncValue::from_sorted_entries(
-        vec![
-            (Value::SmallInt(1), elems[0].clone()),
-            (Value::SmallInt(2), elems[1].clone()),
-            (Value::SmallInt(3), elems[2].clone()),
-        ],
-    )));
+    let func = Value::Func(Rp::new(crate::value::FuncValue::from_sorted_entries(vec![
+        (Value::SmallInt(1), elems[0].clone()),
+        (Value::SmallInt(2), elems[1].clone()),
+        (Value::SmallInt(3), elems[2].clone()),
+    ])));
     let tuple = Value::Tuple(elems.clone().into());
     let seq = Value::Seq(Rp::new(crate::value::SeqValue::from(elems.clone())));
     let intfunc = Value::IntFunc(Rp::new(crate::value::IntIntervalFunc::new(1, 3, elems)));
@@ -165,12 +162,10 @@ fn test_fingerprint_func_shifted_intfunc_equivalence() {
         Value::String(Rp::from("right")),
     ];
 
-    let func = Value::Func(Rp::new(crate::value::FuncValue::from_sorted_entries(
-        vec![
-            (Value::SmallInt(2), vals[0].clone()),
-            (Value::SmallInt(3), vals[1].clone()),
-        ],
-    )));
+    let func = Value::Func(Rp::new(crate::value::FuncValue::from_sorted_entries(vec![
+        (Value::SmallInt(2), vals[0].clone()),
+        (Value::SmallInt(3), vals[1].clone()),
+    ])));
     let intfunc = Value::IntFunc(Rp::new(crate::value::IntIntervalFunc::new(2, 3, vals)));
 
     let func_state = State::from_pairs([("x", func)]);
@@ -182,15 +177,10 @@ fn test_fingerprint_func_shifted_intfunc_equivalence() {
 #[cfg_attr(test, ntest::timeout(10000))]
 #[test]
 fn test_fingerprint_func_record_equivalence() {
-    let func = Value::Func(Rp::new(crate::value::FuncValue::from_sorted_entries(
-        vec![
-            (Value::String(Rp::from("a")), Value::SmallInt(1)),
-            (
-                Value::String(Rp::from("b")),
-                Value::String(Rp::from("tok")),
-            ),
-        ],
-    )));
+    let func = Value::Func(Rp::new(crate::value::FuncValue::from_sorted_entries(vec![
+        (Value::String(Rp::from("a")), Value::SmallInt(1)),
+        (Value::String(Rp::from("b")), Value::String(Rp::from("tok"))),
+    ])));
     let record = Value::record([
         ("a", Value::SmallInt(1)),
         ("b", Value::String(Rp::from("tok"))),

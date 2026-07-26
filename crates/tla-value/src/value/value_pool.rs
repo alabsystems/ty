@@ -12,9 +12,9 @@
 //! Part of #3980: Value interning -- reduce clone/drop overhead for common values.
 
 use super::{SeqValue, SortedSet, Value};
-use std::sync::{OnceLock};
 use crate::rp::Rp as Arc;
 use crate::rp::Rp;
+use std::sync::OnceLock;
 
 // ============================================================================
 // Static singletons

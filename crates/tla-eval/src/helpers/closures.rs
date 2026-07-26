@@ -8,7 +8,6 @@
 //! Extracted from `apply.rs` to keep files under 500 LOC.
 
 use super::super::{EvalCtx, EvalError, EvalResult, StateEnvRef};
-use tla_value::Rp;
 use super::restore_captured_binding_chain;
 use crate::value::{ClosureValue, LazyDomain, LazyFuncCaptures, LazyFuncValue, Value};
 use std::rc::Rc;
@@ -16,6 +15,7 @@ use std::sync::Arc;
 use tla_core::ast::{BoundVar, Expr};
 use tla_core::name_intern::intern_name;
 use tla_core::{Span, Spanned};
+use tla_value::Rp;
 
 /// Create a closure from an argument expression for a higher-order parameter
 pub(crate) fn create_closure_from_arg(

@@ -2,6 +2,24 @@
 
 How to set up and run reproducible benchmark evaluations.
 
+## Current strict-superiority status
+
+Corpus-wide strict superiority over TLC in both runtime and memory is **not
+established**. The current result is unknown after the July 21–23 engine
+changes. The definition of done, current evidence, and ordered blockers are
+tracked in the internal TY-vs-TLC strict-superiority burndown, which is not
+part of this snapshot; the remaining measurement blockers are summarized
+below.
+
+The broad matrix refresh currently collects runtime evidence, not a complete
+both-axis scorecard. Targeted `supremacy compare` now provides repeated paired
+runs and can collect peak RSS, but complete-process-tree memory is still a
+separate blocker. Its performance defaults require TLC/TY runtime speedup
+`> 1.05` and TY/TLC peak-RSS ratio `< 0.95`. Protected launch and enforced
+matrix collection pin native compilation to one job, but neither tool is yet
+confined with OS-level CPU affinity. These remaining gaps are measurement
+blockers, not proof of a current loss or win.
+
 ## Quick Start
 
 ```bash
@@ -13,7 +31,7 @@ CARGO_TARGET_DIR=target/user CARGO_NET_GIT_FETCH_WITH_CLI=true \
     --bins
 TY=target/user/release/ty
 
-# Run the full batchable all-runnable matrix refresh/audit from the binary.
+# Run the full batchable all-runnable runtime refresh/audit from the binary.
 OUT=reports/perf/$(date -u +%Y%m%dT%H%M%SZ)-supremacy-matrix-runtime-full
 "$TY" supremacy matrix-full-suite \
   --baseline tests/tlc_comparison/spec_baseline.json \
@@ -66,8 +84,10 @@ For supremacy evidence:
   `summary.md`, and per-run command/stdout/stderr artifacts.
 - `ty supremacy compare` is the Rust TLC-vs-TY parity/speed/peak-memory gate for
   targeted baseline or explicit spec comparisons. It replaces Python perf-gate
-  scripts for comparison evidence, writes `compare.json` and `compare.md`, and
-  is not final launch evidence.
+  scripts for comparison evidence and writes `compare.json` and `compare.md`.
+  Enforced performance comparisons use an even count of at least six paired
+  repetitions; this remains targeted rather than broad or final launch
+  evidence.
 - `ty supremacy gate --summary-json <summary.json>` evaluates an existing
   benchmark summary or `ty.supremacy.matrix_summary.v1` artifact with the
   Rust policy-verdict engine and writes `policy_verdict.json` plus
@@ -76,11 +96,12 @@ For supremacy evidence:
   path, then feeds the produced `summary.json` into the Rust verdict engine.
 - `ty supremacy matrix` classifies every row in
   `tests/tlc_comparison/spec_baseline.json` against candidate all-runnable speed
-  requirements. It is matrix evidence only; it does not establish an all-test or
-  total supremacy result.
+  requirements. It is runtime matrix evidence only; it does not establish an
+  all-test or total runtime-and-memory supremacy result.
 - `ty supremacy matrix-full-suite` is the Rust convenience entrypoint for the
   full batchable all-runnable matrix refresh/audit. It is broader corpus
-  evidence than the launch-corpus gate, but it is not launch acceptance evidence.
+  runtime evidence than the launch-corpus gate, but it is not launch acceptance
+  or a both-axis result.
 
 The executable Rust evidence commands are the Rust CLI commands above, but only
 `ty supremacy gate --mode enforce --gate-mode full-native-fused` is the final
@@ -110,9 +131,16 @@ Fairness controls for TLC-vs-TY timing evidence:
   controls cannot be audited from the Rust artifacts. Use the Java TLC jar path
   for enforced speed evidence; wrapper-based TLC runs remain diagnostics.
 - Enforced speed evidence is single-thread evidence: `compare` requires
-  `--workers 1` and rejects TY-only `--ty-flag` values, while the final launch
-  gate rejects ad hoc `--ty-flag`, `--interp-env`, and non-policy
-  `--trust_cg-env` overrides during collection.
+  `--workers 1`, an even `--runs >= 6`, and rejects TY-only `--ty-flag` values.
+  Odd pairs launch TLC then TY; even pairs launch TY then TLC, giving both
+  orders equal representation, with each pair in a distinct `run-NNN` artifact
+  directory. The v2 report keeps every raw
+  observation and launch order. Performance is gated on the median of the
+  within-pair TLC/TY runtime ratios and TY/TLC peak-RSS ratios, never a ratio of
+  independently aggregated samples. Missing metrics or TY engine provenance,
+  any pair-level parity failure, or cross-pair verdict/count/engine-tier drift
+  fail closed. The final launch gate rejects ad hoc `--ty-flag`, `--interp-env`,
+  and non-policy `--trust_cg-env` overrides during collection.
 
 The remaining launch-adjacent product guard for silent eval-error coercion is
 also owned by the Rust CLI: run `ty canary-gate --kind silent-error --mode
@@ -153,16 +181,18 @@ OUT=reports/perf/supremacy-matrix-runtime-full
   --format json \
   --runtime-output-dir "$OUT"
 
-# Targeted TLC-vs-TY efficiency gate replacement; not final launch evidence.
+# Targeted TLC-vs-TY paired strict-margin gate. It rejects equality and records
+# alternating launch order, but is not final launch evidence.
 OUT=reports/$(date -u +%Y%m%dT%H%M%SZ)-supremacy-compare
 "$TY" supremacy compare \
   --baseline tests/tlc_comparison/spec_baseline.json \
   --spec <SpecName> \
   --backend trust-cg \
   --workers 1 \
+  --runs 6 \
   --policy parity-and-speed-and-memory \
-  --min-speedup 1.0 \
-  --max-memory-ratio 1.0 \
+  --min-speedup 1.05 \
+  --max-memory-ratio 0.95 \
   --mode enforce \
   --output-dir "$OUT"
 
@@ -281,14 +311,16 @@ and `MCLamportMutex`.
 
 A passing three-spec `full-native-fused` gate is launch evidence for the current
 native-fused hot path. It is not a total or all-test supremacy claim, and this
-document does not claim that all-runnable matrix enforcement currently passes. A
-future total supremacy claim is tracked by the Rust matrix: each eligible row
-must be non-blocking. Pass rows need verified TLC/TY parity, finite positive
-TLC/TY runtimes, and faster TY runtime. Expected-violation rows need
-verified matching violation evidence. They do not need finite runtime evidence,
-because known-invalid specs are correctness evidence rather than performance
-evidence. Policy-comparable rows must satisfy the explicit `runtime_to_error` or
-`timeout_dominance` rules.
+document does not claim that all-runnable matrix enforcement currently passes.
+A future broad strict claim is tracked by the internal strict-superiority
+burndown (not part of this snapshot),
+not by the runtime-only matrix alone. Every eligible row must have verified
+TLC/TY parity, equivalent work where applicable, finite repeated measurements,
+strictly faster TY runtime, and strictly lower complete-process-tree peak RSS.
+Expected-violation rows remain correctness evidence until an equivalent-work
+performance rule is declared. Policy-comparable rows must satisfy the explicit
+`runtime_to_error` or `timeout_dominance` rules, but neither rule converts a
+missing both-axis measurement into a strict win.
 
 The broader execution model was described in the supremacy-execution-model
 design doc, which has since been removed from the repo (the `designs/` tree
@@ -731,7 +763,7 @@ wall-clock medians. The `full-native-fused` launch-corpus gate also recomputes
 speedup to be greater than `1.0`; this prevents launch evidence where trust-cg
 wins only through accounting artifacts while the compiled single-thread loop is
 slower than TLC. The protected `full_native_fused` env pins
-`TY_TRUST_CG_NATIVE_CALLOUT_COMPILE_JOBS=27`, enables native local dedup with
+`TY_TRUST_CG_NATIVE_CALLOUT_COMPILE_JOBS=1`, enables native local dedup with
 `TY_TRUST_CG_NATIVE_FUSED_ENABLE_LOCAL_DEDUP=1`, and disables artifact-cache
 reuse so recorded wall-clock evidence uses the policy-required native fused
 configuration. The stable native fused telemetry

@@ -5,7 +5,6 @@
 //! Control flow, constant, LET/CASE, and operator-call compilation helpers.
 
 use super::super::opcode::{BuiltinOp, Opcode, Register};
-use tla_value::Rp;
 use super::{CompileError, FnCompileState};
 use crate::nodes::{
     PreservedAstBody, StoredTirBody, TirBoolOp, TirCmpOp, TirExpr, TirNameKind, TirOperatorRef,
@@ -13,6 +12,7 @@ use crate::nodes::{
 use std::sync::Arc;
 use tla_core::ast::Expr;
 use tla_core::{free_vars, Span, Spanned};
+use tla_value::Rp;
 use tla_value::{ClosureValue, Value};
 
 /// Return the fixed builtin opcode/arity that takes precedence over a global

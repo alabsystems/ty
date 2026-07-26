@@ -64,6 +64,8 @@ pub use tla_eval::{
     // Binding types
     BindingChain,
     BindingValue,
+    // Guard types
+    EnumMark,
     // Core context types
     Env,
     EvalCtx,
@@ -71,8 +73,6 @@ pub use tla_eval::{
     OpEnv,
     SharedCtx,
     SparseStateEnvRef,
-    // Guard types
-    EnumMark,
     StackMark,
     TlcConfig,
     TlcRuntimeStats,

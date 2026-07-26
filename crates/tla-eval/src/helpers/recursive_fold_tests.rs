@@ -5,12 +5,12 @@
 //! Tests for RECURSIVE fold detection (Part of #2955).
 
 use super::*;
-use tla_value::Rp;
 use std::sync::Arc;
 use tla_core::ast::{BoundVar, OpParam, OperatorDef};
 use tla_core::kani_types::HashMap;
 use tla_core::name_intern::NameId;
 use tla_core::Spanned;
+use tla_value::Rp;
 use tla_value::{LazyDomain, LazyFuncCaptures, LazyFuncValue};
 
 fn spanned<T>(node: T) -> Spanned<T> {

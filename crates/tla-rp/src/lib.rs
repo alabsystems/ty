@@ -804,7 +804,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "flips the process-global Rp mode to non-atomic; unsound to run concurrently with other Value-using tests. Run isolated: --test-threads=1 --ignored"]
     fn lifecycle_single_threaded_mode() {
         let _lock = MODE_LOCK.lock().unwrap();
         let _mode = enter_single_threaded();
@@ -814,7 +813,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "flips the process-global Rp mode to non-atomic; unsound to run concurrently with other Value-using tests. Run isolated: --test-threads=1 --ignored"]
     fn mode_transition_midlife_is_sound() {
         let _lock = MODE_LOCK.lock().unwrap();
         // Allocate + clone in atomic mode.
@@ -903,7 +901,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "flips the process-global Rp mode to non-atomic; unsound to run concurrently with other Value-using tests. Run isolated: --test-threads=1 --ignored"]
     fn dst_single_threaded_mode() {
         let _lock = MODE_LOCK.lock().unwrap();
         let _mode = enter_single_threaded();

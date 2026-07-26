@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::test_support::parse_module;
+use crate::Config;
 
 fn parse_op_names(raw: &str) -> FxHashSet<String> {
     raw.split(',')
@@ -49,6 +50,40 @@ Next == x' = x
         !explicit_all.is_implicit_default_eval_mode(),
         "an explicit eval=all request must remain observable even though its selection shape matches the default",
     );
+}
+
+#[test]
+fn test_liveness_exact_raw_fp_fast_path_rejects_programmatic_explicit_tir_modes() {
+    let module = parse_module(
+        "\
+---- MODULE TirLivenessFastPathOrigin ----
+VARIABLE x
+Init == x = 0
+Next == x' = x
+Live == []<>(x = 0)
+====",
+    );
+    let config = Config {
+        init: Some("Init".to_string()),
+        next: Some("Next".to_string()),
+        properties: vec!["Live".to_string()],
+        ..Default::default()
+    };
+    let mut checker = ModelChecker::new(&module, &config);
+
+    checker.tir_parity = Some(TirParityState::test_eval_selected(
+        module.clone(),
+        Vec::new(),
+        ["Live"],
+    ));
+    assert!(!checker.liveness_exact_raw_fp_leaf_fast_path_allowed());
+
+    checker.tir_parity = Some(TirParityState::test_parity_selected(
+        module.clone(),
+        Vec::new(),
+        ["Live"],
+    ));
+    assert!(!checker.liveness_exact_raw_fp_leaf_fast_path_allowed());
 }
 
 #[test]

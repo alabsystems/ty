@@ -99,7 +99,7 @@ impl FuncValue {
         match self.dense_tag() {
             DenseTag::Dim1 => {
                 // domain == { SmallInt(lo .. lo+len-1) }; direct index = arg-lo.
-                let Value::SmallInt(lo) = self.domain[0] else {
+                let Value::SmallInt(lo) = self.domain.keys[0] else {
                     // Defensive: detection guarantees SmallInt; if not, fall back.
                     return self.apply_binary_search(arg);
                 };
@@ -108,7 +108,7 @@ impl FuncValue {
                 // matches the binary-search result exactly.
                 let n = arg.as_i64()?;
                 let d = n.checked_sub(lo)?;
-                if d >= 0 && (d as u64) < self.domain.len() as u64 {
+                if d >= 0 && (d as u64) < self.domain.keys.len() as u64 {
                     Some(self.get_value_at(d as usize))
                 } else {
                     None
@@ -136,6 +136,7 @@ impl FuncValue {
     #[inline]
     fn apply_binary_search(&self, arg: &Value) -> Option<&Value> {
         self.domain
+            .keys
             .binary_search_by(|k| k.cmp(arg))
             .ok()
             .map(|idx| self.get_value_at(idx))
@@ -154,16 +155,16 @@ impl FuncValue {
         if self.dense_tag() != DenseTag::Dim2 {
             return None;
         }
-        let len = self.domain.len();
+        let len = self.domain.keys.len();
         // domain[0] == <<lo1, lo2>>, domain[len-1] == <<hi1, hi2>> (guaranteed
         // by detection). Re-derive the bounds from the cache-hot endpoints.
-        let (lo1, lo2) = tuple2_ints(&self.domain[0])?;
-        let (hi1, hi2) = tuple2_ints(&self.domain[len - 1])?;
+        let (lo1, lo2) = tuple2_ints(&self.domain.keys[0])?;
+        let (hi1, hi2) = tuple2_ints(&self.domain.keys[len - 1])?;
         if a < lo1 || a > hi1 || b < lo2 || b > hi2 {
             return None;
         }
         let stride = hi2 - lo2 + 1; // > 0: hi2 >= lo2 in a nonempty cross-product
-        // (a-lo1)*stride + (b-lo2) is in [0, len) given the bounds above.
+                                    // (a-lo1)*stride + (b-lo2) is in [0, len) given the bounds above.
         let idx = (a - lo1) * stride + (b - lo2);
         Some(self.get_value_at(idx as usize))
     }
@@ -201,6 +202,7 @@ impl FuncValue {
             }
         }
         self.domain
+            .keys
             .binary_search_by(|k| {
                 super::super::cmp_helpers::cmp_tuple_elements_with_value(elems, k).reverse()
             })
@@ -208,15 +210,14 @@ impl FuncValue {
             .map(|idx| self.get_value_at(idx))
     }
 
-    /// Dense-domain shape (see [`DenseTag`]); a plain field set at construction.
+    /// Dense-domain shape (see [`DenseTag`]); shared with the immutable domain.
     #[inline]
     fn dense_tag(&self) -> DenseTag {
-        self.dense
+        self.domain.dense
     }
 
     /// Classify the (sorted, unique) domain as a dense integer interval, a dense
-    /// 2-D integer cross-product, or neither. Called once per `FuncValue` at
-    /// construction.
+    /// 2-D integer cross-product, or neither. Called once per domain descriptor.
     ///
     /// Detection is fail-closed and self-validating: a cheap O(1) endpoint
     /// pre-check rejects the common non-dense case, then the full canonical
@@ -298,7 +299,7 @@ impl FuncValue {
         crate::value::memory_stats::inc_func_except();
         crate::churn_stats::churn_count(crate::churn_stats::ChurnSite::FuncExcept);
 
-        match self.domain.binary_search_by(|k| k.cmp(&arg)) {
+        match self.domain.keys.binary_search_by(|k| k.cmp(&arg)) {
             Ok(idx) => self.except_existing(idx, value),
             Err(_) => {
                 // Key not in domain - return unchanged (TLA+ function semantics)
@@ -313,7 +314,7 @@ impl FuncValue {
     /// borrowed/shared function values for semantic no-ops.
     #[inline]
     pub fn would_except_change(&self, arg: &Value, new_val: &Value) -> bool {
-        match self.domain.binary_search_by(|k| k.cmp(arg)) {
+        match self.domain.keys.binary_search_by(|k| k.cmp(arg)) {
             Ok(idx) => *self.get_value_at(idx) != *new_val,
             Err(_) => false,
         }

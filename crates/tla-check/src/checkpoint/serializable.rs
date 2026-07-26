@@ -9,12 +9,11 @@
 //! variable–value pairs.
 
 use crate::state::State;
-use tla_value::Rp;
 use crate::value::{intern_string, IntIntervalFunc, RecordValue, SortedSet, Value};
 use num_bigint::BigInt;
 use serde::{Deserialize, Serialize};
 use std::io;
-use std::sync::Arc;
+use tla_value::Rp;
 
 /// Serializable value representation for JSON export
 #[derive(Debug, Clone, Serialize, Deserialize)]

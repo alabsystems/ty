@@ -221,7 +221,7 @@ if [ -n "${BK_BIN_PATH:-}" ]; then
     export PATH
 fi
 
-: "${TY_MCC_PACKAGED_AY_REV:=0adeaab4d66b1414a95ab5cee4ec64078c9dbd97}"
+: "${TY_MCC_PACKAGED_AY_REV:=035e84f25ffe983f4c1a0d8f2cb1d5f945d3bdee}"
 : "${TY_MCC_BACKEND_EVIDENCE_REQUIRED_CHECKS:=mcc_ay_symbolic_execution native_jit_fail_closed_gate trust_ir_transport_identity trust_cg_native_admission ay_solve_decision_profile hardware_proof_replay_boundary hardware_replay_decision trust_cg_compile_artifact_cache_telemetry trust_cg_host_jit_pgo_provenance trust_cg_call_packet_contract_descriptor portfolio_route ay_solver_capability_descriptor ay_symbolic_execution_contract_manifest trust_ir_native_evidence_artifact_resolution trust_ir_native_semantic_bridge_proof_identity petri_trust_mc_model_acceptance}"
 export TY_MCC_PACKAGED_AY_REV
 export TY_MCC_BACKEND_EVIDENCE_REQUIRED_CHECKS

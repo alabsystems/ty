@@ -21,6 +21,7 @@
 //! Part of #3986.
 
 use std::sync::Arc;
+#[cfg(test)]
 use tla_value::Rp;
 
 use crate::var_index::VarRegistry;
@@ -622,7 +623,9 @@ impl SequenceBoundEvidence {
             SequenceBoundEvidence::HeuristicUniverseCapacity { .. } => {
                 seq_heuristic_capacity_enabled()
             }
-            SequenceBoundEvidence::Observed | SequenceBoundEvidence::ProvenInvariant { .. } => false,
+            SequenceBoundEvidence::Observed | SequenceBoundEvidence::ProvenInvariant { .. } => {
+                false
+            }
         }
     }
 }
@@ -1230,7 +1233,9 @@ pub(crate) enum FlatValueLayout {
     /// canonical/injective, so the whole tuple encoding is injective.
     // kept for shape/proof parity
     #[cfg_attr(not(test), allow(dead_code))]
-    HeterogeneousTuple { element_layouts: Vec<FlatValueLayout> },
+    HeterogeneousTuple {
+        element_layouts: Vec<FlatValueLayout>,
+    },
     /// Sequence with a fixed capacity. Slot 0 stores the current length.
     Sequence {
         bound: SequenceBoundEvidence,
@@ -2182,10 +2187,9 @@ impl VarLayoutKind {
                 // this encoding with the gate off; keeping the admission-side
                 // check as well makes a directly-constructed layout fail closed
                 // too (byte-identical default surface).
-                TupleKeyedArrayRangeEncoding::TaggedScalarUnion(_) => {
-                    self.tuple_keyed_tagged_scalar_union_range_primary_proof()
-                        .is_some()
-                }
+                TupleKeyedArrayRangeEncoding::TaggedScalarUnion(_) => self
+                    .tuple_keyed_tagged_scalar_union_range_primary_proof()
+                    .is_some(),
                 // A homogeneous proven-finite model-value/string/bool range: the
                 // interned-`NameId` slot encoding is fixed-width, non-negative and
                 // injective over all strings/model-values, and the `TypeOK` proof
@@ -2773,9 +2777,9 @@ mod tests {
         let scalar_set_field_rec = crate::Value::Record(
             tla_value::value::RecordValue::from_sorted_str_entries(vec![(
                 Arc::from("payload"),
-                crate::Value::Set(Rp::new(tla_value::value::SortedSet::from_sorted_vec(
-                    vec![crate::Value::SmallInt(1)],
-                ))),
+                crate::Value::Set(Rp::new(tla_value::value::SortedSet::from_sorted_vec(vec![
+                    crate::Value::SmallInt(1),
+                ]))),
             )]),
         );
         let scalar_set_field = FlatValueLayout::RecordSetBitmask {
@@ -2796,13 +2800,11 @@ mod tests {
         let nested_set_field_rec = crate::Value::Record(
             tla_value::value::RecordValue::from_sorted_str_entries(vec![(
                 Arc::from("payload"),
-                crate::Value::Set(Rp::new(tla_value::value::SortedSet::from_sorted_vec(
-                    vec![crate::Value::Set(Rp::new(
-                        tla_value::value::SortedSet::from_sorted_vec(vec![crate::Value::SmallInt(
-                            1,
-                        )]),
-                    ))],
-                ))),
+                crate::Value::Set(Rp::new(tla_value::value::SortedSet::from_sorted_vec(vec![
+                    crate::Value::Set(Rp::new(tla_value::value::SortedSet::from_sorted_vec(vec![
+                        crate::Value::SmallInt(1),
+                    ]))),
+                ]))),
             )]),
         );
         let non_representable = FlatValueLayout::RecordSetBitmask {
@@ -3234,12 +3236,18 @@ mod tests {
 
         assert_ne!(
             encode_tagged_scalar_union_value(&FlatScalarValue::Int(1), &universe).unwrap(),
-            encode_tagged_scalar_union_value(&FlatScalarValue::String(std::sync::Arc::from("1")), &universe)
-                .unwrap()
+            encode_tagged_scalar_union_value(
+                &FlatScalarValue::String(std::sync::Arc::from("1")),
+                &universe
+            )
+            .unwrap()
         );
         assert_ne!(
-            encode_tagged_scalar_union_value(&FlatScalarValue::String(std::sync::Arc::from("1")), &universe)
-                .unwrap(),
+            encode_tagged_scalar_union_value(
+                &FlatScalarValue::String(std::sync::Arc::from("1")),
+                &universe
+            )
+            .unwrap(),
             encode_tagged_scalar_union_value(
                 &FlatScalarValue::ModelValue(std::sync::Arc::from("1")),
                 &universe,

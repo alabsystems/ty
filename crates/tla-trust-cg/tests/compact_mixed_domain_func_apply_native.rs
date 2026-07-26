@@ -7,14 +7,13 @@
 #![cfg(feature = "native")]
 
 use std::ffi::c_void;
-use std::sync::Arc;
 
 use tla_jit_abi::{
     CompoundLayout, JitCallOut, JitInvariantFn, JitStatus, SetBitmaskElement, StateLayout,
     VarLayout,
 };
 use tla_tir::bytecode::{BytecodeFunction, ConstantPool, Opcode};
-use tla_value::Value;
+use tla_value::{Rp, Value};
 
 const SYMBOL: &str = "compact_mixed_domain_func_apply_native";
 
@@ -38,9 +37,9 @@ fn pc_layout() -> StateLayout {
 
 fn constants() -> (ConstantPool, u16, u16, u16) {
     let mut pool = ConstantPool::new();
-    let rm2 = pool.add_value(Value::ModelValue(Arc::from("rm2")));
-    let rs = pool.add_value(Value::String(Arc::from("RS")));
-    let ts = pool.add_value(Value::String(Arc::from("TS")));
+    let rm2 = pool.add_value(Value::ModelValue(Rp::from("rm2")));
+    let rs = pool.add_value(Value::String(Rp::from("RS")));
+    let ts = pool.add_value(Value::String(Rp::from("TS")));
     (pool, rm2, rs, ts)
 }
 

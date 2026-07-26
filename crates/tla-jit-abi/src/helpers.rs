@@ -66,7 +66,9 @@ pub fn set_bitmask_element_to_value(element: SetBitmaskElement) -> Value {
         SetBitmaskElement::Int(value) => Value::SmallInt(value),
         SetBitmaskElement::Bool(value) => Value::Bool(value),
         SetBitmaskElement::String(name) => Value::String(tla_core::resolve_name_id(name).into()),
-        SetBitmaskElement::ModelValue(name) => Value::ModelValue(tla_core::resolve_name_id(name).into()),
+        SetBitmaskElement::ModelValue(name) => {
+            Value::ModelValue(tla_core::resolve_name_id(name).into())
+        }
     }
 }
 

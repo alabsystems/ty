@@ -138,6 +138,59 @@ fn whole_next_action_detected_for_single_var_next() {
     );
 }
 
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn whole_next_metadata_rearms_after_property_boundary_clear() {
+    let module = parse_module(INLINE_FAIRNESS_SPEC);
+    let config = inline_fairness_config();
+
+    let mut checker = ModelChecker::new(&module, &config);
+    checker.set_store_states(true);
+    apply_weak_fairness(&mut checker);
+    checker.prepare_inline_fairness_cache();
+
+    let group = checker
+        .liveness_cache
+        .enabled_action_groups
+        .first()
+        .expect("WF_x(Next) should produce one enabled-action group");
+    let enabled_tag = group.enabled_tag;
+    let action_tag = group
+        .action_pred_tag
+        .expect("WF_x(Next) should have a paired ActionPred tag");
+    assert_eq!(
+        crate::liveness::enabled_action_pred_pair(enabled_tag),
+        Some(action_tag)
+    );
+    assert!(crate::liveness::whole_next_enabled_tag(enabled_tag));
+    assert!(crate::liveness::whole_next_action_tag(action_tag));
+
+    crate::liveness::clear_enabled_cache();
+    crate::liveness::clear_leaf_result_cache();
+    assert_eq!(crate::liveness::enabled_action_pred_pair(enabled_tag), None);
+    assert!(!crate::liveness::whole_next_enabled_tag(enabled_tag));
+    assert!(!crate::liveness::whole_next_action_tag(action_tag));
+    assert!(checker
+        .liveness_cache
+        .whole_next_enabled_tags
+        .contains(&enabled_tag));
+    assert!(checker
+        .liveness_cache
+        .whole_next_action_tags
+        .contains(&action_tag));
+
+    checker.rearm_inline_fairness_metadata();
+    assert_eq!(
+        crate::liveness::enabled_action_pred_pair(enabled_tag),
+        Some(action_tag)
+    );
+    assert!(crate::liveness::whole_next_enabled_tag(enabled_tag));
+    assert!(crate::liveness::whole_next_action_tag(action_tag));
+
+    crate::liveness::clear_enabled_cache();
+    crate::liveness::clear_leaf_result_cache();
+}
+
 /// Spec whose whole Next does NOT statically pin every variable: the `Wrap`
 /// disjunct leaves `y'` free, so `action_pins_all_vars(Next)` is FALSE (an `Or`
 /// branch that fails to cover every variable fails the proof). This is the

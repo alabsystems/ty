@@ -10,6 +10,7 @@
 use super::super::build_lazy_func_ctx;
 use super::lazy::bind_lazy_func_args;
 use crate::core::EvalCtx;
+use crate::eval_ident::try_borrow_eager_binding;
 use crate::eval_state_var_lookup::try_borrow_materialized_state_var;
 use crate::helpers::eval;
 use crate::value::Value;
@@ -171,7 +172,59 @@ fn try_apply_func_value_eager_owned_inner(
     }
 }
 
+// Kill-switch (shared with the TIR deep read chain): when set, `f[i][j]` /
+// `r.a.b` read chains materialize every intermediate function/record owned;
+// when unset (default), the intermediates are borrowed in place.
+feature_flag!(pub(crate) no_deep_read_chain, "TY_NO_DEEP_READ_CHAIN");
+
+// Same-binary A/B kill switch for borrowing read-chain roots from eager local
+// bindings (quantifier variables, operator parameters, and LET values).
+feature_flag!(no_binding_read_borrow, "TY_NO_BINDING_READ_BORROW");
+
+/// Borrowed-or-owned result of a read chain. `Borrowed` points into the state
+/// array (or a value borrowed from inside it), `Owned` is a value the chain had
+/// to materialize (binding/overlay state-var reads, or a `Bag`/apply that could
+/// not yield a borrow).
+pub(crate) enum AstRead<'a> {
+    Borrowed(&'a Value),
+    Owned(Value),
+}
+
+impl AstRead<'_> {
+    #[inline(always)]
+    pub(crate) fn as_value(&self) -> &Value {
+        match self {
+            AstRead::Borrowed(v) => v,
+            AstRead::Owned(v) => v,
+        }
+    }
+
+    #[inline(always)]
+    fn into_owned(self) -> Value {
+        match self {
+            AstRead::Borrowed(v) => v.clone(),
+            AstRead::Owned(v) => v,
+        }
+    }
+}
+
 pub(crate) fn try_borrow_materialized_read(
+    ctx: &EvalCtx,
+    expr: &Spanned<Expr>,
+) -> Option<EvalResult<Value>> {
+    if no_deep_read_chain() {
+        return try_borrow_materialized_read_shallow(ctx, expr);
+    }
+    match try_borrow_read_chain_ref(ctx, expr)? {
+        Ok(read) => Some(Ok(read.into_owned())),
+        Err(err) => Some(Err(err)),
+    }
+}
+
+/// Kill-switch reference implementation (`TY_NO_DEEP_READ_CHAIN`): recurses but
+/// materializes an owned intermediate at every level. Preserved verbatim as the
+/// fail-safe baseline for the borrowed core below.
+fn try_borrow_materialized_read_shallow(
     ctx: &EvalCtx,
     expr: &Spanned<Expr>,
 ) -> Option<EvalResult<Value>> {
@@ -180,7 +233,7 @@ pub(crate) fn try_borrow_materialized_read(
             try_borrow_materialized_state_var(ctx, name, *idx, *name_id).map(Ok)
         }
         Expr::RecordAccess(record_expr, field) => {
-            let record_value = match try_borrow_materialized_read(ctx, record_expr)? {
+            let record_value = match try_borrow_materialized_read_shallow(ctx, record_expr)? {
                 Ok(value) => value,
                 Err(err) => return Some(Err(err)),
             };
@@ -206,7 +259,7 @@ pub(crate) fn try_borrow_materialized_read(
             )
         }
         Expr::FuncApply(func_expr, arg_expr) => {
-            let func_value = match try_borrow_materialized_read(ctx, func_expr)? {
+            let func_value = match try_borrow_materialized_read_shallow(ctx, func_expr)? {
                 Ok(value) => value,
                 Err(err) => return Some(Err(err)),
             };
@@ -225,6 +278,156 @@ pub(crate) fn try_borrow_materialized_read(
                 Some(arg_expr.span),
                 Some(expr.span),
             )
+        }
+        _ => None,
+    }
+}
+
+/// Borrowed read-chain core: mirrors `try_borrow_materialized_read_shallow`
+/// step for step, but borrows the intermediate function/record *in place*
+/// (`AstRead::Borrowed`) instead of cloning an owned value out at each level.
+/// Only the state-var read (when a binding/overlay forces the owned path), a
+/// `Bag`/`LazyFunc` apply, or the final materialization ever allocates.
+///
+/// Soundness: every borrow is rooted either in the state array or in an eager
+/// binding's boxed `Value`; both owners remain stable while `ctx` is borrowed.
+/// State roots bail under binding/instance/sparse overlays. Binding roots use
+/// the same substitution-guard lookup and dependency bookkeeping as ordinary
+/// identifier resolution, and reject lazy/closure values. Each arm returns
+/// exactly the value / error the owned reference implementation returns (the
+/// virtual-tuple apply, `try_apply_func_value_eager_*`, and every error
+/// constructor are the same), so the observed result is byte-identical.
+/// Evaluate `expr` as a read-only operand, borrowing a state-rooted read chain
+/// (`sv`, `f[i]`, `r.a.b`, `f[i][j]`, ...) in place when possible and falling
+/// back to a full owned `eval` otherwise. Valid for read-only consumption
+/// (comparison) for as long as `ctx` is borrowed — the borrow is rooted in the
+/// state array, stable for the whole evaluation. Mirrors the TIR
+/// `eval_tir_operand`: `=`/`#` only read their operands, so the owned clone the
+/// plain `eval` produces is pure Arc churn on the hot `f[i] = x` guard.
+#[inline]
+pub(crate) fn eval_read_chain_operand<'a>(
+    ctx: &'a EvalCtx,
+    expr: &'a Spanned<Expr>,
+) -> EvalResult<AstRead<'a>> {
+    if !no_deep_read_chain() {
+        if let Some(result) = try_borrow_read_chain_ref(ctx, expr) {
+            return result;
+        }
+    }
+    eval(ctx, expr).map(AstRead::Owned)
+}
+
+pub(crate) fn try_borrow_read_chain_ref<'a>(
+    ctx: &'a EvalCtx,
+    expr: &'a Spanned<Expr>,
+) -> Option<EvalResult<AstRead<'a>>> {
+    match &expr.node {
+        Expr::Ident(_, name_id)
+            if !no_binding_read_borrow() && *name_id != tla_core::NameId::INVALID =>
+        {
+            try_borrow_eager_binding(ctx, *name_id).map(|value| Ok(AstRead::Borrowed(value)))
+        }
+        Expr::StateVar(name, idx, name_id) => {
+            // Prefer a borrowed state-slot reference; fall back to the exact
+            // owned materialization (bindings / instance / sparse overlays).
+            if let Some(v) = crate::eval_state_var_lookup::try_borrow_plain_state_var_ref(
+                ctx, name, *idx, *name_id,
+            ) {
+                return Some(Ok(AstRead::Borrowed(v)));
+            }
+            try_borrow_materialized_state_var(ctx, name, *idx, *name_id)
+                .map(|v| Ok(AstRead::Owned(v)))
+        }
+        Expr::RecordAccess(record_expr, field) => {
+            let base = match try_borrow_read_chain_ref(ctx, record_expr)? {
+                Ok(base) => base,
+                Err(err) => return Some(Err(err)),
+            };
+            match base {
+                AstRead::Borrowed(rv) => {
+                    let record = match rv.as_record() {
+                        Some(record) => record,
+                        None => {
+                            return Some(Err(EvalError::type_error(
+                                "Record",
+                                rv,
+                                Some(record_expr.span),
+                            )));
+                        }
+                    };
+                    match record.get_by_id(field.field_id) {
+                        Some(f) => Some(Ok(AstRead::Borrowed(f))),
+                        None => Some(Err(EvalError::NoSuchField {
+                            field: field.name.node.clone(),
+                            record_display: Some(format!("{rv}")),
+                            span: Some(expr.span),
+                        })),
+                    }
+                }
+                AstRead::Owned(rv) => {
+                    let record = match rv.as_record() {
+                        Some(record) => record,
+                        None => {
+                            return Some(Err(EvalError::type_error(
+                                "Record",
+                                &rv,
+                                Some(record_expr.span),
+                            )));
+                        }
+                    };
+                    match record.get_by_id(field.field_id) {
+                        Some(f) => Some(Ok(AstRead::Owned(f.clone()))),
+                        None => Some(Err(EvalError::NoSuchField {
+                            field: field.name.node.clone(),
+                            record_display: Some(format!("{rv}")),
+                            span: Some(expr.span),
+                        })),
+                    }
+                }
+            }
+        }
+        Expr::FuncApply(func_expr, arg_expr) => {
+            let base = match try_borrow_read_chain_ref(ctx, func_expr)? {
+                Ok(base) => base,
+                Err(err) => return Some(Err(err)),
+            };
+            // Virtual-tuple apply (`f[<<a, b>>]`) — owned result, identical to
+            // the reference path (same span args: Some(expr.span), None).
+            if let Some(result) = try_eval_ast_virtual_tuple_apply(
+                ctx,
+                base.as_value(),
+                arg_expr,
+                Some(expr.span),
+                None,
+            ) {
+                return Some(result.map(AstRead::Owned));
+            }
+            let arg = match eval(ctx, arg_expr) {
+                Ok(arg) => arg,
+                Err(err) => return Some(Err(err)),
+            };
+            match base {
+                AstRead::Borrowed(fv) => {
+                    if let Some(result) = try_apply_func_value_eager_borrowed(
+                        fv,
+                        &arg,
+                        Some(arg_expr.span),
+                        Some(expr.span),
+                    ) {
+                        return Some(result.map(AstRead::Borrowed));
+                    }
+                    // Bag / LazyFunc / type error: identical owned resolver.
+                    try_apply_func_value_eager_owned(fv, &arg, Some(arg_expr.span), Some(expr.span))
+                        .map(|r| r.map(AstRead::Owned))
+                }
+                AstRead::Owned(fv) => try_apply_func_value_eager_owned(
+                    &fv,
+                    &arg,
+                    Some(arg_expr.span),
+                    Some(expr.span),
+                )
+                .map(|r| r.map(AstRead::Owned)),
+            }
         }
         _ => None,
     }
@@ -388,8 +591,7 @@ fn try_eval_ast_virtual_tuple_apply(
     if elems.is_empty() {
         return None;
     }
-    let mut vals: smallvec::SmallVec<[Value; 4]> =
-        smallvec::SmallVec::with_capacity(elems.len());
+    let mut vals: smallvec::SmallVec<[Value; 4]> = smallvec::SmallVec::with_capacity(elems.len());
     for elem in elems {
         match eval(ctx, elem) {
             Ok(v) => vals.push(v),
@@ -465,15 +667,38 @@ pub(crate) fn eval_func_apply(
         }
     }
 
-    if let Some(func_value) = try_borrow_materialized_read(ctx, func_expr) {
+    // Deep read chain (`f[i][j]`, `r.a[j]`): borrow the base chain in place and
+    // apply the outermost subscript, so the intermediate function/record is
+    // never cloned out. Only the final apply result is materialized. Falls
+    // through to the full owned `eval` below when `func_expr` is not a
+    // borrowable read chain.
+    if !no_deep_read_chain() {
+        if let Some(base) = try_borrow_read_chain_ref(ctx, func_expr) {
+            let base = base?;
+            if let Some(result) = try_eval_ast_virtual_tuple_apply(
+                ctx,
+                base.as_value(),
+                arg_expr,
+                span,
+                Some(func_expr.span),
+            ) {
+                return result;
+            }
+            let arg = eval(ctx, arg_expr)?;
+            return apply_resolved_func_value(
+                ctx,
+                base.as_value(),
+                arg,
+                Some(arg_expr.span),
+                span,
+                Some(func_expr.span),
+            );
+        }
+    } else if let Some(func_value) = try_borrow_materialized_read(ctx, func_expr) {
         let func_value = func_value?;
-        if let Some(result) = try_eval_ast_virtual_tuple_apply(
-            ctx,
-            &func_value,
-            arg_expr,
-            span,
-            Some(func_expr.span),
-        ) {
+        if let Some(result) =
+            try_eval_ast_virtual_tuple_apply(ctx, &func_value, arg_expr, span, Some(func_expr.span))
+        {
             return result;
         }
         let arg = eval(ctx, arg_expr)?;

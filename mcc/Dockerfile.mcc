@@ -1,10 +1,10 @@
 # syntax=docker/dockerfile:1.7
 
-ARG AY_REV=0adeaab4d66b1414a95ab5cee4ec64078c9dbd97
-ARG CLEAN_REV=659a6eeb15b29f7d739ecca852a77483fcfd88ea
-ARG CLEAN_FALLBACK_REV=659a6eeb15b29f7d739ecca852a77483fcfd88ea
-ARG TRUST_IR_REV=9de13453d69f84f24556bd75636bf020206f33c9
-ARG TRUST_CG_REV=7005df3c00a3e1b4042cc49a6608feb1aaa1bfec
+ARG AY_REV=035e84f25ffe983f4c1a0d8f2cb1d5f945d3bdee
+ARG CLEAN_REV=ed8c87702e1bb429d6f2df4333130eac0d577ff7
+ARG CLEAN_FALLBACK_REV=ed8c87702e1bb429d6f2df4333130eac0d577ff7
+ARG TRUST_IR_REV=3fafb62434db0a5b2bd4027a988a7fed74bd8679
+ARG TRUST_CG_REV=98e3ffb6ae59b803a93a3f09f72dd497810ac5b4
 
 FROM rust:trixie AS ay-build
 
@@ -25,7 +25,7 @@ RUN --mount=type=secret,id=github_token,required=false \
         'esac' > /tmp/git-askpass \
     && chmod 0700 /tmp/git-askpass \
     && printf '%s\n' "$AY_REV" | grep -Eq '^[0-9a-f]{40}$' \
-    && test "$AY_REV" = "0adeaab4d66b1414a95ab5cee4ec64078c9dbd97" \
+    && test "$AY_REV" = "035e84f25ffe983f4c1a0d8f2cb1d5f945d3bdee" \
     && GIT_ASKPASS=/tmp/git-askpass GIT_TERMINAL_PROMPT=0 git clone https://github.com/alabsystems/ay.git /ay \
     && git checkout --detach "${AY_REV}" \
     && test "$(git rev-parse HEAD)" = "${AY_REV}" \
@@ -71,11 +71,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && printf '%s\n' "$CLEAN_FALLBACK_REV" | grep -Eq '^[0-9a-f]{40}$' \
     && printf '%s\n' "$TRUST_IR_REV" | grep -Eq '^[0-9a-f]{40}$' \
     && printf '%s\n' "$TRUST_CG_REV" | grep -Eq '^[0-9a-f]{40}$' \
-    && test "$CLEAN_REV" = "659a6eeb15b29f7d739ecca852a77483fcfd88ea" \
-    && test "$CLEAN_FALLBACK_REV" = "659a6eeb15b29f7d739ecca852a77483fcfd88ea" \
-    && test "$AY_REV" = "0adeaab4d66b1414a95ab5cee4ec64078c9dbd97" \
-    && test "$TRUST_IR_REV" = "9de13453d69f84f24556bd75636bf020206f33c9" \
-    && test "$TRUST_CG_REV" = "7005df3c00a3e1b4042cc49a6608feb1aaa1bfec" \
+    && test "$CLEAN_REV" = "ed8c87702e1bb429d6f2df4333130eac0d577ff7" \
+    && test "$CLEAN_FALLBACK_REV" = "ed8c87702e1bb429d6f2df4333130eac0d577ff7" \
+    && test "$AY_REV" = "035e84f25ffe983f4c1a0d8f2cb1d5f945d3bdee" \
+    && test "$TRUST_IR_REV" = "3fafb62434db0a5b2bd4027a988a7fed74bd8679" \
+    && test "$TRUST_CG_REV" = "98e3ffb6ae59b803a93a3f09f72dd497810ac5b4" \
     && grep -F "rev = \"$AY_REV\"" Cargo.toml \
     && grep -F "rev = \"$CLEAN_FALLBACK_REV\"" Cargo.toml \
     && grep -F "rev = \"$TRUST_IR_REV\"" Cargo.toml \

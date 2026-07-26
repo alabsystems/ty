@@ -17,16 +17,15 @@
 //! Part of #2018: Materialize before fingerprinting.
 
 use crate::error::{EvalError, EvalResult};
-use tla_value::Rp;
 use crate::state::{ArrayState, DiffChanges};
 use crate::value::IntIntervalFunc;
 use crate::var_index::VarIndex;
 use crate::Value;
-use std::sync::Arc;
 use tla_core::ast::{Expr, Module, Unit};
 use tla_core::{walk_expr, ExprVisitor};
 use tla_eval::EvalCtx;
 use tla_eval::{materialize_lazy_func_to_func, materialize_setpred_to_vec};
+use tla_value::Rp;
 
 /// AST visitor that detects expressions which produce lazy values at runtime.
 ///
@@ -86,6 +85,22 @@ pub(crate) fn has_lazy_state_value(value: &Value) -> bool {
             .any(|(k, v)| has_lazy_state_value(k) || has_lazy_state_value(v)),
         Value::IntFunc(func) => func.values().iter().any(has_lazy_state_value),
         Value::Set(set) => set.iter().any(has_lazy_state_value),
+        Value::Subset(subset) => has_lazy_state_value(subset.base()),
+        Value::FuncSet(func_set) => {
+            has_lazy_state_value(func_set.domain()) || has_lazy_state_value(func_set.codomain())
+        }
+        Value::RecordSet(record_set) => record_set
+            .fields_iter()
+            .any(|(_, field_set)| has_lazy_state_value(field_set)),
+        Value::TupleSet(tuple_set) => tuple_set.components_iter().any(has_lazy_state_value),
+        Value::SetCup(cup) => has_lazy_state_value(cup.set1()) || has_lazy_state_value(cup.set2()),
+        Value::SetCap(cap) => has_lazy_state_value(cap.set1()) || has_lazy_state_value(cap.set2()),
+        Value::SetDiff(diff) => {
+            has_lazy_state_value(diff.set1()) || has_lazy_state_value(diff.set2())
+        }
+        Value::KSubset(k_subset) => has_lazy_state_value(k_subset.base()),
+        Value::BigUnion(union) => has_lazy_state_value(union.set()),
+        Value::SeqSet(seq_set) => has_lazy_state_value(seq_set.base()),
         _ => false,
     }
 }
@@ -98,7 +113,7 @@ pub(crate) fn has_lazy_state_value(value: &Value) -> bool {
 /// - `Closure` → error (TLC forbids operator lambdas in state variables)
 ///
 /// Recursively materializes nested lazy values within compound types
-/// (tuples, sequences, records, functions, sets).
+/// (tuples, sequences, records, functions, sets, and lazy set wrappers).
 ///
 /// Part of #2018: Materialize before fingerprinting.
 pub(crate) fn materialize_value(ctx: &EvalCtx, value: &Value) -> EvalResult<Value> {
@@ -106,7 +121,15 @@ pub(crate) fn materialize_value(ctx: &EvalCtx, value: &Value) -> EvalResult<Valu
         Value::SetPred(spv) => {
             // TLC: SetPredValue.fingerPrint() → toSetEnum()
             let elements = materialize_setpred_to_vec(ctx, spv)?;
-            Ok(Value::set(elements))
+            let materialized = Value::set(elements);
+            // A predicate set may itself contain lazy values. Concretizing the
+            // outer set is not sufficient in that case: state values must be
+            // expression-free at every depth before fingerprinting.
+            if has_lazy_state_value(&materialized) {
+                materialize_value(ctx, &materialized)
+            } else {
+                Ok(materialized)
+            }
         }
         Value::LazyFunc(f) => {
             // TLC: FcnLambdaValue.fingerPrint() → toFcnRcd()
@@ -137,7 +160,8 @@ pub(crate) fn materialize_value(ctx: &EvalCtx, value: &Value) -> EvalResult<Valu
 /// Recursively materialize lazy children within compound value types.
 ///
 /// Called by `materialize_value` when a compound value (tuple, seq, record,
-/// func, set) contains nested lazy values that need materialization.
+/// func, set, or lazy set wrapper) contains nested lazy values that need
+/// materialization.
 fn materialize_children(ctx: &EvalCtx, value: &Value) -> EvalResult<Value> {
     match value {
         Value::Tuple(elems) => {
@@ -174,13 +198,11 @@ fn materialize_children(ctx: &EvalCtx, value: &Value) -> EvalResult<Value> {
                 .iter()
                 .map(|v| materialize_value(ctx, v))
                 .collect::<EvalResult<Vec<_>>>()?;
-            Ok(Value::IntFunc(Rp::new(
-                crate::value::IntIntervalFunc::new(
-                    IntIntervalFunc::min(func),
-                    IntIntervalFunc::max(func),
-                    m,
-                ),
-            )))
+            Ok(Value::IntFunc(Rp::new(crate::value::IntIntervalFunc::new(
+                IntIntervalFunc::min(func),
+                IntIntervalFunc::max(func),
+                m,
+            ))))
         }
         Value::Set(set) => {
             let m: Vec<Value> = set
@@ -189,6 +211,53 @@ fn materialize_children(ctx: &EvalCtx, value: &Value) -> EvalResult<Value> {
                 .collect::<EvalResult<Vec<_>>>()?;
             Ok(Value::set(m))
         }
+        Value::Subset(subset) => Ok(Value::Subset(crate::value::SubsetValue::new(
+            materialize_value(ctx, subset.base())?,
+        ))),
+        Value::FuncSet(func_set) => Ok(Value::FuncSet(crate::value::FuncSetValue::new(
+            materialize_value(ctx, func_set.domain())?,
+            materialize_value(ctx, func_set.codomain())?,
+        ))),
+        Value::RecordSet(record_set) => {
+            let fields: Vec<_> = record_set
+                .fields_iter()
+                .map(|(name, field_set)| Ok((name.clone(), materialize_value(ctx, field_set)?)))
+                .collect::<EvalResult<Vec<_>>>()?;
+            Ok(Value::RecordSet(Rp::new(
+                crate::value::RecordSetValue::new(fields),
+            )))
+        }
+        Value::TupleSet(tuple_set) => {
+            let components: Vec<_> = tuple_set
+                .components_iter()
+                .map(|component| materialize_value(ctx, component))
+                .collect::<EvalResult<Vec<_>>>()?;
+            Ok(Value::TupleSet(Rp::new(crate::value::TupleSetValue::new(
+                components,
+            ))))
+        }
+        Value::SetCup(cup) => Ok(Value::SetCup(crate::value::SetCupValue::new(
+            materialize_value(ctx, cup.set1())?,
+            materialize_value(ctx, cup.set2())?,
+        ))),
+        Value::SetCap(cap) => Ok(Value::SetCap(crate::value::SetCapValue::new(
+            materialize_value(ctx, cap.set1())?,
+            materialize_value(ctx, cap.set2())?,
+        ))),
+        Value::SetDiff(diff) => Ok(Value::SetDiff(crate::value::SetDiffValue::new(
+            materialize_value(ctx, diff.set1())?,
+            materialize_value(ctx, diff.set2())?,
+        ))),
+        Value::KSubset(k_subset) => Ok(Value::KSubset(crate::value::KSubsetValue::new(
+            materialize_value(ctx, k_subset.base())?,
+            k_subset.k(),
+        ))),
+        Value::BigUnion(union) => Ok(Value::BigUnion(crate::value::UnionValue::new(
+            materialize_value(ctx, union.set())?,
+        ))),
+        Value::SeqSet(seq_set) => Ok(Value::SeqSet(crate::value::SeqSetValue::new(
+            materialize_value(ctx, seq_set.base())?,
+        ))),
         _ => Ok(value.clone()),
     }
 }
@@ -259,6 +328,36 @@ pub(crate) fn materialize_diff_changes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use tla_core::ast::{BoundVar, Expr};
+    use tla_core::kani_types::HashMap;
+    use tla_core::{FileId, Span, Spanned};
+
+    fn true_set_pred(source: Value) -> Value {
+        let dummy_span = Span {
+            file: FileId(0),
+            start: 0,
+            end: 0,
+        };
+        Value::SetPred(Box::new(crate::value::SetPredValue::new(
+            source,
+            BoundVar {
+                name: Spanned {
+                    node: "x".to_string(),
+                    span: dummy_span,
+                },
+                domain: None,
+                pattern: None,
+            },
+            Spanned {
+                node: Expr::Bool(true),
+                span: dummy_span,
+            },
+            HashMap::new(),
+            None,
+            None,
+        )))
+    }
 
     #[test]
     fn test_has_lazy_state_value_concrete() {
@@ -275,35 +374,7 @@ mod tests {
 
     #[test]
     fn test_has_lazy_state_value_nested_setpred() {
-        use tla_core::ast::{BoundVar, Expr};
-        use tla_core::kani_types::HashMap;
-        use tla_core::{FileId, Span, Spanned};
-
-        // Create a minimal SetPred for testing
-        let dummy_span = Span {
-            file: FileId(0),
-            start: 0,
-            end: 0,
-        };
-        let spv = crate::value::SetPredValue::new(
-            Value::set(vec![Value::SmallInt(1)]),
-            BoundVar {
-                name: Spanned {
-                    node: "x".to_string(),
-                    span: dummy_span,
-                },
-                domain: None,
-                pattern: None,
-            },
-            Spanned {
-                node: Expr::Bool(true),
-                span: dummy_span,
-            },
-            HashMap::new(),
-            None,
-            None,
-        );
-        let setpred = Value::SetPred(Box::new(spv));
+        let setpred = true_set_pred(Value::set(vec![Value::SmallInt(1)]));
 
         // Direct SetPred
         assert!(has_lazy_state_value(&setpred));
@@ -311,5 +382,89 @@ mod tests {
         // SetPred nested in tuple
         let nested = Value::Tuple(vec![Value::SmallInt(1), setpred].into());
         assert!(has_lazy_state_value(&nested));
+    }
+
+    #[test]
+    fn test_materialize_lazy_set_wrappers_removes_nested_setpred() {
+        let setpred = true_set_pred(Value::set(vec![Value::SmallInt(1)]));
+        let concrete = Value::set(vec![Value::SmallInt(2)]);
+        let wrappers = [
+            Value::Subset(crate::value::SubsetValue::new(setpred.clone())),
+            Value::FuncSet(crate::value::FuncSetValue::new(
+                concrete.clone(),
+                setpred.clone(),
+            )),
+            Value::RecordSet(Rp::new(crate::value::RecordSetValue::new([(
+                Arc::<str>::from("field"),
+                setpred.clone(),
+            )]))),
+            Value::TupleSet(Rp::new(crate::value::TupleSetValue::new([setpred.clone()]))),
+            Value::SetCup(crate::value::SetCupValue::new(
+                setpred.clone(),
+                concrete.clone(),
+            )),
+            Value::SetCap(crate::value::SetCapValue::new(
+                concrete.clone(),
+                setpred.clone(),
+            )),
+            Value::SetDiff(crate::value::SetDiffValue::new(
+                concrete.clone(),
+                setpred.clone(),
+            )),
+            Value::KSubset(crate::value::KSubsetValue::new(setpred.clone(), 1)),
+            Value::BigUnion(crate::value::UnionValue::new(setpred.clone())),
+            Value::SeqSet(crate::value::SeqSetValue::new(setpred)),
+        ];
+
+        let ctx = EvalCtx::new();
+        for wrapper in wrappers {
+            assert!(has_lazy_state_value(&wrapper), "missed {wrapper:?}");
+            let materialized = materialize_value(&ctx, &wrapper).unwrap();
+            assert!(
+                !has_lazy_state_value(&materialized),
+                "failed to eliminate nested lazy value from {wrapper:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_materialize_setcup_with_setpred_child() {
+        let value = Value::SetCup(crate::value::SetCupValue::new(
+            true_set_pred(Value::set(vec![Value::SmallInt(1), Value::SmallInt(2)])),
+            Value::set(vec![Value::SmallInt(2), Value::SmallInt(3)]),
+        ));
+
+        assert!(has_lazy_state_value(&value));
+        let materialized = materialize_value(&EvalCtx::new(), &value).unwrap();
+        assert!(!has_lazy_state_value(&materialized));
+
+        let Value::SetCup(cup) = &materialized else {
+            panic!("materialized union changed shape");
+        };
+        assert!(matches!(cup.set1(), Value::Set(_)));
+        assert!(matches!(cup.set2(), Value::Set(_)));
+        let elements: Vec<_> = materialized.iter_set().unwrap().collect();
+        assert_eq!(
+            Value::set(elements),
+            Value::set(vec![
+                Value::SmallInt(1),
+                Value::SmallInt(2),
+                Value::SmallInt(3),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_materialize_lazy_set_wrapper_rejects_nested_closure() {
+        let closure = Value::Closure(Rp::new(crate::value::ClosureValue::new(
+            Vec::new(),
+            Spanned::dummy(Expr::Bool(true)),
+            Arc::new(HashMap::new()),
+            None,
+        )));
+        let value = Value::SeqSet(crate::value::SeqSetValue::new(closure));
+
+        assert!(has_lazy_state_value(&value));
+        assert!(materialize_value(&EvalCtx::new(), &value).is_err());
     }
 }

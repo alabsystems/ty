@@ -3,11 +3,10 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::super::{functions::FP_UNSET, Value};
-use crate::rp::Rp;
 use super::RecordValue;
 use crate::dedup_fingerprint::{additive_record_entry_hash, splitmix64};
+use crate::rp::Rp;
 use std::sync::atomic::AtomicU64;
-use std::sync::Arc;
 use tla_core::{intern_name, NameId};
 
 impl RecordValue {
@@ -92,8 +91,10 @@ impl RecordValue {
                 });
                 // Arc::get_mut succeeds when we're the sole owner (no clone needed).
                 if let Some(entries) = crate::rp::Rp::get_mut(&mut self.entries) {
+                    super::intern::count_record_mut(true);
                     entries[idx].1 = value;
                 } else {
+                    super::intern::count_record_mut(false);
                     let mut new_vec = (*self.entries).clone();
                     new_vec[idx].1 = value;
                     self.entries = crate::rp::Rp::new(new_vec);
@@ -113,8 +114,10 @@ impl RecordValue {
                     )
                 });
                 if let Some(entries) = crate::rp::Rp::get_mut(&mut self.entries) {
+                    super::intern::count_record_mut(true);
                     entries.insert(idx, (field, value));
                 } else {
+                    super::intern::count_record_mut(false);
                     let mut new_vec = (*self.entries).clone();
                     new_vec.insert(idx, (field, value));
                     self.entries = crate::rp::Rp::new(new_vec);
@@ -161,8 +164,10 @@ impl RecordValue {
         // falling back to Arc::make_mut only when shared. Since this method takes
         // `self` by value, the caller's move typically makes the Arc uniquely owned.
         if let Some(entries) = crate::rp::Rp::get_mut(&mut self.entries) {
+            super::intern::count_record_mut(true);
             entries[idx].1 = value;
         } else {
+            super::intern::count_record_mut(false);
             crate::rp::Rp::make_mut(&mut self.entries)[idx].1 = value;
         }
         self.reset_caches_with_additive(updated_additive);
@@ -196,8 +201,10 @@ impl RecordValue {
             .get_additive_fp()
             .and_then(|_| additive_record_entry_hash(field, &self.entries[idx].1).ok());
         // Part of #3964: Use Arc::get_mut (non-atomic) when refcount == 1.
-        let entries = if let Some(e) = crate::rp::Rp::get_mut(&mut self.entries) {
-            e
+        let unique = crate::rp::Rp::get_mut(&mut self.entries).is_some();
+        super::intern::count_record_mut(unique);
+        let entries = if unique {
+            crate::rp::Rp::get_mut(&mut self.entries).expect("refcount 1 just verified")
         } else {
             crate::rp::Rp::make_mut(&mut self.entries)
         };
@@ -219,8 +226,10 @@ impl RecordValue {
         });
         // Part of #3964: Arc::get_mut fast path for non-atomic check.
         if let Some(entries) = crate::rp::Rp::get_mut(&mut self.entries) {
+            super::intern::count_record_mut(true);
             entries[idx].1 = value;
         } else {
+            super::intern::count_record_mut(false);
             crate::rp::Rp::make_mut(&mut self.entries)[idx].1 = value;
         }
         self.reset_caches_with_additive(updated_additive);

@@ -21,7 +21,7 @@
 //! - Type syntax: `i8`, `i16`, `i32`, `i64`, `i128`, `float`, `double`, `ptr`, `void`
 
 use crate::TrustCgError;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use trust_ir::constant::Constant;
 use trust_ir::inst::{
@@ -116,27 +116,59 @@ impl<'m> EmitCtx<'m> {
     /// module's struct definitions, type table, and `func_types`, so it can
     /// produce proper LLVM aggregate types instead of collapsing everything
     /// to `ptr`.
-    fn llvm_type(&self, ty: &Ty) -> String {
-        match ty {
-            Ty::I8 => "i8".to_string(),
-            Ty::I16 => "i16".to_string(),
-            Ty::I32 => "i32".to_string(),
-            Ty::I64 => "i64".to_string(),
-            Ty::I128 => "i128".to_string(),
-            Ty::F16 => "half".to_string(),
-            Ty::F32 => "float".to_string(),
-            Ty::F64 => "double".to_string(),
-            Ty::Bool => "i1".to_string(),
-            Ty::Ptr => "ptr".to_string(),
-            Ty::FatPtr(_) => "{ ptr, i64 }".to_string(),
-            Ty::Unit => "void".to_string(),
+    fn representation_ty<'t>(&'t self, ty: &'t Ty) -> Result<&'t Ty, TrustCgError> {
+        let mut current = ty;
+        let mut visited = HashSet::new();
+
+        while let Ty::Refine(base_ty_id, pred_id) = current {
+            if pred_id.as_usize() >= self.module.predicates.len() {
+                return Err(TrustCgError::Emission(format!(
+                    "Refine(_, PredId({})) references a predicate table with {} entries",
+                    pred_id.index(),
+                    self.module.predicates.len(),
+                )));
+            }
+
+            let idx = base_ty_id.as_usize();
+            if !visited.insert(idx) {
+                return Err(TrustCgError::Emission(format!(
+                    "Refine(TyId({}), _) forms a cyclic representation chain",
+                    base_ty_id.index(),
+                )));
+            }
+            current = self.module.types.get(idx).ok_or_else(|| {
+                TrustCgError::Emission(format!(
+                    "Refine(TyId({}), _) references a type table with {} entries",
+                    base_ty_id.index(),
+                    self.module.types.len(),
+                ))
+            })?;
+        }
+
+        Ok(current)
+    }
+
+    fn llvm_type(&self, ty: &Ty) -> Result<String, TrustCgError> {
+        match self.representation_ty(ty)? {
+            Ty::I8 => Ok("i8".to_string()),
+            Ty::I16 => Ok("i16".to_string()),
+            Ty::I32 => Ok("i32".to_string()),
+            Ty::I64 => Ok("i64".to_string()),
+            Ty::I128 => Ok("i128".to_string()),
+            Ty::F16 => Ok("half".to_string()),
+            Ty::F32 => Ok("float".to_string()),
+            Ty::F64 => Ok("double".to_string()),
+            Ty::Bool => Ok("i1".to_string()),
+            Ty::Ptr => Ok("ptr".to_string()),
+            Ty::FatPtr(_) => Ok("{ ptr, i64 }".to_string()),
+            Ty::Unit => Ok("void".to_string()),
             Ty::Struct(sid) => {
                 // Emit named struct reference %struct.Name if we have the def.
                 if let Some(sd) = self.module.structs.iter().find(|s| s.id == *sid) {
-                    format!("%struct.{}", sd.name)
+                    Ok(format!("%struct.{}", sd.name))
                 } else {
                     // Fallback: unnamed struct reference by index.
-                    format!("%struct.{}", sid.index())
+                    Ok(format!("%struct.{}", sid.index()))
                 }
             }
             Ty::Array(elem_ty_id, len) => {
@@ -145,38 +177,51 @@ impl<'m> EmitCtx<'m> {
                     .module
                     .types
                     .get(elem_ty_id.as_usize())
-                    .cloned()
-                    .unwrap_or(Ty::I64);
-                format!("[{} x {}]", len, self.llvm_type(&elem_ty))
+                    .ok_or_else(|| {
+                        TrustCgError::Emission(format!(
+                            "Array(TyId({}), {len}) references a type table with {} entries",
+                            elem_ty_id.index(),
+                            self.module.types.len(),
+                        ))
+                    })?;
+                Ok(format!("[{} x {}]", len, self.llvm_type(elem_ty)?))
             }
-            Ty::Vector(elem_ty, len) => format!("<{} x {}>", len, self.llvm_type(elem_ty)),
+            Ty::Vector(elem_ty, len) => Ok(format!("<{} x {}>", len, self.llvm_type(elem_ty)?)),
             // Emit opaque LLVM function pointer type.
-            Ty::Func(_) => "ptr".to_string(),
+            Ty::Func(_) => Ok("ptr".to_string()),
             // Unsigned integers map to same LLVM iN types as signed.
-            Ty::U8 => "i8".to_string(),
-            Ty::U16 => "i16".to_string(),
-            Ty::U32 => "i32".to_string(),
-            Ty::U64 => "i64".to_string(),
-            Ty::U128 => "i128".to_string(),
+            Ty::U8 => Ok("i8".to_string()),
+            Ty::U16 => Ok("i16".to_string()),
+            Ty::U32 => Ok("i32".to_string()),
+            Ty::U64 => Ok("i64".to_string()),
+            Ty::U128 => Ok("i128".to_string()),
             // trust-ir v25 B1 scalars at the pinned 64-bit LLVM target;
-            // char is its 32-bit carrier. Ty::Error never survives
-            // validate_module — unreachable by construction.
-            Ty::Isize | Ty::Usize => "i64".to_string(),
-            Ty::Char => "i32".to_string(),
-            Ty::Error => unreachable!("Ty::Error is rejected by validate_module"),
+            // char is its 32-bit carrier.
+            Ty::Isize | Ty::Usize => Ok("i64".to_string()),
+            Ty::Char => Ok("i32".to_string()),
+            Ty::Error => Err(TrustCgError::Emission(
+                "Ty::Error has no LLVM representation".to_string(),
+            )),
             // Never type maps to void in LLVM.
-            Ty::Never => "void".to_string(),
+            Ty::Never => Ok("void".to_string()),
             // Tuple types are not directly representable; use opaque ptr.
-            Ty::Tuple(_) => "ptr".to_string(),
+            Ty::Tuple(_) => Ok("ptr".to_string()),
             // Enum types are not directly representable; use opaque ptr.
-            Ty::Enum(_) => "ptr".to_string(),
+            Ty::Enum(_) => Ok("ptr".to_string()),
             // Reference types all lower to ptr in LLVM IR.
             Ty::Ref(_) | Ty::RefMut(_) | Ty::PtrConst(_) | Ty::PtrMut(_) | Ty::Rc(_) => {
-                "ptr".to_string()
+                Ok("ptr".to_string())
             }
             // Compound TLA+ types (Set/Sequence/Record/Closure) lower to opaque
             // ptr in LLVM IR; their layout is managed by the runtime.
-            Ty::Set(_, _) | Ty::Sequence(_) | Ty::Record(_) | Ty::Closure(_) => "ptr".to_string(),
+            Ty::Set(_, _) | Ty::Sequence(_) | Ty::Record(_) | Ty::Closure(_) => {
+                Ok("ptr".to_string())
+            }
+            // `representation_ty` removes every refinement layer before this
+            // match. Keep this arm fail-closed in case that invariant changes.
+            Ty::Refine(_, _) => Err(TrustCgError::Emission(
+                "failed to resolve refinement representation".to_string(),
+            )),
         }
     }
 
@@ -184,15 +229,44 @@ impl<'m> EmitCtx<'m> {
     ///
     /// Deduplicates the `ft.returns.as_slice()` match pattern that previously
     /// appeared in `emit_function`, Call, and `CallIndirect`.
-    fn format_return_type(&self, ft: &trust_ir::ty::FuncTy) -> String {
+    fn format_return_type(&self, ft: &trust_ir::ty::FuncTy) -> Result<String, TrustCgError> {
         match ft.returns.as_slice() {
-            [] => "void".to_string(),
+            [] => Ok("void".to_string()),
             [ty] => self.llvm_type(ty),
             tys => {
-                let parts: Vec<String> = tys.iter().map(|t| self.llvm_type(t)).collect();
-                format!("{{ {} }}", parts.join(", "))
+                let parts = tys
+                    .iter()
+                    .map(|t| self.llvm_type(t))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(format!("{{ {} }}", parts.join(", ")))
             }
         }
+    }
+
+    fn llvm_overflow_intrinsic(&self, op: &OverflowOp, ty: &Ty) -> Result<String, TrustCgError> {
+        let representation_ty = self.representation_ty(ty)?;
+        let prefix = match representation_ty {
+            Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 | Ty::U128 | Ty::Usize => "u",
+            Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::I128 | Ty::Isize => "s",
+            other => {
+                return Err(TrustCgError::Emission(format!(
+                    "Overflow requires an integer type, got {other:?}"
+                )));
+            }
+        };
+        let op_name = match op {
+            OverflowOp::AddOverflow => "add",
+            OverflowOp::SubOverflow => "sub",
+            OverflowOp::MulOverflow => "mul",
+        };
+        Ok(format!(
+            "llvm.{prefix}{op_name}.with.overflow.{}",
+            self.llvm_type(representation_ty)?
+        ))
+    }
+
+    fn llvm_ctpop_intrinsic(&self, ty: &Ty) -> Result<Option<&'static str>, TrustCgError> {
+        Ok(llvm_ctpop_intrinsic(self.representation_ty(ty)?))
     }
 
     fn emit_module(&mut self) -> Result<(), TrustCgError> {
@@ -212,7 +286,7 @@ impl<'m> EmitCtx<'m> {
                 if i > 0 {
                     emit!(self.output, ", ")?;
                 }
-                let ty_str = self.llvm_type(&field.ty);
+                let ty_str = self.llvm_type(&field.ty)?;
                 emit!(self.output, "{}", ty_str)?;
             }
             emitln!(self.output, " }}")?;
@@ -221,7 +295,7 @@ impl<'m> EmitCtx<'m> {
         // Global declarations.
         for global in &self.module.globals {
             let mutability = if global.mutable { "global" } else { "constant" };
-            let ty_str = self.llvm_type(&global.ty);
+            let ty_str = self.llvm_type(&global.ty)?;
             let init = match &global.initializer {
                 Some(c) => self.format_constant(c, &global.ty)?,
                 None => llvm_zero_init(&global.ty),
@@ -260,13 +334,13 @@ impl<'m> EmitCtx<'m> {
     fn emit_runtime_declarations(&mut self) -> Result<(), TrustCgError> {
         // Emit external declarations for runtime helpers.
         for helper in crate::runtime::RUNTIME_HELPERS {
-            let ret_str = llvm_ty_static(&helper.ret);
+            let ret_str = llvm_ty_static(&helper.ret)?;
             emit!(self.output, "declare {} @{}(", ret_str, helper.symbol)?;
             for (i, param_ty) in helper.params.iter().enumerate() {
                 if i > 0 {
                     emit!(self.output, ", ")?;
                 }
-                emit!(self.output, "{}", llvm_ty_static(param_ty))?;
+                emit!(self.output, "{}", llvm_ty_static(param_ty)?)?;
             }
             emitln!(self.output, ")")?;
         }
@@ -288,15 +362,18 @@ impl<'m> EmitCtx<'m> {
         })?;
 
         // Function signature.
-        let ret_ty = self.format_return_type(func_ty);
+        let ret_ty = self.format_return_type(func_ty)?;
 
         // Store return type for use by Return instructions in this function.
         self.current_return_ty = ret_ty.clone();
 
         // Store per-element return types for multi-value returns so we
         // emit correct per-element types instead of hardcoded i64.
-        self.current_return_element_tys =
-            func_ty.returns.iter().map(|t| self.llvm_type(t)).collect();
+        self.current_return_element_tys = func_ty
+            .returns
+            .iter()
+            .map(|t| self.llvm_type(t))
+            .collect::<Result<Vec<_>, _>>()?;
 
         emit!(self.output, "define {} @{}(", ret_ty, func.name)?;
 
@@ -309,7 +386,7 @@ impl<'m> EmitCtx<'m> {
             if i > 0 {
                 emit!(self.output, ", ")?;
             }
-            let ty_str = self.llvm_type(ty);
+            let ty_str = self.llvm_type(ty)?;
             emit!(self.output, "{} %{}", ty_str, val_id.index())?;
         }
 
@@ -339,7 +416,7 @@ impl<'m> EmitCtx<'m> {
             if !block.params.is_empty() {
                 emit!(self.output, "  ; params:")?;
                 for (val, ty) in &block.params {
-                    let ty_str = self.llvm_type(ty);
+                    let ty_str = self.llvm_type(ty)?;
                     emit!(self.output, " %{}:{}", val.index(), ty_str)?;
                 }
             }
@@ -383,7 +460,7 @@ impl<'m> EmitCtx<'m> {
                 let r = result
                     .ok_or_else(|| TrustCgError::Emission("BinOp has no result".to_string()))?;
                 self.value_types.insert(r.index(), ty.clone());
-                let ty_str = self.llvm_type(ty);
+                let ty_str = self.llvm_type(ty)?;
                 emitln!(
                     self.output,
                     "%{} = {} {} %{}, %{}",
@@ -398,7 +475,7 @@ impl<'m> EmitCtx<'m> {
                 let r = result
                     .ok_or_else(|| TrustCgError::Emission("UnOp has no result".to_string()))?;
                 self.value_types.insert(r.index(), ty.clone());
-                let ty_str = self.llvm_type(ty);
+                let ty_str = self.llvm_type(ty)?;
                 #[allow(unreachable_patterns)]
                 match op {
                     UnOp::Neg => emitln!(
@@ -423,7 +500,7 @@ impl<'m> EmitCtx<'m> {
                         operand.index(),
                     )?,
                     UnOp::CtPop => {
-                        let intrinsic = llvm_ctpop_intrinsic(ty).ok_or_else(|| {
+                        let intrinsic = self.llvm_ctpop_intrinsic(ty)?.ok_or_else(|| {
                             TrustCgError::Emission(format!(
                                 "CtPop requires integer type, got {ty:?}"
                             ))
@@ -448,8 +525,8 @@ impl<'m> EmitCtx<'m> {
             Inst::Overflow { op, ty, lhs, rhs } => {
                 let r = result
                     .ok_or_else(|| TrustCgError::Emission("Overflow has no result".to_string()))?;
-                let intrinsic = llvm_overflow_intrinsic(op, ty);
-                let ty_str = self.llvm_type(ty);
+                let intrinsic = self.llvm_overflow_intrinsic(op, ty)?;
+                let ty_str = self.llvm_type(ty)?;
                 emitln!(
                     self.output,
                     "%{} = call {{ {}, i1 }} @{}({} %{}, {} %{})",
@@ -465,7 +542,7 @@ impl<'m> EmitCtx<'m> {
             Inst::ICmp { op, ty, lhs, rhs } => {
                 let r = result
                     .ok_or_else(|| TrustCgError::Emission("ICmp has no result".to_string()))?;
-                let ty_str = self.llvm_type(ty);
+                let ty_str = self.llvm_type(ty)?;
                 emitln!(
                     self.output,
                     "%{} = icmp {} {} %{}, %{}",
@@ -479,7 +556,7 @@ impl<'m> EmitCtx<'m> {
             Inst::FCmp { op, ty, lhs, rhs } => {
                 let r = result
                     .ok_or_else(|| TrustCgError::Emission("FCmp has no result".to_string()))?;
-                let ty_str = self.llvm_type(ty);
+                let ty_str = self.llvm_type(ty)?;
                 emitln!(
                     self.output,
                     "%{} = fcmp {} {} %{}, %{}",
@@ -500,10 +577,12 @@ impl<'m> EmitCtx<'m> {
                     .ok_or_else(|| TrustCgError::Emission("Cast has no result".to_string()))?;
                 // Record the destination type for GEP index resolution.
                 self.value_types.insert(r.index(), dst_ty.clone());
-                let src = self.llvm_type(src_ty);
-                let dst = self.llvm_type(dst_ty);
+                let src = self.llvm_type(src_ty)?;
+                let dst = self.llvm_type(dst_ty)?;
                 if matches!(op, CastOp::PtrToPtr) {
-                    if matches!(src_ty, Ty::FatPtr(_)) || matches!(dst_ty, Ty::FatPtr(_)) {
+                    if matches!(self.representation_ty(src_ty)?, Ty::FatPtr(_))
+                        || matches!(self.representation_ty(dst_ty)?, Ty::FatPtr(_))
+                    {
                         return Err(TrustCgError::Emission(
                             "PtrToPtr casts involving FatPtr are not supported by LLVM text emission"
                                 .to_string(),
@@ -535,7 +614,7 @@ impl<'m> EmitCtx<'m> {
                 let r = result
                     .ok_or_else(|| TrustCgError::Emission("Load has no result".to_string()))?;
                 self.value_types.insert(r.index(), ty.clone());
-                let ty_str = self.llvm_type(ty);
+                let ty_str = self.llvm_type(ty)?;
                 emitln!(
                     self.output,
                     "%{} = load {}, ptr %{}",
@@ -545,7 +624,7 @@ impl<'m> EmitCtx<'m> {
                 )?;
             }
             Inst::Store { ty, ptr, value, .. } => {
-                let ty_str = self.llvm_type(ty);
+                let ty_str = self.llvm_type(ty)?;
                 emitln!(
                     self.output,
                     "store {} %{}, ptr %{}",
@@ -557,7 +636,7 @@ impl<'m> EmitCtx<'m> {
             Inst::Alloca { ty, count, .. } => {
                 let r = result
                     .ok_or_else(|| TrustCgError::Emission("Alloca has no result".to_string()))?;
-                let ty_str = self.llvm_type(ty);
+                let ty_str = self.llvm_type(ty)?;
                 match count {
                     Some(c) => emitln!(
                         self.output,
@@ -577,7 +656,7 @@ impl<'m> EmitCtx<'m> {
             } => {
                 let r = result
                     .ok_or_else(|| TrustCgError::Emission("GEP has no result".to_string()))?;
-                let ty_str = self.llvm_type(pointee_ty);
+                let ty_str = self.llvm_type(pointee_ty)?;
                 let inbounds_kw = if *inbounds { "inbounds " } else { "" };
                 emit!(
                     self.output,
@@ -591,10 +670,10 @@ impl<'m> EmitCtx<'m> {
                     // GEP index type must match the SSA value type. Look up the
                     // type from the value_types map (populated by Const, Cast,
                     // block params, etc.). Fall back to i64 if unknown.
-                    let idx_ty = self
-                        .value_types
-                        .get(&idx.index())
-                        .map_or_else(|| "i64".to_string(), |t| self.llvm_type(t));
+                    let idx_ty = match self.value_types.get(&idx.index()) {
+                        Some(ty) => self.llvm_type(ty)?,
+                        None => "i64".to_string(),
+                    };
                     emit!(self.output, ", {} %{}", idx_ty, idx.index())?;
                 }
                 emitln!(self.output)?;
@@ -603,7 +682,7 @@ impl<'m> EmitCtx<'m> {
                 let r = result.ok_or_else(|| {
                     TrustCgError::Emission("AtomicLoad has no result".to_string())
                 })?;
-                let ty_str = self.llvm_type(ty);
+                let ty_str = self.llvm_type(ty)?;
                 emitln!(
                     self.output,
                     "%{} = load atomic {}, ptr %{} {}",
@@ -619,7 +698,7 @@ impl<'m> EmitCtx<'m> {
                 value,
                 ordering,
             } => {
-                let ty_str = self.llvm_type(ty);
+                let ty_str = self.llvm_type(ty)?;
                 emitln!(
                     self.output,
                     "store atomic {} %{}, ptr %{} {}",
@@ -638,7 +717,7 @@ impl<'m> EmitCtx<'m> {
             } => {
                 let r = result
                     .ok_or_else(|| TrustCgError::Emission("AtomicRMW has no result".to_string()))?;
-                let ty_str = self.llvm_type(ty);
+                let ty_str = self.llvm_type(ty)?;
                 emitln!(
                     self.output,
                     "%{} = atomicrmw {} ptr %{}, {} %{} {}",
@@ -660,7 +739,7 @@ impl<'m> EmitCtx<'m> {
             } => {
                 let r = result
                     .ok_or_else(|| TrustCgError::Emission("CmpXchg has no result".to_string()))?;
-                let ty_str = self.llvm_type(ty);
+                let ty_str = self.llvm_type(ty)?;
                 emitln!(
                     self.output,
                     "%{} = cmpxchg ptr %{}, {} %{}, {} %{} {} {}",
@@ -742,8 +821,10 @@ impl<'m> EmitCtx<'m> {
                     .and_then(|&ft_idx| self.module.func_types.get(ft_idx));
 
                 if let Some(r) = result {
-                    let ret_str = callee_func_ty
-                        .map_or_else(|| "i64".to_string(), |ft| self.format_return_type(ft));
+                    let ret_str = match callee_func_ty {
+                        Some(func_ty) => self.format_return_type(func_ty)?,
+                        None => "i64".to_string(),
+                    };
                     emit!(
                         self.output,
                         "%{} = call {} @{}(",
@@ -759,9 +840,10 @@ impl<'m> EmitCtx<'m> {
                         emit!(self.output, ", ")?;
                     }
                     // Use parameter types from callee signature when available.
-                    let param_ty_str = callee_func_ty
-                        .and_then(|ft| ft.params.get(i))
-                        .map_or_else(|| "i64".to_string(), |ty| self.llvm_type(ty));
+                    let param_ty_str = match callee_func_ty.and_then(|ft| ft.params.get(i)) {
+                        Some(ty) => self.llvm_type(ty)?,
+                        None => "i64".to_string(),
+                    };
                     emit!(self.output, "{} %{}", param_ty_str, arg.index())?;
                 }
                 emitln!(self.output, ")")?;
@@ -776,8 +858,10 @@ impl<'m> EmitCtx<'m> {
                 let sig_ty = self.module.func_types.get(sig.as_usize());
 
                 if let Some(r) = result {
-                    let ret_str =
-                        sig_ty.map_or_else(|| "i64".to_string(), |ft| self.format_return_type(ft));
+                    let ret_str = match sig_ty {
+                        Some(func_ty) => self.format_return_type(func_ty)?,
+                        None => "i64".to_string(),
+                    };
                     emit!(
                         self.output,
                         "%{} = call {} %{}(",
@@ -792,9 +876,10 @@ impl<'m> EmitCtx<'m> {
                     if i > 0 {
                         emit!(self.output, ", ")?;
                     }
-                    let param_ty_str = sig_ty
-                        .and_then(|ft| ft.params.get(i))
-                        .map_or_else(|| "i64".to_string(), |ty| self.llvm_type(ty));
+                    let param_ty_str = match sig_ty.and_then(|ft| ft.params.get(i)) {
+                        Some(ty) => self.llvm_type(ty)?,
+                        None => "i64".to_string(),
+                    };
                     emit!(self.output, "{} %{}", param_ty_str, arg.index())?;
                 }
                 emitln!(self.output, ")")?;
@@ -835,7 +920,7 @@ impl<'m> EmitCtx<'m> {
                 let r = result.ok_or_else(|| {
                     TrustCgError::Emission("ExtractField has no result".to_string())
                 })?;
-                let ty_str = self.llvm_type(ty);
+                let ty_str = self.llvm_type(ty)?;
                 emitln!(
                     self.output,
                     "%{} = extractvalue {} %{}, {}",
@@ -854,9 +939,9 @@ impl<'m> EmitCtx<'m> {
                 let r = result.ok_or_else(|| {
                     TrustCgError::Emission("InsertField has no result".to_string())
                 })?;
-                let ty_str = self.llvm_type(ty);
+                let ty_str = self.llvm_type(ty)?;
                 // Resolve the field type for the inserted value.
-                let field_ty_str = self.resolve_struct_field_ty(ty, *field);
+                let field_ty_str = self.resolve_struct_field_ty(ty, *field)?;
                 emitln!(
                     self.output,
                     "%{} = insertvalue {} %{}, {} %{}, {}",
@@ -880,8 +965,8 @@ impl<'m> EmitCtx<'m> {
                 let r = result.ok_or_else(|| {
                     TrustCgError::Emission("ExtractElement has no result".to_string())
                 })?;
-                let ty_str = self.llvm_type(ty);
-                let elem_ty_str = self.resolve_array_elem_ty(ty);
+                let ty_str = self.llvm_type(ty)?;
+                let elem_ty_str = self.resolve_array_elem_ty(ty)?;
                 let tmp_alloca = self.temp_counter;
                 let tmp_gep = self.temp_counter + 1;
                 self.temp_counter += 2;
@@ -927,8 +1012,8 @@ impl<'m> EmitCtx<'m> {
                 let r = result.ok_or_else(|| {
                     TrustCgError::Emission("InsertElement has no result".to_string())
                 })?;
-                let ty_str = self.llvm_type(ty);
-                let elem_ty_str = self.resolve_array_elem_ty(ty);
+                let ty_str = self.llvm_type(ty)?;
+                let elem_ty_str = self.resolve_array_elem_ty(ty)?;
                 let tmp_alloca = self.temp_counter;
                 let tmp_gep = self.temp_counter + 1;
                 self.temp_counter += 2;
@@ -969,8 +1054,8 @@ impl<'m> EmitCtx<'m> {
                 // Record the type for GEP index resolution.
                 self.value_types.insert(r.index(), ty.clone());
                 let val_str = self.format_constant(value, ty)?;
-                let ty_str = self.llvm_type(ty);
-                match ty {
+                let ty_str = self.llvm_type(ty)?;
+                match self.representation_ty(ty)? {
                     Ty::Ptr
                     | Ty::Ref(_)
                     | Ty::RefMut(_)
@@ -1055,7 +1140,7 @@ impl<'m> EmitCtx<'m> {
             Inst::Undef { ty } => {
                 let r = result
                     .ok_or_else(|| TrustCgError::Emission("Undef has no result".to_string()))?;
-                let ty_str = self.llvm_type(ty);
+                let ty_str = self.llvm_type(ty)?;
                 emitln!(self.output, "%{} = freeze {} undef", r.index(), ty_str,)?;
             }
             Inst::Assume { cond } => {
@@ -1088,8 +1173,8 @@ impl<'m> EmitCtx<'m> {
             Inst::Copy { ty, operand } => {
                 let r = result
                     .ok_or_else(|| TrustCgError::Emission("Copy has no result".to_string()))?;
-                let ty_str = self.llvm_type(ty);
-                match ty {
+                let ty_str = self.llvm_type(ty)?;
+                match self.representation_ty(ty)? {
                     Ty::Ptr
                     | Ty::Ref(_)
                     | Ty::RefMut(_)
@@ -1156,7 +1241,7 @@ impl<'m> EmitCtx<'m> {
             } => {
                 let r = result
                     .ok_or_else(|| TrustCgError::Emission("Select has no result".to_string()))?;
-                let ty_str = self.llvm_type(ty);
+                let ty_str = self.llvm_type(ty)?;
                 emitln!(
                     self.output,
                     "%{} = select i1 %{}, {} %{}, {} %{}",
@@ -1236,27 +1321,29 @@ impl<'m> EmitCtx<'m> {
     }
 
     /// Resolve a struct field type for `InsertField` emission.
-    fn resolve_struct_field_ty(&self, ty: &Ty, field: u32) -> String {
-        if let Ty::Struct(sid) = ty {
+    fn resolve_struct_field_ty(&self, ty: &Ty, field: u32) -> Result<String, TrustCgError> {
+        if let Ty::Struct(sid) = self.representation_ty(ty)? {
             if let Some(sd) = self.module.structs.iter().find(|s| s.id == *sid) {
                 if let Some(f) = sd.fields.get(field as usize) {
                     return self.llvm_type(&f.ty);
                 }
             }
         }
-        // Fallback for non-struct or unresolvable field.
-        "i64".to_string()
+        Err(TrustCgError::Emission(format!(
+            "cannot resolve field {field} for type {ty:?}"
+        )))
     }
 
     /// Resolve an array element type for `InsertElement` emission.
-    fn resolve_array_elem_ty(&self, ty: &Ty) -> String {
-        if let Ty::Array(elem_ty_id, _) = ty {
+    fn resolve_array_elem_ty(&self, ty: &Ty) -> Result<String, TrustCgError> {
+        if let Ty::Array(elem_ty_id, _) = self.representation_ty(ty)? {
             if let Some(elem_ty) = self.module.types.get(elem_ty_id.as_usize()) {
                 return self.llvm_type(elem_ty);
             }
         }
-        // Fallback for non-array or unresolvable element.
-        "i64".to_string()
+        Err(TrustCgError::Emission(format!(
+            "cannot resolve array element type for {ty:?}"
+        )))
     }
 
     /// Format a constant value as an LLVM IR literal.
@@ -1266,7 +1353,8 @@ impl<'m> EmitCtx<'m> {
     /// correct per-element types for aggregate constants instead of
     /// defaulting everything to i64.
     fn format_constant(&self, c: &Constant, ty: &Ty) -> Result<String, TrustCgError> {
-        if matches!(ty, Ty::FatPtr(_)) {
+        let representation_ty = self.representation_ty(ty)?;
+        if matches!(representation_ty, Ty::FatPtr(_)) {
             return Err(TrustCgError::Emission(
                 "FatPtr constants are not supported by LLVM text emission".to_string(),
             ));
@@ -1297,7 +1385,7 @@ impl<'m> EmitCtx<'m> {
                 }
             }
             Constant::Aggregate(elems) | Constant::Array(elems) | Constant::Vector(elems) => {
-                let parts: Vec<String> = match ty {
+                let parts: Vec<String> = match representation_ty {
                     Ty::Struct(sid) => {
                         // Use struct field types for each element.
                         let fields = self
@@ -1311,8 +1399,10 @@ impl<'m> EmitCtx<'m> {
                             .enumerate()
                             .map(|(i, e)| {
                                 let field_ty = fields.and_then(|fs| fs.get(i)).map(|f| &f.ty);
-                                let ty_str = field_ty
-                                    .map_or_else(|| "i64".to_string(), |t| self.llvm_type(t));
+                                let ty_str = match field_ty {
+                                    Some(ty) => self.llvm_type(ty)?,
+                                    None => "i64".to_string(),
+                                };
                                 let val = field_ty.map_or_else(
                                     || self.format_constant(e, &Ty::I64),
                                     |t| self.format_constant(e, t),
@@ -1323,22 +1413,27 @@ impl<'m> EmitCtx<'m> {
                     }
                     Ty::Array(elem_ty_id, _) => {
                         // Use array element type for all elements.
-                        let elem_ty = self
-                            .module
-                            .types
-                            .get(elem_ty_id.as_usize())
-                            .cloned()
-                            .unwrap_or(Ty::I64);
-                        let ty_str = self.llvm_type(&elem_ty);
+                        let elem_ty =
+                            self.module
+                                .types
+                                .get(elem_ty_id.as_usize())
+                                .ok_or_else(|| {
+                                    TrustCgError::Emission(format!(
+                                "Array(TyId({}), _) references a type table with {} entries",
+                                elem_ty_id.index(),
+                                self.module.types.len(),
+                            ))
+                                })?;
+                        let ty_str = self.llvm_type(elem_ty)?;
                         elems
                             .iter()
                             .map(|e| {
-                                Ok(format!("{} {}", ty_str, self.format_constant(e, &elem_ty)?))
+                                Ok(format!("{} {}", ty_str, self.format_constant(e, elem_ty)?))
                             })
                             .collect::<Result<Vec<_>, TrustCgError>>()?
                     }
                     Ty::Vector(elem_ty, _) => {
-                        let ty_str = self.llvm_type(elem_ty);
+                        let ty_str = self.llvm_type(elem_ty)?;
                         elems
                             .iter()
                             .map(|e| {
@@ -1352,9 +1447,9 @@ impl<'m> EmitCtx<'m> {
                         )));
                     }
                 };
-                if matches!(ty, Ty::Array(_, _)) {
+                if matches!(representation_ty, Ty::Array(_, _)) {
                     Ok(format!("[ {} ]", parts.join(", ")))
-                } else if matches!(ty, Ty::Vector(_, _)) {
+                } else if matches!(representation_ty, Ty::Vector(_, _)) {
                     Ok(format!("< {} >", parts.join(", ")))
                 } else {
                     Ok(format!("{{ {} }}", parts.join(", ")))
@@ -1397,35 +1492,37 @@ fn block_label(id: BlockId) -> String {
 
 /// Static type mapping for primitive types only (used by runtime declarations
 /// where module context is not needed).
-fn llvm_ty_static(ty: &Ty) -> &'static str {
+fn llvm_ty_static(ty: &Ty) -> Result<&'static str, TrustCgError> {
     match ty {
-        Ty::I8 => "i8",
-        Ty::I16 => "i16",
-        Ty::I32 => "i32",
-        Ty::I64 => "i64",
-        Ty::I128 => "i128",
-        Ty::F16 => "half",
-        Ty::F32 => "float",
-        Ty::F64 => "double",
-        Ty::Bool => "i1",
-        Ty::Ptr => "ptr",
-        Ty::FatPtr(_) => "{ ptr, i64 }",
-        Ty::Unit => "void",
-        Ty::Struct(_) | Ty::Array(_, _) | Ty::Vector(_, _) | Ty::Func(_) => "ptr",
-        Ty::U8 => "i8",
-        Ty::U16 => "i16",
-        Ty::U32 => "i32",
-        Ty::U64 => "i64",
-        Ty::U128 => "i128",
+        Ty::I8 => Ok("i8"),
+        Ty::I16 => Ok("i16"),
+        Ty::I32 => Ok("i32"),
+        Ty::I64 => Ok("i64"),
+        Ty::I128 => Ok("i128"),
+        Ty::F16 => Ok("half"),
+        Ty::F32 => Ok("float"),
+        Ty::F64 => Ok("double"),
+        Ty::Bool => Ok("i1"),
+        Ty::Ptr => Ok("ptr"),
+        Ty::FatPtr(_) => Ok("{ ptr, i64 }"),
+        Ty::Unit => Ok("void"),
+        Ty::Struct(_) | Ty::Array(_, _) | Ty::Vector(_, _) | Ty::Func(_) => Ok("ptr"),
+        Ty::U8 => Ok("i8"),
+        Ty::U16 => Ok("i16"),
+        Ty::U32 => Ok("i32"),
+        Ty::U64 => Ok("i64"),
+        Ty::U128 => Ok("i128"),
         // v25 B1 scalars (see the sibling emitter above).
-        Ty::Isize | Ty::Usize => "i64",
-        Ty::Char => "i32",
-        Ty::Error => unreachable!("Ty::Error is rejected by validate_module"),
-        Ty::Never => "void",
-        Ty::Tuple(_) | Ty::Enum(_) => "ptr",
-        Ty::Ref(_) | Ty::RefMut(_) | Ty::PtrConst(_) | Ty::PtrMut(_) | Ty::Rc(_) => "ptr",
+        Ty::Isize | Ty::Usize => Ok("i64"),
+        Ty::Char => Ok("i32"),
+        Ty::Never => Ok("void"),
+        Ty::Tuple(_) | Ty::Enum(_) => Ok("ptr"),
+        Ty::Ref(_) | Ty::RefMut(_) | Ty::PtrConst(_) | Ty::PtrMut(_) | Ty::Rc(_) => Ok("ptr"),
         // Compound TLA+ types lower to opaque ptr in LLVM IR.
-        Ty::Set(_, _) | Ty::Sequence(_) | Ty::Record(_) | Ty::Closure(_) => "ptr",
+        Ty::Set(_, _) | Ty::Sequence(_) | Ty::Record(_) | Ty::Closure(_) => Ok("ptr"),
+        Ty::Error | Ty::Refine(_, _) => Err(TrustCgError::Emission(format!(
+            "type {ty:?} requires module context for LLVM lowering"
+        ))),
     }
 }
 
@@ -1537,23 +1634,6 @@ fn llvm_rmw(op: &AtomicRMWOp) -> &'static str {
     }
 }
 
-fn llvm_overflow_intrinsic(op: &OverflowOp, ty: &Ty) -> String {
-    let prefix = if matches!(ty, Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 | Ty::U128) {
-        "u"
-    } else {
-        "s"
-    };
-    let op_name = match op {
-        OverflowOp::AddOverflow => "add",
-        OverflowOp::SubOverflow => "sub",
-        OverflowOp::MulOverflow => "mul",
-    };
-    format!(
-        "llvm.{prefix}{op_name}.with.overflow.{}",
-        llvm_ty_static(ty)
-    )
-}
-
 fn llvm_ctpop_intrinsic(ty: &Ty) -> Option<&'static str> {
     match ty {
         Ty::I8 | Ty::U8 => Some("llvm.ctpop.i8"),
@@ -1583,8 +1663,8 @@ mod tests {
     use tla_jit_abi::{CompoundLayout, SetBitmaskElement, StateLayout, VarLayout};
     use tla_tir::bytecode::{BuiltinOp, BytecodeFunction, ConstantPool, Opcode};
     use trust_ir::ty::{FieldDef, FuncTy, StructDef, StructRepr};
-    use trust_ir::value::{FuncId, StructId, ValueId};
-    use trust_ir::{Block, Function, InstrNode};
+    use trust_ir::value::{FuncId, StructId, TyId, ValueId};
+    use trust_ir::{Block, Function, InstrNode, Pred};
 
     fn int_range_set_bitmask_layout(lo: i64, hi: i64) -> CompoundLayout {
         CompoundLayout::SetBitmask {
@@ -1633,6 +1713,63 @@ mod tests {
         let ir = emit_module(&module).expect("should emit");
         assert!(ir.contains("; ModuleID = 'test_header'"));
         assert!(ir.contains("source_filename = \"test_header\""));
+    }
+
+    #[test]
+    fn test_emit_refinement_uses_base_carrier_without_predicate_authority() {
+        let mut module = Module::new("refined_i32");
+        let base = module.add_type(Ty::I32);
+        let predicate = module
+            .intern_pred(Pred::NonZero)
+            .expect("canonical predicate");
+        let refined = Ty::Refine(base, predicate);
+        let ft = module.add_func_type(FuncTy {
+            params: vec![refined.clone()],
+            returns: vec![refined.clone()],
+            is_vararg: false,
+        });
+        let entry = BlockId::new(0);
+        let mut func = Function::new(FuncId::new(0), "identity", ft, entry);
+        let mut block = Block::new(entry).with_param(ValueId::new(0), refined);
+        block.body.push(InstrNode::new(Inst::Return {
+            values: vec![ValueId::new(0)],
+        }));
+        func.blocks.push(block);
+        module.add_function(func);
+
+        let ir = emit_module(&module).expect("valid refinement should emit");
+        assert!(ir.contains("define i32 @identity(i32 %0)"));
+        assert!(ir.contains("ret i32 %0"));
+        assert!(!ir.contains("NonZero"));
+    }
+
+    #[test]
+    fn test_emit_refinement_preserves_pointer_width_carrier() {
+        let mut module = Module::new("refined_usize");
+        let base = module.add_type(Ty::Usize);
+        let predicate = module.intern_pred(Pred::Top).expect("canonical predicate");
+        let ctx = EmitCtx::new(&module);
+
+        assert_eq!(
+            ctx.llvm_type(&Ty::Refine(base, predicate))
+                .expect("valid refinement"),
+            "i64"
+        );
+    }
+
+    #[test]
+    fn test_emit_refinement_rejects_dangling_base_without_panicking() {
+        let mut module = Module::new("dangling_refinement");
+        let predicate = module.intern_pred(Pred::Top).expect("canonical predicate");
+        let refined = Ty::Refine(TyId::new(99), predicate);
+        let ctx = EmitCtx::new(&module);
+
+        let err = ctx
+            .llvm_type(&refined)
+            .expect_err("dangling refinement base must fail closed");
+        assert!(
+            matches!(err, TrustCgError::Emission(message) if message.contains("Refine(TyId(99)"))
+        );
     }
 
     #[test]

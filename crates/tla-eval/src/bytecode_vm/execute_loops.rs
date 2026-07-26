@@ -7,8 +7,8 @@
 //! Owns the iterator-loop state machine: quantifier loops (Forall/Exists),
 //! set builders, set filters, function-definition loops, and CHOOSE.
 
-use tla_value::Rp;
 use tla_value::error::EvalError;
+use tla_value::Rp;
 use tla_value::{FuncValue, SortedSet, Value};
 
 use super::execute::VmError;

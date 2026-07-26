@@ -53,7 +53,8 @@ fn emit_property_check_stats(stats: &tla_check::CheckStats, to_stderr: bool) {
 /// Print the standard statistics footer for human-readable output.
 ///
 /// Used by the invariant, property, liveness, and deadlock arms (to stderr).
-/// Prints states_found, initial_states, transitions, time, and storage stats.
+/// Prints states_found, initial_states, TLC-style generated states,
+/// transitions, time, and storage stats.
 /// The Error arm uses its own minimal inline stats (states_found + time only).
 /// The Success and LimitReached arms use inline code for their extra fields.
 fn emit_human_stats_footer(
@@ -73,6 +74,11 @@ fn emit_human_stats_footer(
         format_guard_suppression_suffix(stats.suppressed_guard_errors)
     );
     out!("  Initial states: {}", stats.initial_states);
+    out!(
+        "  Initial states generated: {}",
+        stats.raw_initial_states_generated
+    );
+    out!("  States generated: {}", stats.states_generated());
     out!("  Transitions: {}", stats.transitions);
     out!("  Time: {:.3}s", elapsed.as_secs_f64());
     emit_property_check_stats(stats, to_stderr);
@@ -125,6 +131,11 @@ pub(crate) fn report_check_human(
                 format_guard_suppression_suffix(stats.suppressed_guard_errors)
             );
             println!("  Initial states: {}", stats.initial_states);
+            println!(
+                "  Initial states generated: {}",
+                stats.raw_initial_states_generated
+            );
+            println!("  States generated: {}", stats.states_generated());
             println!("  Transitions: {}", stats.transitions);
             println!("  Max queue depth: {}", stats.max_queue_depth);
             if stats.phantom_dequeues > 0 {
@@ -319,6 +330,11 @@ pub(crate) fn report_check_human(
                 format_guard_suppression_suffix(stats.suppressed_guard_errors)
             );
             println!("  Initial states: {}", stats.initial_states);
+            println!(
+                "  Initial states generated: {}",
+                stats.raw_initial_states_generated
+            );
+            println!("  States generated: {}", stats.states_generated());
             println!("  Transitions: {}", stats.transitions);
             println!("  Max depth: {}", stats.max_depth);
             println!("  Time: {:.3}s", elapsed.as_secs_f64());

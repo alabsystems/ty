@@ -2107,6 +2107,13 @@ impl TirLowerCtx {
                 ));
             }
 
+            Opcode::EdgeFilter { .. } => {
+                self.stats.opcodes_skipped += 1;
+                return Err(TrustCgError::UnsupportedInst(
+                    "EdgeFilter requires bytecode-VM lowering".to_string(),
+                ));
+            }
+
             // =================================================================
             // Unsupported opcodes (closures, set builders, etc.)
             // =================================================================
@@ -2704,6 +2711,13 @@ fn max_register_in_opcode(op: &Opcode) -> u8 {
         | Opcode::Implies { rd, r1, r2 }
         | Opcode::Equiv { rd, r1, r2 } => rd.max(r1).max(r2),
         Opcode::RoundStepEq { rd, child, parent } => rd.max(child).max(parent),
+        Opcode::EdgeFilter {
+            rd,
+            first,
+            arg,
+            domain,
+            ..
+        } => rd.max(first).max(arg).max(domain),
         Opcode::NegInt { rd, rs } | Opcode::Not { rd, rs } => rd.max(rs),
         Opcode::Ret { rs } => rs,
         // Phase 2: control flow registers.

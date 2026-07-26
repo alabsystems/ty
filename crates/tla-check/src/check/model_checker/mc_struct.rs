@@ -146,6 +146,42 @@ pub(super) struct SymmetryState {
     /// reduction in concurrently-running checkers (observed as flaky
     /// state-count assertions in the symmetry test suite).
     pub(super) auto_symmetry_override: Option<bool>,
+    /// Adaptive zero-yield symmetry cutoff (sym-yield): set once the
+    /// symmetry group has PROVABLY merged nothing — zero ORBIT MERGES (no
+    /// two distinct raw fingerprints canonicalized to the same fp, tracked
+    /// exactly by `yield_merge_probe`) — for at least the cutoff threshold
+    /// of distinct states. Once set (permanent for the run),
+    /// `state_fingerprint` returns raw fingerprints. NOTE: merge-freedom is
+    /// deliberately WEAKER than fp-identity (`states_folded == 0`): a group
+    /// can move 40% of fingerprints (`canonical != raw`) while merging zero
+    /// orbits (measured on MultiPaxos_MC_small: 142,152 of 343,796 states
+    /// fp-changed, ZERO merged). See `maybe_fire_symmetry_yield_cutoff` in
+    /// `fingerprint.rs` for the mixed-domain soundness proof. Kill switch:
+    /// `TY_NO_SYM_YIELD_CUTOFF=1`.
+    pub(super) yield_cutoff_active: bool,
+    /// Latched when the cutoff can never fire for this run: a real orbit
+    /// merge was observed (`yield_merges > 0`), the kill switch is set,
+    /// probing is disabled, or trace, checkpoint, or liveness machinery is
+    /// active (fail closed). Avoids re-running the predicates on every
+    /// subsequent miss.
+    pub(super) yield_cutoff_declined: bool,
+    /// Distinct-state canonicalizations (`fp_cache_misses`) at the moment the
+    /// zero-yield cutoff fired. 0 = never fired. Observability only.
+    pub(super) yield_cutoff_fired_at: u64,
+    /// Canonicalizations skipped (raw fp returned directly) after the
+    /// zero-yield cutoff fired. Observability only.
+    pub(super) yield_cutoff_skipped: u64,
+    /// Orbit merges observed by the probe (>= 1 latches the decline; probing
+    /// stops at the first merge, so this is effectively a boolean).
+    pub(super) yield_merges: u64,
+    /// EXACT merge detector: the set of canonical fingerprints produced by
+    /// `fp_cache` MISSES so far. A miss is by definition a raw fingerprint
+    /// never canonicalized before, so an insert that finds its canonical fp
+    /// already present is precisely an orbit merge (two distinct raw fps,
+    /// one canonical fp). Bounded: a decision (fire or decline) is made at
+    /// or before `sym_yield_cutoff_threshold()` misses, and the probe is
+    /// dropped on every exit path, so it never exceeds threshold entries.
+    pub(super) yield_merge_probe: rustc_hash::FxHashSet<Fingerprint>,
 }
 
 /// Part of #2752: Shared periodic liveness state — re-export from crate root
@@ -220,10 +256,11 @@ pub(super) struct CoverageState {
     /// / `native_fast_path_coverage_skippable`).
     ///
     /// Consumed by `auto_select_post_compile_trust_cg_gate`: when the
-    /// post-compile gate abandons native (partial action coverage, no admitted
-    /// fused level) the perf rationale for the skip never materialized, so the
-    /// gate re-enables collection before the BFS loop takes any transition —
-    /// restoring the default V2 dead-action WARNING for interpreter runs.
+    /// post-compile gate abandons native (zero/partial action coverage, no
+    /// admitted fused level) the perf rationale for the skip never
+    /// materialized, so the gate re-enables collection before the BFS loop
+    /// takes any transition — restoring the default V2 dead-action WARNING for
+    /// interpreter runs.
     pub(super) native_fast_path_skipped: bool,
     /// Cached detected actions (including expressions) for coverage collection.
     ///
@@ -249,10 +286,10 @@ pub(super) struct CoverageState {
 
 /// Liveness checking cache state.
 pub(super) struct LivenessCacheState {
-    /// Cached successors from BFS (fingerprint -> list of successor fingerprints).
-    /// Used for liveness checking to avoid regenerating transitions.
-    /// Part of #3176: now uses `SuccessorGraph` dispatch enum supporting
-    /// both in-memory HashMap and disk-backed storage.
+    /// Ordered BFS adjacency used by cached checking and hybrid replay.
+    /// In-memory storage retains O(states + edges) heap data; disk storage puts
+    /// edge records in a file while retaining an O(states) offset index and a
+    /// fixed-slot, fanout-dependent direct cache in memory.
     pub(super) successors: SuccessorGraph,
     /// Concrete successor witnesses keyed by canonical source fingerprint.
     ///
@@ -311,6 +348,13 @@ pub(super) struct LivenessCacheState {
     /// with WF disjunction ordering, TLC skips action body evaluation when the action
     /// is not enabled.
     pub(super) enabled_action_groups: Vec<EnabledActionGroup>,
+    /// Stable fairness tags whose ENABLED leaf is over the configured whole
+    /// Next relation. Retained after the mid-BFS regeneration trip so each
+    /// post-BFS property can re-arm the thread-local exact successor-scan path.
+    pub(super) whole_next_enabled_tags: Vec<u32>,
+    /// Stable paired ActionPred tags that are true on every real whole-Next
+    /// behavior-graph edge. Retained alongside `whole_next_enabled_tags`.
+    pub(super) whole_next_action_tags: Vec<u32>,
     /// Part of #4179: Set of action leaf tags covered by at least one
     /// `action_provenance_tags[*]` entry. Tags in this set can be selectively
     /// evaluated based on the split_action that produced a given successor,
@@ -343,7 +387,9 @@ pub(super) struct LivenessCacheState {
     pub(super) inline_action_bitmasks: ActionBitmaskMap,
     /// Property-scoped inline liveness plans and recorded leaf results.
     pub(super) inline_property_plans: Vec<InlineLivenessPropertyPlan>,
-    /// Cache successors for liveness (active when properties exist and liveness not skipped).
+    /// Capture successors for liveness (active when properties exist and liveness not skipped).
+    /// Remains true after an automatic regeneration trip when adjacency-only
+    /// disk capture stays complete; `regenerate_on_the_fly` disables inline work.
     /// Part of #3175: no longer requires store_full_states.
     pub(super) cache_for_liveness: bool,
     /// Testing-only override: when set, the reachable state graph is captured into
@@ -358,7 +404,8 @@ pub(super) struct LivenessCacheState {
     pub(super) force_capture_for_testing: bool,
     /// Initial states cached during BFS for post-BFS liveness checking.
     /// Part of #3175: populated regardless of store_full_states mode.
-    /// Small: typically 1-10 states.
+    /// Often small, but Init may enumerate the entire reachable space (for
+    /// example CoffeeCan), so liveness consumers must not assume a narrow set.
     pub(super) init_states: Vec<(Fingerprint, ArrayState)>,
     /// Part of #3210: Cached fp-only state replay result. Populated on first
     /// call to `build_fp_only_liveness_state_cache` and reused across properties
@@ -381,12 +428,12 @@ pub(super) struct LivenessCacheState {
     /// Large-liveness memory guard (`TY_LIVENESS_REGEN_BUDGET_MB`): set to `true`
     /// mid-BFS by [`maybe_trip_liveness_regen_budget`] when the cached liveness
     /// structures (successor graph + inline bitmasks + seeded states) exceed the
-    /// configured byte budget. Once set, BFS stops caching (the caches are
-    /// dropped to free memory) and the post-BFS liveness pass REGENERATES system
-    /// successors on demand instead of reading the cached graph — matching TLC's
-    /// memory/time tradeoff. Never true when the budget is disabled (`0`), so the
-    /// historical always-cached behavior is available through the explicit
-    /// `TY_LIVENESS_REGEN_BUDGET_MB=0` kill switch.
+    /// configured byte budget. Once set, inline caches are dropped, ordered
+    /// adjacency continues on disk with an O(states) index and fixed-slot cache,
+    /// and the post-BFS checker replays exactly resolvable sources while
+    /// regenerating all others. This is a routing flag, not a promise that every
+    /// source evaluates Next. The explicit `TY_LIVENESS_REGEN_BUDGET_MB=0` kill
+    /// switch preserves the historical always-cached behavior.
     pub(super) regenerate_on_the_fly: bool,
 }
 
@@ -405,6 +452,12 @@ pub(super) struct StateStorage {
     /// Uses the shared FingerprintSet trait, which supports both in-memory
     /// HashSet and memory-mapped storage.
     pub(super) seen_fps: Arc<dyn FingerprintSet>,
+    /// Logical distinct-state count after terminal membership retirement.
+    ///
+    /// `Some` means exact post-BFS liveness owns every remaining payload need,
+    /// the physical fingerprint membership table is empty, and only the same
+    /// backend object's terminal error state remains live.
+    pub(super) retired_seen_fps_len: Option<usize>,
     /// Whether to force full states as the primary trace-reconstruction store.
     ///
     /// When false, the checker still may keep selected canonical payload
@@ -416,6 +469,50 @@ pub(super) struct StateStorage {
     /// states. These witnesses authorize true duplicates under the shared
     /// canonical-payload-equality fingerprint policy and fail closed on mismatch.
     pub(super) compiled_flat_payload_witnesses: FingerprintPayloadWitnesses,
+}
+
+impl StateStorage {
+    /// Install a new membership backend and clear any terminal logical count.
+    pub(super) fn replace_seen_fps(&mut self, seen_fps: Arc<dyn FingerprintSet>) {
+        self.seen_fps = seen_fps;
+        self.retired_seen_fps_len = None;
+    }
+
+    /// Return the authoritative logical membership count.
+    pub(super) fn logical_seen_fps_len(&self) -> usize {
+        self.retired_seen_fps_len
+            .unwrap_or_else(|| self.seen_fps.len())
+    }
+
+    /// Try to release a uniquely owned backend's terminal membership entries.
+    ///
+    /// Shared, custom, mmap, and disk backends fail closed unless they
+    /// explicitly opt into the trait contract. The pre-release count is kept
+    /// separately while the backend object remains installed for final error
+    /// probes.
+    pub(super) fn try_release_terminal_seen_fps_entries(&mut self, expected_len: usize) -> usize {
+        if self.retired_seen_fps_len.is_some() {
+            return 0;
+        }
+
+        let Some(backend) = Arc::get_mut(&mut self.seen_fps) else {
+            return 0;
+        };
+        // Sample membership only after acquiring exclusive ownership. Before
+        // `Arc::get_mut` succeeds, an external strong alias could still insert
+        // and make a previously sampled count stale.
+        let live_len = backend.len();
+        if live_len != expected_len {
+            return 0;
+        }
+        let Some(released_len) = backend.release_terminal_entries() else {
+            return 0;
+        };
+
+        debug_assert_eq!(released_len, live_len);
+        self.retired_seen_fps_len = Some(live_len);
+        live_len
+    }
 }
 
 /// Trace reconstruction state: depths and disk-based trace storage.
@@ -719,8 +816,7 @@ pub struct ModelChecker<'a> {
     pub(super) invariant_verdict_cache: super::invariants::InvariantVerdictCache,
     /// Exact Boolean-verdict cache for the complete ordered state-constraint list.
     /// Misses retain the canonical bytecode/TIR/AST dispatch unchanged.
-    pub(super) state_constraint_verdict_cache:
-        super::invariants::StateConstraintVerdictCache,
+    pub(super) state_constraint_verdict_cache: super::invariants::StateConstraintVerdictCache,
     /// Part of #3578: Compiled bytecode for invariant operators (bytecode VM fast path).
     pub(super) bytecode: Option<tla_eval::bytecode_vm::CompiledBytecode>,
     /// Part of #3910: Compiled bytecode for next-state action operators (JIT next-state fast path).
@@ -732,6 +828,14 @@ pub struct ModelChecker<'a> {
     /// final transformed/split shape. Runtime errors and shadow mismatches
     /// route back through the canonical interpreter.
     pub(super) value_action_vm: super::value_action_vm::ValueActionVmDispatch,
+    /// Which BFS loop actually ran: `Some(true)` = compiled (trust-cg) loop,
+    /// `Some(false)` = interpreter loop, `None` = no BFS tier recorded (e.g.
+    /// non-BFS strategies). Recorded by `record_engine_tier` at loop entry;
+    /// the last record wins, with `engine_tier_hot_swapped` noting an AUTO
+    /// interpreter→compiled mid-run swap. Feeds `engine_provenance_json`.
+    pub(super) executed_tier_compiled: Option<bool>,
+    /// True when the tier changed interpreter→compiled mid-run (AUTO tier-up).
+    pub(super) engine_tier_hot_swapped: bool,
     /// Lever 1 (#EWD998PCal): CONSTRAINT operators compiled once per run to
     /// bytecode, executed directly over the candidate `ArrayState` (no ctx
     /// binds, no per-check cache clears, no per-check `TirProgram` rebuild).
@@ -1129,7 +1233,7 @@ pub struct ModelChecker<'a> {
     /// compound (not fully flat) spec with >=1 flat-admissible variable.
     pub(super) trust_cg_hybrid_cache: Option<super::trust_cg_dispatch::TrustCgNativeCache>,
     /// The hybrid jit layout `trust_cg_hybrid_cache` was compiled against
-    /// (`check_layout_to_jit_layout(hybrid check layout).with_hybrid_flat_view()`),
+    /// (`try_check_layout_to_jit_layout(hybrid check layout).with_hybrid_flat_view()`),
     /// kept for width/offset parity assertions at dispatch time.
     pub(super) trust_cg_hybrid_jit_layout: Option<tla_jit_abi::StateLayout>,
     /// Reusable output scratch for hybrid native action evaluation (mirrors
@@ -1375,11 +1479,10 @@ impl<'a> ModelChecker<'a> {
             .map(|stats| (stats.actions_compiled, stats.actions_total()))
     }
 
-    /// Number of actions recognized as the runtime-domain multi-successor
-    /// ("NextStateLoop") shape but routed to the interpreter because the native
-    /// multi-successor ABI codegen is not yet implemented. Used by the
-    /// `#[ignore]`d `glowing_raccoon_next_state_loop` parity test to document
-    /// the target for full native multi-successor execution.
+    /// Number of runtime-domain multi-successor ("NextStateLoop") actions that
+    /// were recognized but still routed to the interpreter because they fall
+    /// outside the supported direct-range/record-set kernels. A fully covered
+    /// native run reports zero.
     #[must_use]
     pub fn trust_cg_next_state_loop_recognized_for_testing(&self) -> Option<usize> {
         self.trust_cg_build_stats
@@ -1443,6 +1546,10 @@ impl<'a> ModelChecker<'a> {
         self.state_storage.seen.is_empty()
     }
 
+    pub(in crate::check) fn test_seen_capacity(&self) -> usize {
+        self.state_storage.seen.capacity()
+    }
+
     /// Test helper: whether the checker is in full-state storage mode.
     /// Used to assert the former SYMMETRY+liveness auto-upgrade stays gone
     /// (declared SYMMETRY is now ignored for genuine temporal properties).
@@ -1451,7 +1558,15 @@ impl<'a> ModelChecker<'a> {
     }
 
     pub(in crate::check) fn test_seen_fps_len(&self) -> usize {
+        self.states_count()
+    }
+
+    pub(in crate::check) fn test_active_seen_fps_len(&self) -> usize {
         self.state_storage.seen_fps.len()
+    }
+
+    pub(in crate::check) fn test_retired_seen_fps_len(&self) -> Option<usize> {
+        self.state_storage.retired_seen_fps_len
     }
 
     /// Test helper: inject fp into seen_fps to create trace.depths mismatch.

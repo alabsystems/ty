@@ -443,7 +443,7 @@ impl ResizableAtomicFpSet {
                 }
 
                 let retry = inner.insert_if_absent(fp);
-                assert!(retry != InsertResult::TableFull, 
+                assert!(retry != InsertResult::TableFull,
                     "ResizableAtomicFpSet: insert_if_absent({fp:#018x}) returned TableFull after resize (capacity={})",
                     inner.capacity()
                 );

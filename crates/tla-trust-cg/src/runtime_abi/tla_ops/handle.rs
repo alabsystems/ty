@@ -744,9 +744,7 @@ mod tests {
         // successor without clobbering).
         clear();
         tla_jit_abi::clear_compound_scratch();
-        let s1 = Value::Set(Rp::new(SortedSet::from_vec(vec![
-            Value::SmallInt(1),
-        ])));
+        let s1 = Value::Set(Rp::new(SortedSet::from_vec(vec![Value::SmallInt(1)])));
         let s2 = Value::Set(Rp::new(SortedSet::from_vec(vec![
             Value::SmallInt(2),
             Value::SmallInt(3),

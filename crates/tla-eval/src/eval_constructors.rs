@@ -7,7 +7,6 @@
 //! Part of #3214: Split from eval_expr_helpers.rs.
 
 use super::core::EvalCtx;
-use tla_value::Rp;
 use super::{eval, try_borrow_materialized_read, EvalError, EvalResult};
 use crate::value::{
     intern_string, range_set, ComponentDomain, FuncSetValue, LazyDomain, RecordBuilder, SetBuilder,
@@ -18,6 +17,7 @@ use num_traits::{One, ToPrimitive, Zero};
 use smallvec::SmallVec;
 use std::sync::Arc;
 use tla_core::{Span, Spanned};
+use tla_value::Rp;
 
 /// Evaluate a lambda expression by creating a closure that captures the current environment.
 /// Fixes #174: Must capture local_stack bindings AND local_ops.
@@ -71,10 +71,24 @@ pub(crate) fn union_values(
     }
     // Preserve identity for empty-set unions to avoid wrapping finite compound
     // sets in structural SetCup shells (for example {} \cup [a : {1,2}]).
-    if av.set_len().is_some_and(|n| n.is_zero()) {
+    //
+    // Decide emptiness STRUCTURALLY first (non-materializing); only fall back to
+    // the materializing `set_len` when structure cannot decide. This is the same
+    // empty/non-empty verdict as `set_len().is_zero()` for every shape it
+    // decides, but it avoids materializing + dedup-hashing a large compound
+    // operand (e.g. a nested `SetCup` of record sets) merely to learn it is
+    // non-empty — the dominant per-state cost of VM-compiled record-set-union
+    // `TypeOK` invariants.
+    let av_empty = av
+        .is_empty_set_structural()
+        .or_else(|| av.set_len().map(|n| n.is_zero()));
+    if av_empty == Some(true) {
         return Ok(bv);
     }
-    if bv.set_len().is_some_and(|n| n.is_zero()) {
+    let bv_empty = bv
+        .is_empty_set_structural()
+        .or_else(|| bv.set_len().map(|n| n.is_zero()));
+    if bv_empty == Some(true) {
         return Ok(av);
     }
     // Part of #3063: only materialize when both operands are already concrete
@@ -163,7 +177,28 @@ pub(super) fn eval_record_access(
     field: &tla_core::ast::RecordFieldName,
     span: Option<Span>,
 ) -> EvalResult<Value> {
-    if let Some(record_value) = try_borrow_materialized_read(ctx, rec_expr) {
+    // Deep read chain (`f[i].field`, `r.a.b`): borrow the base record in place
+    // and clone only the accessed field, rather than materializing the whole
+    // intermediate record owned first. Falls through to the full owned `eval`
+    // below when `rec_expr` is not a borrowable read chain.
+    if !crate::helpers::function_values::no_deep_read_chain() {
+        if let Some(base) =
+            crate::helpers::function_values::try_borrow_read_chain_ref(ctx, rec_expr)
+        {
+            let base = base?;
+            let rv = base.as_value();
+            let record = rv
+                .as_record()
+                .ok_or_else(|| EvalError::type_error("Record", rv, Some(rec_expr.span)))?;
+            return record.get_by_id(field.field_id).cloned().ok_or_else(|| {
+                EvalError::NoSuchField {
+                    field: field.name.node.clone(),
+                    record_display: Some(format!("{rv}")),
+                    span,
+                }
+            });
+        }
+    } else if let Some(record_value) = try_borrow_materialized_read(ctx, rec_expr) {
         let record_value = record_value?;
         let record = record_value
             .as_record()

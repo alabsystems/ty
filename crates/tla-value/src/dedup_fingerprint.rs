@@ -154,7 +154,7 @@ fn compute_seq_additive_fp(
 /// Part of #3221: Record uses the same additive scheme as function-like values,
 /// with NameId keys instead of Value keys. This enables O(1) incremental updates
 /// for nested EXCEPT operations on Record fields.
-fn compute_record_additive_fp(
+pub(crate) fn compute_record_additive_fp(
     rec: &RecordValue,
 ) -> crate::value::value_fingerprint::FingerprintResult<u64> {
     let mut fp = ADDITIVE_FUNC_SEED;
@@ -173,9 +173,15 @@ fn compute_record_additive_fp(
 pub(crate) fn compute_set_additive_fp(
     set: &crate::SortedSet,
 ) -> crate::value::value_fingerprint::FingerprintResult<u64> {
+    // Normalize FIRST (as_slice), then read the length from the normalized
+    // slice. Calling `set.len()` on an unnormalized set runs a full
+    // FxHashSet dedup-count pass (deep-hashing every element) that is
+    // immediately made redundant by the normalization the iteration forces
+    // anyway. Same value either way: dedup len == normalized slice len.
+    let elems = set.as_slice();
     let mut fp = ADDITIVE_SET_SEED;
-    fp = fp.wrapping_add(splitmix64(set.len() as u64));
-    for elem in set.iter() {
+    fp = fp.wrapping_add(splitmix64(elems.len() as u64));
+    for elem in elems {
         fp = fp.wrapping_add(splitmix64(state_value_fingerprint(elem)?));
     }
     Ok(fp)
@@ -266,10 +272,14 @@ pub(crate) fn state_value_fingerprint(
         _ => {}
     }
 
+    use crate::churn_stats::{churn_count, ChurnSite};
+
     if let Value::Func(func) = value {
         if let Some(cached) = func.get_additive_fp() {
+            churn_count(ChurnSite::FpAdditiveCacheHit);
             return Ok(cached);
         }
+        churn_count(ChurnSite::FpAdditiveComputeFunc);
         let fp = compute_func_additive_fp(func)?;
         if !crate::parallel_readonly_value_caches_active() {
             func.cache_additive_fp(fp);
@@ -286,8 +296,10 @@ pub(crate) fn state_value_fingerprint(
 
     if let Value::IntFunc(func) = value {
         if let Some(cached) = func.get_additive_fp() {
+            churn_count(ChurnSite::FpAdditiveCacheHit);
             return Ok(cached);
         }
+        churn_count(ChurnSite::FpAdditiveComputeIntFunc);
         let fp = compute_int_func_additive_fp(func)?;
         if !crate::parallel_readonly_value_caches_active() {
             func.cache_additive_fp(fp);
@@ -301,8 +313,10 @@ pub(crate) fn state_value_fingerprint(
     // where `msgs' = msgs \cup {m}` occurs on every transition.
     if let Value::Set(set) = value {
         if let Some(cached) = set.get_additive_fp() {
+            churn_count(ChurnSite::FpAdditiveCacheHit);
             return Ok(cached);
         }
+        churn_count(ChurnSite::FpAdditiveComputeSet);
         let fp = compute_set_additive_fp(set)?;
         if !crate::parallel_readonly_value_caches_active() {
             set.cache_additive_fp(fp);
@@ -314,6 +328,7 @@ pub(crate) fn state_value_fingerprint(
     // lockstep with tla-check's compute_interval_additive_fp so both sequential
     // and worker-local state hashing converge on the same representation.
     if let Value::Interval(interval) = value {
+        churn_count(ChurnSite::FpAdditiveComputeInterval);
         return compute_interval_additive_fp(interval);
     }
 
@@ -322,8 +337,10 @@ pub(crate) fn state_value_fingerprint(
     // EXCEPT operations on Record fields.
     if let Value::Record(rec) = value {
         if let Some(cached) = rec.get_additive_fp() {
+            churn_count(ChurnSite::FpAdditiveCacheHit);
             return Ok(cached);
         }
+        churn_count(ChurnSite::FpAdditiveComputeRecord);
         let fp = compute_record_additive_fp(rec)?;
         if !crate::parallel_readonly_value_caches_active() {
             rec.cache_additive_fp(fp);
@@ -339,8 +356,10 @@ pub(crate) fn state_value_fingerprint(
     // which is reserved for FP64 (TLC-compatible) fingerprinting.
     if let Value::Seq(seq) = value {
         if let Some(cached) = seq.get_additive_fp() {
+            churn_count(ChurnSite::FpAdditiveCacheHit);
             return Ok(cached);
         }
+        churn_count(ChurnSite::FpAdditiveComputeSeq);
         let fp = compute_seq_additive_fp(seq)?;
         if !crate::parallel_readonly_value_caches_active() {
             seq.cache_additive_fp(fp);
@@ -351,6 +370,7 @@ pub(crate) fn state_value_fingerprint(
     // Part of #3191: Tuple uses additive fingerprint (same as Seq and IntFunc with min=1).
     // TLC treats tuples and sequences as the same type (FcnRcdValue).
     if let Value::Tuple(elems) = value {
+        churn_count(ChurnSite::FpAdditiveComputeTuple);
         return compute_tuple_additive_fp(elems);
     }
 

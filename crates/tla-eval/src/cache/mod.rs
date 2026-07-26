@@ -30,6 +30,7 @@ pub(crate) mod quantifier_hoist;
 pub(crate) mod scope_ids;
 pub(crate) mod small_caches;
 pub(crate) mod subst_cache;
+pub(crate) mod subst_chain_memo;
 pub(crate) mod zero_arg_cache;
 
 // === pub(crate) re-exports for sibling modules (eval_prime.rs, core.rs, etc.) ===
@@ -111,12 +112,15 @@ pub(crate) use subst_cache::SubstCacheGuard;
 
 pub use dep_tracking::try_eval_const_level;
 pub use let_def_interning::{clear_let_def_interning, intern_let_def_arc};
-pub use openv_memo::{clear_openv_memos, merged_let_env_memoized, MergedLetSite};
 pub use lifecycle::{
     clear_diagnostic_counters, clear_for_eval_scope_boundary, clear_for_inline_liveness_boundary,
     clear_for_phase_boundary, clear_for_run_reset, clear_for_state_boundary, clear_for_test_reset,
     enter_enabled_scope, enter_enabled_scope_with_ctx, print_subst_cache_stats, EnabledScopeGuard,
 };
+pub use openv_memo::{
+    clear_openv_memos, merged_let_env_memoized, merged_let_env_memoized_with_ctx, MergedLetSite,
+};
+pub use subst_chain_memo::{clear_subst_chain_memo, print_subst_memo_stats};
 // Part of #3025: op_result_cache_clear/op_result_cache_len removed — cache was dead.
 pub use small_caches::clear_state_scoped_let_and_fold_caches;
 pub use subst_cache::{clear_subst_cache, evict_next_state_subst_entries};

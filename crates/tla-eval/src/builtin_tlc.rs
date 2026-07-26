@@ -8,9 +8,8 @@ use super::{
     EvalError, EvalResult, Expr, FuncValue, OperatorRef, SortedSet, Span, Spanned, Value,
 };
 use crate::builtin_tlc_get::{eval_tlcget, eval_tlcset};
-use tla_value::Rp;
 use crate::value::intern_string;
-use std::sync::Arc;
+use tla_value::Rp;
 use tla_value::{value_fingerprint, ClosureValue};
 
 // Built-in TLC and TLCExt module operators

@@ -10,6 +10,7 @@ use crate::check::model_checker::CheckResult;
 use crate::config::Config;
 use crate::liveness::LiveExpr;
 use crate::state::{ArrayState, State};
+use crate::storage::SuccessorGraph;
 use crate::test_support::parse_module;
 use crate::Value;
 use crate::{set_liveness_disk_bitmask_flush_threshold_override, set_use_disk_bitmasks_override};
@@ -33,6 +34,16 @@ Init == x = 0
 Next == x' = 1 - x
 OnlyFromZero == x = 0 /\ x' = 1
 Prop == []<>OnlyFromZero
+====
+"#;
+
+const NON_ALPHABETICAL_VARIABLE_SPEC: &str = r#"
+---- MODULE NonAlphabeticalVariables ----
+EXTENDS Integers
+VARIABLES z, a
+Init == z = 0 /\ a = 0
+Next == z' = 1 - z /\ a' = 1 - a
+Prop == []<>(z = 0)
 ====
 "#;
 
@@ -124,7 +135,7 @@ fn record_inline_liveness_results_records_property_state_results() {
 
 #[cfg_attr(test, ntest::timeout(10000))]
 #[test]
-fn liveness_regen_trip_drops_all_inline_maps_and_disables_recording() {
+fn liveness_regen_trip_retains_disk_adjacency_but_disables_inline_recording() {
     let module = parse_module(INLINE_PROPERTY_SPEC);
     let config = property_config();
 
@@ -156,10 +167,12 @@ fn liveness_regen_trip_drops_all_inline_maps_and_disables_recording() {
         after_property_entry > before_property_entry,
         "property-plan bitmask entries must contribute to the regen estimate"
     );
-    assert!(checker.liveness_cache.inline_property_plans[0]
-        .state_bitmasks
-        .len()
-        > 0);
+    assert!(
+        checker.liveness_cache.inline_property_plans[0]
+            .state_bitmasks
+            .len()
+            > 0
+    );
 
     checker
         .liveness_cache
@@ -187,11 +200,16 @@ fn liveness_regen_trip_drops_all_inline_maps_and_disables_recording() {
 
     assert!(checker.liveness_cache_estimated_bytes() < pre_trip_estimate);
 
-    assert!(!checker.liveness_cache.cache_for_liveness);
+    assert!(checker.liveness_cache.cache_for_liveness);
     assert!(checker.liveness_cache.regenerate_on_the_fly);
     assert!(checker.should_run_on_the_fly_liveness());
     assert!(!checker.inline_liveness_active());
-    assert_eq!(checker.liveness_cache.successors.len(), 0);
+    assert!(checker.liveness_cache.successors.is_disk());
+    assert_eq!(checker.liveness_cache.successors.len(), 1);
+    assert_eq!(
+        checker.liveness_cache.successors.get(&current_fp),
+        Some(vec![next_fp])
+    );
     assert!(checker.liveness_cache.inline_state_bitmasks.is_empty());
     assert!(checker.liveness_cache.inline_action_bitmasks.is_empty());
     assert!(checker.liveness_cache.inline_property_plans.is_empty());
@@ -202,16 +220,87 @@ fn liveness_regen_trip_drops_all_inline_maps_and_disables_recording() {
     assert_eq!(crate::liveness::census_scan_pred_len(), 0);
 
     checker
-        .record_inline_liveness_results(
-            current_fp,
-            &current_arr,
-            &[(next_arr, next_fp)],
-            &[],
-        )
+        .record_inline_liveness_results(current_fp, &current_arr, &[(next_arr, next_fp)], &[])
         .expect("inactive inline recorder should be a no-op");
     assert!(checker.liveness_cache.inline_state_bitmasks.is_empty());
     assert!(checker.liveness_cache.inline_action_bitmasks.is_empty());
     assert!(checker.liveness_cache.inline_property_plans.is_empty());
+
+    checker
+        .liveness_cache
+        .successors
+        .insert(next_fp, Vec::new())
+        .expect("adjacency-only capture should continue after the trip");
+    assert_eq!(checker.liveness_cache.successors.len(), 2);
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn retained_adjacency_replay_is_exact_and_falls_back_as_a_whole_source() {
+    let module = parse_module(NON_ALPHABETICAL_VARIABLE_SPEC);
+    let config = property_config();
+    let mut checker = ModelChecker::new(&module, &config);
+    checker.set_store_states(true);
+    checker.set_stuttering_allowed(false);
+
+    let registry = checker.ctx.var_registry().clone();
+    let current = State::from_pairs([("z", Value::int(0)), ("a", Value::int(0))]);
+    let next = State::from_pairs([("z", Value::int(1)), ("a", Value::int(1))]);
+    let current_arr = ArrayState::from_state(&current, &registry);
+    let next_arr = ArrayState::from_state(&next, &registry);
+    let mut current_for_fp = current_arr.clone();
+    let mut next_for_fp = next_arr.clone();
+    let current_fp = checker
+        .array_state_fingerprint(&mut current_for_fp)
+        .expect("current BFS fingerprint");
+    let next_fp = checker
+        .array_state_fingerprint(&mut next_for_fp)
+        .expect("next BFS fingerprint");
+    let init_states = vec![(current_fp, current_arr), (next_fp, next_arr)];
+
+    let mut graph = SuccessorGraph::in_memory();
+    graph
+        .insert(current_fp, vec![next_fp, current_fp, next_fp])
+        .expect("retained adjacency");
+    let mut retained = check_property::OtfRetainedSuccessors::new(graph, &init_states);
+    let replayed = checker
+        .replay_liveness_successors_from_retained(&current, &retained)
+        .expect("retained replay")
+        .expect("complete retained source");
+    assert_eq!(
+        replayed,
+        vec![next.clone(), current.clone(), next.clone()],
+        "generation order and duplicate edges must be preserved"
+    );
+
+    let mut incomplete_graph = SuccessorGraph::in_memory();
+    incomplete_graph
+        .insert(current_fp, vec![next_fp, Fingerprint(u64::MAX)])
+        .expect("incomplete retained adjacency");
+    let incomplete = check_property::OtfRetainedSuccessors::new(incomplete_graph, &init_states);
+    assert!(checker
+        .replay_liveness_successors_from_retained(&current, &incomplete)
+        .expect("missing payload is not an evaluation error")
+        .is_none());
+
+    checker.set_stuttering_allowed(true);
+    let replayed_with_stutter = checker
+        .replay_liveness_successors_from_retained(&current, &retained)
+        .expect("retained replay with stuttering")
+        .expect("complete retained source");
+    assert_eq!(
+        replayed_with_stutter,
+        vec![next.clone(), current.clone(), next, current.clone()],
+        "the implicit stuttering edge must be appended exactly once"
+    );
+
+    assert!(retained.release());
+    assert!(!retained.is_active());
+    assert!(checker
+        .replay_liveness_successors_from_retained(&current, &retained)
+        .expect("released retained replay")
+        .is_none());
+    assert!(retained.into_graph().is_none());
 }
 
 #[cfg_attr(test, ntest::timeout(10000))]

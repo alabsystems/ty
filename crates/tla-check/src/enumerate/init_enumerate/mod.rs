@@ -5,7 +5,7 @@
 //! Init predicate constraint enumeration.
 
 use rustc_hash::FxHashSet;
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use tla_core::ast::Expr;
@@ -162,7 +162,42 @@ pub fn enumerate_states_from_constraint_branches_probed(
     branches: &[Vec<Constraint>],
     probe: &mut Option<tla_resource::MemoryProbe>,
 ) -> Result<Option<Vec<crate::state::State>>, EvalError> {
-    let mut all_states = BTreeSet::new();
+    enumerate_states_from_constraint_branches_with_multiplicity_probed(ctx, vars, branches, probe)
+        .map(|states| {
+            states.map(|states| {
+                states
+                    .into_iter()
+                    .map(|(state, _multiplicity)| state)
+                    .collect()
+            })
+        })
+}
+
+/// Enumerate distinct states while retaining how many raw Init branches
+/// generated each state before semantic deduplication.
+///
+/// The Vec-based checker normally only needs the distinct states, but strict
+/// TLC work accounting also needs the multiplicities discarded by the
+/// historical `BTreeMap`/`BTreeSet` collapse.
+#[allow(clippy::mutable_key_type)]
+pub(crate) fn enumerate_states_from_constraint_branches_with_multiplicity(
+    ctx: Option<&EvalCtx>,
+    vars: &[Arc<str>],
+    branches: &[Vec<Constraint>],
+) -> Result<Option<Vec<(crate::state::State, usize)>>, EvalError> {
+    enumerate_states_from_constraint_branches_with_multiplicity_probed(
+        ctx, vars, branches, &mut None,
+    )
+}
+
+#[allow(clippy::mutable_key_type)]
+fn enumerate_states_from_constraint_branches_with_multiplicity_probed(
+    ctx: Option<&EvalCtx>,
+    vars: &[Arc<str>],
+    branches: &[Vec<Constraint>],
+    probe: &mut Option<tla_resource::MemoryProbe>,
+) -> Result<Option<Vec<(crate::state::State, usize)>>, EvalError> {
+    let mut all_states = BTreeMap::new();
     for branch in branches {
         if probe.as_mut().is_some_and(|p| p.over_budget()) {
             return Err(EvalError::Internal {
@@ -173,7 +208,16 @@ pub fn enumerate_states_from_constraint_branches_probed(
         match enumerate_states_from_constraints_probed(ctx, vars, branch, probe)? {
             Some(states) => {
                 for state in states {
-                    all_states.insert(state);
+                    let multiplicity = all_states.entry(state).or_insert(0usize);
+                    *multiplicity =
+                        multiplicity
+                            .checked_add(1)
+                            .ok_or_else(|| EvalError::Internal {
+                                message:
+                                    "raw initial-state generation multiplicity overflowed usize"
+                                        .to_string(),
+                                span: None,
+                            })?;
                 }
             }
             None => return Ok(None),
@@ -299,6 +343,7 @@ where
 
 /// Compatibility wrapper returning only the distinct states inserted into storage.
 #[allow(clippy::mutable_key_type)]
+#[cfg(test)]
 pub fn enumerate_constraints_to_bulk<F>(
     ctx: &mut EvalCtx,
     vars: &[Arc<str>],

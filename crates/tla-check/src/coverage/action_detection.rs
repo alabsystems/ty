@@ -60,7 +60,6 @@ pub fn detect_actions(next_def: &OperatorDef) -> Vec<DetectedAction> {
 
 #[derive(Debug, Clone, Default)]
 struct ActionContext {
-    guards: Vec<Spanned<Expr>>,
     wrappers: Vec<ActionWrapper>,
 }
 
@@ -68,6 +67,8 @@ struct ActionContext {
 enum ActionWrapper {
     Exists(Vec<BoundVar>),
     Let(Vec<OperatorDef>),
+    IfThen(Spanned<Expr>),
+    IfElse(Spanned<Expr>),
 }
 
 fn detect_actions_rec(
@@ -99,19 +100,28 @@ fn detect_actions_rec(
             detect_actions_rec(body, &next_ctx, actions, counter);
         }
 
-        // IF expression - each branch is a different action, guarded by the condition.
+        // IF expression - each branch is a different action, but preserve the
+        // condition as an IF rather than rewriting it to a conjunction.
+        //
+        // This distinction is semantically observable for a condition such as
+        // `\E x \in S: P(x)`: IF evaluates that expression once as a Boolean,
+        // while an action-level conjunction enumerates every satisfying witness
+        // and can emit duplicate successors. Keeping an IF-shaped wrapper gives
+        // per-action dispatch the original branch-selection semantics while
+        // retaining separate coverage attribution.
         Expr::If(cond, then_branch, else_branch) => {
             let cond_expr = (**cond).clone();
 
-            // THEN branch: cond /\ action
+            // THEN branch: IF cond THEN action ELSE FALSE
             let mut then_ctx = ctx.clone();
-            then_ctx.guards.push(cond_expr.clone());
+            then_ctx
+                .wrappers
+                .push(ActionWrapper::IfThen(cond_expr.clone()));
             detect_actions_rec(then_branch, &then_ctx, actions, counter);
 
-            // ELSE branch: ~cond /\ action
+            // ELSE branch: IF cond THEN FALSE ELSE action
             let mut else_ctx = ctx.clone();
-            let not_cond = Spanned::new(Expr::Not(Box::new(cond_expr.clone())), cond_expr.span);
-            else_ctx.guards.push(not_cond);
+            else_ctx.wrappers.push(ActionWrapper::IfElse(cond_expr));
             detect_actions_rec(else_branch, &else_ctx, actions, counter);
         }
 
@@ -158,21 +168,16 @@ fn push_detected_action(
     expr: Spanned<Expr>,
     ctx: &ActionContext,
 ) {
+    // Identity belongs to the source disjunct, not to its synthesized context
+    // wrapper. A guard and action can originate in different modules, in which
+    // case `merged_span` must use a dummy span for the wrapper. Keying on that
+    // synthesized span would collapse every such action into one coverage row.
+    let id = DetectedActionId::new(expr.span);
     let expr = apply_action_context(expr, ctx);
-    actions.push(DetectedAction {
-        id: DetectedActionId::new(expr.span),
-        name,
-        expr,
-    });
+    actions.push(DetectedAction { id, name, expr });
 }
 
 fn apply_action_context(mut expr: Spanned<Expr>, ctx: &ActionContext) -> Spanned<Expr> {
-    // Conjoin guards first (so they remain inside any EXISTS wrappers).
-    for guard in &ctx.guards {
-        let span = merged_span(guard.span, expr.span);
-        expr = Spanned::new(Expr::And(Box::new(guard.clone()), Box::new(expr)), span);
-    }
-
     // Wrap from inner to outer.
     for wrapper in ctx.wrappers.iter().rev() {
         let span = expr.span;
@@ -181,6 +186,22 @@ fn apply_action_context(mut expr: Spanned<Expr>, ctx: &ActionContext) -> Spanned
                 Spanned::new(Expr::Exists(bounds.clone(), Box::new(expr)), span)
             }
             ActionWrapper::Let(defs) => Spanned::new(Expr::Let(defs.clone(), Box::new(expr)), span),
+            ActionWrapper::IfThen(cond) => {
+                let span = merged_span(cond.span, expr.span);
+                let false_expr = Spanned::new(Expr::Bool(false), span);
+                Spanned::new(
+                    Expr::If(Box::new(cond.clone()), Box::new(expr), Box::new(false_expr)),
+                    span,
+                )
+            }
+            ActionWrapper::IfElse(cond) => {
+                let span = merged_span(cond.span, expr.span);
+                let false_expr = Spanned::new(Expr::Bool(false), span);
+                Spanned::new(
+                    Expr::If(Box::new(cond.clone()), Box::new(false_expr), Box::new(expr)),
+                    span,
+                )
+            }
         };
     }
 

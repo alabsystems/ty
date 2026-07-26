@@ -185,8 +185,15 @@ fn wp07_gate_on_compiles_and_dispatches_with_exact_states() {
         checker.hybrid_native_cache_ready_for_testing(),
         "the hybrid-layout native action cache must be built and non-empty"
     );
-    let (routed, mismatch_fallback, _decl, native_dispatched, native_matched, _ndecl, native_errors) =
-        checker.hybrid_dispatch_stats_for_testing();
+    let (
+        routed,
+        mismatch_fallback,
+        _decl,
+        native_dispatched,
+        native_matched,
+        _ndecl,
+        native_errors,
+    ) = checker.hybrid_dispatch_stats_for_testing();
     assert!(
         native_dispatched > 0,
         "the compiled growing-sequence actions must actually execute natively"

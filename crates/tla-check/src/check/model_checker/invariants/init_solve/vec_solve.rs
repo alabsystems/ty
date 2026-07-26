@@ -8,6 +8,7 @@ use super::super::super::{
     enumerate_states_from_constraint_branches, Arc, CheckError, ModelChecker, State, Value,
 };
 use super::Constraint;
+use crate::enumerate::enumerate_states_from_constraint_branches_with_multiplicity;
 use crate::init_strategy::analyze_init_predicate;
 use crate::{ConfigCheckError, EvalCheckError};
 
@@ -17,6 +18,16 @@ impl<'a> ModelChecker<'a> {
         &mut self,
         pred_name: &str,
     ) -> Result<Vec<State>, CheckError> {
+        self.solve_predicate_for_states_with_raw_count(pred_name)
+            .map(|(states, _raw_initial_states_generated)| states)
+    }
+
+    /// Solve a predicate while retaining the number of states produced before
+    /// semantic deduplication.
+    pub(in crate::check::model_checker) fn solve_predicate_for_states_with_raw_count(
+        &mut self,
+        pred_name: &str,
+    ) -> Result<(Vec<State>, usize), CheckError> {
         let resolved = self.resolve_init_predicate(pred_name)?;
         let def = &self.module.op_defs[&resolved.resolved_name];
 
@@ -44,18 +55,31 @@ impl<'a> ModelChecker<'a> {
         // Try ay enumeration first.
         #[cfg(feature = "ay")]
         if let Some(states) = self.try_ay_init_states(&resolved, true) {
-            return Ok(states);
+            // AY emits one state per blocked model and performs no later
+            // Vec-level deduplication, so its emitted length is its raw count.
+            let raw_initial_states_generated = states.len();
+            return Ok((states, raw_initial_states_generated));
         }
 
         // Direct constraint enumeration (all variables constrained).
         if let Some(branches) = &resolved.extracted_branches {
             if resolved.unconstrained_vars.is_empty() {
-                return match enumerate_states_from_constraint_branches(
+                return match enumerate_states_from_constraint_branches_with_multiplicity(
                     Some(&self.ctx),
                     &self.module.vars,
                     branches,
                 ) {
-                    Ok(Some(states)) => Ok(states),
+                    Ok(Some(states)) => {
+                        let mut raw_initial_states_generated = 0usize;
+                        let mut distinct_states = Vec::with_capacity(states.len());
+                        for (state, multiplicity) in states {
+                            raw_initial_states_generated = raw_initial_states_generated
+                                .checked_add(multiplicity)
+                                .expect("raw initial-state generation count overflowed usize");
+                            distinct_states.push(state);
+                        }
+                        Ok((distinct_states, raw_initial_states_generated))
+                    }
                     Ok(None) => Err(ConfigCheckError::InitCannotEnumerate(
                         "failed to enumerate states from constraints".to_string(),
                     )
@@ -72,7 +96,7 @@ impl<'a> ModelChecker<'a> {
             let Some(branches) = self.candidate_branches(&cand_name) else {
                 continue;
             };
-            let base_states = match enumerate_states_from_constraint_branches(
+            let base_states = match enumerate_states_from_constraint_branches_with_multiplicity(
                 Some(&self.ctx),
                 &self.module.vars,
                 &branches,
@@ -83,7 +107,8 @@ impl<'a> ModelChecker<'a> {
             };
 
             let mut filtered: Vec<State> = Vec::new();
-            for state in base_states {
+            let mut raw_initial_states_generated = 0usize;
+            for (state, multiplicity) in base_states {
                 let _scope_guard = self.ctx.scope_guard();
                 for (name, value) in state.vars() {
                     self.ctx.bind_mut(Arc::clone(name), value.clone());
@@ -95,10 +120,13 @@ impl<'a> ModelChecker<'a> {
                 };
                 drop(_scope_guard);
                 if keep {
+                    raw_initial_states_generated = raw_initial_states_generated
+                        .checked_add(multiplicity)
+                        .expect("raw initial-state generation count overflowed usize");
                     filtered.push(state);
                 }
             }
-            return Ok(filtered);
+            return Ok((filtered, raw_initial_states_generated));
         }
 
         // Build error hint with strategy recommendation.

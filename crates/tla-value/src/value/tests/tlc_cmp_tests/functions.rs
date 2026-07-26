@@ -6,7 +6,6 @@
 
 use super::super::super::*;
 use super::tlc_normalized;
-use crate::rp::Rp as Arc;
 use crate::rp::Rp;
 #[cfg_attr(test, ntest::timeout(10000))]
 #[test]

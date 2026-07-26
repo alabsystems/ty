@@ -7,11 +7,10 @@
 use parking_lot::{const_reentrant_mutex, ReentrantMutex, ReentrantMutexGuard};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tla_check::{FuncValue, Value};
 use tla_core::{lower, parse_to_syntax_tree, FileId};
-use tla_value::SortedSet;
+use tla_value::{Rp, SortedSet};
 
 static ENV_VAR_LOCK: ReentrantMutex<()> = const_reentrant_mutex(());
 
@@ -96,7 +95,7 @@ pub fn int_set(values: &[i32]) -> Value {
     let mut vals: Vec<Value> = values.iter().map(|&v| Value::int(v.into())).collect();
     vals.sort();
     vals.dedup();
-    Value::Set(Arc::new(SortedSet::from_sorted_vec(vals)))
+    Value::Set(Rp::new(SortedSet::from_sorted_vec(vals)))
 }
 
 /// Create a SortedSet from an unsorted iterator of Values (sort + dedup).

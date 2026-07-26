@@ -27,9 +27,6 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod cache;
 mod catalog;
 mod cert_gate;
-/// Single blessed choke point for process-environment mutation. The one
-/// `env_mutation` allow lives on `env_guard::raw_env_write`.
-mod env_guard;
 mod check_report;
 mod cli_schema;
 mod cmd_absorb;
@@ -185,6 +182,9 @@ mod cmd_vmt;
 mod cmd_watch;
 mod cmd_weight;
 mod cmd_witness;
+/// Single blessed choke point for process-environment mutation. The one
+/// `env_mutation` allow lives on `env_guard::raw_env_write`.
+mod env_guard;
 mod flatten;
 mod helpers;
 mod tlc_codes;
@@ -275,6 +275,39 @@ fn cmd_server(
 // The default 2MB stack is insufficient for specs with deeply nested recursive functions
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    // Trim mimalloc's page-purge delay so freed pages from short bursts of
+    // transient allocation are returned to the OS before they pile up into the
+    // peak RSS. mimalloc v3 (the version this build links) ships a `purge_delay`
+    // default of 1000 ms — freed pages are held a full second — so any spec that
+    // finishes in under a second never purges and its peak RSS equals its total
+    // committed churn. The trust-cg fused BFS churns a large transient working
+    // set on even tiny specs, so this dominates their footprint. Dropping the
+    // delay to 2 ms reclaims that churn while still batching frees inside the
+    // hot loop. Measured: GameOfLife peak RSS 203 MB -> 160 MB, MCBakery
+    // 620 MB -> 573 MB, both at unchanged wall time; larger specs see the same
+    // directional reduction with no throughput change. `purge_delay = 0`
+    // (immediate purge) is deliberately NOT used — it madvise-thrashes tight hot
+    // loops (GameOfLife wall 1.16 s -> 1.71 s).
+    //
+    // This must go through `mi_option_set` rather than the `MIMALLOC_PURGE_DELAY`
+    // environment variable: mimalloc reads its env options in a load-time
+    // constructor that runs before `main`, so an in-process `set_var` here is too
+    // late. `mi_option_set` overrides the cached option value directly and is
+    // honoured on the first purge (which happens well into the run). An operator
+    // MIMALLOC_PURGE_DELAY in the environment is respected — we only set the
+    // option when it was left at mimalloc's own default. Option index 15 is
+    // `mi_option_purge_delay` in both bundled mimalloc majors (v2 and v3);
+    // libmimalloc-sys 0.1's bindings don't export the constant, but they do
+    // export its neighbours (`eager_commit_delay` = 14, `use_numa_nodes` = 16),
+    // which bracket it.
+    #[cfg(all(feature = "mimalloc", not(feature = "dhat-heap")))]
+    unsafe {
+        const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
+        if std::env::var_os("MIMALLOC_PURGE_DELAY").is_none() {
+            libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, 2);
+        }
+    }
+
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
 
@@ -2658,6 +2691,8 @@ mod tests {
                     "--workers",
                     "1",
                     "4",
+                    "--runs",
+                    "7",
                     "--policy",
                     "parity-and-speed-and-memory",
                     "--min-speedup",
@@ -2700,6 +2735,7 @@ mod tests {
                 assert_eq!(compare.config, Some(std::path::PathBuf::from("Demo.cfg")));
                 assert_eq!(compare.backend, SupremacyCompareBackend::TrustCg);
                 assert_eq!(compare.workers, vec![1, 4]);
+                assert_eq!(compare.runs, 7);
                 assert_eq!(
                     compare.policy,
                     SupremacyComparePolicy::ParityAndSpeedAndMemory
@@ -2725,6 +2761,18 @@ mod tests {
                 );
                 assert_eq!(compare.timeout, 42);
                 assert!(matches!(compare.format, SupremacyOutputFormat::Json));
+
+                let defaults = Cli::try_parse_from(["ty", "supremacy", "compare"])
+                    .expect("supremacy compare defaults should parse");
+                let Command::Supremacy(defaults) = defaults.command else {
+                    panic!("expected supremacy command");
+                };
+                let SupremacyCommand::Compare(defaults) = defaults.command else {
+                    panic!("expected supremacy compare command");
+                };
+                assert_eq!(defaults.min_speedup, 1.05);
+                assert_eq!(defaults.max_memory_ratio, 0.95);
+                assert_eq!(defaults.runs, 1);
             })
             .unwrap()
             .join()
@@ -2742,21 +2790,26 @@ mod tests {
                 assert_eq!(err.kind(), ErrorKind::DisplayHelp);
                 let help = err.to_string();
                 assert!(
-                    help.contains("targeted parity and speed evidence"),
+                    help.contains(
+                        "targeted parity, runtime, and process-tree peak-memory diagnostics"
+                    ),
                     "{help}"
                 );
                 assert!(
-                    help.contains("This is targeted comparison evidence only"),
+                    help.contains("This remains targeted diagnostic evidence"),
                     "{help}"
                 );
-                assert!(
-                    help.contains("It is not launch acceptance evidence"),
-                    "{help}"
-                );
+                assert!(help.contains("--backend auto"), "{help}");
+                assert!(help.contains("--backend auto-cpu"), "{help}");
+                assert!(help.contains("at least six pairs"), "{help}");
+                assert!(help.contains("strictly greater than 1.05"), "{help}");
+                assert!(help.contains("strictly less than 0.95"), "{help}");
                 assert!(
                     help.contains("TY_PARALLEL_READONLY_VALUE_CACHES=0|1"),
                     "{help}"
                 );
+                assert!(help.contains("median within-pair ratio"), "{help}");
+                assert!(help.contains("even count of at least six pairs"), "{help}");
             })
             .unwrap()
             .join()
@@ -2903,6 +2956,8 @@ mod tests {
                     "MCReachabilityTestAllGraphs",
                     "--runtime-timeout",
                     "42",
+                    "--runtime-runs",
+                    "7",
                     "--runtime-ty-bin",
                     "target/user/release/ty",
                     "--allow-debug-runtime",
@@ -2943,6 +2998,7 @@ mod tests {
                     vec!["MCReachabilityTestAllGraphs".to_string()]
                 );
                 assert_eq!(matrix.runtime_timeout, 42);
+                assert_eq!(matrix.runtime_runs, 7);
                 assert_eq!(
                     matrix.runtime_ty_bin,
                     Some(std::path::PathBuf::from("target/user/release/ty"))
@@ -2971,6 +3027,7 @@ mod tests {
                 };
                 assert!(!default_matrix.allow_debug_runtime);
                 assert_eq!(default_matrix.policy, None);
+                assert_eq!(default_matrix.runtime_runs, 6);
             })
             .unwrap()
             .join()
@@ -2998,6 +3055,8 @@ mod tests {
                     "reports/runtime",
                     "--runtime-timeout",
                     "42",
+                    "--runtime-runs",
+                    "7",
                     "--runtime-ty-bin",
                     "target/user/release/ty",
                     "--allow-debug-runtime",
@@ -3034,6 +3093,7 @@ mod tests {
                     Some(std::path::PathBuf::from("reports/runtime"))
                 );
                 assert_eq!(matrix.runtime_timeout, 42);
+                assert_eq!(matrix.runtime_runs, 7);
                 assert_eq!(
                     matrix.runtime_ty_bin,
                     Some(std::path::PathBuf::from("target/user/release/ty"))
@@ -3051,6 +3111,91 @@ mod tests {
                     matrix.runtime_tla_library,
                     Some(std::path::PathBuf::from("/tmp/tlapm/library"))
                 );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn supremacy_campaign_plan_requires_explicit_timeout_and_parses_inventory_merge() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let missing_timeout = Cli::try_parse_from([
+                    "ty",
+                    "supremacy",
+                    "matrix-campaign-plan",
+                    "--artifact-root",
+                    "/campaign",
+                    "--output",
+                    "/campaign/campaign-plan.json",
+                ])
+                .expect_err("campaign plan timeout must be explicit");
+                assert_eq!(missing_timeout.kind(), ErrorKind::MissingRequiredArgument);
+                assert!(missing_timeout.to_string().contains("--runtime-timeout"));
+
+                let cli = Cli::try_parse_from([
+                    "ty",
+                    "supremacy",
+                    "matrix-campaign-plan",
+                    "--artifact-root",
+                    "/campaign",
+                    "--output",
+                    "/campaign/campaign-plan.json",
+                    "--runtime-timeout",
+                    "14400",
+                    "--segment-project-id-start",
+                    "50000",
+                ])
+                .expect("campaign plan with explicit timeout should parse");
+                let Command::Supremacy(args) = cli.command else {
+                    panic!("expected supremacy command");
+                };
+                let SupremacyCommand::MatrixCampaignPlan(plan) = args.command else {
+                    panic!("expected matrix-campaign-plan command");
+                };
+                assert_eq!(plan.runtime_timeout, 14_400);
+                assert_eq!(plan.artifact_root, std::path::PathBuf::from("/campaign"));
+                assert_eq!(plan.segment_size, 1);
+                assert_eq!(plan.max_observation_allocated_bytes, 135_291_469_824);
+                assert_eq!(plan.hard_observation_allocated_bytes, 137_438_953_472);
+                assert_eq!(plan.max_observation_entries, 80_000);
+                assert_eq!(plan.hard_observation_inodes, 90_000);
+                assert_eq!(plan.evidence_soft_allocated_bytes, 5_368_709_120);
+                assert_eq!(plan.evidence_hard_allocated_bytes, 6_442_450_944);
+                assert_eq!(plan.evidence_soft_inodes, 10_000);
+                assert_eq!(plan.evidence_hard_inodes, 12_000);
+                assert_eq!(plan.minimum_filesystem_available_bytes, 80_530_636_800);
+                assert_eq!(plan.minimum_prelaunch_available_bytes, 226_559_524_864);
+                assert_eq!(plan.minimum_filesystem_available_inodes, 1_000_000);
+                assert_eq!(plan.minimum_prelaunch_available_inodes, 1_104_000);
+                assert_eq!(plan.monitor_interval_ms, 50);
+                assert_eq!(plan.stdout_max_bytes, 67_108_864);
+                assert_eq!(plan.stderr_max_bytes, 67_108_864);
+                assert_eq!(plan.segment_project_id_start, 50_000);
+
+                let cli = Cli::try_parse_from([
+                    "ty",
+                    "supremacy",
+                    "matrix-merge-inventory",
+                    "--campaign-plan",
+                    "/campaign/campaign-plan.json",
+                    "--segment-report",
+                    "/campaign/segments/segment-0001/runtime_evidence.json",
+                    "--runtime-output-dir",
+                    "/campaign/merge-inventory",
+                    "--mode",
+                    "enforce",
+                ])
+                .expect("inventory merge should parse");
+                let Command::Supremacy(args) = cli.command else {
+                    panic!("expected supremacy command");
+                };
+                assert!(matches!(
+                    args.command,
+                    SupremacyCommand::MatrixMergeInventory(_)
+                ));
             })
             .unwrap()
             .join()

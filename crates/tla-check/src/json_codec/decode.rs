@@ -6,7 +6,6 @@
 
 use std::cell::RefCell;
 use tla_value::Rp;
-use std::sync::Arc;
 
 use crate::json_output::JsonValue;
 use crate::json_path::append_json_path_key;

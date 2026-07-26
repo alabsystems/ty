@@ -1364,7 +1364,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Andrew Yates"]
 license = "Apache-2.0"
@@ -1388,40 +1388,40 @@ readme = "README.md"
 # matching cargo-test.
 # Bumping a SHA = bump it everywhere or the guard fails the commit.
 #
-ay = { git = "https://github.com/alabsystems/ay.git", rev = "0adeaab4d66b1414a95ab5cee4ec64078c9dbd97", default-features = false }
-ay-dpll = { git = "https://github.com/alabsystems/ay.git", rev = "0adeaab4d66b1414a95ab5cee4ec64078c9dbd97" }
-ay-core = { git = "https://github.com/alabsystems/ay.git", rev = "0adeaab4d66b1414a95ab5cee4ec64078c9dbd97" }
-ay-proof = { git = "https://github.com/alabsystems/ay.git", rev = "0adeaab4d66b1414a95ab5cee4ec64078c9dbd97" }
-ay-allsat = { git = "https://github.com/alabsystems/ay.git", rev = "0adeaab4d66b1414a95ab5cee4ec64078c9dbd97" }
-ay-chc = { git = "https://github.com/alabsystems/ay.git", rev = "0adeaab4d66b1414a95ab5cee4ec64078c9dbd97" }
-ay-sat = { git = "https://github.com/alabsystems/ay.git", rev = "0adeaab4d66b1414a95ab5cee4ec64078c9dbd97" }
+ay = { git = "https://github.com/alabsystems/ay.git", rev = "035e84f25ffe983f4c1a0d8f2cb1d5f945d3bdee", default-features = false }
+ay-dpll = { git = "https://github.com/alabsystems/ay.git", rev = "035e84f25ffe983f4c1a0d8f2cb1d5f945d3bdee" }
+ay-core = { git = "https://github.com/alabsystems/ay.git", rev = "035e84f25ffe983f4c1a0d8f2cb1d5f945d3bdee" }
+ay-proof = { git = "https://github.com/alabsystems/ay.git", rev = "035e84f25ffe983f4c1a0d8f2cb1d5f945d3bdee" }
+ay-allsat = { git = "https://github.com/alabsystems/ay.git", rev = "035e84f25ffe983f4c1a0d8f2cb1d5f945d3bdee" }
+ay-chc = { git = "https://github.com/alabsystems/ay.git", rev = "035e84f25ffe983f4c1a0d8f2cb1d5f945d3bdee" }
+ay-sat = { git = "https://github.com/alabsystems/ay.git", rev = "035e84f25ffe983f4c1a0d8f2cb1d5f945d3bdee" }
 # LRAT proof checker — the independent, theory-free leaf of the BTOR2 array
 # SAFE certifier (tla-btor2::array_cert) verifies ay-sat's UNSAT proofs here.
-ay-lrat-check = { git = "https://github.com/alabsystems/ay.git", rev = "0adeaab4d66b1414a95ab5cee4ec64078c9dbd97" }
-ay-frontend = { git = "https://github.com/alabsystems/ay.git", rev = "0adeaab4d66b1414a95ab5cee4ec64078c9dbd97" }
+ay-lrat-check = { git = "https://github.com/alabsystems/ay.git", rev = "035e84f25ffe983f4c1a0d8f2cb1d5f945d3bdee" }
+ay-frontend = { git = "https://github.com/alabsystems/ay.git", rev = "035e84f25ffe983f4c1a0d8f2cb1d5f945d3bdee" }
 
 # Shared AY engine: ty discharges CHC obligations through ay-encode — the single
 # AY-interface crate it shares with trust-mc — instead of calling ay-chc
 # directly. The shared exact AY identity keeps its ay-chc unified with TY's.
-ay-encode = { git = "https://github.com/alabsystems/ay.git", rev = "0adeaab4d66b1414a95ab5cee4ec64078c9dbd97" }
+ay-encode = { git = "https://github.com/alabsystems/ay.git", rev = "035e84f25ffe983f4c1a0d8f2cb1d5f945d3bdee" }
 
-clean-ck0 = { git = "https://github.com/alabsystems/clean.git", rev = "659a6eeb15b29f7d739ecca852a77483fcfd88ea" }
-clean-elab = { git = "https://github.com/alabsystems/clean.git", rev = "659a6eeb15b29f7d739ecca852a77483fcfd88ea" }
-clean-kernel = { git = "https://github.com/alabsystems/clean.git", rev = "659a6eeb15b29f7d739ecca852a77483fcfd88ea" }
-clean-mathverse = { git = "https://github.com/alabsystems/clean.git", rev = "659a6eeb15b29f7d739ecca852a77483fcfd88ea" }
-clean-olean = { git = "https://github.com/alabsystems/clean.git", rev = "659a6eeb15b29f7d739ecca852a77483fcfd88ea" }
-clean-parser = { git = "https://github.com/alabsystems/clean.git", rev = "659a6eeb15b29f7d739ecca852a77483fcfd88ea" }
-trust-ir = { git = "https://github.com/alabsystems/trust-ir.git", rev = "9de13453d69f84f24556bd75636bf020206f33c9" }
-trust-ir-build = { git = "https://github.com/alabsystems/trust-ir.git", rev = "9de13453d69f84f24556bd75636bf020206f33c9" }
-trust-cg-codegen = { git = "https://github.com/alabsystems/trust-cg.git", rev = "7005df3c00a3e1b4042cc49a6608feb1aaa1bfec" }
-trust-cg-ir = { git = "https://github.com/alabsystems/trust-cg.git", rev = "7005df3c00a3e1b4042cc49a6608feb1aaa1bfec" }
-trust-cg-lower = { git = "https://github.com/alabsystems/trust-cg.git", rev = "7005df3c00a3e1b4042cc49a6608feb1aaa1bfec" }
-trust-cg-opt = { git = "https://github.com/alabsystems/trust-cg.git", rev = "7005df3c00a3e1b4042cc49a6608feb1aaa1bfec" }
+clean-ck0 = { git = "https://github.com/alabsystems/clean.git", rev = "ed8c87702e1bb429d6f2df4333130eac0d577ff7" }
+clean-elab = { git = "https://github.com/alabsystems/clean.git", rev = "ed8c87702e1bb429d6f2df4333130eac0d577ff7" }
+clean-kernel = { git = "https://github.com/alabsystems/clean.git", rev = "ed8c87702e1bb429d6f2df4333130eac0d577ff7" }
+clean-mathverse = { git = "https://github.com/alabsystems/clean.git", rev = "ed8c87702e1bb429d6f2df4333130eac0d577ff7" }
+clean-olean = { git = "https://github.com/alabsystems/clean.git", rev = "ed8c87702e1bb429d6f2df4333130eac0d577ff7" }
+clean-parser = { git = "https://github.com/alabsystems/clean.git", rev = "ed8c87702e1bb429d6f2df4333130eac0d577ff7" }
+trust-ir = { git = "https://github.com/alabsystems/trust-ir.git", rev = "3fafb62434db0a5b2bd4027a988a7fed74bd8679" }
+trust-ir-build = { git = "https://github.com/alabsystems/trust-ir.git", rev = "3fafb62434db0a5b2bd4027a988a7fed74bd8679" }
+trust-cg-codegen = { git = "https://github.com/alabsystems/trust-cg.git", rev = "98e3ffb6ae59b803a93a3f09f72dd497810ac5b4" }
+trust-cg-ir = { git = "https://github.com/alabsystems/trust-cg.git", rev = "98e3ffb6ae59b803a93a3f09f72dd497810ac5b4" }
+trust-cg-lower = { git = "https://github.com/alabsystems/trust-cg.git", rev = "98e3ffb6ae59b803a93a3f09f72dd497810ac5b4" }
+trust-cg-opt = { git = "https://github.com/alabsystems/trust-cg.git", rev = "98e3ffb6ae59b803a93a3f09f72dd497810ac5b4" }
 # Provides `executable_buffer_cache` — the persistent, content-addressed,
 # cross-process on-disk ExecutableBuffer cache (serialize/decode/publish +
 # fail-closed disk I/O) consumed by the native batch JIT path so compiled
 # shards survive a process boundary.
-trust-cg-jit-matrix = { git = "https://github.com/alabsystems/trust-cg.git", rev = "7005df3c00a3e1b4042cc49a6608feb1aaa1bfec" }
+trust-cg-jit-matrix = { git = "https://github.com/alabsystems/trust-cg.git", rev = "98e3ffb6ae59b803a93a3f09f72dd497810ac5b4" }
 
 # tla-jit-abi - leaf crate holding the stable JIT/AOT calling-convention
 # ABI types (JitCallOut, JitStatus, JitRuntimeErrorKind, JitRuntimeError +

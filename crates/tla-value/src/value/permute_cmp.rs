@@ -39,22 +39,23 @@
 //! semantics — not worth it for a variant that effectively never appears in
 //! reachable states.
 
-use std::cmp::Ordering;
-use crate::rp::Rp as Arc;
-use crate::rp::Rp;
 use super::cmp_helpers::{cmp_i64_with_value, type_order};
 use super::permute::PermLookup;
 use super::{FuncValue, IntIntervalFunc, MVPerm, Value};
+use crate::rp::Rp as Arc;
 use smallvec::SmallVec;
+use std::cmp::Ordering;
 
 impl Value {
     /// Compute `self.permute(perm).cmp(other)` lazily (FuncValue lookup).
     pub fn permute_cmp(&self, perm: &FuncValue, other: &Value) -> Ordering {
+        crate::churn_stats::churn_count(crate::churn_stats::ChurnSite::PermuteCmp);
         permute_cmp_impl(self, perm, other)
     }
 
     /// Compute `self.permute_fast(perm).cmp(other)` lazily (MVPerm O(1) lookup).
     pub fn permute_cmp_fast(&self, perm: &MVPerm, other: &Value) -> Ordering {
+        crate::churn_stats::churn_count(crate::churn_stats::ChurnSite::PermuteCmp);
         permute_cmp_impl(self, perm, other)
     }
 }
@@ -213,6 +214,16 @@ fn permute_cmp_impl<P: PermLookup>(v: &Value, perm: &P, other: &Value) -> Orderi
         // normalization), never the SortedSet/Value wrappers.
         Value::Set(s) => match other {
             Value::Set(o) => {
+                // NOTE(value-canon): an earlier draft routed this arm through
+                // memoized whole-set materialization. That was a measured
+                // REGRESSION (2.3x wall, 2x RSS on MultiPaxos): growing
+                // message sets get a FRESH storage allocation per successor,
+                // so set-level memo entries almost never hit while pinning a
+                // full materialized permuted set per (state, perm) — cap
+                // thrash plus retention bloat. The streaming path below stays;
+                // its per-ELEMENT `permute_impl` calls hit the memo for the
+                // shared record/function elements, which is where the reuse
+                // actually is.
                 let raw = s.raw_slice();
                 // Borrow unchanged elements; own only the rebuilt ones.
                 let mut permuted: SmallVec<[PermutedElem<'_>; 16]> =
@@ -414,7 +425,7 @@ fn cmp_permuted_tuple_with_intfunc<P: PermLookup>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use crate::rp::Rp;
 
     fn mv(name: &str) -> Value {
         Value::try_model_value(name).unwrap()

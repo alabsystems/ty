@@ -8,7 +8,6 @@
 //! Generic PartialEq/Ord::cmp consistency tests live in cmp_consistency.rs (#3462).
 
 use super::super::super::*;
-use crate::rp::Rp as Arc;
 use crate::rp::Rp;
 /// Bug #179: Tuple should equal Func with same domain 1..n and same values
 #[cfg_attr(test, ntest::timeout(10000))]

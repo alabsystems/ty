@@ -37,8 +37,8 @@
 
 mod common;
 
-use tla_check::{check_module, CheckResult, Config};
 use tla_check::ModelChecker;
+use tla_check::{check_module, CheckResult, Config};
 use tla_eval::clear_for_test_reset;
 
 const M1_TLA: &str = r#"

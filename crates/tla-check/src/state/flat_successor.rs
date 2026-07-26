@@ -10,6 +10,7 @@
 //! handful of slots change.
 
 use std::sync::Arc;
+#[cfg(test)]
 use tla_value::Rp;
 
 use smallvec::SmallVec;

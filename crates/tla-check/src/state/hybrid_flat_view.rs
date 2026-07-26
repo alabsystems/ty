@@ -60,6 +60,7 @@
 //! differential against the interpreter successor.
 
 use std::sync::Arc;
+#[cfg(test)]
 use tla_value::Rp;
 
 use super::flat_state::FlatState;
@@ -292,7 +293,8 @@ impl HybridFlatView {
         let mut admissible_indices = Vec::new();
         let mut hybrid_kinds: Vec<VarLayoutKind> = Vec::with_capacity(var_count);
 
-        let layout_debug = std::env::var_os("TY_HYBRID_ELIGIBILITY_DEBUG").is_some_and(|v| v == "1");
+        let layout_debug =
+            std::env::var_os("TY_HYBRID_ELIGIBILITY_DEBUG").is_some_and(|v| v == "1");
         for (var_idx, var) in layout.iter().enumerate() {
             let admissible = var.kind.supports_flat_primary();
             // WP-15 diagnosis surface: with the per-action reason dump on, also
@@ -342,7 +344,7 @@ impl HybridFlatView {
     /// The hybrid [`StateLayout`] backing this view: admissible variables keep
     /// their original kind, non-admissible variables are demoted to
     /// [`VarLayoutKind::Dynamic`] placeholders. This is the layout the hybrid
-    /// native compilation path converts (via `check_layout_to_jit_layout`) so
+    /// native compilation path converts (via `try_check_layout_to_jit_layout`) so
     /// compiled slot offsets match [`Self::project`]'s buffer exactly (item 4
     /// M0-G1).
     #[must_use]
@@ -817,10 +819,7 @@ mod tests {
 
         // The empty set and the full universe are both canonical mask values;
         // pin their round-trips too (the empty mask is the Paxos Init shape).
-        for msgs in [
-            small_set(vec![]),
-            small_set(universe.clone()),
-        ] {
+        for msgs in [small_set(vec![]), small_set(universe.clone())] {
             let state = ArrayState::from_values(vec![msgs, Value::SmallInt(3)]);
             let rebuilt = view
                 .project_then_reconstruct(&state, &state, &registry)

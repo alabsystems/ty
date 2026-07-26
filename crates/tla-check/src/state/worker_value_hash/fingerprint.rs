@@ -9,7 +9,6 @@
 
 use rustc_hash::FxHashMap;
 use tla_value::Rp;
-use std::sync::Arc;
 
 use crate::value::{FuncValue, IntIntervalFunc, RecordValue, SeqValue, SortedSet};
 use crate::Value;

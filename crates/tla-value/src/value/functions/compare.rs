@@ -4,8 +4,9 @@
 
 use super::super::Value;
 use super::FuncValue;
-use std::cmp::Ordering;
 use crate::rp::Rp as Arc;
+use std::cmp::Ordering;
+
 impl FuncValue {
     /// Check if two FuncValues share the same domain and values buffers
     /// and neither has an overlay.
@@ -43,10 +44,10 @@ impl FuncValue {
             (key.clone(), final_value)
         };
 
-        while self_idx < self.domain.len() && other_idx < other.domain.len() {
-            let self_key = &self.domain[self_idx];
+        while self_idx < self.domain.keys.len() && other_idx < other.domain.keys.len() {
+            let self_key = &self.domain.keys[self_idx];
             let self_value = self.get_value_at(self_idx);
-            let other_key = &other.domain[other_idx];
+            let other_key = &other.domain.keys[other_idx];
             let other_value = other.get_value_at(other_idx);
             match self_key.cmp(other_key) {
                 Ordering::Less => {
@@ -65,14 +66,17 @@ impl FuncValue {
             }
         }
 
-        for idx in other_idx..other.domain.len() {
+        for idx in other_idx..other.domain.keys.len() {
             entries.push(compose_other_entry(
-                &other.domain[idx],
+                &other.domain.keys[idx],
                 other.get_value_at(idx),
             ));
         }
-        for idx in self_idx..self.domain.len() {
-            entries.push((self.domain[idx].clone(), self.get_value_at(idx).clone()));
+        for idx in self_idx..self.domain.keys.len() {
+            entries.push((
+                self.domain.keys[idx].clone(),
+                self.get_value_at(idx).clone(),
+            ));
         }
 
         FuncValue::from_sorted_entries(entries)

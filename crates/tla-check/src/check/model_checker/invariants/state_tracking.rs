@@ -640,15 +640,15 @@ impl<'a> ModelChecker<'a> {
                 // flat buffers are byte-equal (the orbit relation). Fails
                 // closed to non-duplicate (sound overcount) when either state
                 // does not encode losslessly.
-                BfsFingerprintDomain::FlatSymmetryCanonical => {
-                    Ok(match (
+                BfsFingerprintDomain::FlatSymmetryCanonical => Ok(
+                    match (
                         self.flat_symmetry_canonical_slots(candidate),
                         self.flat_symmetry_canonical_slots(resident),
                     ) {
                         (Some(a), Some(b)) => a == b,
                         _ => false,
-                    })
-                }
+                    },
+                ),
                 _ => Ok(candidate.values() == resident.values()),
             };
         }
@@ -710,9 +710,12 @@ impl<'a> ModelChecker<'a> {
     /// domains (View / SymmetryCanonical / ArrayFp64 / FullStateFp64) are left
     /// byte-for-byte unchanged: their dedup is not raw-slot equality, so `seen`
     /// stays the witness store.
-    fn fp_only_flat_witness_active(&self) -> bool {
-        !self.state_storage.store_full_states
-            && Self::fp_only_flat_witness_kill_switch_on()
+    pub(in crate::check::model_checker) fn fp_only_flat_witness_policy_enabled(&self) -> bool {
+        !self.state_storage.store_full_states && Self::fp_only_flat_witness_kill_switch_on()
+    }
+
+    pub(in crate::check::model_checker) fn fp_only_flat_witness_active(&self) -> bool {
+        self.fp_only_flat_witness_policy_enabled()
             && matches!(
                 self.bfs_fingerprint_domain(),
                 BfsFingerprintDomain::CompiledFlat
@@ -752,13 +755,15 @@ impl<'a> ModelChecker<'a> {
                 == self.symmetry_canonical_values(resident)),
             // WP-11 slice 2: canonical flat-buffer equality (orbit relation);
             // fail-closed to non-duplicate on encode failure.
-            BfsFingerprintDomain::FlatSymmetryCanonical => Ok(match (
-                self.flat_symmetry_canonical_slots(candidate),
-                self.flat_symmetry_canonical_slots(resident),
-            ) {
-                (Some(a), Some(b)) => a == b,
-                _ => false,
-            }),
+            BfsFingerprintDomain::FlatSymmetryCanonical => Ok(
+                match (
+                    self.flat_symmetry_canonical_slots(candidate),
+                    self.flat_symmetry_canonical_slots(resident),
+                ) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => false,
+                },
+            ),
             _ => Ok(candidate.values() == resident.values()),
         }
     }
@@ -1306,7 +1311,7 @@ impl<'a> ModelChecker<'a> {
 
     /// Get the number of states found (works in both modes)
     pub(in crate::check::model_checker) fn states_count(&self) -> usize {
-        self.state_storage.seen_fps.len()
+        self.state_storage.logical_seen_fps_len()
     }
 
     /// Check if the fingerprint storage has encountered any errors (e.g., overflow).

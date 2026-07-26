@@ -12,6 +12,7 @@
 
 use tla_value::CompactValue;
 
+#[cfg(test)]
 use super::ArrayState;
 
 /// Typed storage form carried by a [`StatePayloadWitness`].
@@ -39,6 +40,7 @@ pub(crate) enum StatePayloadWitness {
 impl StatePayloadWitness {
     /// Build an exact witness from an interpreter `ArrayState`.
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn from_array_state(state: &ArrayState) -> Self {
         Self::CompactValueSlots(state.values().to_vec().into_boxed_slice())
     }
@@ -69,6 +71,7 @@ impl StatePayloadWitness {
 
     /// Confirm an `ArrayState` candidate against this witness.
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn matches_array_state(&self, candidate: &ArrayState) -> bool {
         match self {
             Self::CompactValueSlots(values) => values.as_ref() == candidate.values(),

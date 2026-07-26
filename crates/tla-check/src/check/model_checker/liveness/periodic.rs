@@ -32,7 +32,7 @@ impl<'a> ModelChecker<'a> {
         bfs_start_time: &std::time::Instant,
     ) -> Option<CheckResult> {
         // Fast exit: no liveness properties or caching disabled.
-        if !self.liveness_cache.cache_for_liveness {
+        if self.liveness_cache.regenerate_on_the_fly || !self.liveness_cache.cache_for_liveness {
             return None;
         }
 

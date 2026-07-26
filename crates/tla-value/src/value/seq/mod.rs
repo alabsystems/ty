@@ -15,9 +15,9 @@ mod cache;
 mod core;
 mod traits;
 
-use std::sync::atomic::AtomicU64;
-use std::sync::{OnceLock};
 use crate::rp::Rp as Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::OnceLock;
 use tla_core::kani_types::Vector;
 
 use super::Value;

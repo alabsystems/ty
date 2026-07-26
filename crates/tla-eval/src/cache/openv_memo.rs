@@ -39,12 +39,14 @@
 //! exactly what recomputation would produce. No content hashing is involved in
 //! the keys, so there is no collision risk.
 //!
-//! **Recursive scopes are never memoized by the merged-env memo.** A merged
-//! env containing a recursive operator def must present a fresh `Arc` identity
-//! per LET entry (each recursion frame captures different bindings; sharing a
-//! scope id across frames would alias `SUBST_CACHE`/`NARY_OP_CACHE` entries —
-//! the #3156 bug class). Such calls fall through to the unmemoized build path,
-//! byte-for-byte identical to the previous behavior.
+//! **Recursive scopes reuse content, never identity.** A merged env containing
+//! a recursive operator def must present a fresh `Arc` identity per LET entry
+//! (each recursion frame captures different bindings; sharing a scope id across
+//! frames would alias `SUBST_CACHE`/`NARY_OP_CACHE` entries — the #3156 bug
+//! class). The memo therefore retains one immutable persistent-HAMT template,
+//! shallow-clones that map, and wraps the clone in a fresh `Arc` on every hit.
+//! The static definitions and HAMT nodes are shared, while the cache-visible
+//! scope identity remains unique.
 //!
 //! The scope-id memo (#2) IS sound for recursive envs: for those the scope id
 //! *is* the Arc pointer, i.e. a pure function of the (pinned) key.
@@ -59,17 +61,24 @@
 //!
 //! Set `TY_NO_OPENV_MEMO=1` to disable both memos (bypass to the original
 //! build/walk paths, e.g. for A/B soundness or perf attribution).
+//! Set `TY_NO_RECURSIVE_OPENV_TEMPLATE=1` to disable only recursive content
+//! templates while retaining the established non-recursive and scope-id memos.
+//! Recursive templates also disable themselves for the rest of a run when an
+//! initial bounded sample does not show the near-constant reuse needed to
+//! repay their lookup and pinning costs.
 //! Set `TY_OPENV_STATS=1` to print per-site call/hit counters at end of run.
 
 use crate::core::OpEnv;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tla_core::ast::OperatorDef;
 
-use super::scope_ids::compute_local_ops_scope_id_and_recursive;
+use super::scope_ids::{
+    compute_local_ops_id, compute_local_ops_scope_id_and_recursive, local_ops_requires_arc_identity,
+};
 
 // ===========================================================================
 // Env-gated switches
@@ -81,6 +90,15 @@ pub(crate) fn openv_memo_disabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("TY_NO_OPENV_MEMO").is_some())
+}
+
+/// `TY_NO_RECURSIVE_OPENV_TEMPLATE=1` restores the pre-template behavior for
+/// recursive merges while leaving the existing OpEnv memos enabled.
+#[inline]
+fn recursive_template_disabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("TY_NO_RECURSIVE_OPENV_TEMPLATE").is_some())
 }
 
 /// `TY_OPENV_STATS=1` enables counters + end-of-run stats print.
@@ -142,9 +160,11 @@ const ZERO: AtomicU64 = AtomicU64::new(0);
 
 static MERGED_CALLS: [AtomicU64; MERGED_SITES] = [ZERO; MERGED_SITES];
 static MERGED_HITS: [AtomicU64; MERGED_SITES] = [ZERO; MERGED_SITES];
-static MERGED_RECURSIVE_BUILDS: [AtomicU64; MERGED_SITES] = [ZERO; MERGED_SITES];
+static MERGED_RECURSIVE_CALLS: [AtomicU64; MERGED_SITES] = [ZERO; MERGED_SITES];
+static MERGED_AMBIENT_RECURSIVE_CALLS: [AtomicU64; MERGED_SITES] = [ZERO; MERGED_SITES];
 /// Total entries in ambient envs cloned on (miss) builds — HAMT clone cost proxy.
 static MERGED_AMBIENT_ENTRIES_CLONED: AtomicU64 = AtomicU64::new(0);
+static MERGED_RECURSIVE_CAP_CLEARS: AtomicU64 = AtomicU64::new(0);
 
 static SCOPE_CALLS: [AtomicU64; SCOPE_SITES] = [ZERO; SCOPE_SITES];
 static SCOPE_HITS: [AtomicU64; SCOPE_SITES] = [ZERO; SCOPE_SITES];
@@ -159,27 +179,39 @@ pub fn print_openv_memo_stats() {
     if openv_memo_disabled() {
         eprintln!("  [memo DISABLED via TY_NO_OPENV_MEMO — calls = unmemoized builds/walks]");
     }
-    eprintln!("  merged LET env memo (build = HAMT clone + inserts + Arc + id walk):");
+    eprintln!("  merged LET env memo (build = HAMT clone + inserts + Arc + scope id):");
     for i in 0..MERGED_SITES {
         let calls = MERGED_CALLS[i].load(Ordering::Relaxed);
         if calls == 0 {
             continue;
         }
         let hits = MERGED_HITS[i].load(Ordering::Relaxed);
-        let rec = MERGED_RECURSIVE_BUILDS[i].load(Ordering::Relaxed);
+        let rec = MERGED_RECURSIVE_CALLS[i].load(Ordering::Relaxed);
+        let ambient_rec = MERGED_AMBIENT_RECURSIVE_CALLS[i].load(Ordering::Relaxed);
         eprintln!(
-            "    {:<16} calls {:>12}  hits {:>12}  builds {:>12}  (recursive-unmemoizable {})",
+            "    {:<16} calls {:>12}  hits {:>12}  builds {:>12}  (recursive fresh-Arc calls {}; ambient-recursive calls {})",
             MERGED_SITE_NAMES[i],
             calls,
             hits,
             calls - hits,
-            rec
+            rec,
+            ambient_rec
         );
     }
     eprintln!(
         "    ambient HAMT entries cloned on builds: {}",
         MERGED_AMBIENT_ENTRIES_CLONED.load(Ordering::Relaxed)
     );
+    MERGED_LET_ENV_MEMO.with(|memo| {
+        let memo = memo.borrow();
+        eprintln!(
+            "    live templates: stable {}  recursive {}  recursive cap clears {}  adaptive rejected {}",
+            memo.stable.len(),
+            memo.recursive.len(),
+            MERGED_RECURSIVE_CAP_CLEARS.load(Ordering::Relaxed),
+            MERGED_RECURSIVE_REJECTED.with(Cell::get)
+        );
+    });
     eprintln!("  scope-id memo (walk = ops.values().any + content fingerprint):");
     for i in 0..SCOPE_SITES {
         let calls = SCOPE_CALLS[i].load(Ordering::Relaxed);
@@ -214,23 +246,62 @@ struct MergedKey {
 }
 
 struct MergedEntry {
+    /// Immutable persistent-HAMT template. Recursive hits shallow-clone its
+    /// map into a fresh outer Arc; non-recursive hits return this Arc itself.
     env: Arc<OpEnv>,
     scope_id: u64,
+    recursive: bool,
     /// Pin: keeps the keyed ambient allocation alive (no ABA, no in-place COW).
     _ambient_pin: Option<Arc<OpEnv>>,
     /// Pin: keeps the keyed def allocations alive.
     _def_pins: SmallVec<[Arc<OperatorDef>; 8]>,
 }
 
+#[derive(Default)]
+struct MergedMemos {
+    /// Stable non-recursive environments: returned by Arc clone on a hit.
+    stable: FxHashMap<MergedKey, MergedEntry>,
+    /// Recursive content templates: shallow-cloned into a fresh Arc on a hit.
+    /// These keys are usually frame-local, so keep only a small rolling window.
+    recursive: FxHashMap<MergedKey, MergedEntry>,
+    recursive_window_probes: u64,
+    recursive_window_hits: u64,
+}
+
+impl MergedMemos {
+    fn record_recursive_probe(&mut self, hit: bool) -> bool {
+        self.recursive_window_probes += 1;
+        self.recursive_window_hits += u64::from(hit);
+        if self.recursive_window_probes < MERGED_RECURSIVE_SAMPLE_LEN {
+            return false;
+        }
+
+        let profitable = self.recursive_window_hits * 100
+            >= self.recursive_window_probes * MERGED_RECURSIVE_MIN_HIT_PERCENT;
+        self.recursive_window_probes = 0;
+        self.recursive_window_hits = 0;
+        !profitable
+    }
+}
+
 thread_local! {
-    static MERGED_LET_ENV_MEMO: RefCell<FxHashMap<MergedKey, MergedEntry>> =
-        RefCell::new(FxHashMap::default());
+    static MERGED_LET_ENV_MEMO: RefCell<MergedMemos> = RefCell::default();
+    static MERGED_RECURSIVE_REJECTED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Cap on merged-env memo entries. Entries are O(LET sites x ambient scopes)
 /// in practice (ambient Arcs are themselves memo-stable), so this is
 /// effectively never hit; it bounds memory for pathological workloads.
 const MERGED_LET_ENV_MEMO_CAP: usize = 16_384;
+
+/// Recursive keys are overwhelmingly one-state/frame identities. Calls for a
+/// key are clustered (one build followed immediately by one or two hits), so a
+/// small rolling cache captures reuse without pinning thousands of dead frames.
+const MERGED_RECURSIVE_TEMPLATE_CAP: usize = 256;
+/// Recursive templates must demonstrate near-constant reuse to repay key
+/// construction, hash lookup, pinning, and fresh frame-Arc construction.
+const MERGED_RECURSIVE_SAMPLE_LEN: u64 = 1 << 11;
+const MERGED_RECURSIVE_MIN_HIT_PERCENT: u64 = 90;
 
 /// Build (or reuse) the merged `local_ops` env for a LET entry.
 ///
@@ -240,19 +311,70 @@ const MERGED_LET_ENV_MEMO_CAP: usize = 16_384;
 /// where `scope_id` is value-identical to
 /// `compute_local_ops_scope_id(&merged_env)`.
 ///
-/// On a memo hit the SAME `Arc` is returned every call — downstream
-/// pointer-keyed consumers (closure scope-id memo) become hits too.
-/// Recursive merged envs are rebuilt fresh per call (never memoized) to
-/// preserve per-entry Arc identity for `SUBST_CACHE` keying.
+/// On a non-recursive memo hit the SAME `Arc` is returned every call —
+/// downstream pointer-keyed consumers (closure scope-id memo) become hits too.
+/// On a recursive hit the persistent map content is shallow-cloned from the
+/// memoized template into a fresh `Arc`, preserving per-entry identity for
+/// `SUBST_CACHE` keying without repeating the ambient merge and static inserts.
 pub fn merged_let_env_memoized(
     ambient: Option<&Arc<OpEnv>>,
     defs: &[OperatorDef],
     site: MergedLetSite,
+    insert_def: impl FnMut(&OperatorDef) -> bool,
+) -> (Arc<OpEnv>, u64, bool) {
+    let ambient_recursive = ambient.is_some_and(|ops| local_ops_requires_arc_identity(ops));
+    merged_let_env_memoized_with_ambient_recursive(
+        ambient,
+        ambient_recursive,
+        defs,
+        site,
+        insert_def,
+    )
+}
+
+/// [`merged_let_env_memoized`] using the ambient scope and already-cached
+/// recursion fact owned by `ctx`.
+///
+/// Keeping the recursion fact behind this context-based API prevents external
+/// callers from pairing an environment with an inconsistent boolean. Reusing
+/// the cached fact avoids walking the ambient HAMT again on every LET entry.
+pub fn merged_let_env_memoized_with_ctx(
+    ctx: &crate::EvalCtx,
+    defs: &[OperatorDef],
+    site: MergedLetSite,
+    insert_def: impl FnMut(&OperatorDef) -> bool,
+) -> (Arc<OpEnv>, u64, bool) {
+    merged_let_env_memoized_with_ambient_recursive(
+        ctx.local_ops().as_ref(),
+        ctx.local_ops_scope_recursive(),
+        defs,
+        site,
+        insert_def,
+    )
+}
+
+/// Internal primitive for callers that have an exact cached recursion fact.
+///
+/// `ambient_recursive` must equal whether `ambient` contains a recursive
+/// operator. Only [`merged_let_env_memoized_with_ctx`] exposes this fast path
+/// outside the crate, so an external caller cannot violate that invariant.
+pub(crate) fn merged_let_env_memoized_with_ambient_recursive(
+    ambient: Option<&Arc<OpEnv>>,
+    ambient_recursive: bool,
+    defs: &[OperatorDef],
+    site: MergedLetSite,
     mut insert_def: impl FnMut(&OperatorDef) -> bool,
 ) -> (Arc<OpEnv>, u64, bool) {
+    debug_assert!(
+        ambient.is_some() || !ambient_recursive,
+        "an absent ambient scope cannot be recursive"
+    );
     let stats = stats_enabled();
     if stats {
         MERGED_CALLS[site as usize].fetch_add(1, Ordering::Relaxed);
+        if ambient_recursive {
+            MERGED_AMBIENT_RECURSIVE_CALLS[site as usize].fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     // Intern the inserted defs (run-stable Arcs; also what the unmemoized
@@ -262,6 +384,11 @@ pub fn merged_let_env_memoized(
         .filter(|def| insert_def(def))
         .map(super::intern_let_def_arc)
         .collect();
+    // If an inserted definition is recursive, the merged environment is
+    // necessarily recursive. Use that static fact to avoid probing the stable
+    // map first on the hot recursive path. When only the ambient scope may be
+    // recursive, probe stable then recursive and let the cached result decide.
+    let inserted_recursive = interned.iter().any(|def| def.is_recursive);
 
     let build = |interned: &SmallVec<[Arc<OperatorDef>; 8]>| -> (Arc<OpEnv>, u64, bool) {
         let mut merged: OpEnv = ambient.map(|o| (**o).clone()).unwrap_or_default();
@@ -274,11 +401,30 @@ pub fn merged_let_env_memoized(
             merged.insert(def.name.node.clone(), Arc::clone(def));
         }
         let merged = Arc::new(merged);
-        let (id, recursive) = compute_local_ops_scope_id_and_recursive(&merged);
+        // When one of the definitions just inserted is recursive, the merged
+        // environment necessarily requires per-frame Arc identity. Avoid
+        // walking the whole persistent map to rediscover that static fact.
+        // Ambient-only recursion is carried by the owning context's cached
+        // flag, so neither case needs a second walk of the merged map.
+        let recursive = inserted_recursive || ambient_recursive;
+        let id = if recursive {
+            Arc::as_ptr(&merged) as usize as u64
+        } else {
+            compute_local_ops_id(&merged)
+        };
         (merged, id, recursive)
     };
 
     if openv_memo_disabled() {
+        return build(&interned);
+    }
+
+    let mut recursive_template_disabled =
+        recursive_template_disabled() || MERGED_RECURSIVE_REJECTED.with(Cell::get);
+    if inserted_recursive && recursive_template_disabled {
+        if stats {
+            MERGED_RECURSIVE_CALLS[site as usize].fetch_add(1, Ordering::Relaxed);
+        }
         return build(&interned);
     }
 
@@ -288,35 +434,97 @@ pub fn merged_let_env_memoized(
     };
 
     MERGED_LET_ENV_MEMO.with(|memo| {
-        if let Some(entry) = memo.borrow().get(&key) {
+        let (hit, probed_recursive) = {
+            let memo = memo.borrow();
+            let (entry, probed_recursive) = if inserted_recursive {
+                if recursive_template_disabled {
+                    (None, false)
+                } else {
+                    (memo.recursive.get(&key), true)
+                }
+            } else {
+                let stable = memo.stable.get(&key);
+                if stable.is_some() || recursive_template_disabled {
+                    (stable, false)
+                } else {
+                    (memo.recursive.get(&key), true)
+                }
+            };
+            (
+                entry.map(|entry| {
+                    if entry.recursive {
+                        // `OpEnv` is a persistent HAMT. Its clone shares
+                        // immutable internal nodes, while this new outer Arc
+                        // gives the recursion frame the unique cache scope
+                        // required by #3156.
+                        let env = Arc::new((*entry.env).clone());
+                        let id = Arc::as_ptr(&env) as usize as u64;
+                        (env, id, true)
+                    } else {
+                        (Arc::clone(&entry.env), entry.scope_id, false)
+                    }
+                }),
+                probed_recursive,
+            )
+        };
+        let reject_recursive = if probed_recursive {
+            let mut memo = memo.borrow_mut();
+            let reject = memo.record_recursive_probe(hit.is_some());
+            if reject {
+                memo.recursive.clear();
+            }
+            reject
+        } else {
+            false
+        };
+        if reject_recursive {
+            MERGED_RECURSIVE_REJECTED.with(|rejected| rejected.set(true));
+            recursive_template_disabled = true;
+        }
+        if let Some(hit) = hit {
             if stats {
                 MERGED_HITS[site as usize].fetch_add(1, Ordering::Relaxed);
+                if hit.2 {
+                    MERGED_RECURSIVE_CALLS[site as usize].fetch_add(1, Ordering::Relaxed);
+                }
             }
-            return (Arc::clone(&entry.env), entry.scope_id, false);
+            return hit;
         }
         let (env, id, recursive) = build(&interned);
         if recursive {
-            // Never memoize: each LET entry must present a fresh Arc identity
-            // (per-recursion-frame scope ids; see module docs / #3156).
             if stats {
-                MERGED_RECURSIVE_BUILDS[site as usize].fetch_add(1, Ordering::Relaxed);
+                MERGED_RECURSIVE_CALLS[site as usize].fetch_add(1, Ordering::Relaxed);
             }
-            return (env, id, true);
+            if recursive_template_disabled {
+                return (env, id, true);
+            }
         }
         let mut m = memo.borrow_mut();
-        if m.len() >= MERGED_LET_ENV_MEMO_CAP {
-            m.clear();
-        }
-        m.insert(
+        let entries = if recursive {
+            if m.recursive.len() >= MERGED_RECURSIVE_TEMPLATE_CAP {
+                m.recursive.clear();
+                if stats {
+                    MERGED_RECURSIVE_CAP_CLEARS.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            &mut m.recursive
+        } else {
+            if m.stable.len() >= MERGED_LET_ENV_MEMO_CAP {
+                m.stable.clear();
+            }
+            &mut m.stable
+        };
+        entries.insert(
             key,
             MergedEntry {
                 env: Arc::clone(&env),
                 scope_id: id,
+                recursive,
                 _ambient_pin: ambient.map(Arc::clone),
                 _def_pins: interned,
             },
         );
-        (env, id, false)
+        (env, id, recursive)
     })
 }
 
@@ -394,7 +602,14 @@ pub(crate) fn recursive_flag_memoized(ops: &Option<Arc<OpEnv>>, site: ScopeIdSit
 /// same breath, so no entry can ever outlive the allocations it keys on.
 /// Clearing is sound at any point: later calls rebuild/recompute fresh.
 pub fn clear_openv_memos() {
-    MERGED_LET_ENV_MEMO.with(|memo| memo.borrow_mut().clear());
+    MERGED_RECURSIVE_REJECTED.with(|rejected| rejected.set(false));
+    MERGED_LET_ENV_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        memo.stable.clear();
+        memo.recursive.clear();
+        memo.recursive_window_probes = 0;
+        memo.recursive_window_hits = 0;
+    });
     OPENV_SCOPE_ID_MEMO.with(|memo| memo.borrow_mut().clear());
 }
 
@@ -425,10 +640,8 @@ mod tests {
         clear_openv_memos();
         super::super::clear_let_def_interning();
         let defs = vec![mk_def("a", 10, 14, false), mk_def("b", 20, 24, false)];
-        let (e1, id1, r1) =
-            merged_let_env_memoized(None, &defs, MergedLetSite::EvalLet, |_| true);
-        let (e2, id2, r2) =
-            merged_let_env_memoized(None, &defs, MergedLetSite::EvalLet, |_| true);
+        let (e1, id1, r1) = merged_let_env_memoized(None, &defs, MergedLetSite::EvalLet, |_| true);
+        let (e2, id2, r2) = merged_let_env_memoized(None, &defs, MergedLetSite::EvalLet, |_| true);
         assert!(Arc::ptr_eq(&e1, &e2), "hit must return the same Arc");
         assert_eq!(id1, id2);
         assert!(!r1 && !r2);
@@ -449,12 +662,10 @@ mod tests {
         let ambient = Arc::new(ambient);
         let defs = vec![mk_def("a", 10, 14, false), mk_def("b", 20, 24, false)];
         // Filter inserts only "a".
-        let (env, id, _) = merged_let_env_memoized(
-            Some(&ambient),
-            &defs,
-            MergedLetSite::EvalLet,
-            |d| d.name.node == "a",
-        );
+        let (env, id, _) =
+            merged_let_env_memoized(Some(&ambient), &defs, MergedLetSite::EvalLet, |d| {
+                d.name.node == "a"
+            });
         assert_eq!(env.len(), 2, "ambient + a");
         assert!(env.get("outer").is_some() && env.get("a").is_some());
         assert!(env.get("b").is_none());
@@ -468,13 +679,13 @@ mod tests {
     }
 
     #[test]
-    fn merged_memo_never_memoizes_recursive_envs() {
+    fn merged_memo_reuses_recursive_content_with_fresh_arc_identity() {
         clear_openv_memos();
         super::super::clear_let_def_interning();
         let defs = vec![mk_def("rec", 30, 34, true)];
         let (e1, id1, r1) =
             merged_let_env_memoized(None, &defs, MergedLetSite::EnumConjunct, |_| true);
-        let (e2, id2, r2) =
+        let (mut e2, id2, r2) =
             merged_let_env_memoized(None, &defs, MergedLetSite::EnumConjunct, |_| true);
         assert!(r1 && r2, "recursive merged env must report arc-identity");
         assert!(
@@ -485,6 +696,72 @@ mod tests {
         assert_ne!(id1, id2);
         assert_eq!(id1, Arc::as_ptr(&e1) as usize as u64);
         assert_eq!(id2, Arc::as_ptr(&e2) as usize as u64);
+        assert_eq!(*e1, *e2, "recursive template hits must preserve content");
+
+        // Even accidental copy-on-write mutation of a returned frame cannot
+        // alter the retained template or a later frame cloned from it.
+        Arc::make_mut(&mut e2).insert(
+            "frame-only".into(),
+            Arc::new(mk_def("frame-only", 35, 39, false)),
+        );
+        assert!(e2.get("frame-only").is_some());
+        assert!(e1.get("frame-only").is_none());
+        let (e3, id3, r3) =
+            merged_let_env_memoized(None, &defs, MergedLetSite::EnumConjunct, |_| true);
+        assert!(r3);
+        assert_ne!(id2, id3);
+        assert!(e3.get("frame-only").is_none());
+        clear_openv_memos();
+        super::super::clear_let_def_interning();
+    }
+
+    #[test]
+    fn statically_known_recursive_scope_matches_full_oracle() {
+        clear_openv_memos();
+        super::super::clear_let_def_interning();
+        let mut ambient = OpEnv::default();
+        ambient.insert("outer".into(), Arc::new(mk_def("outer", 36, 40, false)));
+        let ambient = Arc::new(ambient);
+        let defs = vec![
+            mk_def("ordinary", 41, 45, false),
+            mk_def("recursive", 46, 50, true),
+        ];
+
+        let (env, id, recursive) =
+            merged_let_env_memoized(Some(&ambient), &defs, MergedLetSite::EvalLet, |_| true);
+        let oracle = compute_local_ops_scope_id_and_recursive(&env);
+        assert_eq!((id, recursive), oracle);
+        assert!(recursive);
+        assert_eq!(id, Arc::as_ptr(&env) as usize as u64);
+
+        clear_openv_memos();
+        super::super::clear_let_def_interning();
+    }
+
+    #[test]
+    fn cached_ambient_recursive_flag_matches_full_oracle() {
+        clear_openv_memos();
+        super::super::clear_let_def_interning();
+        let mut ambient = OpEnv::default();
+        ambient.insert(
+            "recursive-outer".into(),
+            Arc::new(mk_def("recursive-outer", 51, 55, true)),
+        );
+        let ambient = Arc::new(ambient);
+        let defs = vec![mk_def("ordinary", 56, 60, false)];
+
+        let (env, id, recursive) = merged_let_env_memoized_with_ambient_recursive(
+            Some(&ambient),
+            true,
+            &defs,
+            MergedLetSite::EvalLet,
+            |_| true,
+        );
+        let oracle = compute_local_ops_scope_id_and_recursive(&env);
+        assert_eq!((id, recursive), oracle);
+        assert!(recursive);
+        assert_eq!(id, Arc::as_ptr(&env) as usize as u64);
+
         clear_openv_memos();
         super::super::clear_let_def_interning();
     }
@@ -535,5 +812,65 @@ mod tests {
             crate::cache::scope_ids::local_ops_recursive_flag(&rec)
         );
         clear_openv_memos();
+    }
+
+    #[test]
+    fn recursive_template_policy_requires_near_constant_reuse() {
+        clear_openv_memos();
+        let mut memo = MergedMemos::default();
+        for _ in 1..MERGED_RECURSIVE_SAMPLE_LEN {
+            assert!(!memo.record_recursive_probe(false));
+        }
+        assert!(memo.record_recursive_probe(false));
+
+        let required_hits =
+            (MERGED_RECURSIVE_SAMPLE_LEN * MERGED_RECURSIVE_MIN_HIT_PERCENT).div_ceil(100);
+        let mut memo = MergedMemos::default();
+        memo.recursive_window_probes = MERGED_RECURSIVE_SAMPLE_LEN - 1;
+        memo.recursive_window_hits = required_hits - 2;
+        assert!(memo.record_recursive_probe(true));
+
+        let mut memo = MergedMemos::default();
+        memo.recursive_window_probes = MERGED_RECURSIVE_SAMPLE_LEN - 1;
+        memo.recursive_window_hits = required_hits - 1;
+        assert!(!memo.record_recursive_probe(true));
+
+        MERGED_RECURSIVE_REJECTED.with(|rejected| rejected.set(true));
+        clear_openv_memos();
+        assert!(!MERGED_RECURSIVE_REJECTED.with(Cell::get));
+    }
+
+    #[test]
+    fn recursive_template_policy_rejects_low_reuse_through_public_path() {
+        clear_openv_memos();
+        super::super::clear_let_def_interning();
+        let defs = vec![mk_def("rec", 70, 74, true)];
+        let mut last_ambient = None;
+
+        for _ in 0..MERGED_RECURSIVE_SAMPLE_LEN {
+            let ambient = Arc::new(OpEnv::default());
+            let (_, _, recursive) =
+                merged_let_env_memoized(Some(&ambient), &defs, MergedLetSite::EnumConjunct, |_| {
+                    true
+                });
+            assert!(recursive);
+            last_ambient = Some(ambient);
+        }
+
+        assert!(MERGED_RECURSIVE_REJECTED.with(Cell::get));
+        MERGED_LET_ENV_MEMO.with(|memo| assert!(memo.borrow().recursive.is_empty()));
+
+        let ambient = last_ambient.as_ref().unwrap();
+        let (first, first_id, first_recursive) =
+            merged_let_env_memoized(Some(ambient), &defs, MergedLetSite::EnumConjunct, |_| true);
+        let (second, second_id, second_recursive) =
+            merged_let_env_memoized(Some(ambient), &defs, MergedLetSite::EnumConjunct, |_| true);
+        assert!(first_recursive && second_recursive);
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_ne!(first_id, second_id);
+        MERGED_LET_ENV_MEMO.with(|memo| assert!(memo.borrow().recursive.is_empty()));
+
+        clear_openv_memos();
+        super::super::clear_let_def_interning();
     }
 }

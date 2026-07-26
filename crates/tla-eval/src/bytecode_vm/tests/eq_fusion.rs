@@ -8,9 +8,8 @@
 //! identical results — the fused opcodes' semantic contract.
 
 use super::super::execute::{BytecodeVm, VmError};
-use tla_value::Rp;
-use std::sync::Arc;
 use tla_tir::bytecode::{BytecodeChunk, BytecodeFunction, Opcode};
+use tla_value::Rp;
 use tla_value::{IntIntervalFunc, RecordValue, Value};
 
 /// Execute one function over `regs`-preloaded values by emitting LoadConst

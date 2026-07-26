@@ -7,10 +7,9 @@
 //! Verifies that record update operations (update_existing_field_id,
 //! take/restore, insert) correctly preserve the additive fingerprint cache.
 
+use crate::rp::Rp;
 use crate::RecordValue;
 use crate::Value;
-use crate::rp::Rp as Arc;
-use crate::rp::Rp;
 use tla_core::intern_name;
 
 use super::state_value_fingerprint_unwrap;

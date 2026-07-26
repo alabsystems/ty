@@ -3,7 +3,6 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::*;
-use tla_value::Rp;
 use crate::clear_for_test_reset;
 use crate::helpers::function_values::try_borrow_materialized_read;
 use crate::value::IntIntervalFunc;
@@ -11,6 +10,7 @@ use std::sync::Arc;
 use tla_core::ast::{Expr, RecordFieldName, Substitution};
 use tla_core::name_intern::{intern_name, NameId};
 use tla_core::{Span, Spanned};
+use tla_value::Rp;
 
 fn state_var_expr(name: &str, idx: u16) -> Spanned<Expr> {
     Spanned::dummy(Expr::StateVar(name.to_string(), idx, intern_name(name)))

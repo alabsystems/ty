@@ -9,11 +9,10 @@
 //! in eval_membership.rs and eval_sets.rs. They had no direct unit tests;
 //! only indirect coverage through the evaluator.
 
+use crate::rp::Rp;
 use crate::value::sorted_set::SortedSet;
 use crate::value::Value;
 use num_bigint::BigInt;
-use crate::rp::Rp as Arc;
-use crate::rp::Rp;
 // === equals_integer_interval ===
 
 #[cfg_attr(test, ntest::timeout(10000))]

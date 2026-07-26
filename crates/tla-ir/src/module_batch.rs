@@ -36,9 +36,9 @@ use trust_ir::constant::Constant;
 use trust_ir::dialect::{AttrValue, DialectInst};
 use trust_ir::inst::{BindingFrameDef, Inst, SwitchCase};
 use trust_ir::ty::{EnumDef, FatPtrKind, FieldDef, FuncTy, RecordDef, StructDef, Ty};
-use trust_ir::value::{EnumId, FuncId, FuncTyId, RecordId, StructId, TyId};
+use trust_ir::value::{EnumId, FuncId, FuncTyId, PredId, RecordId, StructId, TyId};
 use trust_ir::{
-    Block, Function, Global, Linkage, Module, ObligationDiagnostic, ProofCertificate,
+    Block, Function, Global, Linkage, Module, ObligationDiagnostic, Pred, ProofCertificate,
     ProofObligation, SpecModule,
 };
 
@@ -1561,6 +1561,16 @@ fn module_shared_shape_digest_input(
     input.push_str("spec_modules=");
     let _ = write!(input, "{:?}", module.spec_modules);
     input.push('\n');
+    // The predicate and universe tables are authority-bearing parts of a
+    // refinement type. The conservative assembler below requires the tables
+    // to match exactly, so the partition identity must distinguish them even
+    // when an entry is not referenced by a type yet.
+    input.push_str("universes=");
+    let _ = write!(input, "{:?}", module.universes);
+    input.push('\n');
+    input.push_str("predicates=");
+    let _ = write!(input, "{:?}", module.predicates);
+    input.push('\n');
     append_struct_shape_input(module_index, module, &mut input, &module.structs, &names)?;
     append_enum_shape_input(module_index, module, &mut input, &module.enums, &names)?;
     append_record_shape_input(module_index, module, &mut input, &module.records, &names)?;
@@ -1762,6 +1772,8 @@ impl ModuleBatchAssembler {
         output.files = first.files.clone();
         output.obligation_diagnostics = first.obligation_diagnostics.clone();
         output.spec_modules = first.spec_modules.clone();
+        output.universes = first.universes.clone();
+        output.predicates = first.predicates.clone();
 
         Self {
             output,
@@ -1986,6 +1998,8 @@ struct SharedTables {
     files: Vec<String>,
     obligation_diagnostics: Vec<ObligationDiagnostic>,
     spec_modules: Vec<SpecModule>,
+    universes: Vec<trust_ir::Universe>,
+    predicates: Vec<Pred>,
 }
 
 impl SharedTables {
@@ -2002,6 +2016,8 @@ impl SharedTables {
             files: module.files.clone(),
             obligation_diagnostics: module.obligation_diagnostics.clone(),
             spec_modules: module.spec_modules.clone(),
+            universes: module.universes.clone(),
+            predicates: module.predicates.clone(),
         }
     }
 }
@@ -2082,6 +2098,25 @@ fn validate_module_tables(
         "spec_modules",
         &module.spec_modules,
         &reference.spec_modules,
+    )?;
+    // Refinement IDs are content-interned within a module but remain table
+    // indices on the wire. Until batching grows a full predicate-table merge,
+    // require the complete tables to match byte-for-byte and preserve the
+    // first module's tables in the output. This is a safe conservative refusal:
+    // it never aliases two different predicates or drops a refinement fact.
+    validate_identical_shared_table(
+        module_index,
+        module,
+        "universes",
+        &module.universes,
+        &reference.universes,
+    )?;
+    validate_identical_shared_table(
+        module_index,
+        module,
+        "predicates",
+        &module.predicates,
+        &reference.predicates,
     )?;
     reject_non_empty_table(module_index, module, "closure_types", &module.closure_types)?;
 
@@ -2234,6 +2269,7 @@ enum SemanticTyKey {
     Ref(&'static str, Box<SemanticTyKey>),
     Set(Box<SemanticTyKey>, &'static str),
     Sequence(Box<SemanticTyKey>),
+    Refine(Box<SemanticTyKey>, String),
 }
 
 struct SharedIdNames {
@@ -2664,6 +2700,34 @@ fn semantic_ty_key(
             };
             SemanticTyKey::Record(name.clone())
         }
+        Ty::Refine(base, predicate) => {
+            if matches!(type_table.get(base.as_usize()), Some(Ty::Refine(_, _))) {
+                return Err(unsupported_table(
+                    module_index,
+                    module,
+                    table,
+                    "nested refinement types are not canonical".to_string(),
+                ));
+            }
+            SemanticTyKey::Refine(
+                Box::new(semantic_ty_id_key(
+                    module_index,
+                    module,
+                    table,
+                    *base,
+                    type_table,
+                    names,
+                    visiting,
+                )?),
+                semantic_pred_key(
+                    module_index,
+                    module,
+                    table,
+                    *predicate,
+                    &mut BTreeSet::new(),
+                )?,
+            )
+        }
         Ty::Func(_) | Ty::Closure(_) => {
             return Err(unsupported_table(
                 module_index,
@@ -2674,6 +2738,110 @@ fn semantic_ty_key(
             ));
         }
     })
+}
+
+/// Canonical, ID-independent predicate identity for refinement-type shape.
+///
+/// Predicate and universe IDs are module-local table positions. Hashing the
+/// raw IDs would let two different conventions (for example index-space and
+/// member-space predicates) collide in a batch compatibility key. Resolve the
+/// complete content recursively instead. Connective children are sorted by
+/// their semantic keys because conjunction/disjunction identity is set-like,
+/// while malformed, dangling, or cyclic tables fail closed.
+fn semantic_pred_key(
+    module_index: usize,
+    module: &Module,
+    table: &'static str,
+    id: PredId,
+    visiting: &mut BTreeSet<PredId>,
+) -> Result<String, ModuleBatchError> {
+    if !visiting.insert(id) {
+        return Err(unsupported_table(
+            module_index,
+            module,
+            table,
+            format!(
+                "predicate table contains a cycle through PredId({})",
+                id.index()
+            ),
+        ));
+    }
+    let Some(predicate) = module.predicates.get(id.as_usize()) else {
+        return Err(unsupported_table(
+            module_index,
+            module,
+            table,
+            format!("references missing PredId({})", id.index()),
+        ));
+    };
+    if !predicate.is_canonical() {
+        return Err(unsupported_table(
+            module_index,
+            module,
+            table,
+            format!("references non-canonical PredId({})", id.index()),
+        ));
+    }
+
+    let key = match predicate {
+        Pred::Interval { lo, hi } => format!("interval({lo},{hi})"),
+        Pred::FiniteSet(values) => format!("finite_set({values:?})"),
+        Pred::InUniverse(universe_id, space) => {
+            let Some(universe) = module.universes.get(universe_id.as_usize()) else {
+                return Err(unsupported_table(
+                    module_index,
+                    module,
+                    table,
+                    format!("references missing UnivId({})", universe_id.index()),
+                ));
+            };
+            if !universe.is_canonical() {
+                return Err(unsupported_table(
+                    module_index,
+                    module,
+                    table,
+                    format!(
+                        "PredId({}) references non-canonical UnivId({})",
+                        id.index(),
+                        universe_id.index()
+                    ),
+                ));
+            }
+            format!("in_universe({universe:?},{space:?})")
+        }
+        Pred::NonZero => "non_zero".to_string(),
+        Pred::NonNull => "non_null".to_string(),
+        Pred::Top => "top".to_string(),
+        Pred::Bottom => "bottom".to_string(),
+        Pred::Conj(children) | Pred::Disj(children) => {
+            if children.iter().any(|child| child.index() >= id.index()) {
+                return Err(unsupported_table(
+                    module_index,
+                    module,
+                    table,
+                    format!("PredId({}) has a non-earlier connective child", id.index()),
+                ));
+            }
+            let mut child_keys = Vec::with_capacity(children.len());
+            for child in children {
+                child_keys.push(semantic_pred_key(
+                    module_index,
+                    module,
+                    table,
+                    *child,
+                    visiting,
+                )?);
+            }
+            child_keys.sort();
+            if matches!(predicate, Pred::Conj(_)) {
+                format!("conj({child_keys:?})")
+            } else {
+                format!("disj({child_keys:?})")
+            }
+        }
+    };
+    visiting.remove(&id);
+    Ok(key)
 }
 
 fn set_repr_key(repr: trust_ir::ty::SetRepr) -> &'static str {
@@ -2798,6 +2966,12 @@ fn remap_shared_ty_ids(
         }
         Ty::Array(elem, _) | Ty::Set(elem, _) | Ty::Sequence(elem) => {
             *elem = map_ty_id_for_table(module_index, module, table, *elem, remap)?;
+            Ok(())
+        }
+        Ty::Refine(base, _) => {
+            // Predicate IDs remain valid because batching requires the full
+            // predicate/universe tables to match the reference exactly.
+            *base = map_ty_id_for_table(module_index, module, table, *base, remap)?;
             Ok(())
         }
         Ty::Enum(id) => {
@@ -3057,7 +3231,8 @@ fn ty_mentions_function_type(ty: &Ty) -> bool {
         | Ty::Enum(_)
         | Ty::Set(_, _)
         | Ty::Sequence(_)
-        | Ty::Record(_) => false,
+        | Ty::Record(_)
+        | Ty::Refine(_, _) => false,
     }
 }
 
@@ -3289,6 +3464,12 @@ fn remap_ty(
         }
         Ty::Array(elem, _) | Ty::Set(elem, _) | Ty::Sequence(elem) => {
             *elem = map_ty_id_for_table(module_index, module, "types", *elem, remap)?;
+            Ok(())
+        }
+        Ty::Refine(base, _) => {
+            // The predicate table is an exactly shared authority; only the
+            // base TyId is local to the source module and needs remapping.
+            *base = map_ty_id_for_table(module_index, module, "types", *base, remap)?;
             Ok(())
         }
         Ty::Enum(id) => {
@@ -3556,8 +3737,8 @@ mod tests {
         WHOLE_PROGRAM_KERNEL_METADATA_SCHEMA_VERSION,
     };
     use trust_ir::ty::StructRepr;
-    use trust_ir::value::{BlockId, ProofId, StructId, TyId, ValueId};
-    use trust_ir::{Inst, InstrNode, ObligationKind, ProofEvidence, ProofStatus};
+    use trust_ir::value::{BlockId, PredId, ProofId, StructId, TyId, UnivId, ValueId};
+    use trust_ir::{Inst, InstrNode, ObligationKind, ProofEvidence, ProofStatus, Space, Universe};
 
     fn ft_id(index: u32) -> FuncTyId {
         FuncTyId::new(index)
@@ -3577,6 +3758,14 @@ mod tests {
 
     fn ty_id(index: u32) -> TyId {
         TyId::new(index)
+    }
+
+    fn pred_id(index: u32) -> PredId {
+        PredId::new(index)
+    }
+
+    fn univ_id(index: u32) -> UnivId {
+        UnivId::new(index)
     }
 
     fn value_id(index: u32) -> ValueId {
@@ -4109,6 +4298,81 @@ mod tests {
             first_undef_ty(batch.function_by_name("right_entry").unwrap()),
             Ty::Array(ty_id(0), 4)
         );
+    }
+
+    #[test]
+    fn preserves_refinement_tables_and_remaps_the_base_type_id() {
+        let mut left = helper_call_module("left", "left_entry", "left_helper");
+        let mut right = helper_call_module("right", "right_entry", "right_helper");
+
+        let universe = Universe::range(10, 13).expect("non-empty universe");
+        let predicate = Pred::InUniverse(univ_id(0), Space::Index);
+        left.universes.push(universe.clone());
+        right.universes.push(universe);
+        left.predicates.push(predicate.clone());
+        right.predicates.push(predicate);
+
+        left.types.push(Ty::I64);
+        left.types.push(Ty::Refine(ty_id(0), pred_id(0)));
+        right.types.push(Ty::Refine(ty_id(1), pred_id(0)));
+        right.types.push(Ty::I64);
+        insert_entry_undef(&mut left, "left_entry", Ty::Refine(ty_id(0), pred_id(0)));
+        insert_entry_undef(&mut right, "right_entry", Ty::Refine(ty_id(1), pred_id(0)));
+
+        let batch = assemble_module_batch("batch", [&left, &right]).expect("batch assembles");
+
+        assert_eq!(batch.universes, left.universes);
+        assert_eq!(batch.predicates, left.predicates);
+        assert_eq!(batch.types, left.types);
+        assert_eq!(
+            first_undef_ty(batch.function_by_name("right_entry").unwrap()),
+            Ty::Refine(ty_id(0), pred_id(0))
+        );
+    }
+
+    #[test]
+    fn refinement_predicate_content_is_part_of_partition_identity() {
+        let mut narrow = helper_call_module("narrow", "narrow_entry", "narrow_helper");
+        let mut wide = helper_call_module("wide", "wide_entry", "wide_helper");
+        narrow.predicates.push(Pred::Interval { lo: 0, hi: 3 });
+        wide.predicates.push(Pred::Interval { lo: 0, hi: 4 });
+        narrow.types.push(Ty::I64);
+        wide.types.push(Ty::I64);
+        narrow.types.push(Ty::Refine(ty_id(0), pred_id(0)));
+        wide.types.push(Ty::Refine(ty_id(0), pred_id(0)));
+
+        let narrow_plan = plan_module_batch_partitions(
+            [partition_input("same", &narrow)],
+            BatchPartitionOptions::new(4),
+        )
+        .expect("narrow partition plan");
+        let wide_plan = plan_module_batch_partitions(
+            [partition_input("same", &wide)],
+            BatchPartitionOptions::new(4),
+        )
+        .expect("wide partition plan");
+
+        assert_ne!(
+            narrow_plan.shards[0].shared_shape_id, wide_plan.shards[0].shared_shape_id,
+            "different refinement facts must never share a batch shape identity"
+        );
+    }
+
+    #[test]
+    fn rejects_mismatched_refinement_authority_tables() {
+        let mut left = helper_call_module("left", "left_entry", "left_helper");
+        let mut right = helper_call_module("right", "right_entry", "right_helper");
+        left.predicates.push(Pred::Interval { lo: 0, hi: 3 });
+        right.predicates.push(Pred::Interval { lo: 0, hi: 4 });
+
+        let err = assemble_module_batch("batch", [&left, &right]).unwrap_err();
+        assert!(matches!(
+            err,
+            ModuleBatchError::UnsupportedTableMismatch {
+                table: "predicates",
+                ..
+            }
+        ));
     }
 
     #[test]

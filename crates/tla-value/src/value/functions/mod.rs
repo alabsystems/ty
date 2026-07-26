@@ -14,9 +14,9 @@ mod core;
 mod overlay;
 
 use super::Value;
-use std::sync::atomic::AtomicU64;
-use std::sync::{OnceLock};
 use crate::rp::Rp as Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::OnceLock;
 
 /// Sentinel value for "fingerprint not yet computed" in AtomicU64 caches.
 /// Matches SortedSet's SORTED_SET_FP_UNSET. A real fingerprint of u64::MAX
@@ -52,7 +52,7 @@ fn additive_cache_val(fp: Option<u64>) -> u64 {
 ///
 /// The tag records only the *shape*; the interval bounds are re-derived from the
 /// (cache-hot) domain endpoints on each apply, keeping it a single byte stored
-/// as a plain (non-atomic) `FuncValue` field computed once at construction.
+/// as a plain (non-atomic) field in the shared domain descriptor.
 ///
 /// SAFETY / EXACTNESS: detection reconstructs the canonical enumeration and
 /// compares it element-by-element against the actual sorted domain. The tag is
@@ -69,6 +69,23 @@ pub(crate) enum DenseTag {
     /// domain == `{ <<i,j>> : i in lo1..=hi1, j in lo2..=hi2 }` enumerated in
     /// canonical (row-major) `Value::cmp` order, all present.
     Dim2,
+}
+
+/// Immutable metadata shared by functions with the same sorted domain.
+///
+/// General function sets produce many values whose keys, TLC-normalized key
+/// order, and dense-domain classification are identical. Keeping those three
+/// domain-only properties behind one thin `Arc` avoids repeating the wide
+/// `Arc<[Value]>` and `OnceLock<Arc<[usize]>>` handles in every `FuncValue`.
+/// Independently constructed functions still receive their own descriptor.
+pub(in crate::value) struct FuncDomain {
+    /// Domain keys sorted by `Value::cmp`.
+    /// Invariant: keys are unique and sorted.
+    keys: Arc<[Value]>,
+    /// Lazily-computed TLC-normalized indices into `keys`.
+    tlc_normalized: OnceLock<Arc<[usize]>>,
+    /// Dense-domain shape for O(1) indexed `apply`.
+    dense: DenseTag,
 }
 
 // === Interval length utility ===
@@ -105,9 +122,9 @@ pub fn checked_interval_len(min: i64, max: i64) -> Option<usize> {
 /// slice access). In BFS, most successor states are fingerprinted and stored
 /// without ever materializing — eliminating the O(n) values clone entirely.
 pub struct FuncValue {
-    /// Domain keys sorted by `Value::cmp`.
-    /// Invariant: keys are unique and sorted.
-    domain: Arc<[Value]>,
+    /// Immutable keys and domain-only metadata. General function-set outputs
+    /// share this descriptor; clones and EXCEPT operations always preserve it.
+    domain: Arc<FuncDomain>,
     /// Values positionally aligned with `domain`.
     /// Uses `Arc<Vec<...>>` to enable `Arc::make_mut` COW in `except()`.
     values: Arc<Vec<Value>>,
@@ -133,21 +150,6 @@ pub struct FuncValue {
     ///
     /// Part of #3285: `cached_fp` (FP64) removed — recomputed on demand.
     additive_fp: AtomicU64,
-    /// Lazily-computed TLC-normalized domain index order.
-    /// For homogeneous-safe domains (Bool/Int), the stored order already
-    /// matches TLC order and this field is never populated.
-    /// For non-safe domains (String, ModelValue, Tuple, Set), computed on first
-    /// TLC comparison/fingerprint and cached as indices into `domain`/`values`.
-    /// Part of #1434: TLC's `isNorm` flag equivalent for immutable FuncValue.
-    tlc_normalized: OnceLock<Arc<[usize]>>,
-    /// Dense-domain shape for O(1) indexed `apply`, computed once at
-    /// construction from `domain`.
-    ///
-    /// A plain (non-atomic) field so the hot `apply` path reads it with no
-    /// synchronization. It depends only on `domain`, which EXCEPT preserves (it
-    /// mutates values, not keys), so it is copied verbatim on `clone()` and
-    /// stays valid across EXCEPT chains. See [`DenseTag`]. One byte.
-    dense: DenseTag,
 }
 
 /// Builder for constructing FuncValue incrementally.

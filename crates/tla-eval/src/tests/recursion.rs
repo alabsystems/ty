@@ -4,7 +4,6 @@
 
 use super::*;
 use tla_value::Rp;
-use std::sync::Arc;
 
 #[cfg_attr(test, ntest::timeout(2000))]
 #[test]
@@ -160,6 +159,81 @@ Op == LET sc == [i \in {1, 2} |-> i]
     // Sum(sc, {1, 2}) should yield sc[1] + sc[2] = 1 + 2 = 3
     let val = ctx.eval_op("Op").unwrap();
     assert_eq!(val, Value::int(3));
+}
+
+/// The recursive memo must not force a non-trivial argument that the historical
+/// LazyBinding path leaves unused. Eagerly evaluating the second argument turns
+/// this valid expression into a division-by-zero error.
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_recursive_memo_preserves_unused_lazy_argument() {
+    let src = r#"
+---- MODULE RecursiveMemoLazyArgument ----
+EXTENDS Integers
+RECURSIVE First(_, _)
+First(n, unused) == IF n = 0 THEN 42 ELSE First(n - 1, unused)
+Op == First(0, 1 \div 0)
+====
+"#;
+    let tree = parse_to_syntax_tree(src);
+    let lower_result = lower(FileId(0), &tree);
+    assert!(
+        lower_result.errors.is_empty(),
+        "Errors: {:?}",
+        lower_result.errors
+    );
+    let module = lower_result.module.unwrap();
+    let mut ctx = EvalCtx::new();
+    ctx.load_module(&module);
+
+    assert_eq!(
+        ctx.eval_op("Op")
+            .expect("unused lazy argument must not be forced"),
+        Value::int(42),
+    );
+}
+
+/// A recursive operator can construct a LazyFunc without reading its captured
+/// state until the function is applied. Such a value must never enter the
+/// process-long recursive-result cache.
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_recursive_memo_rejects_state_capturing_lazy_func_result() {
+    crate::cache::lifecycle::clear_for_test_reset();
+
+    let src = r#"
+---- MODULE RecursiveMemoCapturedState ----
+VARIABLE x
+RECURSIVE Captured(_)
+Captured(n) == IF n = 0 THEN [i \in {1} |-> x] ELSE Captured(n - 1)
+Read == Captured(0)[1]
+====
+"#;
+    let tree = parse_to_syntax_tree(src);
+    let lower_result = lower(FileId(0), &tree);
+    assert!(
+        lower_result.errors.is_empty(),
+        "Errors: {:?}",
+        lower_result.errors
+    );
+    let module = lower_result.module.unwrap();
+    let mut ctx = EvalCtx::new();
+    ctx.load_module(&module);
+    // `bind_state_array` uses the model's registered variable layout. Direct
+    // evaluator tests do not run tla-check's model-setup registration step.
+    ctx.register_var("x");
+
+    let first_state = vec![Value::int(3)];
+    ctx.bind_state_array(&first_state);
+    assert_eq!(ctx.eval_op("Read").unwrap(), Value::int(3));
+
+    let second_state = vec![Value::int(9)];
+    ctx.bind_state_array(&second_state);
+    assert_eq!(
+        ctx.eval_op("Read").unwrap(),
+        Value::int(9),
+        "a recursive memo hit must not replay a LazyFunc captured in the prior state",
+    );
 }
 
 #[cfg_attr(test, ntest::timeout(10000))]

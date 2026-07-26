@@ -5,9 +5,15 @@
 //! TLC baseline collector — Rust port of `scripts/collect_tlc_baseline/`.
 //!
 //! Runs the Java TLC baseline tool (`~/tlaplus/tytools.jar`) against
-//! every spec listed in `tests/tlc_comparison/spec_catalog.py`, parses
-//! TLC stdout/stderr, classifies the verdict, and emits or refreshes
-//! `tests/tlc_comparison/spec_baseline.json` (schema v3).
+//! every eligible row in
+//! `tests/tlc_comparison/strict_corpus_manifest.json`, parses TLC
+//! stdout/stderr, classifies the verdict, and emits or refreshes
+//! `tests/tlc_comparison/spec_baseline.json` (schema v4).
+//!
+//! The checked-in manifest is the only default catalog. It enumerates every
+//! pinned `tlaplus/Examples` config, records non-same-stem TLA mappings, and
+//! retains excluded rows with stable reason codes. `--list`, `--dry-run`, and
+//! `--write-skeleton` validate this contract without starting model checking.
 //!
 //! Provenance fields (TLC version, jar SHA-256, examples-repo git
 //! head, etc.) are recorded deterministically so consumers like
@@ -25,34 +31,75 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 // ---------- Constants ----------
 
-const SCHEMA_VERSION: u64 = 3;
+const SCHEMA_VERSION: u64 = 4;
 const DEFAULT_TIMEOUT_SECONDS: u64 = 600;
+const WORK_EQUIVALENCE_POLICY_SCHEMA_VERSION: u64 = 1;
+const EXHAUSTIVE_WORK_EQUIVALENCE_RULE_ID: &str = "exhaustive_generated_work_parity_v1";
+const STRICT_EXCLUSION_REASON_CODES: &[&str] = &[
+    "deadlock_first_found_noncomparable",
+    "expected_violation_first_found_noncomparable",
+    "external_io_dependency",
+    "external_io_side_effect",
+    "nested_tool_driver",
+    "randomized_external_operator",
+    "semantic_assertion_only",
+    "simulation_only",
+];
 const STATS_KEY_ORDER: &[&str] = &[
     "tlc_pass",
     "tlc_error",
     "tlc_timeout",
+    "tlc_unsupported",
+    "tlc_uncollected",
     "ty_match",
     "ty_mismatch",
     "ty_fail",
     "ty_untested",
 ];
 const CATEGORIES_KEY_ORDER: &[&str] = &["small", "medium", "large", "xlarge", "skip", "unknown"];
-const TLC_ENTRY_KEY_ORDER: &[&str] =
-    &["status", "states", "runtime_seconds", "error_type", "error"];
-const TY_ENTRY_KEY_ORDER: &[&str] = &["status", "states", "error_type", "last_run", "git_commit"];
-const SPEC_ENTRY_KEY_ORDER: &[&str] =
-    &["tlc", "ty", "verified_match", "issue", "category", "source"];
+const TLC_ENTRY_KEY_ORDER: &[&str] = &[
+    "status",
+    "states",
+    "raw_initial_states_generated",
+    "raw_successors_generated",
+    "states_generated",
+    "runtime_seconds",
+    "error_type",
+    "error",
+];
+const TY_ENTRY_KEY_ORDER: &[&str] = &[
+    "status",
+    "states",
+    "raw_initial_states_generated",
+    "raw_successors_generated",
+    "states_generated",
+    "error_type",
+    "last_run",
+    "git_commit",
+];
+const SPEC_ENTRY_KEY_ORDER: &[&str] = &[
+    "tlc",
+    "ty",
+    "verified_match",
+    "eligibility",
+    "work_equivalence",
+    "exclusion",
+    "issue",
+    "category",
+    "source",
+];
 const LEGACY_V2_KEYS: &[&str] = &[
     "expected_states",
     "tlc_runtime_seconds",
@@ -66,11 +113,12 @@ const LEGACY_V2_KEYS: &[&str] = &[
 #[derive(Parser, Debug)]
 #[command(
     name = "ty-tlc-baseline",
-    about = "Collect TLC baselines for every spec listed in spec_catalog.py",
-    long_about = "Rust replacement for scripts/collect_tlc_baseline/. Runs TLC against \
-                  every spec in tests/tlc_comparison/spec_catalog.py and writes \
-                  tests/tlc_comparison/spec_baseline.json (schema v3) with full \
-                  provenance and a JCS digest of the specs map."
+    about = "Collect TLC baselines from the pinned strict-corpus manifest",
+    long_about = "Runs TLC against every eligible row in \
+                  tests/tlc_comparison/strict_corpus_manifest.json and writes \
+                  tests/tlc_comparison/spec_baseline.json (schema v4). The manifest \
+                  is the auditable catalog: all pinned configs, exact TLA mappings, \
+                  and stable exclusions remain visible in the output."
 )]
 struct Cli {
     /// Timeout per spec in seconds.
@@ -81,10 +129,24 @@ struct Cli {
     #[arg(long)]
     no_resume: bool,
 
-    /// Override `spec_catalog.py` path. Defaults to
-    /// `tests/tlc_comparison/spec_catalog.py` under the project root.
+    /// Override the strict-corpus manifest. Defaults to
+    /// `tests/tlc_comparison/strict_corpus_manifest.json`.
     #[arg(long, value_name = "PATH")]
-    spec_catalog: Option<PathBuf>,
+    manifest: Option<PathBuf>,
+
+    /// Print the normalized catalog as TSV and exit without reading source
+    /// files, writing output, or launching TLC.
+    #[arg(long, conflicts_with_all = ["dry_run", "write_skeleton"])]
+    list: bool,
+
+    /// Validate the manifest and pinned source checkout, then exit without
+    /// writing output or launching TLC.
+    #[arg(long, conflicts_with_all = ["list", "write_skeleton"])]
+    dry_run: bool,
+
+    /// Write a complete 181-row baseline skeleton without launching TLC.
+    #[arg(long, conflicts_with_all = ["list", "dry_run"])]
+    write_skeleton: bool,
 
     /// Override `spec_baseline.json` output path.
     #[arg(long, value_name = "PATH")]
@@ -124,106 +186,287 @@ struct SpecInfo {
     name: String,
     tla_path: String,
     cfg_path: String,
+    exclusion: Option<ManifestExclusion>,
 }
 
-/// Parse `spec_catalog.py` for `SpecInfo("name", "tla_path", "cfg_path", ...)` rows.
-///
-/// We only care about the first three string positional arguments; any
-/// remaining keyword/positional arguments are ignored. We do **not**
-/// invoke a Python interpreter — the catalog is a flat list of
-/// literal-string constructor calls and is parseable with a small state
-/// machine.
-fn parse_spec_catalog(text: &str) -> Result<Vec<SpecInfo>> {
-    let mut specs = Vec::new();
-    let mut in_all_specs = false;
-    for raw in text.lines() {
-        let trimmed = raw.trim();
-        if !in_all_specs {
-            if trimmed.starts_with("ALL_SPECS") && trimmed.contains('[') {
-                in_all_specs = true;
-            }
-            continue;
-        }
-        if trimmed.starts_with("LARGE_SPECS")
-            || trimmed.starts_with("KNOWN_BLOCKERS")
-            || trimmed.starts_with("TY_LIMITATIONS")
-            || trimmed.starts_with("TY_BUGS")
-            || trimmed.starts_with("def ")
-        {
-            break;
-        }
-        if !trimmed.starts_with("SpecInfo(") {
-            continue;
-        }
-        let inner = trimmed
-            .trim_start_matches("SpecInfo(")
-            .trim_end_matches(',')
-            .trim_end_matches(')')
-            .trim_end_matches(',')
-            .trim_end_matches(')')
-            .trim();
-        let strings = parse_python_strings(inner, 3)?;
-        if strings.len() < 3 {
-            bail!("spec_catalog row missing required positional arguments: {trimmed}");
-        }
-        specs.push(SpecInfo {
-            name: strings[0].clone(),
-            tla_path: strings[1].clone(),
-            cfg_path: strings[2].clone(),
-        });
-    }
-    if specs.is_empty() {
-        bail!("no SpecInfo rows parsed from spec_catalog.py — wrong file?");
-    }
-    Ok(specs)
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct ManifestExclusion {
+    reason_code: String,
+    detail: String,
 }
 
-/// Pull the first `n` Python-style string literals from `text`.
-///
-/// Recognizes both single- and double-quoted strings with `\\` and
-/// `\"`/`\'` escapes — enough for the catalog rows which only use
-/// double-quoted ASCII paths.
-fn parse_python_strings(text: &str, n: usize) -> Result<Vec<String>> {
-    let mut out = Vec::with_capacity(n);
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() && out.len() < n {
-        let c = bytes[i];
-        if c == b'"' || c == b'\'' {
-            let quote = c;
-            i += 1;
-            let mut buf = String::new();
-            while i < bytes.len() {
-                let b = bytes[i];
-                if b == b'\\' && i + 1 < bytes.len() {
-                    let esc = bytes[i + 1];
-                    match esc {
-                        b'n' => buf.push('\n'),
-                        b't' => buf.push('\t'),
-                        b'\\' => buf.push('\\'),
-                        b'\'' => buf.push('\''),
-                        b'"' => buf.push('"'),
-                        other => {
-                            buf.push('\\');
-                            buf.push(other as char);
-                        }
-                    }
-                    i += 2;
-                    continue;
-                }
-                if b == quote {
-                    i += 1;
-                    out.push(buf);
-                    break;
-                }
-                buf.push(b as char);
-                i += 1;
-            }
-        } else {
-            i += 1;
+#[derive(Debug, Deserialize)]
+struct CorpusManifest {
+    schema_version: u64,
+    claim: String,
+    source: ManifestSource,
+    eligibility: ManifestEligibility,
+    work_equivalence_policy: ManifestWorkEquivalencePolicy,
+    #[serde(default)]
+    tla_path_overrides: BTreeMap<String, String>,
+    #[serde(default)]
+    baseline_gaps: BTreeMap<String, ManifestGap>,
+    rows: Vec<ManifestRow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestSource {
+    repository: String,
+    commit: String,
+    root: String,
+    enumeration: String,
+    default_tla_mapping: String,
+    expected_cfg_count: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestEligibility {
+    default: String,
+    #[serde(default)]
+    exclusions: BTreeMap<String, ManifestExclusion>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestWorkEquivalencePolicy {
+    schema_version: u64,
+    default_eligible_rule_id: String,
+    rules: BTreeMap<String, ManifestWorkEquivalenceRule>,
+    outcome_dispositions: ManifestOutcomeDispositions,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestWorkEquivalenceRule {
+    kind: String,
+    required_verdict: String,
+    require_complete_exploration: bool,
+    distinct_state_parity: String,
+    raw_initial_state_generation_parity: String,
+    raw_successor_generation_parity: String,
+    total_state_generation_parity: String,
+    count_arm: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestOutcomeDispositions {
+    expected_violation: String,
+    deadlock: String,
+    simulation: String,
+    randomized_external_operator: String,
+    external_io: String,
+    timeout: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestGap {
+    row_name: String,
+    tla_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestRow {
+    name: String,
+    cfg_path: String,
+    tla_path: String,
+}
+
+fn parse_corpus_manifest(text: &str) -> Result<CorpusManifest> {
+    let manifest: CorpusManifest =
+        serde_json::from_str(text).context("parse strict-corpus manifest JSON")?;
+    validate_corpus_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+fn validate_corpus_manifest(manifest: &CorpusManifest) -> Result<()> {
+    if manifest.schema_version != 1 {
+        bail!(
+            "unsupported strict-corpus manifest schema {}; expected 1",
+            manifest.schema_version
+        );
+    }
+    if manifest.claim != "ty_vs_tlc_strict_superiority" {
+        bail!("unexpected corpus claim: {}", manifest.claim);
+    }
+    if manifest.source.enumeration != "all_cfg_files"
+        || manifest.source.default_tla_mapping != "same_stem"
+    {
+        bail!("manifest must enumerate all cfg files with same-stem default mapping");
+    }
+    if manifest.eligibility.default != "eligible" {
+        bail!("manifest eligibility.default must be eligible");
+    }
+    validate_work_equivalence_policy(&manifest.work_equivalence_policy)?;
+    if manifest.source.commit.len() != 40
+        || !manifest
+            .source
+            .commit
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!("manifest source commit must be a full 40-hex Git object ID");
+    }
+    validate_relative_manifest_path(&manifest.source.root, None)?;
+    if manifest.rows.len() != manifest.source.expected_cfg_count {
+        bail!(
+            "manifest has {} rows but source.expected_cfg_count is {}",
+            manifest.rows.len(),
+            manifest.source.expected_cfg_count
+        );
+    }
+
+    let mut names = BTreeSet::new();
+    let mut cfg_paths = BTreeSet::new();
+    let mut previous_cfg: Option<&str> = None;
+    for row in &manifest.rows {
+        if row.name.trim().is_empty() {
+            bail!("manifest row has an empty name");
+        }
+        if !names.insert(row.name.as_str()) {
+            bail!("duplicate manifest row name: {}", row.name);
+        }
+        if !cfg_paths.insert(row.cfg_path.as_str()) {
+            bail!("duplicate manifest cfg path: {}", row.cfg_path);
+        }
+        if previous_cfg.is_some_and(|previous| previous >= row.cfg_path.as_str()) {
+            bail!("manifest rows must be strictly sorted by cfg_path");
+        }
+        previous_cfg = Some(&row.cfg_path);
+        validate_relative_manifest_path(&row.cfg_path, Some("cfg"))?;
+        validate_relative_manifest_path(&row.tla_path, Some("tla"))?;
+
+        let same_stem = format!(
+            "{}.tla",
+            row.cfg_path
+                .strip_suffix(".cfg")
+                .expect("validated cfg extension")
+        );
+        let expected_tla = manifest
+            .tla_path_overrides
+            .get(&row.cfg_path)
+            .map(String::as_str)
+            .unwrap_or(&same_stem);
+        if row.tla_path != expected_tla {
+            bail!(
+                "manifest row {} maps {} to {}, expected {} from mapping rules",
+                row.name,
+                row.cfg_path,
+                row.tla_path,
+                expected_tla
+            );
         }
     }
-    Ok(out)
+
+    for cfg_path in manifest.tla_path_overrides.keys() {
+        if !cfg_paths.contains(cfg_path.as_str()) {
+            bail!("TLA override references unknown cfg: {cfg_path}");
+        }
+    }
+    for cfg_path in manifest.eligibility.exclusions.keys() {
+        if !cfg_paths.contains(cfg_path.as_str()) {
+            bail!("exclusion references unknown cfg: {cfg_path}");
+        }
+    }
+    for (cfg_path, exclusion) in &manifest.eligibility.exclusions {
+        if !STRICT_EXCLUSION_REASON_CODES.contains(&exclusion.reason_code.as_str()) {
+            bail!(
+                "exclusion for {cfg_path} uses unsupported reason code {:?}",
+                exclusion.reason_code
+            );
+        }
+        if exclusion.detail.trim().is_empty() {
+            bail!("exclusion for {cfg_path} must include a nonempty detail");
+        }
+    }
+    for (cfg_path, gap) in &manifest.baseline_gaps {
+        let Some(row) = manifest.rows.iter().find(|row| row.cfg_path == *cfg_path) else {
+            bail!("baseline gap references unknown cfg: {cfg_path}");
+        };
+        if row.name != gap.row_name || row.tla_path != gap.tla_path {
+            bail!("baseline gap metadata disagrees with explicit row for {cfg_path}");
+        }
+    }
+    Ok(())
+}
+
+fn validate_work_equivalence_policy(policy: &ManifestWorkEquivalencePolicy) -> Result<()> {
+    if policy.schema_version != WORK_EQUIVALENCE_POLICY_SCHEMA_VERSION {
+        bail!(
+            "unsupported work-equivalence policy schema {}; expected {}",
+            policy.schema_version,
+            WORK_EQUIVALENCE_POLICY_SCHEMA_VERSION
+        );
+    }
+    if policy.default_eligible_rule_id != EXHAUSTIVE_WORK_EQUIVALENCE_RULE_ID {
+        bail!("work-equivalence default rule must be {EXHAUSTIVE_WORK_EQUIVALENCE_RULE_ID:?}");
+    }
+    if policy.rules.len() != 1 {
+        bail!(
+            "work-equivalence policy schema {} must define exactly one rule",
+            WORK_EQUIVALENCE_POLICY_SCHEMA_VERSION
+        );
+    }
+    let rule = policy
+        .rules
+        .get(EXHAUSTIVE_WORK_EQUIVALENCE_RULE_ID)
+        .context("work-equivalence policy is missing its default exhaustive rule")?;
+    if rule.kind != "exhaustive_state_space"
+        || rule.required_verdict != "holds"
+        || !rule.require_complete_exploration
+        || rule.distinct_state_parity != "exact"
+        || rule.raw_initial_state_generation_parity != "exact"
+        || rule.raw_successor_generation_parity != "exact"
+        || rule.total_state_generation_parity != "exact"
+        || rule.count_arm != "bfs_no_reduction_single_worker"
+    {
+        bail!(
+            "work-equivalence rule {EXHAUSTIVE_WORK_EQUIVALENCE_RULE_ID:?} does not match the schema-v1 exhaustive contract"
+        );
+    }
+
+    let dispositions = &policy.outcome_dispositions;
+    if dispositions.expected_violation != "exclude_unless_predeclared_typed_rule"
+        || dispositions.deadlock != "exclude_unless_predeclared_typed_rule"
+        || dispositions.simulation != "exclude"
+        || dispositions.randomized_external_operator != "exclude"
+        || dispositions.external_io != "exclude"
+        || dispositions.timeout != "missing_or_stale"
+    {
+        bail!("work-equivalence outcome dispositions do not match the schema-v1 contract");
+    }
+    Ok(())
+}
+
+fn validate_relative_manifest_path(path: &str, extension: Option<&str>) -> Result<()> {
+    if path.is_empty() || Path::new(path).is_absolute() {
+        bail!("manifest path must be nonempty and relative: {path:?}");
+    }
+    if Path::new(path)
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        bail!("manifest path may not contain traversal or special components: {path}");
+    }
+    if let Some(extension) = extension {
+        if Path::new(path).extension().and_then(|value| value.to_str()) != Some(extension) {
+            bail!("manifest path must end in .{extension}: {path}");
+        }
+    }
+    Ok(())
+}
+
+fn catalog_from_manifest(manifest: &CorpusManifest) -> Vec<SpecInfo> {
+    manifest
+        .rows
+        .iter()
+        .map(|row| SpecInfo {
+            name: row.name.clone(),
+            tla_path: row.tla_path.clone(),
+            cfg_path: row.cfg_path.clone(),
+            exclusion: manifest.eligibility.exclusions.get(&row.cfg_path).cloned(),
+        })
+        .collect()
 }
 
 // ---------- TLC execution ----------
@@ -232,9 +475,31 @@ fn parse_python_strings(text: &str, n: usize) -> Result<Vec<String>> {
 struct TlcOutcome {
     status: String,
     states: Option<u64>,
+    raw_initial_states_generated: Option<u64>,
+    raw_successors_generated: Option<u64>,
+    states_generated: Option<u64>,
     runtime_seconds: Option<f64>,
     error_type: Option<String>,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+struct TlcParsedCounts {
+    states: Option<u64>,
+    raw_initial_states_generated: Option<u64>,
+    raw_successors_generated: Option<u64>,
+    states_generated: Option<u64>,
+    states_left: Option<u64>,
+}
+
+impl TlcParsedCounts {
+    fn complete(self) -> bool {
+        self.states.is_some()
+            && self.raw_initial_states_generated.is_some()
+            && self.raw_successors_generated.is_some()
+            && self.states_generated.is_some()
+            && self.states_left == Some(0)
+    }
 }
 
 fn run_tlc(
@@ -248,6 +513,9 @@ fn run_tlc(
     let mut outcome = TlcOutcome {
         status: "unknown".into(),
         states: None,
+        raw_initial_states_generated: None,
+        raw_successors_generated: None,
+        states_generated: None,
         runtime_seconds: None,
         error_type: None,
         error: None,
@@ -341,38 +609,17 @@ fn run_tlc(
                 return outcome;
             }
             let combined = format!("{stdout}{stderr}");
-            let (states, parse_err) = parse_tlc_output(&combined);
-            outcome.states = states;
-            outcome.error_type = classify_error(&combined);
-
-            if states.is_some() {
-                outcome.status = "pass".into();
-            } else if let Some(err) = parse_err.as_deref() {
-                if let Some(module) = err.strip_prefix("missing_module:") {
+            let (counts, parse_err) = parse_tlc_output(&combined);
+            outcome.states = counts.states;
+            outcome.raw_initial_states_generated = counts.raw_initial_states_generated;
+            outcome.raw_successors_generated = counts.raw_successors_generated;
+            outcome.states_generated = counts.states_generated;
+            match validate_tlc_completion(code, &combined, counts, parse_err.as_deref()) {
+                Ok(()) => outcome.status = "pass".into(),
+                Err((error_type, error)) => {
                     outcome.status = "error".into();
-                    outcome.error_type = Some("missing_module".into());
-                    outcome.error = Some(format!("Missing module: {module}"));
-                } else if code != 0 && combined.contains("Exception") {
-                    outcome.status = "error".into();
-                } else {
-                    outcome.status = "error".into();
-                    outcome.error = Some(err.to_string());
-                }
-            } else {
-                outcome.status = "unknown".into();
-                outcome.error = Some("No state count found in output".into());
-            }
-
-            if matches!(outcome.status.as_str(), "error" | "unknown") && outcome.error.is_none() {
-                for line in combined.lines() {
-                    if line.contains("Error:") || line.contains("Exception") {
-                        let mut s = line.to_string();
-                        if s.len() > 200 {
-                            s.truncate(200);
-                        }
-                        outcome.error = Some(s);
-                        break;
-                    }
+                    outcome.error_type = Some(error_type);
+                    outcome.error = Some(error);
                 }
             }
         }
@@ -389,26 +636,58 @@ fn run_tlc(
     outcome
 }
 
-fn parse_tlc_output(output: &str) -> (Option<u64>, Option<String>) {
-    // Pattern 1: "N states generated, M distinct states found, ..."
+fn parse_tlc_output(output: &str) -> (TlcParsedCounts, Option<String>) {
+    let mut counts = TlcParsedCounts::default();
+
     for line in output.lines() {
-        let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix(|c: char| c.is_ascii_digit() || c == ',') {
-            // backtrack — easier to scan with explicit search
-            let _ = rest;
-        }
-        if let Some((Some(distinct), _rest)) = split_states_generated_distinct_left(
-            trimmed,
-            "states generated,",
-            "distinct states found,",
-        ) {
-            return (Some(distinct), None);
+        if let Some(initial) = parse_tlc_initial_generated(line.trim()) {
+            counts.raw_initial_states_generated = Some(initial);
         }
     }
 
-    // Pattern 2: "N distinct states found"
-    if let Some(value) = parse_last_count_before(output, "distinct states found") {
-        return (Some(value), None);
+    // Pattern 1: "N state(s) generated, M distinct state(s) found,
+    // L state(s) left ..."
+    for line in output.lines() {
+        let trimmed = line.trim_start();
+        for (generated_marker, distinct_marker) in [
+            ("states generated,", "distinct states found,"),
+            ("states generated,", "distinct state found,"),
+            ("state generated,", "distinct states found,"),
+            ("state generated,", "distinct state found,"),
+        ] {
+            if let Some((generated, distinct, states_left)) =
+                split_states_generated_distinct_left(trimmed, generated_marker, distinct_marker)
+            {
+                counts.states_generated = Some(generated);
+                counts.states = Some(distinct);
+                counts.states_left = Some(states_left);
+                break;
+            }
+        }
+    }
+
+    // Pattern 2: "N distinct state(s) found"
+    if counts.states.is_none() {
+        counts.states = parse_last_count_before(output, "distinct states found")
+            .or_else(|| parse_last_count_before(output, "distinct state found"));
+    }
+
+    if let (Some(generated), Some(initial)) =
+        (counts.states_generated, counts.raw_initial_states_generated)
+    {
+        counts.raw_successors_generated = generated.checked_sub(initial);
+        if counts.raw_successors_generated.is_none() {
+            return (
+                counts,
+                Some(format!(
+                    "total generated-state count {generated} is smaller than raw initial-state count {initial}"
+                )),
+            );
+        }
+    }
+
+    if counts.complete() {
+        return (counts, None);
     }
 
     // Pattern 3: "Cannot find source file for module Foo"
@@ -419,27 +698,96 @@ fn parse_tlc_output(output: &str) -> (Option<u64>, Option<String>) {
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
             .collect();
         if !module.is_empty() {
-            return (None, Some(format!("missing_module:{module}")));
+            return (counts, Some(format!("missing_module:{module}")));
         }
     }
 
-    (None, Some("no_state_count".into()))
+    let mut missing = Vec::new();
+    if counts.states.is_none() {
+        missing.push("distinct_states");
+    }
+    if counts.raw_initial_states_generated.is_none() {
+        missing.push("raw_initial_states_generated");
+    }
+    if counts.raw_successors_generated.is_none() {
+        missing.push("raw_successors_generated");
+    }
+    if counts.states_generated.is_none() {
+        missing.push("states_generated");
+    }
+    match counts.states_left {
+        Some(0) => {}
+        Some(states_left) => {
+            return (
+                counts,
+                Some(format!(
+                    "TLC completion summary reports {states_left} state(s) left on the queue"
+                )),
+            );
+        }
+        None => missing.push("states_left"),
+    }
+    (
+        counts,
+        Some(format!(
+            "missing TLC count field(s): {}",
+            missing.join(", ")
+        )),
+    )
 }
 
 /// Match `"N states generated, M distinct states found, L states left"` and
-/// return the *distinct* count (M).
+/// return the total-generated, distinct, and queue-left counts.
 fn split_states_generated_distinct_left(
     line: &str,
     sep_generated: &str,
     sep_distinct: &str,
-) -> Option<(Option<u64>, ())> {
+) -> Option<(u64, u64, u64)> {
     let gen_idx = line.find(sep_generated)?;
+    let generated_token = line[..gen_idx].trim();
+    let generated_cleaned: String = generated_token.chars().filter(|c| *c != ',').collect();
     let after_gen = &line[gen_idx + sep_generated.len()..];
     let dist_idx = after_gen.find(sep_distinct)?;
-    let token = after_gen[..dist_idx].trim();
-    let cleaned: String = token.chars().filter(|c| *c != ',').collect();
-    let value = cleaned.parse::<u64>().ok();
-    Some((value, ()))
+    let distinct_token = after_gen[..dist_idx].trim();
+    let distinct_cleaned: String = distinct_token.chars().filter(|c| *c != ',').collect();
+    let after_distinct = after_gen[dist_idx + sep_distinct.len()..].trim_start();
+    let left_token_end = after_distinct
+        .char_indices()
+        .take_while(|(_, ch)| ch.is_ascii_digit() || *ch == ',')
+        .map(|(idx, ch)| idx + ch.len_utf8())
+        .last()?;
+    let left_token: String = after_distinct[..left_token_end]
+        .chars()
+        .filter(|ch| *ch != ',')
+        .collect();
+    let left_suffix = after_distinct[left_token_end..].trim_start();
+    if !left_suffix.starts_with("state left") && !left_suffix.starts_with("states left") {
+        return None;
+    }
+    Some((
+        generated_cleaned.parse::<u64>().ok()?,
+        distinct_cleaned.parse::<u64>().ok()?,
+        left_token.parse::<u64>().ok()?,
+    ))
+}
+
+fn parse_tlc_initial_generated(line: &str) -> Option<u64> {
+    let tail = line
+        .strip_prefix("Finished computing initial states:")?
+        .trim_start();
+    let describes_initial_generation = tail.contains(" distinct state generated")
+        || tail.contains(" distinct states generated")
+        || tail.contains(" state generated, with ")
+        || tail.contains(" states generated, with ");
+    if !describes_initial_generation {
+        return None;
+    }
+    let token: String = tail
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit() || *ch == ',')
+        .filter(|ch| *ch != ',')
+        .collect();
+    token.parse::<u64>().ok()
 }
 
 fn parse_last_count_before(output: &str, marker: &str) -> Option<u64> {
@@ -493,6 +841,56 @@ fn classify_error(output: &str) -> Option<String> {
     Some("unknown".into())
 }
 
+const TLC_SUCCESS_MARKER: &str = "Model checking completed. No error has been found.";
+
+fn validate_tlc_completion(
+    exit_code: i32,
+    output: &str,
+    counts: TlcParsedCounts,
+    parse_error: Option<&str>,
+) -> std::result::Result<(), (String, String)> {
+    if let Some(module) = parse_error.and_then(|error| error.strip_prefix("missing_module:")) {
+        return Err(("missing_module".into(), format!("Missing module: {module}")));
+    }
+    if let Some(error_type) = classify_error(output) {
+        return Err((
+            error_type,
+            first_tlc_failure_line(output).unwrap_or_else(|| "TLC reported an error".into()),
+        ));
+    }
+    if exit_code != 0 {
+        return Err((
+            "process_exit".into(),
+            first_tlc_failure_line(output)
+                .unwrap_or_else(|| format!("TLC exited with status {exit_code}")),
+        ));
+    }
+    if !output.contains(TLC_SUCCESS_MARKER) {
+        return Err((
+            "incomplete_completion".into(),
+            format!("missing exact TLC success marker: {TLC_SUCCESS_MARKER}"),
+        ));
+    }
+    if !counts.complete() {
+        return Err((
+            "count_parse".into(),
+            parse_error
+                .unwrap_or(
+                    "TLC success output did not contain a complete empty-queue count summary",
+                )
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn first_tlc_failure_line(output: &str) -> Option<String> {
+    output
+        .lines()
+        .find(|line| line.contains("Error:") || line.contains("Exception"))
+        .map(|line| truncate(line.trim(), 200))
+}
+
 fn cleanup_states_dir(states_dir: &Path) {
     // Safety guard: only ever remove a directory named "states" under a spec dir.
     if states_dir.file_name().and_then(|n| n.to_str()) != Some("states") {
@@ -507,38 +905,57 @@ fn cleanup_states_dir(states_dir: &Path) {
 
 fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<(i32, bool, String, String)> {
     let mut child = cmd.spawn().context("spawn java tlc child")?;
+    let mut child_stdout = child
+        .stdout
+        .take()
+        .context("TLC child stdout was not piped")?;
+    let mut child_stderr = child
+        .stderr
+        .take()
+        .context("TLC child stderr was not piped")?;
+    // Drain both pipes while TLC runs. Waiting for process exit before reading
+    // can deadlock once either finite kernel pipe buffer fills.
+    let stdout_reader = std::thread::spawn(move || {
+        let mut output = String::new();
+        child_stdout.read_to_string(&mut output)?;
+        std::io::Result::Ok(output)
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut output = String::new();
+        child_stderr.read_to_string(&mut output)?;
+        std::io::Result::Ok(output)
+    });
+
     let start = Instant::now();
-    loop {
-        match child.try_wait()? {
-            Some(status) => {
-                let mut stdout = String::new();
-                let mut stderr = String::new();
-                if let Some(mut s) = child.stdout.take() {
-                    let _ = s.read_to_string(&mut stdout);
-                }
-                if let Some(mut s) = child.stderr.take() {
-                    let _ = s.read_to_string(&mut stderr);
-                }
-                return Ok((status.code().unwrap_or(-1), false, stdout, stderr));
-            }
-            None => {
+    let (exit_code, timed_out) = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break (status.code().unwrap_or(-1), false),
+            Ok(None) => {
                 if start.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
-                    let mut stdout = String::new();
-                    let mut stderr = String::new();
-                    if let Some(mut s) = child.stdout.take() {
-                        let _ = s.read_to_string(&mut stdout);
-                    }
-                    if let Some(mut s) = child.stderr.take() {
-                        let _ = s.read_to_string(&mut stderr);
-                    }
-                    return Ok((-1, true, stdout, stderr));
+                    break (-1, true);
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(error).context("wait for TLC child");
+            }
         }
-    }
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("TLC stdout reader thread panicked"))?
+        .context("read TLC stdout")?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("TLC stderr reader thread panicked"))?
+        .context("read TLC stderr")?;
+    Ok((exit_code, timed_out, stdout, stderr))
 }
 
 fn categorize_runtime(seconds: Option<f64>) -> &'static str {
@@ -557,7 +974,11 @@ fn round2(value: f64) -> f64 {
 
 // ---------- Provenance ----------
 
-fn build_provenance(timeout_seconds: u64, ctx: &PathContext) -> Map<String, Value> {
+fn build_provenance(
+    timeout_seconds: u64,
+    ctx: &PathContext,
+    manifest: &CorpusManifest,
+) -> Map<String, Value> {
     let has_community = ctx.community_modules.exists();
     let mut collector = Map::new();
     collector.insert(
@@ -567,6 +988,40 @@ fn build_provenance(timeout_seconds: u64, ctx: &PathContext) -> Map<String, Valu
     collector.insert(
         "script".into(),
         Value::String("crates/tla-petri/src/bin/ty-tlc-baseline.rs".into()),
+    );
+    collector.insert(
+        "script_sha256".into(),
+        Value::String(sha256_file(
+            &ctx.project_root
+                .join("crates/tla-petri/src/bin/ty-tlc-baseline.rs"),
+        )),
+    );
+    collector.insert(
+        "cargo_lock_sha256".into(),
+        Value::String(sha256_file(&ctx.project_root.join("Cargo.lock"))),
+    );
+    let collector_binary = std::env::current_exe().ok();
+    collector.insert(
+        "binary_path".into(),
+        collector_binary
+            .as_ref()
+            .map(|path| Value::String(path.display().to_string()))
+            .unwrap_or(Value::Null),
+    );
+    collector.insert(
+        "binary_sha256".into(),
+        collector_binary
+            .as_ref()
+            .map(|path| Value::String(sha256_file(path)))
+            .unwrap_or(Value::Null),
+    );
+    collector.insert(
+        "manifest".into(),
+        Value::String(ctx.manifest.display().to_string()),
+    );
+    collector.insert(
+        "manifest_sha256".into(),
+        Value::String(sha256_file(&ctx.manifest)),
     );
 
     let mut tlc = Map::new();
@@ -609,6 +1064,22 @@ fn build_provenance(timeout_seconds: u64, ctx: &PathContext) -> Map<String, Valu
     );
     inputs.insert("examples_git".into(), git_info(&ctx.examples_base_dir));
     inputs.insert("tlaplus_git".into(), git_info(&ctx.tlaplus_dir));
+    inputs.insert(
+        "strict_corpus".into(),
+        json!({
+            "manifest_schema_version": manifest.schema_version,
+            "repository": manifest.source.repository,
+            "commit": manifest.source.commit,
+            "root": manifest.source.root,
+            "total_rows": manifest.rows.len(),
+            "eligible_rows": manifest.rows.len() - manifest.eligibility.exclusions.len(),
+            "excluded_rows": manifest.eligibility.exclusions.len(),
+            "work_equivalence_policy_schema_version":
+                manifest.work_equivalence_policy.schema_version,
+            "default_eligible_work_equivalence_rule_id":
+                manifest.work_equivalence_policy.default_eligible_rule_id,
+        }),
+    );
 
     let mut seed = Map::new();
     seed.insert("enabled".into(), Value::Bool(false));
@@ -801,9 +1272,19 @@ fn make_untested_ty_entry() -> Value {
     json!({
         "status": "untested",
         "states": Value::Null,
+        "raw_initial_states_generated": Value::Null,
+        "raw_successors_generated": Value::Null,
+        "states_generated": Value::Null,
         "error_type": Value::Null,
         "last_run": Value::Null,
         "git_commit": Value::Null,
+    })
+}
+
+fn exhaustive_work_equivalence_entry() -> Value {
+    json!({
+        "schema_version": WORK_EQUIVALENCE_POLICY_SCHEMA_VERSION,
+        "rule_id": EXHAUSTIVE_WORK_EQUIVALENCE_RULE_ID,
     })
 }
 
@@ -815,6 +1296,24 @@ fn load_existing_output(path: &Path) -> Option<Value> {
     } else {
         None
     }
+}
+
+fn resume_output_matches_provenance(existing: &Value, provenance: &Map<String, Value>) -> bool {
+    let specs_digest_matches = existing
+        .get("specs")
+        .and_then(|specs| sha256_jcs(specs).ok())
+        .zip(
+            existing
+                .get("specs_jcs_sha256")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        )
+        .is_some_and(|(actual, recorded)| actual == recorded);
+    specs_digest_matches
+        && existing.get("schema_version").and_then(Value::as_u64) == Some(SCHEMA_VERSION)
+        && ["collector", "tlc", "inputs", "seed", "tlc_timeout_seconds"]
+            .into_iter()
+            .all(|key| existing.get(key) == provenance.get(key))
 }
 
 fn order_spec_entry(entry: Value) -> Value {
@@ -957,6 +1456,8 @@ fn compute_stats(specs: &Map<String, Value>) -> Map<String, Value> {
         match tlc_status {
             "pass" => *counts.entry("tlc_pass").or_default() += 1,
             "timeout" => *counts.entry("tlc_timeout").or_default() += 1,
+            "unsupported" => *counts.entry("tlc_unsupported").or_default() += 1,
+            "uncollected" => *counts.entry("tlc_uncollected").or_default() += 1,
             _ => *counts.entry("tlc_error").or_default() += 1,
         }
 
@@ -1010,6 +1511,22 @@ fn compute_categories(specs: &Map<String, Value>) -> Map<String, Value> {
     out
 }
 
+fn complete_raw_generated_counts(tlc: &Map<String, Value>) -> bool {
+    let Some(raw_initial) = tlc
+        .get("raw_initial_states_generated")
+        .and_then(Value::as_u64)
+    else {
+        return false;
+    };
+    let Some(raw_successors) = tlc.get("raw_successors_generated").and_then(Value::as_u64) else {
+        return false;
+    };
+    let Some(total) = tlc.get("states_generated").and_then(Value::as_u64) else {
+        return false;
+    };
+    raw_initial.checked_add(raw_successors) == Some(total)
+}
+
 fn validate_baselines(specs: &Map<String, Value>) -> Vec<String> {
     let mut warnings = Vec::new();
     for (name, data) in specs {
@@ -1020,10 +1537,14 @@ fn validate_baselines(specs: &Map<String, Value>) -> Vec<String> {
             .get("status")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
-        let states = tlc.get("states");
-        if status == "pass" && (states.is_none() || matches!(states, Some(Value::Null))) {
+        if status == "pass" && tlc.get("states").and_then(Value::as_u64).is_none() {
             warnings.push(format!(
                 "{name}: TLC status=pass but states=null — state count not parsed"
+            ));
+        }
+        if status == "pass" && !complete_raw_generated_counts(tlc) {
+            warnings.push(format!(
+                "{name}: TLC status=pass but raw initial + raw successor != total generated count"
             ));
         }
         let error_type = tlc.get("error_type").and_then(Value::as_str);
@@ -1041,32 +1562,11 @@ fn build_ordered_specs(
     baselines: BTreeMap<String, Value>,
     catalog: &[SpecInfo],
 ) -> Map<String, Value> {
-    let catalog_names: BTreeSet<&str> = catalog.iter().map(|s| s.name.as_str()).collect();
     let mut work = baselines;
     let mut result = Map::new();
     for spec in catalog {
         if let Some(value) = work.remove(&spec.name) {
             result.insert(spec.name.clone(), order_spec_entry(value));
-        }
-    }
-    let mut extras: Vec<String> = work
-        .keys()
-        .filter(|k| !catalog_names.contains(k.as_str()))
-        .cloned()
-        .collect();
-    extras.sort();
-    for name in extras {
-        if let Some(value) = work.remove(&name) {
-            result.insert(name, order_spec_entry(value));
-        }
-    }
-    // Anything still left (e.g. a baseline entry that *was* in the catalog
-    // but failed the migration) — append sorted.
-    let mut remaining: Vec<String> = work.keys().cloned().collect();
-    remaining.sort();
-    for name in remaining {
-        if let Some(value) = work.remove(&name) {
-            result.insert(name, order_spec_entry(value));
         }
     }
     result
@@ -1211,6 +1711,20 @@ fn write_output(
             .unwrap_or_else(|| json!(DEFAULT_TIMEOUT_SECONDS)),
     );
     output.insert("total_specs".into(), json!(catalog.len()));
+    output.insert(
+        "eligible_specs".into(),
+        json!(catalog
+            .iter()
+            .filter(|spec| spec.exclusion.is_none())
+            .count()),
+    );
+    output.insert(
+        "excluded_specs".into(),
+        json!(catalog
+            .iter()
+            .filter(|spec| spec.exclusion.is_some())
+            .count()),
+    );
     output.insert("specs_jcs_sha256".into(), Value::String(specs_jcs));
     output.insert("stats".into(), Value::Object(stats));
     output.insert("categories".into(), Value::Object(categories));
@@ -1276,7 +1790,7 @@ struct PathContext {
     tlaplus_dir: PathBuf,
     examples_base_dir: PathBuf,
     output: PathBuf,
-    spec_catalog: PathBuf,
+    manifest: PathBuf,
 }
 
 fn home() -> PathBuf {
@@ -1295,14 +1809,19 @@ impl PathContext {
             .tlaplus_dir
             .clone()
             .unwrap_or_else(|| home().join("tlaplus"));
-        let examples_base_dir = cli
-            .examples_base_dir
-            .clone()
-            .unwrap_or_else(|| home().join("tlaplus-examples"));
-        let examples_dir = cli
-            .examples_dir
-            .clone()
-            .unwrap_or_else(|| examples_base_dir.join("specifications"));
+        let examples_dir = cli.examples_dir.clone().unwrap_or_else(|| {
+            cli.examples_base_dir
+                .clone()
+                .unwrap_or_else(|| home().join("tlaplus-examples"))
+                .join("specifications")
+        });
+        let examples_base_dir = cli.examples_base_dir.clone().unwrap_or_else(|| {
+            cli.examples_dir
+                .as_ref()
+                .and_then(|path| path.parent())
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| home().join("tlaplus-examples"))
+        });
         let tlc_jar = cli
             .tlc_jar
             .clone()
@@ -1317,11 +1836,11 @@ impl PathContext {
                 .join("tlc_comparison")
                 .join("spec_baseline.json")
         });
-        let spec_catalog = cli.spec_catalog.clone().unwrap_or_else(|| {
+        let manifest = cli.manifest.clone().unwrap_or_else(|| {
             project_root
                 .join("tests")
                 .join("tlc_comparison")
-                .join("spec_catalog.py")
+                .join("strict_corpus_manifest.json")
         });
         PathContext {
             project_root,
@@ -1331,9 +1850,230 @@ impl PathContext {
             tlaplus_dir,
             examples_base_dir,
             output,
-            spec_catalog,
+            manifest,
         }
     }
+}
+
+fn print_catalog(catalog: &[SpecInfo]) {
+    println!("eligibility\tname\tcfg_path\ttla_path\treason_code");
+    for spec in catalog {
+        let (eligibility, reason_code) = match &spec.exclusion {
+            Some(exclusion) => ("excluded", exclusion.reason_code.as_str()),
+            None => ("eligible", ""),
+        };
+        println!(
+            "{eligibility}\t{}\t{}\t{}\t{reason_code}",
+            spec.name, spec.cfg_path, spec.tla_path
+        );
+    }
+}
+
+fn verify_collection_source(
+    ctx: &PathContext,
+    manifest: &CorpusManifest,
+    catalog: &[SpecInfo],
+) -> Result<()> {
+    let git_dir = ctx.examples_base_dir.join(".git");
+    if !git_dir.exists() {
+        bail!(
+            "strict collection requires a Git checkout at {}; use a detached worktree at {}",
+            ctx.examples_base_dir.display(),
+            manifest.source.commit
+        );
+    }
+    let actual_head = git_capture(&ctx.examples_base_dir, &["rev-parse", "HEAD"])
+        .context("read examples checkout HEAD")?;
+    if actual_head != manifest.source.commit {
+        bail!(
+            "examples checkout is at {actual_head}, but strict corpus requires {}; \
+             use a separate detached worktree rather than changing the existing checkout",
+            manifest.source.commit
+        );
+    }
+    let status = git_capture_raw(&ctx.examples_base_dir, &["status", "--porcelain=v1"])
+        .context("read examples checkout status")?;
+    if !status.trim().is_empty() {
+        bail!(
+            "examples checkout at {} is dirty; strict collection requires the clean pinned tree",
+            ctx.examples_base_dir.display()
+        );
+    }
+    if !ctx.examples_dir.is_dir() {
+        bail!(
+            "examples source root is missing: {}",
+            ctx.examples_dir.display()
+        );
+    }
+
+    let mut actual_cfg_paths = Vec::new();
+    collect_relative_cfg_paths(&ctx.examples_dir, &ctx.examples_dir, &mut actual_cfg_paths)?;
+    actual_cfg_paths.sort();
+    let expected_cfg_paths: Vec<&str> = catalog.iter().map(|spec| spec.cfg_path.as_str()).collect();
+    if actual_cfg_paths.len() != expected_cfg_paths.len() {
+        bail!(
+            "pinned source has {} cfg files, manifest has {}",
+            actual_cfg_paths.len(),
+            expected_cfg_paths.len()
+        );
+    }
+    for (actual, expected) in actual_cfg_paths.iter().zip(expected_cfg_paths) {
+        if actual != expected {
+            bail!("pinned cfg set differs from manifest: found {actual}, expected {expected}");
+        }
+    }
+    for spec in catalog {
+        let tla_path = ctx.examples_dir.join(&spec.tla_path);
+        if !tla_path.is_file() {
+            bail!(
+                "manifest row {} maps to missing TLA module {}",
+                spec.name,
+                tla_path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn collect_relative_cfg_paths(root: &Path, dir: &Path, output: &mut Vec<String>) -> Result<()> {
+    let mut entries: Vec<_> = fs::read_dir(dir)
+        .with_context(|| format!("reading corpus directory {}", dir.display()))?
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("reading entries under {}", dir.display()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("reading file type for {}", path.display()))?;
+        if file_type.is_dir() {
+            collect_relative_cfg_paths(root, &path, output)?;
+        } else if file_type.is_file()
+            && path.extension().and_then(|value| value.to_str()) == Some("cfg")
+        {
+            let relative = path
+                .strip_prefix(root)
+                .with_context(|| format!("relativizing {}", path.display()))?;
+            output.push(relative.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    Ok(())
+}
+
+fn skeleton_entry(spec: &SpecInfo) -> Value {
+    let (tlc_status, error_type, error, category, eligibility) = match &spec.exclusion {
+        Some(exclusion) => (
+            "unsupported",
+            Value::String(exclusion.reason_code.clone()),
+            Value::String(exclusion.detail.clone()),
+            "skip",
+            "excluded",
+        ),
+        None => (
+            "uncollected",
+            Value::Null,
+            Value::Null,
+            "unknown",
+            "eligible",
+        ),
+    };
+    let mut entry = Map::new();
+    entry.insert(
+        "tlc".into(),
+        json!({
+            "status": tlc_status,
+            "states": Value::Null,
+            "raw_initial_states_generated": Value::Null,
+            "raw_successors_generated": Value::Null,
+            "states_generated": Value::Null,
+            "runtime_seconds": Value::Null,
+            "error_type": error_type,
+            "error": error,
+        }),
+    );
+    entry.insert("ty".into(), make_untested_ty_entry());
+    entry.insert("verified_match".into(), Value::Bool(false));
+    entry.insert("eligibility".into(), Value::String(eligibility.into()));
+    if let Some(exclusion) = &spec.exclusion {
+        entry.insert(
+            "exclusion".into(),
+            json!({
+                "reason_code": exclusion.reason_code,
+                "detail": exclusion.detail,
+            }),
+        );
+    } else {
+        entry.insert(
+            "work_equivalence".into(),
+            exhaustive_work_equivalence_entry(),
+        );
+    }
+    entry.insert("category".into(), Value::String(category.into()));
+    entry.insert(
+        "source".into(),
+        json!({
+            "tla_path": spec.tla_path,
+            "cfg_path": spec.cfg_path,
+        }),
+    );
+    order_spec_entry(Value::Object(entry))
+}
+
+fn entry_matches_manifest_source(entry: &Value, spec: &SpecInfo) -> bool {
+    let source = entry.get("source").and_then(Value::as_object);
+    source
+        .and_then(|source| source.get("tla_path"))
+        .and_then(Value::as_str)
+        == Some(spec.tla_path.as_str())
+        && source
+            .and_then(|source| source.get("cfg_path"))
+            .and_then(Value::as_str)
+            == Some(spec.cfg_path.as_str())
+}
+
+fn normalize_existing_entry(entry: Value, spec: &SpecInfo) -> Value {
+    let Some(mut object) = entry.as_object().cloned() else {
+        return skeleton_entry(spec);
+    };
+    object.insert("eligibility".into(), Value::String("eligible".into()));
+    object.remove("exclusion");
+    object.remove("work_equivalence_rule");
+    object.remove("equivalent_work_rule");
+    object.remove("performance_work_equivalence_rule");
+    object.insert(
+        "work_equivalence".into(),
+        exhaustive_work_equivalence_entry(),
+    );
+    object.insert(
+        "source".into(),
+        json!({
+            "tla_path": spec.tla_path,
+            "cfg_path": spec.cfg_path,
+        }),
+    );
+    order_spec_entry(Value::Object(object))
+}
+
+fn initialize_baselines(
+    catalog: &[SpecInfo],
+    existing: BTreeMap<String, Value>,
+) -> BTreeMap<String, Value> {
+    catalog
+        .iter()
+        .map(|spec| {
+            let entry = if spec.exclusion.is_some() {
+                skeleton_entry(spec)
+            } else {
+                existing
+                    .get(&spec.name)
+                    .filter(|entry| entry_matches_manifest_source(entry, spec))
+                    .cloned()
+                    .map(|entry| normalize_existing_entry(entry, spec))
+                    .unwrap_or_else(|| skeleton_entry(spec))
+            };
+            (spec.name.clone(), entry)
+        })
+        .collect()
 }
 
 // ---------- Main ----------
@@ -1342,15 +2082,56 @@ fn run(cli: Cli) -> Result<()> {
     let ctx = PathContext::from_cli(&cli);
     let timeout_seconds = cli.timeout;
 
-    let catalog_text = fs::read_to_string(&ctx.spec_catalog)
-        .with_context(|| format!("reading {}", ctx.spec_catalog.display()))?;
-    let catalog = parse_spec_catalog(&catalog_text)
-        .with_context(|| format!("parsing {}", ctx.spec_catalog.display()))?;
+    let manifest_text = fs::read_to_string(&ctx.manifest)
+        .with_context(|| format!("reading {}", ctx.manifest.display()))?;
+    let manifest = parse_corpus_manifest(&manifest_text)
+        .with_context(|| format!("validating {}", ctx.manifest.display()))?;
+    let catalog = catalog_from_manifest(&manifest);
+    let eligible_count = catalog
+        .iter()
+        .filter(|spec| spec.exclusion.is_none())
+        .count();
+    let excluded_count = catalog.len() - eligible_count;
 
-    let provenance = build_provenance(timeout_seconds, &ctx);
+    if cli.list {
+        print_catalog(&catalog);
+        eprintln!(
+            "normalized catalog: {} rows ({eligible_count} eligible, {excluded_count} excluded)",
+            catalog.len()
+        );
+        return Ok(());
+    }
 
-    println!("Collecting TLC baselines for {} specs...", catalog.len());
+    if cli.dry_run {
+        verify_collection_source(&ctx, &manifest, &catalog)?;
+        println!(
+            "dry run OK: {} pinned rows ({eligible_count} eligible, {excluded_count} excluded); no TLC processes launched",
+            catalog.len()
+        );
+        return Ok(());
+    }
+
+    let provenance = build_provenance(timeout_seconds, &ctx, &manifest);
+
+    if cli.write_skeleton {
+        let baselines = initialize_baselines(&catalog, BTreeMap::new());
+        write_output(&ctx.output, baselines, &provenance, &catalog)?;
+        println!(
+            "Wrote normalized baseline skeleton with {} rows ({eligible_count} eligible, {excluded_count} excluded) to {}",
+            catalog.len(),
+            ctx.output.display()
+        );
+        return Ok(());
+    }
+
+    verify_collection_source(&ctx, &manifest, &catalog)?;
+
+    println!(
+        "Collecting TLC baselines for {eligible_count} eligible specs ({} excluded rows retained)...",
+        excluded_count
+    );
     println!("Output: {}", ctx.output.display());
+    println!("Manifest: {}", ctx.manifest.display());
     println!("Timeout: {timeout_seconds}s per spec");
     let prov_collector_short = provenance
         .get("collector")
@@ -1372,22 +2153,32 @@ fn run(cli: Cli) -> Result<()> {
         "Provenance: schema_version={SCHEMA_VERSION}, tlc={tlc_version_str}, examples={examples_short}, collector={prov_collector_short}"
     );
 
-    let mut baselines: BTreeMap<String, Value> = if cli.no_resume {
+    let existing: BTreeMap<String, Value> = if cli.no_resume {
         BTreeMap::new()
     } else if let Some(existing) = load_existing_output(&ctx.output) {
-        let specs = existing
-            .get("specs")
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        specs
-            .into_iter()
-            .filter(|(_, v)| v.is_object())
-            .map(|(k, v)| (k, order_spec_entry(v)))
-            .collect()
+        if resume_output_matches_provenance(&existing, &provenance) {
+            let specs = existing
+                .get("specs")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            specs
+                .into_iter()
+                .filter(|(_, v)| v.is_object())
+                .map(|(k, v)| (k, order_spec_entry(v)))
+                .collect()
+        } else {
+            eprintln!(
+                "Ignoring stale resume data in {}: schema or collection provenance differs",
+                ctx.output.display()
+            );
+            BTreeMap::new()
+        }
     } else {
         BTreeMap::new()
     };
+    let mut baselines = initialize_baselines(&catalog, existing);
+    write_output(&ctx.output, baselines.clone(), &provenance, &catalog)?;
 
     let total = catalog.len();
     for (idx, spec) in catalog.iter().enumerate() {
@@ -1398,18 +2189,21 @@ fn run(cli: Cli) -> Result<()> {
         };
         eprint!("\r[{}/{}] {progress_label:<40}", idx + 1, total);
 
+        if spec.exclusion.is_some() {
+            continue;
+        }
+
         let existing_entry = baselines.get(&spec.name).cloned();
         if let Some(Value::Object(existing_obj)) = &existing_entry {
             if let Some(tlc) = existing_obj.get("tlc").and_then(Value::as_object) {
                 let status = tlc.get("status").and_then(Value::as_str);
-                let states_present = tlc
-                    .get("states")
-                    .map(|v| !matches!(v, Value::Null))
-                    .unwrap_or(false);
-                if status == Some("pass") && states_present {
-                    continue;
-                }
-                if matches!(status, Some("error") | Some("timeout")) {
+                let states_present = tlc.get("states").and_then(Value::as_u64).is_some();
+                let no_error = matches!(tlc.get("error_type"), None | Some(Value::Null));
+                if status == Some("pass")
+                    && states_present
+                    && no_error
+                    && complete_raw_generated_counts(tlc)
+                {
                     continue;
                 }
             }
@@ -1423,6 +2217,7 @@ fn run(cli: Cli) -> Result<()> {
                 spec.name.clone(),
                 missing_entry(
                     &existing_entry,
+                    spec,
                     "missing_file",
                     &format!("File not found: {}", spec.tla_path),
                 ),
@@ -1435,6 +2230,7 @@ fn run(cli: Cli) -> Result<()> {
                 spec.name.clone(),
                 missing_entry(
                     &existing_entry,
+                    spec,
                     "missing_config",
                     &format!("Config not found: {}", spec.cfg_path),
                 ),
@@ -1468,14 +2264,29 @@ fn run(cli: Cli) -> Result<()> {
 
         let tlc_states = outcome.states;
         let ty_states = ty_data.get("states").and_then(|v| v.as_u64());
+        let ty_raw_initial_states_generated = ty_data
+            .get("raw_initial_states_generated")
+            .and_then(Value::as_u64);
+        let ty_raw_successors_generated = ty_data
+            .get("raw_successors_generated")
+            .and_then(Value::as_u64);
+        let ty_states_generated = ty_data.get("states_generated").and_then(Value::as_u64);
         let ty_status = ty_data
             .get("status")
             .and_then(Value::as_str)
             .unwrap_or("untested");
-        let verified_match = ty_status == "pass"
+        let verified_match = outcome.status == "pass"
+            && ty_status == "pass"
             && ty_states.is_some()
             && tlc_states.is_some()
             && ty_states == tlc_states;
+        let verified_match = verified_match
+            && outcome.raw_initial_states_generated.is_some()
+            && outcome.raw_initial_states_generated == ty_raw_initial_states_generated
+            && outcome.raw_successors_generated.is_some()
+            && outcome.raw_successors_generated == ty_raw_successors_generated
+            && outcome.states_generated.is_some()
+            && outcome.states_generated == ty_states_generated;
 
         let mut tlc_entry = Map::new();
         tlc_entry.insert("status".into(), Value::String(outcome.status.clone()));
@@ -1485,6 +2296,22 @@ fn run(cli: Cli) -> Result<()> {
                 Some(s) => json!(s),
                 None => Value::Null,
             },
+        );
+        tlc_entry.insert(
+            "raw_initial_states_generated".into(),
+            outcome
+                .raw_initial_states_generated
+                .map_or(Value::Null, Value::from),
+        );
+        tlc_entry.insert(
+            "raw_successors_generated".into(),
+            outcome
+                .raw_successors_generated
+                .map_or(Value::Null, Value::from),
+        );
+        tlc_entry.insert(
+            "states_generated".into(),
+            outcome.states_generated.map_or(Value::Null, Value::from),
         );
         tlc_entry.insert(
             "runtime_seconds".into(),
@@ -1512,6 +2339,11 @@ fn run(cli: Cli) -> Result<()> {
         spec_entry.insert("tlc".into(), Value::Object(tlc_entry));
         spec_entry.insert("ty".into(), ty_data);
         spec_entry.insert("verified_match".into(), Value::Bool(verified_match));
+        spec_entry.insert("eligibility".into(), Value::String("eligible".into()));
+        spec_entry.insert(
+            "work_equivalence".into(),
+            exhaustive_work_equivalence_entry(),
+        );
         spec_entry.insert("category".into(), Value::String(category.into()));
         spec_entry.insert(
             "source".into(),
@@ -1552,6 +2384,8 @@ fn run(cli: Cli) -> Result<()> {
     println!("TLC pass:    {}", get(&stats, "tlc_pass"));
     println!("TLC error:   {}", get(&stats, "tlc_error"));
     println!("TLC timeout: {}", get(&stats, "tlc_timeout"));
+    println!("Excluded:    {}", get(&stats, "tlc_unsupported"));
+    println!("Uncollected: {}", get(&stats, "tlc_uncollected"));
     println!();
     println!("Runtime Categories:");
     println!("  Small (<1s):     {}", get(&categories, "small"));
@@ -1604,10 +2438,18 @@ fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-fn missing_entry(existing: &Option<Value>, error_type: &str, message: &str) -> Value {
+fn missing_entry(
+    existing: &Option<Value>,
+    spec: &SpecInfo,
+    error_type: &str,
+    message: &str,
+) -> Value {
     let mut tlc = Map::new();
     tlc.insert("status".into(), Value::String("error".into()));
     tlc.insert("states".into(), Value::Null);
+    tlc.insert("raw_initial_states_generated".into(), Value::Null);
+    tlc.insert("raw_successors_generated".into(), Value::Null);
+    tlc.insert("states_generated".into(), Value::Null);
     tlc.insert("runtime_seconds".into(), Value::Null);
     tlc.insert("error_type".into(), Value::String(error_type.into()));
     tlc.insert("error".into(), Value::String(message.into()));
@@ -1624,7 +2466,19 @@ fn missing_entry(existing: &Option<Value>, error_type: &str, message: &str) -> V
     entry.insert("tlc".into(), Value::Object(tlc));
     entry.insert("ty".into(), ty);
     entry.insert("verified_match".into(), Value::Bool(false));
+    entry.insert("eligibility".into(), Value::String("eligible".into()));
+    entry.insert(
+        "work_equivalence".into(),
+        exhaustive_work_equivalence_entry(),
+    );
     entry.insert("category".into(), Value::String("unknown".into()));
+    entry.insert(
+        "source".into(),
+        json!({
+            "tla_path": spec.tla_path,
+            "cfg_path": spec.cfg_path,
+        }),
+    );
     order_spec_entry(Value::Object(entry))
 }
 
@@ -1645,75 +2499,334 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
 
-    #[test]
-    fn parse_catalog_extracts_three_string_fields() {
-        let body = r#"
-ALL_SPECS = [
-    SpecInfo("MCBakery", "Bakery/MCBakery.tla", "Bakery/MCBakery.cfg", "Bakery"),
-    SpecInfo("DieHard", "DieHard/DieHard.tla", "DieHard/DieHard.cfg", "DieHard"),
-]
-
-LARGE_SPECS = {}
-"#;
-        let specs = parse_spec_catalog(body).unwrap();
-        assert_eq!(specs.len(), 2);
-        assert_eq!(specs[0].name, "MCBakery");
-        assert_eq!(specs[0].tla_path, "Bakery/MCBakery.tla");
-        assert_eq!(specs[0].cfg_path, "Bakery/MCBakery.cfg");
-        assert_eq!(specs[1].name, "DieHard");
+    fn complete_tlc_counts() -> TlcParsedCounts {
+        TlcParsedCounts {
+            states: Some(3),
+            raw_initial_states_generated: Some(1),
+            raw_successors_generated: Some(2),
+            states_generated: Some(3),
+            states_left: Some(0),
+        }
     }
 
     #[test]
-    fn parse_real_spec_catalog_yields_known_specs() {
+    fn parse_manifest_resolves_override_and_exclusion() {
+        let body = serde_json::to_string(&json!({
+            "schema_version": 1,
+            "claim": "ty_vs_tlc_strict_superiority",
+            "source": {
+                "repository": "https://example.invalid/Examples.git",
+                "commit": "0123456789abcdef0123456789abcdef01234567",
+                "root": "specifications",
+                "enumeration": "all_cfg_files",
+                "default_tla_mapping": "same_stem",
+                "expected_cfg_count": 2
+            },
+            "eligibility": {
+                "default": "eligible",
+                "exclusions": {
+                    "B/B.cfg": {
+                        "reason_code": "simulation_only",
+                        "detail": "simulation"
+                    }
+                }
+            },
+            "work_equivalence_policy": {
+                "schema_version": 1,
+                "default_eligible_rule_id": "exhaustive_generated_work_parity_v1",
+                "rules": {
+                    "exhaustive_generated_work_parity_v1": {
+                        "kind": "exhaustive_state_space",
+                        "required_verdict": "holds",
+                        "require_complete_exploration": true,
+                        "distinct_state_parity": "exact",
+                        "raw_initial_state_generation_parity": "exact",
+                        "raw_successor_generation_parity": "exact",
+                        "total_state_generation_parity": "exact",
+                        "count_arm": "bfs_no_reduction_single_worker"
+                    }
+                },
+                "outcome_dispositions": {
+                    "expected_violation": "exclude_unless_predeclared_typed_rule",
+                    "deadlock": "exclude_unless_predeclared_typed_rule",
+                    "simulation": "exclude",
+                    "randomized_external_operator": "exclude",
+                    "external_io": "exclude",
+                    "timeout": "missing_or_stale"
+                }
+            },
+            "tla_path_overrides": {
+                "B/B.cfg": "B/Shared.tla"
+            },
+            "baseline_gaps": {},
+            "rows": [
+                {"name": "A", "cfg_path": "A/A.cfg", "tla_path": "A/A.tla"},
+                {"name": "B", "cfg_path": "B/B.cfg", "tla_path": "B/Shared.tla"}
+            ]
+        }))
+        .unwrap();
+        let manifest = parse_corpus_manifest(&body).unwrap();
+        let specs = catalog_from_manifest(&manifest);
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].name, "A");
+        assert_eq!(specs[1].tla_path, "B/Shared.tla");
+        assert_eq!(
+            specs[1]
+                .exclusion
+                .as_ref()
+                .map(|exclusion| exclusion.reason_code.as_str()),
+            Some("simulation_only")
+        );
+    }
+
+    #[test]
+    fn checked_in_manifest_is_complete_and_includes_legacy_gaps() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
             .parent()
             .unwrap()
-            .join("tests/tlc_comparison/spec_catalog.py");
+            .join("tests/tlc_comparison/strict_corpus_manifest.json");
         if !path.exists() {
             return; // tolerate missing checkout (e.g. published crate)
         }
         let text = fs::read_to_string(&path).unwrap();
-        let specs = parse_spec_catalog(&text).unwrap();
-        assert!(
-            specs.len() >= 100,
-            "expected at least 100 specs, got {}",
-            specs.len()
+        let manifest = parse_corpus_manifest(&text).unwrap();
+        let specs = catalog_from_manifest(&manifest);
+        assert_eq!(specs.len(), 181);
+        assert_eq!(manifest.tla_path_overrides.len(), 35);
+        assert_eq!(manifest.baseline_gaps.len(), 5);
+        assert_eq!(
+            manifest.work_equivalence_policy.default_eligible_rule_id,
+            EXHAUSTIVE_WORK_EQUIVALENCE_RULE_ID
         );
+        assert_eq!(
+            specs.iter().filter(|spec| spec.exclusion.is_none()).count(),
+            141
+        );
+        for cfg_path in [
+            "CheckpointCoordination/MCCheckpointCoordinationFailure.cfg",
+            "DieHard/DieHard.cfg",
+            "DieHard/MCDieHarder.cfg",
+            "EinsteinRiddle/Einstein.cfg",
+            "FiniteMonotonic/MCDistributedReplicatedLog.cfg",
+            "MissionariesAndCannibals/MissionariesAndCannibals.cfg",
+            "N-Queens/Queens.toolbox/FourQueens/MC.cfg",
+            "N-Queens/QueensPluscal.toolbox/FourQueens/MC.cfg",
+            "SDP_Verification/SDP_Attack_Spec/MC.cfg",
+            "SlidingPuzzles/SlidingPuzzles.cfg",
+            "SlidingPuzzles/SlidingPuzzles_anim.cfg",
+            "SpecifyingSystems/RealTime/MCRealTimeHourClock.cfg",
+            "spanning/MC_spanning.cfg",
+            "tower_of_hanoi/Hanoi.toolbox/Model_1/MC.cfg",
+            "tower_of_hanoi/Hanoi_anim.cfg",
+        ] {
+            let spec = specs
+                .iter()
+                .find(|spec| spec.cfg_path == cfg_path)
+                .unwrap_or_else(|| panic!("missing intentional-violation row {cfg_path}"));
+            assert_eq!(
+                spec.exclusion
+                    .as_ref()
+                    .map(|value| value.reason_code.as_str()),
+                Some("expected_violation_first_found_noncomparable"),
+                "{cfg_path} must remain correctness-only until a typed replay rule exists"
+            );
+        }
+        for (cfg_path, reason_code) in [
+            ("ewd687a/EWD687a_anim.cfg", "external_io_side_effect"),
+            ("ewd840/EWD840_json.cfg", "external_io_side_effect"),
+            ("ewd998/EWD998ChanTrace.cfg", "external_io_dependency"),
+        ] {
+            let external_io = specs
+                .iter()
+                .find(|spec| spec.cfg_path == cfg_path)
+                .unwrap_or_else(|| panic!("missing external-IO row {cfg_path}"));
+            assert_eq!(
+                external_io
+                    .exclusion
+                    .as_ref()
+                    .map(|value| value.reason_code.as_str()),
+                Some(reason_code)
+            );
+        }
+        for cfg_path in [
+            "CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_1/MC.cfg",
+            "CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_2/MC.cfg",
+            "CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_3/MC.cfg",
+            "MisraReachability/MCReachabilityTestAllGraphs.cfg",
+            "SpecifyingSystems/AsynchronousInterface/PrintValues.cfg",
+            "SpecifyingSystems/SimpleMath/SimpleMath.cfg",
+            "Stones/Stones.cfg",
+            "TransitiveClosure/TransitiveClosure.cfg",
+            "sums_even/MC_sums_even.cfg",
+        ] {
+            let spec = specs
+                .iter()
+                .find(|spec| spec.cfg_path == cfg_path)
+                .unwrap_or_else(|| panic!("missing semantic-assertion row {cfg_path}"));
+            assert_eq!(
+                spec.exclusion
+                    .as_ref()
+                    .map(|value| value.reason_code.as_str()),
+                Some("semantic_assertion_only"),
+                "{cfg_path} must remain outside the reachable-state performance claim"
+            );
+        }
         assert!(specs.iter().any(|s| s.name == "MCBakery"));
-        assert!(specs.iter().any(|s| s.name == "DieHard"));
+        for name in [
+            "SlidingPuzzles_anim",
+            "BlockDagTest",
+            "TLCSailfish1",
+            "TLCSailfish2",
+            "Hanoi_anim",
+        ] {
+            assert!(
+                specs.iter().any(|spec| spec.name == name),
+                "missing normalized row {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_rejects_free_form_or_unknown_work_equivalence_rules() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("tests/tlc_comparison/strict_corpus_manifest.json");
+        if !path.exists() {
+            return;
+        }
+        let mut value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        value["work_equivalence_policy"]["default_eligible_rule_id"] =
+            json!("whatever the collector says");
+        let error = parse_corpus_manifest(&serde_json::to_string(&value).unwrap()).unwrap_err();
+        assert!(
+            error.to_string().contains("work-equivalence default rule"),
+            "{error:#}"
+        );
+
+        let mut value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        value["work_equivalence_policy"]["rules"][EXHAUSTIVE_WORK_EQUIVALENCE_RULE_ID]
+            ["free_form_exception"] = json!("close enough");
+        let error = parse_corpus_manifest(&serde_json::to_string(&value).unwrap()).unwrap_err();
+        let error_chain = format!("{error:#}");
+        assert!(
+            error_chain.contains("unknown field"),
+            "unexpected parse error: {error_chain}"
+        );
+
+        let mut value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        value["eligibility"]["exclusions"]["FiniteMonotonic/MCCRDT.cfg"]["reason_code"] =
+            json!("ty_was_too_slow");
+        let error = parse_corpus_manifest(&serde_json::to_string(&value).unwrap()).unwrap_err();
+        assert!(
+            error.to_string().contains("unsupported reason code"),
+            "unexpected exclusion error: {error:#}"
+        );
     }
 
     #[test]
     fn parse_tlc_output_states_generated_distinct_left() {
         let text = "Progress(7) at 2024-01-01 12:00:00\n\
+                    Finished computing initial states: 1,001 distinct states generated at 2024-01-01 12:00:01.\n\
                     1,234,567 states generated, 1,234,000 distinct states found, 0 states left on queue.\n";
-        let (states, err) = parse_tlc_output(text);
-        assert_eq!(states, Some(1_234_000));
+        let (counts, err) = parse_tlc_output(text);
+        assert_eq!(counts.states, Some(1_234_000));
+        assert_eq!(counts.raw_initial_states_generated, Some(1_001));
+        assert_eq!(counts.raw_successors_generated, Some(1_233_566));
+        assert_eq!(counts.states_generated, Some(1_234_567));
+        assert_eq!(counts.states_left, Some(0));
         assert!(err.is_none());
     }
 
     #[test]
     fn parse_tlc_output_distinct_only() {
         let text = "Model checking completed.\n42 distinct states found.\n";
-        let (states, _err) = parse_tlc_output(text);
-        assert_eq!(states, Some(42));
+        let (counts, err) = parse_tlc_output(text);
+        assert_eq!(counts.states, Some(42));
+        assert!(err
+            .as_deref()
+            .is_some_and(|error| error.contains("raw_initial_states_generated")));
+    }
+
+    #[test]
+    fn parse_tlc_output_non_distinct_initial_generation() {
+        let text = "Finished computing initial states: 5 states generated, with 2 of them distinct at 2026-07-23 07:34:16.\n\
+                    17 states generated, 9 distinct states found, 0 states left on queue.\n";
+        let (counts, err) = parse_tlc_output(text);
+        assert_eq!(
+            counts,
+            TlcParsedCounts {
+                states: Some(9),
+                raw_initial_states_generated: Some(5),
+                raw_successors_generated: Some(12),
+                states_generated: Some(17),
+                states_left: Some(0),
+            }
+        );
+        assert!(err.is_none());
+    }
+
+    #[test]
+    fn parse_tlc_output_singular_generated_summary() {
+        let text = "Finished computing initial states: 1 distinct state generated at 2026-07-23 07:34:16.\n\
+                    1 state generated, 1 distinct state found, 0 states left on queue.\n";
+        let (counts, err) = parse_tlc_output(text);
+        assert_eq!(
+            counts,
+            TlcParsedCounts {
+                states: Some(1),
+                raw_initial_states_generated: Some(1),
+                raw_successors_generated: Some(0),
+                states_generated: Some(1),
+                states_left: Some(0),
+            }
+        );
+        assert!(err.is_none());
+    }
+
+    #[test]
+    fn parse_tlc_output_rejects_generated_total_smaller_than_initial() {
+        let text = "Finished computing initial states: 5 distinct states generated at 2026-07-23 07:34:16.\n\
+                    4 states generated, 4 distinct states found, 0 states left on queue.\n";
+        let (counts, err) = parse_tlc_output(text);
+        assert_eq!(counts.raw_successors_generated, None);
+        assert!(err
+            .as_deref()
+            .is_some_and(|error| error.contains("smaller than raw initial-state count")));
+    }
+
+    #[test]
+    fn parse_tlc_output_rejects_nonempty_final_queue() {
+        let text =
+            "Finished computing initial states: 1 distinct state generated at fixture time.\n\
+                    3 states generated, 3 distinct states found, 2 states left on queue.\n";
+        let (counts, err) = parse_tlc_output(text);
+        assert_eq!(counts.states_left, Some(2));
+        assert!(!counts.complete());
+        assert!(err
+            .as_deref()
+            .is_some_and(|error| error.contains("2 state(s) left")));
     }
 
     #[test]
     fn parse_tlc_output_missing_module() {
         let text = "Cannot find source file for module Naturals imported";
-        let (states, err) = parse_tlc_output(text);
-        assert_eq!(states, None);
+        let (counts, err) = parse_tlc_output(text);
+        assert_eq!(counts, TlcParsedCounts::default());
         assert_eq!(err.as_deref(), Some("missing_module:Naturals"));
     }
 
     #[test]
     fn parse_tlc_output_no_state_count() {
-        let (states, err) = parse_tlc_output("nothing useful here\n");
-        assert_eq!(states, None);
-        assert_eq!(err.as_deref(), Some("no_state_count"));
+        let (counts, err) = parse_tlc_output("nothing useful here\n");
+        assert_eq!(counts, TlcParsedCounts::default());
+        assert!(err
+            .as_deref()
+            .is_some_and(|error| error.contains("distinct_states")));
     }
 
     #[test]
@@ -1737,6 +2850,137 @@ LARGE_SPECS = {}
     #[test]
     fn classify_no_error_returns_none() {
         assert_eq!(classify_error("Model checking completed.").as_deref(), None);
+    }
+
+    #[test]
+    fn completion_requires_success_marker_zero_exit_empty_queue_and_counts() {
+        let output = format!(
+            "{TLC_SUCCESS_MARKER}\n3 states generated, 3 distinct states found, 0 states left on queue."
+        );
+        assert_eq!(
+            validate_tlc_completion(0, &output, complete_tlc_counts(), None),
+            Ok(())
+        );
+
+        for (error_line, expected_type) in [
+            ("Error: Invariant TypeOK is violated.", "invariant"),
+            ("Error: Deadlock reached.", "deadlock"),
+            ("Error: Temporal properties were violated.", "liveness"),
+            ("Error: Action property StepOK is violated.", "action"),
+            ("Error: evaluator failed.", "unknown"),
+        ] {
+            let output = format!("{error_line}\n{TLC_SUCCESS_MARKER}");
+            let error =
+                validate_tlc_completion(0, &output, complete_tlc_counts(), None).unwrap_err();
+            assert_eq!(error.0, expected_type);
+        }
+
+        let error = validate_tlc_completion(2, TLC_SUCCESS_MARKER, complete_tlc_counts(), None)
+            .unwrap_err();
+        assert_eq!(error.0, "process_exit");
+
+        let error =
+            validate_tlc_completion(0, "no error text", complete_tlc_counts(), None).unwrap_err();
+        assert_eq!(error.0, "incomplete_completion");
+
+        let mut nonempty_queue = complete_tlc_counts();
+        nonempty_queue.states_left = Some(1);
+        let error = validate_tlc_completion(
+            0,
+            TLC_SUCCESS_MARKER,
+            nonempty_queue,
+            Some("TLC completion summary reports 1 state(s) left on the queue"),
+        )
+        .unwrap_err();
+        assert_eq!(error.0, "count_parse");
+    }
+
+    #[test]
+    fn raw_generated_count_completeness_requires_all_three_fields() {
+        let complete = json!({
+            "raw_initial_states_generated": 2,
+            "raw_successors_generated": 5,
+            "states_generated": 7,
+        });
+        assert!(complete_raw_generated_counts(complete.as_object().unwrap()));
+
+        for missing in [
+            json!({
+                "raw_successors_generated": 5,
+                "states_generated": 7,
+            }),
+            json!({
+                "raw_initial_states_generated": 2,
+                "states_generated": 7,
+            }),
+            json!({
+                "raw_initial_states_generated": 2,
+                "raw_successors_generated": 5,
+            }),
+            json!({
+                "raw_initial_states_generated": 2,
+                "raw_successors_generated": 5,
+                "states_generated": 8,
+            }),
+        ] {
+            assert!(!complete_raw_generated_counts(missing.as_object().unwrap()));
+        }
+    }
+
+    #[test]
+    fn resume_requires_v4_exact_provenance_and_intact_specs_digest() {
+        let provenance = json!({
+            "schema_version": SCHEMA_VERSION,
+            "collector": {"script_sha256": "script"},
+            "tlc": {"jar_sha256": "jar"},
+            "inputs": {"strict_corpus": {"commit": "pin"}},
+            "seed": {"enabled": false},
+            "tlc_timeout_seconds": 60,
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let specs = json!({"A": {"tlc": {"status": "pass"}}});
+        let digest = sha256_jcs(&specs).unwrap();
+        let mut existing = json!({
+            "schema_version": SCHEMA_VERSION,
+            "collector": {"script_sha256": "script"},
+            "tlc": {"jar_sha256": "jar"},
+            "inputs": {"strict_corpus": {"commit": "pin"}},
+            "seed": {"enabled": false},
+            "tlc_timeout_seconds": 60,
+            "specs_jcs_sha256": digest,
+            "specs": specs,
+        });
+        assert!(resume_output_matches_provenance(&existing, &provenance));
+
+        existing["schema_version"] = json!(3);
+        assert!(!resume_output_matches_provenance(&existing, &provenance));
+        existing["schema_version"] = json!(SCHEMA_VERSION);
+
+        existing["specs"]["A"]["tlc"]["states"] = json!(99);
+        assert!(!resume_output_matches_provenance(&existing, &provenance));
+        existing["specs"]["A"]["tlc"]["states"] = Value::Null;
+        existing["specs_jcs_sha256"] = json!(sha256_jcs(&existing["specs"]).unwrap());
+        existing["collector"]["script_sha256"] = json!("other-script");
+        assert!(!resume_output_matches_provenance(&existing, &provenance));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_runner_drains_output_larger_than_pipe_capacity() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("yes x | head -c 262144")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let (code, timed_out, stdout, stderr) =
+            run_with_timeout(command, Duration::from_secs(5)).unwrap();
+        assert_eq!(code, 0);
+        assert!(!timed_out);
+        assert_eq!(stdout.len(), 262_144);
+        assert!(stderr.is_empty());
     }
 
     #[test]
@@ -1867,6 +3111,8 @@ LARGE_SPECS = {}
         assert_eq!(stats.get("tlc_pass").unwrap(), &json!(2));
         assert_eq!(stats.get("tlc_timeout").unwrap(), &json!(1));
         assert_eq!(stats.get("tlc_error").unwrap(), &json!(1));
+        assert_eq!(stats.get("tlc_unsupported").unwrap(), &json!(0));
+        assert_eq!(stats.get("tlc_uncollected").unwrap(), &json!(0));
         assert_eq!(stats.get("ty_match").unwrap(), &json!(1));
         assert_eq!(stats.get("ty_mismatch").unwrap(), &json!(1));
         assert_eq!(stats.get("ty_fail").unwrap(), &json!(1));
@@ -1904,20 +3150,22 @@ LARGE_SPECS = {}
     }
 
     #[test]
-    fn build_ordered_specs_includes_catalog_and_extras() {
-        // serde_json::Map = BTreeMap, so serialized output is always
-        // alphabetical regardless of insertion order. Contract: (1)
-        // catalog specs and extras are both retained, (2) no data loss.
+    fn build_ordered_specs_discards_rows_outside_manifest_catalog() {
+        // The strict manifest is the complete source of truth. Legacy
+        // repo-local and deleted-fixture baseline rows must not leak into a
+        // normalized refresh.
         let catalog = vec![
             SpecInfo {
                 name: "Beta".into(),
                 tla_path: "B.tla".into(),
                 cfg_path: "B.cfg".into(),
+                exclusion: None,
             },
             SpecInfo {
                 name: "Alpha".into(),
                 tla_path: "A.tla".into(),
                 cfg_path: "A.cfg".into(),
+                exclusion: None,
             },
         ];
         let mut baselines: BTreeMap<String, Value> = BTreeMap::new();
@@ -1934,16 +3182,71 @@ LARGE_SPECS = {}
             json!({"tlc": {"status": "pass"}, "ty": {"status": "untested"}, "category": "small"}),
         );
         let ordered = build_ordered_specs(baselines, &catalog);
-        for name in ["Alpha", "Beta", "Zeta"] {
+        for name in ["Alpha", "Beta"] {
             assert!(ordered.contains_key(name), "missing {name}");
         }
-        assert_eq!(ordered.len(), 3);
+        assert!(!ordered.contains_key("Zeta"));
+        assert_eq!(ordered.len(), 2);
+    }
+
+    #[test]
+    fn skeleton_is_complete_and_marks_exclusions_without_measurements() {
+        let catalog = vec![
+            SpecInfo {
+                name: "Eligible".into(),
+                tla_path: "A/A.tla".into(),
+                cfg_path: "A/A.cfg".into(),
+                exclusion: None,
+            },
+            SpecInfo {
+                name: "Excluded".into(),
+                tla_path: "B/B.tla".into(),
+                cfg_path: "B/B.cfg".into(),
+                exclusion: Some(ManifestExclusion {
+                    reason_code: "simulation_only".into(),
+                    detail: "simulation".into(),
+                }),
+            },
+        ];
+        let skeleton = initialize_baselines(&catalog, BTreeMap::new());
+        assert_eq!(skeleton.len(), 2);
+        assert_eq!(
+            skeleton["Eligible"]["tlc"]["status"],
+            Value::String("uncollected".into())
+        );
+        assert_eq!(
+            skeleton["Eligible"]["eligibility"],
+            Value::String("eligible".into())
+        );
+        assert_eq!(
+            skeleton["Eligible"]["work_equivalence"]["rule_id"],
+            Value::String(EXHAUSTIVE_WORK_EQUIVALENCE_RULE_ID.into())
+        );
+        assert_eq!(
+            skeleton["Excluded"]["tlc"]["status"],
+            Value::String("unsupported".into())
+        );
+        assert!(skeleton["Excluded"].get("work_equivalence").is_none());
+        assert_eq!(
+            skeleton["Excluded"]["exclusion"]["reason_code"],
+            Value::String("simulation_only".into())
+        );
+        let map: Map<String, Value> = skeleton.into_iter().collect();
+        let stats = compute_stats(&map);
+        assert_eq!(stats["tlc_uncollected"], json!(1));
+        assert_eq!(stats["tlc_unsupported"], json!(1));
     }
 
     #[test]
     fn missing_entry_marks_status_error_and_keeps_existing_ty() {
         let prev = json!({"ty": {"status": "pass", "states": 7}});
-        let entry = missing_entry(&Some(prev), "missing_file", "File not found: x.tla");
+        let spec = SpecInfo {
+            name: "X".into(),
+            tla_path: "x.tla".into(),
+            cfg_path: "x.cfg".into(),
+            exclusion: None,
+        };
+        let entry = missing_entry(&Some(prev), &spec, "missing_file", "File not found: x.tla");
         let obj = entry.as_object().unwrap();
         assert_eq!(
             obj.get("tlc").unwrap().get("error_type").unwrap(),
@@ -1964,6 +3267,7 @@ LARGE_SPECS = {}
             name: "Alpha".into(),
             tla_path: "A.tla".into(),
             cfg_path: "A.cfg".into(),
+            exclusion: None,
         }];
         let mut baselines: BTreeMap<String, Value> = BTreeMap::new();
         baselines.insert(

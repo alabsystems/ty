@@ -8,7 +8,6 @@
 //! nested paths and lazy functions over infinite domains.
 
 use super::super::build_lazy_func_ctx;
-use tla_value::Rp;
 use super::lazy::bind_lazy_func_args;
 use crate::core::EvalCtx;
 use crate::helpers::eval;
@@ -20,6 +19,7 @@ use tla_core::ast::{ExceptPathElement, ExceptSpec, Expr};
 use tla_core::name_intern::{intern_name, NameId};
 use tla_core::{Span, Spanned};
 use tla_value::error::{EvalError, EvalResult};
+use tla_value::Rp;
 
 /// Process-wide allocation of the "@" binding name for EXCEPT operations.
 ///
@@ -46,6 +46,12 @@ pub(crate) type ResolvedExceptPath = SmallVec<[ResolvedExceptPathElement; 2]>;
 // fallback first collects into Vec, whose usual capacity exceeds the two-slot
 // inline buffer, so SmallVec retains that allocation through `from_vec`.
 feature_flag!(no_except_path_smallvec, "TY_NO_EXCEPT_PATH_SMALLVEC");
+
+// Same-binary A/B switch for the pre-grouping post-EXCEPT canonicalization
+// walk. The legacy path processes each resolved path independently, probing
+// common parent records repeatedly and pinning them before later siblings can
+// be reached. Production uses the grouped bottom-up traversal below.
+feature_flag!(legacy_record_canon_paths, "TY_LEGACY_RECORD_CANON_PATHS");
 
 pub(crate) fn collect_resolved_except_path(
     iter: impl Iterator<Item = EvalResult<ResolvedExceptPathElement>>,
@@ -164,11 +170,66 @@ pub(crate) fn eval_except(
     let fv = eval(ctx, func_expr)?;
     let mut result = fv;
 
+    // Resolve each spec's path once, apply it, and KEEP the resolved path
+    // for the post-EXCEPT record canonicalization walk below.
+    let mut resolved_paths: SmallVec<[ResolvedExceptPath; 4]> = SmallVec::new();
     for spec in specs {
-        result = apply_except_spec(ctx, result, &spec.path, &spec.value, span)?;
+        let resolved_path = collect_resolved_except_path(
+            spec.path
+                .iter()
+                .map(|elem| resolve_ast_except_path_element(ctx, elem)),
+        )?;
+        let mut eval_new_value = |new_ctx: &EvalCtx| eval(new_ctx, &spec.value);
+        result = apply_resolved_except_spec(
+            ctx,
+            result,
+            &resolved_path,
+            &mut eval_new_value,
+            &AstLazyExceptHandler,
+            span,
+        )?;
+        resolved_paths.push(resolved_path);
     }
 
+    // Record hash-consing (Program A, mutation-path phase): EXCEPT chains
+    // keep intermediates uniquely owned so field updates mutate in place;
+    // interning per mutation would force a COW per spec (the cascade). Only
+    // HERE — after ALL specs are applied — are the produced records final,
+    // so canonicalize them bottom-up along each modified path.
+    canonicalize_except_result(&mut result, &resolved_paths);
+
     Ok(result)
+}
+
+/// Canonicalize records produced by a completed EXCEPT expression along each
+/// spec's resolved path (shared by the AST and TIR EXCEPT evaluators).
+pub(crate) fn canonicalize_except_result(
+    result: &mut Value,
+    resolved_paths: &[ResolvedExceptPath],
+) {
+    use tla_value::value::RecordCanonPathElem;
+    let canon_paths: SmallVec<[SmallVec<[RecordCanonPathElem<'_>; 4]>; 4]> = resolved_paths
+        .iter()
+        .map(|path| {
+            path.iter()
+                .map(|elem| match elem {
+                    ResolvedExceptPathElement::Index(v) => RecordCanonPathElem::Index(v),
+                    ResolvedExceptPathElement::Field { field_id, .. } => {
+                        RecordCanonPathElem::Field(*field_id)
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    if legacy_record_canon_paths() {
+        for path in &canon_paths {
+            tla_value::value::canonicalize_records_along_path(result, path);
+        }
+        return;
+    }
+    let path_slices: SmallVec<[&[RecordCanonPathElem<'_>]; 4]> =
+        canon_paths.iter().map(SmallVec::as_slice).collect();
+    tla_value::value::canonicalize_records_along_paths(result, &path_slices);
 }
 
 fn resolve_ast_except_path_element(
@@ -189,30 +250,6 @@ fn resolve_ast_except_path_element(
             field_id: field.field_id,
         }),
     }
-}
-
-/// Apply a single EXCEPT spec to a value, supporting nested paths
-/// For `![a].b = v`: first index into the function/seq at `a`, then update field `b`
-pub(crate) fn apply_except_spec(
-    ctx: &EvalCtx,
-    value: Value,
-    path: &[ExceptPathElement],
-    new_value_expr: &Spanned<Expr>,
-    span: Option<Span>,
-) -> EvalResult<Value> {
-    let resolved_path = collect_resolved_except_path(
-        path.iter()
-            .map(|elem| resolve_ast_except_path_element(ctx, elem)),
-    )?;
-    let mut eval_new_value = |new_ctx: &EvalCtx| eval(new_ctx, new_value_expr);
-    apply_resolved_except_spec(
-        ctx,
-        value,
-        &resolved_path,
-        &mut eval_new_value,
-        &AstLazyExceptHandler,
-        span,
-    )
 }
 
 #[cfg(test)]

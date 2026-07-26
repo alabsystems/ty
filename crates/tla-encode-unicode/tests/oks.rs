@@ -291,8 +291,14 @@ fn edges_middle() {
 }
 
 #[test]
-#[ignore]
 fn all() {
+    if !std::env::var_os("TY_RUN_EXHAUSTIVE_UNICODE_TEST").is_some_and(|value| value == "1") {
+        eprintln!(
+            "SKIP all: set TY_RUN_EXHAUSTIVE_UNICODE_TEST=1 to authorize \
+             exhaustive Unicode scalar-value coverage"
+        );
+        return;
+    }
     for cp in std::iter::Iterator::chain(0..0xd800, 0xe000..0x110000) {
         let c = char::from_u32(cp).expect("not a valid char");
         test(c);

@@ -15,7 +15,6 @@
 //! Part of #3753.
 
 use serde_json::{json, Value as JsonValue};
-use crate::rp::Rp;
 
 use crate::Value;
 
@@ -158,9 +157,9 @@ fn escape_tla_string(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rp::Rp;
     use crate::{RecordBuilder, SeqValue, SetBuilder};
     use num_bigint::BigInt;
-    use crate::rp::Rp;
 
     /// Shorthand for creating a `Value::SmallInt` in tests.
     fn int(n: i64) -> Value {

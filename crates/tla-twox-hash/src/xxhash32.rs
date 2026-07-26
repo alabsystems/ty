@@ -479,9 +479,15 @@ mod test {
     // large inputs of a 32-bit hash, but runs very slowly in the
     // normal "cargo test" build config since it hashes 4.3GB of
     // data. It runs reasonably quick under "cargo test --release".
-    #[ignore]
     #[test]
     fn length_overflows_32bit() {
+        if !std::env::var_os("TY_RUN_XXHASH32_4GB_TEST").is_some_and(|value| value == "1") {
+            eprintln!(
+                "SKIP length_overflows_32bit: set TY_RUN_XXHASH32_4GB_TEST=1 \
+                 to authorize hashing 4.3 GB"
+            );
+            return;
+        }
         // Hash 4.3 billion (4_300_000_000) bytes, which overflows a u32.
         let bytes200: [u8; 200] = array::from_fn(|i| i as _);
 

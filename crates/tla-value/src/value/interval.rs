@@ -8,13 +8,12 @@
 //! materializing all elements. Used for TLA+ integer interval expressions like
 //! `1..N`.
 
+use super::SortedSet;
 use super::Value;
+use crate::rp::Rp;
 use num_bigint::BigInt;
 use num_traits::{One, ToPrimitive, Zero};
 use std::cmp::Ordering;
-use crate::rp::Rp as Arc;
-use crate::rp::Rp;
-use super::SortedSet;
 
 /// A lazy interval value representing a..b without allocating all elements
 ///

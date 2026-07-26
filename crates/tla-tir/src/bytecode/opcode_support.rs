@@ -126,6 +126,7 @@ impl Opcode {
             | Self::SetDiff { rd, .. }
             | Self::Subseteq { rd, .. }
             | Self::RoundStepEq { rd, .. }
+            | Self::EdgeFilter { rd, .. }
             | Self::Powerset { rd, .. }
             | Self::BigUnion { rd, .. }
             | Self::KSubset { rd, .. }
@@ -299,6 +300,18 @@ impl Opcode {
                     Some(tuple_max)
                 } else {
                     Some(*set)
+                }
+            }
+
+            // Fused edge-filter comprehension: first, arg, domain sources.
+            Self::EdgeFilter {
+                first, arg, domain, ..
+            } => {
+                let m = if *first > *arg { *first } else { *arg };
+                if m > *domain {
+                    Some(m)
+                } else {
+                    Some(*domain)
                 }
             }
 

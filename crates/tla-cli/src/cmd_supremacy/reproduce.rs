@@ -157,9 +157,14 @@ fn ensure_prerequisites(no_install: bool, do_tlc: bool, do_apalache: bool) -> Re
             );
         } else {
             eprintln!("tlc: missing at {} — installing", tlc_jar.display());
+            // Take the proof library too: 25 eligible corpus rows EXTEND TLAPS /
+            // FiniteSetTheorems / NaturalsInduction and TLC cannot parse them
+            // without it. A reproduce run that silently skipped those rows would
+            // understate the corpus.
             crate::cmd_tlc::cmd_tlc(TlcAction::Install {
                 dest: None,
                 force: false,
+                with_proof_library: true,
             })
             .context("auto-install TLC failed")?;
         }
@@ -259,12 +264,13 @@ fn run_tlc_compare(
         // and is not a fair general-purpose comparison engine here.)
         backend: SupremacyCompareBackend::Interpreter,
         workers: vec![args.workers],
+        runs: 1,
         // warn: collect the numbers without failing the reproduce run on a
         // structural loss — the scorecard reports losses honestly instead.
         mode: SupremacyMode::Warn,
         policy: SupremacyComparePolicy::Parity,
-        min_speedup: 1.0,
-        max_memory_ratio: 1.0,
+        min_speedup: 1.05,
+        max_memory_ratio: 0.95,
         output_dir: Some(compare_out.clone()),
         ty_bin: None,
         tlc_jar: None,
@@ -290,27 +296,13 @@ fn run_tlc_compare(
 
 /// Map a compare.json row to a scorecard row with an HONEST comparability call.
 ///
-/// A row counts as comparable (its time/memory ratios feed the win tally) iff
-/// both tools ran without error AND distinct-state counts agree. A row that
-/// passes compare's gate fully is `ok`; a row that agrees on states + verdict
-/// but trips only compare's transition-count parity (TLC frequently omits a
-/// parseable transition line) is still comparable runtime evidence, flagged
-/// `ok*` with the discrepancy noted. Genuine state/verdict divergence and tool
-/// failures are non-comparable and excluded from the win counts.
+/// A row counts as comparable (its time/memory ratios feed the win tally) only
+/// when compare's parity gate passes. That gate requires matching verdict,
+/// distinct states, and exact raw initial/successor/total generated work.
+/// Diagnostic/internal transition counters never promote a failed row.
 fn score_tlc_row(row: CompareRowView) -> ScoreRow {
-    let tlc_ok = row.tlc.error_type.is_none();
-    let backend_ok = row.backend_run.error_type.is_none();
-    let verdict_match = row.tlc.error_type == row.backend_run.error_type;
-
     let (comparable, parity, note) = if row.passed {
         (true, "ok".to_string(), row.reason)
-    } else if tlc_ok && backend_ok && verdict_match && row.parity_states {
-        // States + verdict agree; only the transition-count check tripped.
-        (
-            true,
-            "ok*".to_string(),
-            format!("state/verdict parity ok; {}", row.reason),
-        )
     } else {
         (false, format!("FAIL ({})", row.class), row.reason)
     };
@@ -360,11 +352,13 @@ fn localize_baseline(out_dir: &Path) -> Result<PathBuf> {
     Ok(dest)
 }
 
-/// Minimal re-read of the compare.json schema written by `super::compare`. We
-/// deserialize only the scorecard-relevant fields; the authoritative schema and
-/// the verdict policy live in compare.rs.
+/// Minimal re-read of the compare.json schema written by `super::compare`.
+/// Later schemas retain the aggregate `tlc` and `backend_run` aliases, so the
+/// one-pair reproduce scorecard remains compatible while the full paired
+/// observations stay authoritative in compare.json.
 #[derive(Debug, Deserialize)]
 struct CompareReportView {
+    schema: Option<String>,
     rows: Vec<CompareRowView>,
 }
 
@@ -376,8 +370,6 @@ struct CompareRowView {
     class: String,
     #[serde(default)]
     reason: String,
-    #[serde(default)]
-    parity_states: bool,
     tlc: RunObservationView,
     backend_run: RunObservationView,
 }
@@ -387,13 +379,22 @@ struct RunObservationView {
     elapsed_seconds: f64,
     #[serde(default)]
     peak_rss_bytes: Option<u64>,
-    #[serde(default)]
-    error_type: Option<String>,
 }
 
 fn read_compare_report(path: &Path) -> Result<CompareReportView> {
     let text = fs::read_to_string(path)?;
     let report: CompareReportView = serde_json::from_str(&text)?;
+    if !matches!(
+        report.schema.as_deref(),
+        Some(
+            "ty.supremacy.compare.v1"
+                | "ty.supremacy.compare.v2"
+                | "ty.supremacy.compare.v3"
+                | "ty.supremacy.compare.v4"
+        )
+    ) {
+        bail!("unsupported supremacy compare schema {:?}", report.schema);
+    }
     Ok(report)
 }
 

@@ -9,8 +9,8 @@
 //! thread-local work stack. These tests verify that concurrent drops across
 //! threads don't corrupt the per-thread TLS drop stacks.
 
-use crate::Value;
 use crate::rp::Rp as Arc;
+use crate::Value;
 /// Concurrent drops across threads with shared Arc<Set> values.
 /// Verifies thread-local DROP_STACK isolation under concurrent access —
 /// each thread's UnsafeCell<Vec<Value>> must not interfere with other

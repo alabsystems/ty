@@ -71,6 +71,17 @@ impl EvalCtx {
         module_name: &str,
         explicit_subs: &[Substitution],
     ) -> Vec<Substitution> {
+        // TY_SUBST_STATS diagnostic: expose calls-per-distinct-input redundancy.
+        if crate::cache::subst_chain_memo::subst_stats_enabled() {
+            use std::hash::{Hash, Hasher};
+            let mut h = rustc_hash::FxHasher::default();
+            module_name.hash(&mut h);
+            for sub in explicit_subs {
+                sub.from.node.hash(&mut h);
+                sub.to.span.hash(&mut h);
+            }
+            crate::cache::subst_chain_memo::count_ces_call(h.finish());
+        }
         let mut effective_subs = explicit_subs.to_vec();
         let explicit_names: FxHashSet<&str> = explicit_subs
             .iter()

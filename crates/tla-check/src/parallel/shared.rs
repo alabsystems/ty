@@ -16,7 +16,7 @@ use crate::Value;
 use dashmap::DashMap;
 use rustc_hash::{FxHashMap, FxHasher};
 use std::hash::BuildHasherDefault;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// FxHasher-based BuildHasher for faster hashing of Fingerprint keys.
@@ -25,6 +25,16 @@ pub(crate) type FxBuildHasher = BuildHasherDefault<FxHasher>;
 
 /// FxHasher-based DashMap for concurrent fingerprint storage.
 pub(crate) type FxDashMap<K, V> = DashMap<K, V, FxBuildHasher>;
+
+/// Add to an authoritative usize counter without allowing release-mode wrap.
+#[inline]
+pub(crate) fn checked_atomic_add_usize(counter: &AtomicUsize, value: usize, label: &'static str) {
+    if let Err(current) = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        current.checked_add(value)
+    }) {
+        panic!("{label} overflowed usize (current={current}, increment={value})");
+    }
+}
 
 /// Part of #3178: Append-only parent pointer log for trace reconstruction.
 ///
@@ -429,6 +439,9 @@ pub(crate) struct WorkerStats {
     pub(crate) steal_latency_ns: u64,
     /// Work stealing: total successor states this worker generated (enqueued).
     pub(crate) states_generated: usize,
+    /// Successors generated before state/action constraints or POR filtering,
+    /// matching TLC's worker `statesGenerated` accounting boundary.
+    pub(crate) raw_successors_generated: usize,
 }
 
 // Part of #3254: promoted to feature_flag! for release-mode timing.

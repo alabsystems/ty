@@ -311,6 +311,46 @@ fn test_bmc_set_equality_different_sets() {
 
 #[cfg_attr(test, ntest::timeout(10000))]
 #[test]
+fn test_bmc_closed_nested_set_equality_is_extensional() {
+    let mut bmc = bmc_array(0);
+
+    // Source order and duplicates do not affect either the inner or outer set.
+    let left = spanned(Expr::SetEnum(vec![
+        spanned(Expr::SetEnum(vec![int(1), int(2)])),
+        spanned(Expr::SetEnum(vec![])),
+        spanned(Expr::SetEnum(vec![int(1), int(2)])),
+    ]));
+    let right = spanned(Expr::SetEnum(vec![
+        spanned(Expr::SetEnum(vec![])),
+        spanned(Expr::SetEnum(vec![int(2), int(1), int(1)])),
+    ]));
+    let eq = spanned(Expr::Eq(Box::new(left), Box::new(right)));
+
+    let term = bmc.translate_init(&eq).unwrap();
+    bmc.assert(term);
+    assert!(matches!(bmc.check_sat(), SolveResult::Sat));
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
+fn test_bmc_closed_nested_set_equality_preserves_scalar_kinds() {
+    let mut bmc = bmc_array(0);
+
+    // Int 1 and String "1" remain different even though both eventually use
+    // integer-like carriers in other BMC encodings.
+    let int_nested = spanned(Expr::SetEnum(vec![spanned(Expr::SetEnum(vec![int(1)]))]));
+    let string_nested = spanned(Expr::SetEnum(vec![spanned(Expr::SetEnum(vec![spanned(
+        Expr::String("1".to_string()),
+    )]))]));
+    let eq = spanned(Expr::Eq(Box::new(int_nested), Box::new(string_nested)));
+
+    let term = bmc.translate_init(&eq).unwrap();
+    bmc.assert(term);
+    assert!(matches!(bmc.check_sat(), SolveResult::Unsat(_)));
+}
+
+#[cfg_attr(test, ntest::timeout(10000))]
+#[test]
 fn test_bmc_set_membership_in_set_enum_of_sets() {
     let mut bmc = bmc_array(0);
 

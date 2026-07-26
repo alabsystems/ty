@@ -9,10 +9,9 @@
 //! Part of #1371.
 
 use tla_check::Value;
-use tla_value::SortedSet;
+use tla_value::{Rp, SortedSet};
 
 use super::helpers::eval_str;
-use std::sync::Arc;
 
 #[cfg_attr(test, ntest::timeout(10000))]
 #[test]
@@ -46,7 +45,7 @@ fn test_transitive_closure_cycle() {
 fn test_transitive_closure_empty() {
     // Empty relation should produce empty closure
     let result = eval_str(r#"TransitiveClosure({})"#).unwrap();
-    assert_eq!(result, Value::Set(Arc::new(SortedSet::new())));
+    assert_eq!(result, Value::Set(Rp::new(SortedSet::new())));
 }
 
 #[cfg_attr(test, ntest::timeout(10000))]
@@ -91,7 +90,7 @@ fn test_connected_nodes_simple() {
 fn test_connected_nodes_empty() {
     // Empty relation should have no connected nodes
     let result = eval_str(r#"ConnectedNodes({})"#).unwrap();
-    assert_eq!(result, Value::Set(Arc::new(SortedSet::new())));
+    assert_eq!(result, Value::Set(Rp::new(SortedSet::new())));
 }
 
 #[cfg_attr(test, ntest::timeout(10000))]

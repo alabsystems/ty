@@ -19,10 +19,11 @@
 //!
 //! (a) cross-backend: interpreter and the default compiled BFS find the same
 //!     invariant violation through the instance layer; and
-//! (b) native parity: the trust-codegen backend
-//!     finds the violation AND reports complete executable action coverage
-//!     (`compiled == total > 0`), i.e. every instance-imported action compiled
-//!     natively.
+//! (b) native-admission fallback parity: trust-codegen prepares every
+//!     instance-imported action, its currently unstaged install manifest is
+//!     rejected fail-closed, and the fallback still finds the same violation.
+//!     When the coordinated Trust-CG manifest work lands, this assertion must
+//!     be replaced by an admitted-native coverage assertion.
 //!
 //! Mirrors the assertion structure of the flat-state / subseq native-fold
 //! soundness tests.
@@ -109,6 +110,11 @@ fn violation_config() -> Config {
 #[cfg_attr(test, ntest::timeout(30000))]
 #[test]
 fn instance_resolve_native_fold_cross_backend_finds_violation() {
+    // Hold the shared integration-test environment lock for the complete run
+    // so this test cannot race the trust-cg-enabled fallback test below.
+    let _no_trust_cg = common::EnvVarGuard::set("TY_TRUST_CG", Some("0"));
+    let _no_trust_cg_bfs = common::EnvVarGuard::remove("TY_TRUST_CG_BFS");
+
     tla_eval::clear_for_test_reset();
 
     let base = base_module();
@@ -124,15 +130,19 @@ fn instance_resolve_native_fold_cross_backend_finds_violation() {
     );
 }
 
-/// (b) Native parity: trust-codegen must find the SAME violation AND every
-/// instance-imported action must compile natively (`compiled == total > 0`),
-/// proving the instance names were resolved into the action-bytecode compile
-/// path rather than disqualifying the spec.
+/// (b) Fail-closed native-admission parity: trust-codegen must prepare every
+/// instance-imported action, reject activation because the install manifest is
+/// not yet staged, and preserve the SAME violation through its fallback.
+///
+/// This is deliberately an assertion on the production admission report, not
+/// a boolean "manifest available" test flag. Once Trust-CG supplies a validated
+/// install manifest, this test will fail on the stale `missing_manifest`
+/// expectation and must graduate to admitted-native execution.
 #[cfg_attr(test, ntest::timeout(30000))]
 #[test]
-#[ignore = "external-blocked: trust-cg native install gate rejects missing_manifest (A2A blocker); requires manifest plumbing in ~/trust-cg"]
-fn instance_resolve_native_fold_trust_cg_parity_finds_violation_with_full_coverage() {
+fn instance_resolve_native_fold_trust_cg_fail_closed_fallback_preserves_violation() {
     let _trust_cg = common::EnvVarGuard::set("TY_TRUST_CG", Some("1"));
+    let _trust_cg_bfs = common::EnvVarGuard::remove("TY_TRUST_CG_BFS");
 
     tla_eval::clear_for_test_reset();
     tla_trust_cg::compile::clear_jit_cache();
@@ -146,14 +156,40 @@ fn instance_resolve_native_fold_trust_cg_parity_finds_violation_with_full_covera
 
     assert!(
         matches!(result, tla_check::CheckResult::InvariantViolation { .. }),
-        "trust-cg native run must find the INSTANCE-resolved invariant violation, got {result:?}"
+        "trust-cg fail-closed fallback must find the INSTANCE-resolved invariant violation, \
+         got {result:?}"
     );
 
     let (compiled, total) = checker
         .trust_cg_action_coverage_for_testing()
-        .expect("trust-cg run should record executable action coverage");
+        .expect("trust-cg preparation should record executable action coverage");
     assert!(
         compiled == total && total > 0,
-        "expected complete native coverage for instance-imported actions, got {compiled}/{total}"
+        "instance-imported actions must all reach native preparation before admission, \
+         got {compiled}/{total}"
+    );
+
+    let admission = checker
+        .trust_cg_native_admission_evidence_report_json()
+        .expect("trust-cg preparation should record structured native-admission evidence");
+    assert_eq!(
+        admission["fields"]["status_code"].as_str(),
+        Some("rejected"),
+        "unstaged native artifacts must be rejected fail-closed"
+    );
+    assert_eq!(
+        admission["fields"]["reason_code"].as_str(),
+        Some("missing_manifest"),
+        "the current coordinated blocker must remain explicit"
+    );
+    assert_eq!(
+        admission["fields"]["production_selected"].as_str(),
+        Some("false"),
+        "a missing manifest must never select native production execution"
+    );
+    assert_eq!(
+        admission["fields"]["actions_ty_native_activate"].as_str(),
+        Some("false"),
+        "a missing manifest must deny TY native activation"
     );
 }

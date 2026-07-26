@@ -273,8 +273,7 @@ pub(crate) fn probe_and_record(
 
             // Only cache when we can record a validating span (bug #1558). Without
             // a span we cannot defend against AST-pointer reuse, so fail safe.
-            if let Some(span) =
-                span.filter(|_| deps_are_persistent(&deps) && !value_captures_state)
+            if let Some(span) = span.filter(|_| deps_are_persistent(&deps) && !value_captures_state)
             {
                 CONST_SET_STATE.with(|s| {
                     s.borrow_mut().values.insert(key, (span, value.clone()));

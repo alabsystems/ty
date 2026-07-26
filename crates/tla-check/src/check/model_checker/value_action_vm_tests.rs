@@ -224,10 +224,13 @@ fn track_only_coverage_keeps_dead_action_evidence_and_bypasses_vm() {
     assert!(!checker.coverage.default_dead_action_tracking);
     assert!(stats.coverage.is_none());
 
-    let dead_actions = stats.vacuity_warnings.iter().find_map(|warning| match warning {
-        crate::VacuityWarning::DeadActions(names) => Some(names.as_slice()),
-        _ => None,
-    });
+    let dead_actions = stats
+        .vacuity_warnings
+        .iter()
+        .find_map(|warning| match warning {
+            crate::VacuityWarning::DeadActions(names) => Some(names.as_slice()),
+            _ => None,
+        });
     assert_eq!(dead_actions, Some(["C".to_string()].as_slice()));
 }
 
@@ -271,6 +274,63 @@ fn explicit_tracking_modes_clear_default_dead_action_provenance() {
     assert!(checker.coverage.coverage_guided);
     assert!(!checker.coverage.default_dead_action_tracking);
     assert!(!checker.coverage.native_fast_path_skipped);
+}
+
+#[test]
+fn cache_absent_native_fallback_restores_retired_action_route() {
+    let module = parse_module(COVERAGE_ROUTE_SPEC);
+    let config = coverage_route_config();
+    let mut checker = ModelChecker::new(&module, &config);
+
+    // Model the pre-native AUTO setup: default tracking yielded because the
+    // native fast path looked viable, while setup retained the original
+    // run-stable action allocation for a possible post-compile fallback. Also
+    // install a dormant Value plan so this exercises every selector side
+    // effect, not only the coverage-restoration helper.
+    checker.coverage.default_dead_action_tracking = true;
+    checker.coverage.collect = false;
+    checker.coverage.native_fast_path_skipped = true;
+    checker.trust_cg_lazy_pending = true;
+    checker.value_action_vm.auto_candidate = true;
+    checker.value_action_vm.install_plan(ValueActionVmPlan {
+        entries: Vec::new(),
+        split_instance_count: 0,
+        linked_chunk: BytecodeChunk::new(),
+        canonical_vars: Some(Vec::new()),
+        uniform_slot_guard_index: None,
+        self_recursive_helper_count: 0,
+        self_recursive_call_site_count: 0,
+    });
+    checker.setup_actions_and_por("Next");
+    assert!(!checker.coverage.actions.is_empty());
+    assert!(checker.stats.coverage.is_none());
+
+    // Cover the native-fused admission shape too: it may have retired the
+    // exact action Arc immediately before the selector abandons native.
+    let retired = std::mem::replace(
+        &mut checker.coverage.actions,
+        std::sync::Arc::new(Vec::new()),
+    );
+    checker.coverage.retired_actions.push(retired);
+
+    assert!(checker.try_restore_auto_route_after_absent_native_cache());
+
+    assert!(checker.trust_cg_structurally_vetoed());
+    assert!(!checker.trust_cg_lazy_pending);
+    assert!(checker.jit_monolithic_disabled);
+    assert!(checker.value_action_vm.auto_selected());
+    assert!(checker.coverage.collect);
+    assert!(checker.stats.coverage.is_some());
+    assert!(!checker.coverage.native_fast_path_skipped);
+    assert!(!checker.coverage.actions.is_empty());
+    assert_eq!(
+        checker
+            .stats
+            .coverage
+            .as_ref()
+            .map(|coverage| coverage.actions.len()),
+        Some(3),
+    );
 }
 
 fn metadata_with_expr(name: &str, expr: Spanned<Expr>) -> ActionInstanceMeta {
@@ -783,9 +843,9 @@ fn first_guard_certifies_direct_and_reversed_constants_but_rejects_stale_slots()
             .expect("both equality orientations should certify");
         assert!(!guard.mismatches(&ArrayState::from_values(vec![ready.clone()])));
         assert!(
-            guard.mismatches(&ArrayState::from_values(vec![Value::ModelValue(
-                Rp::from("busy")
-            )]))
+            guard.mismatches(&ArrayState::from_values(vec![Value::ModelValue(Rp::from(
+                "busy"
+            ))]))
         );
     }
 
@@ -1272,10 +1332,7 @@ Next == \E key \in {1} : BoundAction(key)
     let mut checker = ModelChecker::new(&module, &config);
     std::sync::Arc::make_mut(checker.ctx.shared_arc_mut())
         .precomputed_constants_mut()
-        .insert(
-            intern_name("READY"),
-            Value::ModelValue(Rp::from("ready")),
-        );
+        .insert(intern_name("READY"), Value::ModelValue(Rp::from("ready")));
     let next = checker.ctx.get_op("Next").unwrap();
     let instances = crate::action_instance::split_action_instances(&checker.ctx, &next.body)
         .expect("the bounded action should split");
@@ -1334,10 +1391,7 @@ End(actor) ==
             std::sync::Arc::make_mut(checker.ctx.shared_arc_mut()).precomputed_constants_mut();
         constants.insert(intern_name("Access"), Value::string("Access"));
         constants.insert(intern_name("Advance"), Value::string("Advance"));
-        constants.insert(
-            intern_name("w1"),
-            Value::ModelValue(Rp::from("w1")),
-        );
+        constants.insert(intern_name("w1"), Value::ModelValue(Rp::from("w1")));
     }
     let expr = checker.ctx.get_op("End").unwrap().body.clone();
     let mut action = metadata_with_expr("End", expr);
@@ -1476,10 +1530,8 @@ A ==
     assert!(plan.entries[0].first_guard.is_some());
 
     let nil = Value::ModelValue(Rp::from("nil"));
-    let wrong_phase = ArrayState::from_values(vec![
-        nil.clone(),
-        Value::ModelValue(Rp::from("busy")),
-    ]);
+    let wrong_phase =
+        ArrayState::from_values(vec![nil.clone(), Value::ModelValue(Rp::from("busy"))]);
     let (result, stats) = execute_value_action_vm_plan_attempt(
         &plan,
         &mut checker.ctx,
@@ -1825,18 +1877,22 @@ fn shadow_comparison_preserves_order_and_multiplicity() {
     };
     let candidate = SuccessorResult {
         successors: vec![successor(1), successor(1), successor(2)],
+        raw_successor_count: 3,
         had_raw_successors: true,
     };
     let identical = SuccessorResult {
         successors: vec![successor(1), successor(1), successor(2)],
+        raw_successor_count: 3,
         had_raw_successors: true,
     };
     let reordered = SuccessorResult {
         successors: vec![successor(1), successor(2), successor(1)],
+        raw_successor_count: 3,
         had_raw_successors: true,
     };
     let deduplicated = SuccessorResult {
         successors: vec![successor(1), successor(2)],
+        raw_successor_count: 2,
         had_raw_successors: true,
     };
 

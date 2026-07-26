@@ -95,10 +95,84 @@ pub(in crate::check) fn hybrid_native_authoritative_enabled() -> bool {
         && std::env::var_os("TY_HYBRID_NATIVE_AUTHORITATIVE").is_some_and(|v| v == "1")
 }
 
+const ROUTER_PILOT_PARENTS: u64 = 16_384;
+const ROUTER_TRIAL_PARENTS: u32 = 64;
+const ROUTER_MIN_SKIP_PERCENT: u128 = 80;
+// The trial compares local successor generation, while the pre-router route
+// may additionally save materialization through inline streaming dedup. Keep a
+// large margin before changing the end-to-end route; a small local win is not
+// evidence that batch consumption will also win.
+const ROUTER_MIN_GENERATION_SPEEDUP_PERCENT: u128 = 40;
+const ROUTER_PARITY_SAMPLE_STRIDE: u64 = 4_096;
+const ROUTER_MAX_SUCCESSORS_PER_PARENT: usize = 4_096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouterRequest {
+    Disabled,
+    Auto,
+    Forced,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum RouterPhase {
+    #[default]
+    Disabled,
+    Pilot,
+    Trial,
+    Active,
+    Forced,
+    Declined,
+    Failback,
+}
+
+/// Resolve the standalone router's tri-state policy.
+///
+/// `TY_ROUTER=1` preserves the explicit force-on diagnostic. Any other
+/// present value is a stable opt-out. With the variable absent, only CLI AUTO
+/// engine selection may run the conservative online pilot; library callers
+/// and explicitly selected backends are unchanged.
+fn router_request_from(value: Option<&std::ffi::OsStr>, auto_select: bool) -> RouterRequest {
+    match value {
+        Some(value) if value.to_str().is_some_and(tla_backend::env_flag_enabled) => {
+            RouterRequest::Forced
+        }
+        Some(_) => RouterRequest::Disabled,
+        None if auto_select => RouterRequest::Auto,
+        None => RouterRequest::Disabled,
+    }
+}
+
+fn router_request() -> RouterRequest {
+    let value = std::env::var_os("TY_ROUTER");
+    router_request_from(
+        value.as_deref(),
+        crate::check::debug::trust_cg_auto_select_enabled(),
+    )
+}
+
+#[inline]
+fn router_skip_rate_admitted(skips: u64, checks: u64) -> bool {
+    checks != 0
+        && u128::from(skips).saturating_mul(100)
+            >= u128::from(checks).saturating_mul(ROUTER_MIN_SKIP_PERCENT)
+}
+
+#[inline]
+fn router_timing_admitted(batch_ns: u128, whole_next_ns: u128) -> bool {
+    if whole_next_ns == 0 {
+        return false;
+    }
+    let retained_percent = 100_u128.saturating_sub(ROUTER_MIN_GENERATION_SPEEDUP_PERCENT);
+    let allowed_batch_ns =
+        (whole_next_ns / 100) * retained_percent + ((whole_next_ns % 100) * retained_percent) / 100;
+    batch_ns <= allowed_batch_ns
+}
+
 /// WP-29 lever 1: whether the per-(parent, action) enabling PRE-CHECK runs
 /// before the batch path's interpreter enumeration (default ON;
-/// `TY_HYBRID_ACTION_GUARD_PRECHECK=0` restores the pre-WP-29 behaviour where
-/// every instance enters the enumerator).
+/// `TY_HYBRID_ACTION_GUARD_PRECHECK=0` (or
+/// `TY_ROUTER_GUARD_PRECHECK=0` for the standalone router) restores the
+/// pre-WP-29 behaviour where every instance enters the enumerator).
 ///
 /// The pre-check is a sound UNDER-approximation of enabledness: it only ever
 /// reports "definitely disabled", and only when a syntactically extracted
@@ -112,6 +186,17 @@ pub(in crate::check) fn action_guard_precheck_enabled() -> bool {
             std::env::var("TY_HYBRID_ACTION_GUARD_PRECHECK").as_deref(),
             Ok("0")
         )
+    })
+}
+
+/// Router-local guard-precheck kill switch. It is consulted only when the
+/// standalone router is the sole route owner, so router diagnostics cannot
+/// change POR, coverage, or hybrid behavior.
+pub(in crate::check) fn router_guard_precheck_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        !std::env::var("TY_ROUTER_GUARD_PRECHECK")
+            .is_ok_and(|value| tla_backend::env_flag_disabled(&value))
     })
 }
 
@@ -197,9 +282,7 @@ pub(in crate::check) fn hybrid_guard_debug_enabled() -> bool {
 /// elides scans of variables proven identical to a lazy-free parent variable.
 pub(in crate::check) fn consume_delta_materialize_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| {
-        !matches!(std::env::var("TY_HYBRID_CONSUME_DELTA").as_deref(), Ok("0"))
-    })
+    *FLAG.get_or_init(|| !matches!(std::env::var("TY_HYBRID_CONSUME_DELTA").as_deref(), Ok("0")))
 }
 
 /// WP-34 lever 1: whether the extractor may collect MORE than the single
@@ -848,6 +931,7 @@ fn guard_expr_is_pure(
                 None => true,
                 Some(def) => {
                     def.params.is_empty()
+                        && !crate::eval::should_prefer_builtin_override(resolved, def, 0, ctx)
                         && guard_expr_is_pure(ctx, op_defs, &def.body.node, nodes, depth + 1)
                 }
             }
@@ -921,8 +1005,12 @@ fn guard_expr_is_pure(
             let resolved = ctx.resolve_op_name(op_name.as_str());
             match op_defs.get(resolved) {
                 Some(def) => {
-                    def.params.len() == args.len()
-                        && guard_expr_is_pure(ctx, op_defs, &def.body.node, nodes, depth + 1)
+                    if crate::eval::should_prefer_builtin_override(resolved, def, args.len(), ctx) {
+                        crate::enumerate::is_replay_stable_named_builtin(resolved, args.len())
+                    } else {
+                        def.params.len() == args.len()
+                            && guard_expr_is_pure(ctx, op_defs, &def.body.node, nodes, depth + 1)
+                    }
                 }
                 None => guard_builtin_is_pure(resolved),
             }
@@ -931,14 +1019,14 @@ fn guard_expr_is_pure(
             arms.iter().all(|arm| {
                 guard_expr_is_pure(ctx, op_defs, &arm.guard.node, nodes, depth)
                     && guard_expr_is_pure(ctx, op_defs, &arm.body.node, nodes, depth)
-            }) && other.as_ref().is_none_or(|d| {
-                guard_expr_is_pure(ctx, op_defs, &d.node, nodes, depth)
-            })
+            }) && other
+                .as_ref()
+                .is_none_or(|d| guard_expr_is_pure(ctx, op_defs, &d.node, nodes, depth))
         }
         E::Let(defs, body) => {
-            defs.iter().all(|def| {
-                guard_expr_is_pure(ctx, op_defs, &def.body.node, nodes, depth)
-            }) && guard_expr_is_pure(ctx, op_defs, &body.node, nodes, depth)
+            defs.iter()
+                .all(|def| guard_expr_is_pure(ctx, op_defs, &def.body.node, nodes, depth))
+                && guard_expr_is_pure(ctx, op_defs, &body.node, nodes, depth)
         }
         E::Except(base, specs) => {
             guard_expr_is_pure(ctx, op_defs, &base.node, nodes, depth)
@@ -1002,7 +1090,7 @@ fn guard_bounds_are_pure(
 fn guard_builtin_is_pure(name: &str) -> bool {
     matches!(
         name,
-        "Cardinality" | "IsFiniteSet" | "Len" | "Head" | "Tail" | "Append" | "SubSeq"
+        "Cardinality" | "IsFiniteSet" | "Len" | "Head" | "Tail" | "Append"
     )
 }
 
@@ -1159,6 +1247,180 @@ fn extract_action_state_guard(
     extract_guard_rec(ctx, op_defs, expr, bound, depth, &mut budget)
 }
 
+/// Extract only an evaluation-order-safe enabling prefix for the standalone
+/// router.
+///
+/// The broad hybrid precheck may combine state-only conjuncts found anywhere
+/// in an action. That preserves the successor relation, but a later false
+/// conjunct could otherwise hide an evaluation error in an earlier conjunct.
+/// AUTO has a stricter contract: it descends only through wrappers that occur
+/// before the action body and then selects the syntactically first conjunct.
+/// Quantifier domains are retained around the guard so their evaluation/error
+/// order is preserved. LET definitions and operator arguments are call-by-name;
+/// accepted guards may not mention their bound names, so no skipped expression
+/// would have been forced before the prefix in the canonical action.
+fn extract_router_prefix_state_guard(
+    ctx: &crate::eval::EvalCtx,
+    op_defs: &rustc_hash::FxHashMap<String, tla_core::ast::OperatorDef>,
+    expr: &tla_core::Spanned<tla_core::ast::Expr>,
+    bound: &mut Vec<String>,
+    depth: usize,
+) -> Option<tla_core::Spanned<tla_core::ast::Expr>> {
+    let mut budget = GuardBudget::new();
+    extract_router_prefix_guard_rec(ctx, op_defs, expr, bound, depth, &mut budget)
+}
+
+fn extract_router_prefix_guard_rec(
+    ctx: &crate::eval::EvalCtx,
+    op_defs: &rustc_hash::FxHashMap<String, tla_core::ast::OperatorDef>,
+    expr: &tla_core::Spanned<tla_core::ast::Expr>,
+    bound: &mut Vec<String>,
+    depth: usize,
+    budget: &mut GuardBudget,
+) -> Option<tla_core::Spanned<tla_core::ast::Expr>> {
+    use tla_core::ast::{BoundPattern, Expr as E};
+
+    if depth > GUARD_EXTRACT_MAX_DEPTH || !budget.step() {
+        return None;
+    }
+    match &expr.node {
+        E::Label(label) => {
+            extract_router_prefix_guard_rec(ctx, op_defs, &label.body, bound, depth, budget)
+        }
+        // TLA+ conjunction evaluation is left-to-right. Only the first
+        // conjunct (recursing through a left-nested conjunction spine) may be
+        // tested without suppressing an earlier error.
+        E::And(left, _) => {
+            extract_router_prefix_guard_rec(ctx, op_defs, left, bound, depth, budget)
+        }
+        E::Let(defs, body) => {
+            let mark = bound.len();
+            for def in defs {
+                bound.push(def.name.node.clone());
+            }
+            let guard =
+                extract_router_prefix_guard_rec(ctx, op_defs, body, bound, depth + 1, budget);
+            bound.truncate(mark);
+            guard
+        }
+        E::Exists(bounds, body) => {
+            if bounds.iter().any(|bound_var| bound_var.domain.is_none()) {
+                return None;
+            }
+            // The synthesized guard is moved outside any enclosing LET or
+            // unfolded-operator scope. A retained domain that mentions one of
+            // those outer bound names could resolve a different global symbol
+            // during the precheck and no longer be implied by the action.
+            if bounds.iter().any(|bound_var| {
+                bound_var.domain.as_ref().is_some_and(|domain| {
+                    bound
+                        .iter()
+                        .any(|name| tla_core::expr_mentions_name_v(&domain.node, name.as_str()))
+                })
+            }) {
+                return None;
+            }
+            // The retained domains execute before the extracted body guard.
+            // They must themselves be deterministic current-state expressions;
+            // otherwise this standalone precheck could observe a stale/missing
+            // next state or replay an effect before canonical enumeration.
+            let mut domain_nodes = 0usize;
+            if !guard_bounds_are_pure(ctx, op_defs, bounds, &mut domain_nodes, depth + 1) {
+                return None;
+            }
+            let mark = bound.len();
+            for bound_var in bounds {
+                bound.push(bound_var.name.node.clone());
+                match &bound_var.pattern {
+                    None => {}
+                    Some(BoundPattern::Var(name)) => bound.push(name.node.clone()),
+                    Some(BoundPattern::Tuple(names)) => {
+                        bound.extend(names.iter().map(|name| name.node.clone()));
+                    }
+                }
+            }
+            let guard =
+                extract_router_prefix_guard_rec(ctx, op_defs, body, bound, depth + 1, budget);
+            bound.truncate(mark);
+            let guard = guard?;
+            Some(tla_core::Spanned::new(
+                E::Exists(bounds.clone(), Box::new(guard)),
+                expr.span,
+            ))
+        }
+        E::Ident(name, _) => {
+            if bound.iter().any(|bound_name| bound_name == name)
+                || ctx.has_local_binding(name)
+                || ctx.name_in_local_scope(name)
+                || ctx.is_config_constant(name)
+                || ctx.resolve_op_name(name.as_str()) != name
+                || ctx.instance_substitutions().is_some()
+                || ctx.call_by_name_subs().is_some()
+                || ctx.local_ops().is_some()
+            {
+                return None;
+            }
+            let resolved = ctx.resolve_op_name(name.as_str());
+            match op_defs.get(resolved) {
+                Some(def) if def.params.is_empty() => {
+                    if crate::eval::should_prefer_builtin_override(resolved, def, 0, ctx) {
+                        return None;
+                    }
+                    extract_router_prefix_guard_rec(
+                        ctx,
+                        op_defs,
+                        &def.body,
+                        bound,
+                        depth + 1,
+                        budget,
+                    )
+                }
+                _ => guard_candidate(ctx, op_defs, expr, bound, budget),
+            }
+        }
+        E::Apply(op_expr, args) => {
+            let E::Ident(op_name, _) = &op_expr.node else {
+                return guard_candidate(ctx, op_defs, expr, bound, budget);
+            };
+            if bound.iter().any(|bound_name| bound_name == op_name)
+                || ctx.has_local_binding(op_name)
+                || ctx.name_in_local_scope(op_name)
+                || ctx.is_config_constant(op_name)
+                || ctx.resolve_op_name(op_name.as_str()) != op_name
+                || ctx.instance_substitutions().is_some()
+                || ctx.call_by_name_subs().is_some()
+                || ctx.local_ops().is_some()
+            {
+                return None;
+            }
+            let resolved = ctx.resolve_op_name(op_name.as_str());
+            match op_defs.get(resolved) {
+                Some(def) if def.params.len() == args.len() => {
+                    if crate::eval::should_prefer_builtin_override(resolved, def, args.len(), ctx) {
+                        return None;
+                    }
+                    let mark = bound.len();
+                    bound.extend(def.params.iter().map(|param| param.name.node.clone()));
+                    let guard = extract_router_prefix_guard_rec(
+                        ctx,
+                        op_defs,
+                        &def.body,
+                        bound,
+                        depth + 1,
+                        budget,
+                    );
+                    bound.truncate(mark);
+                    guard
+                }
+                _ => guard_candidate(ctx, op_defs, expr, bound, budget),
+            }
+        }
+        // The first expression is itself the prefix only when it is a pure
+        // state predicate. Prime/action/temporal shapes fail closed here.
+        _ => guard_candidate(ctx, op_defs, expr, bound, budget),
+    }
+}
+
 fn extract_guard_rec(
     ctx: &crate::eval::EvalCtx,
     op_defs: &rustc_hash::FxHashMap<String, tla_core::ast::OperatorDef>,
@@ -1282,8 +1544,14 @@ fn extract_guard_rec(
                             for param in &def.params {
                                 bound.push(param.name.node.clone());
                             }
-                            let guard =
-                                extract_guard_rec(ctx, op_defs, &def.body, bound, depth + 1, budget);
+                            let guard = extract_guard_rec(
+                                ctx,
+                                op_defs,
+                                &def.body,
+                                bound,
+                                depth + 1,
+                                budget,
+                            );
                             bound.truncate(mark);
                             guard
                         }
@@ -1299,6 +1567,22 @@ fn extract_guard_rec(
         // the temporal operators are rejected by the purity whitelist.
         _ => guard_candidate(ctx, op_defs, expr, bound, budget),
     }
+}
+
+/// Return `true` only when evaluating an extracted state-only guard proves the
+/// action disabled in `parent`. Every other outcome, including evaluation
+/// errors and non-boolean values, is deliberately undecided so canonical
+/// action enumeration remains authoritative.
+fn guard_proves_disabled(
+    ctx: &mut crate::eval::EvalCtx,
+    guard: &tla_core::Spanned<tla_core::ast::Expr>,
+    parent: &ArrayState,
+) -> bool {
+    let verdict = {
+        let _state_guard = ctx.bind_state_env_guard(parent.env_ref());
+        crate::eval::eval(ctx, guard)
+    };
+    matches!(verdict, Ok(crate::Value::Bool(false)))
 }
 
 /// WP-34 diagnostics: one-line rendering of an accepted guard
@@ -1562,6 +1846,11 @@ pub(super) struct HybridDispatchState {
     /// the whole run so its node addresses stay stable for the evaluator's
     /// pointer-keyed caches.
     action_state_guards: Vec<Option<Option<Arc<tla_core::Spanned<tla_core::ast::Expr>>>>>,
+    /// Standalone-router variant of `action_state_guards`: only the first
+    /// evaluation-order-safe state predicate is retained, with any enclosing
+    /// quantifier domains preserved. This prevents a later false conjunct from
+    /// suppressing an earlier canonical evaluation error.
+    router_prefix_state_guards: Vec<Option<Option<Arc<tla_core::Spanned<tla_core::ast::Expr>>>>>,
     /// WP-29 lever 2: per-variable single-variable layouts over the hybrid
     /// layout's flat-admissible variables, used to decode ONE changed variable
     /// out of a native successor buffer without rebuilding the whole state.
@@ -1574,6 +1863,40 @@ pub(super) struct HybridDispatchState {
     /// WP-34 lever 1 diagnostics: whether the one-shot per-action guard dump
     /// (`TY_HYBRID_GUARD_DEBUG=1`) has already run.
     pub(super) guards_dumped: bool,
+    /// Whether the standalone-router arming pass has run. This is independent
+    /// of hybrid initialization because full-state consumers may consult route
+    /// selection before touching the hybrid dispatcher.
+    router_armed: bool,
+    /// Conservative AUTO lifecycle, or an explicit forced route.
+    router_phase: RouterPhase,
+    /// Stable detected-action decomposition retained after AUTO's delayed
+    /// static admission, or immediately for a forced route.
+    router_actions: Option<Arc<Vec<DetectedAction>>>,
+    /// Whether the router is the sole reason action boundaries matter. Other
+    /// engines use this fence to keep the router's blast radius on the
+    /// interpreter array/diff route even when setup had already retained a
+    /// dormant detected-action vector for bytecode.
+    router_sole_route_owner: bool,
+    /// Whether activation copied router actions into `coverage.actions`.
+    router_installed_actions: bool,
+    /// Expanded-parent delay and exact-trial guard-decision evidence.
+    router_pilot_parents: u64,
+    router_trial_checks: u64,
+    router_trial_skips: u64,
+    router_trial_checks_start: u64,
+    router_trial_skips_start: u64,
+    /// Exact-parity/timing trial evidence.
+    router_parity_checked: u32,
+    router_batch_ns: u128,
+    router_whole_next_ns: u128,
+    /// Routed parents after trial, used for sparse parity sampling.
+    router_active_parents: u64,
+    /// Whether the first parent presented to the admitted router passed the
+    /// recursive, read-only TLC token-closure check. Static action/source
+    /// admission then preserves that property inductively for successors.
+    router_parent_tokens_checked: bool,
+    /// Stable diagnostic reason for a conservative decline/failback.
+    router_decision_reason: Option<String>,
 }
 
 /// Native successor candidates for one (parent, hybrid-eligible action)
@@ -1706,6 +2029,505 @@ fn hybrid_shadow_flat_view_dispatch(
 }
 
 impl<'a> ModelChecker<'a> {
+    /// Whether an observer or specialized successor engine already owns
+    /// routing. AUTO never steals from one of these routes. This includes
+    /// implicit dead-action coverage: it already selects the same per-action
+    /// batch route, so router activation could add parity work but no speedup.
+    fn router_has_existing_route_owner(&self) -> bool {
+        let explicit_tir = self
+            .tir_parity
+            .as_ref()
+            .is_some_and(|parity| !parity.is_implicit_default_eval_mode());
+        self.coverage.collect
+            || self.coverage.display
+            || self.coverage.coverage_guided
+            || self.hybrid_dispatch.enabled
+            || (!self.hybrid_dispatch.initialized
+                && std::env::var_os("TY_HYBRID_FLAT_VIEW").is_some_and(|value| value == "1"))
+            || std::env::var_os("TY_HYBRID_INTERP_DIFF").is_some_and(|value| value == "0")
+            || self.por.independence.is_some()
+            || self.jit_hybrid_ready()
+            || self.jit_monolithic_ready()
+            || self.compiled.pc_dispatch.is_some()
+            || self.compiled.pc_var_idx.is_some()
+            || self.trust_cg_action_dispatch_ready()
+            || self.trust_cg_hybrid_action_dispatch_ready()
+            || self.value_action_vm.is_armed()
+            || self.value_action_vm.auto_selected()
+            || self.flat_state_primary
+            || self.uses_compiled_bfs_fingerprint_domain()
+            || self.nested_set_slide_arm.is_some()
+            || self.liveness_cache.cache_for_liveness
+            || self.inline_liveness_active()
+            || self.should_run_on_the_fly_liveness()
+            || !self.compiled.eval_implied_actions.is_empty()
+            || !self.config.constraints.is_empty()
+            || !self.config.action_constraints.is_empty()
+            || !self.config.trace_invariants.is_empty()
+            || self.config.terminal.is_some()
+            || self.config.postcondition.is_some()
+            || self.config.alias.is_some()
+            || self.compiled.cached_view_name.is_some()
+            || !self.symmetry.perms.is_empty()
+            || explicit_tir
+    }
+
+    fn decline_router(&mut self, phase: RouterPhase, reason: impl Into<String>) {
+        if self.hybrid_dispatch.router_installed_actions {
+            if self.router_has_existing_route_owner() {
+                // A later route owner (for example lazy native compilation)
+                // needs the same stable action Arc. Transfer ownership rather
+                // than clearing it underneath that engine.
+            } else {
+                let old = std::mem::replace(&mut self.coverage.actions, Arc::new(Vec::new()));
+                self.coverage.retired_actions.push(old);
+            }
+            self.hybrid_dispatch.router_installed_actions = false;
+        }
+        self.hybrid_dispatch.router_phase = phase;
+        self.hybrid_dispatch.router_decision_reason = Some(reason.into());
+    }
+
+    fn resolve_router_actions(&self) -> Result<(Arc<Vec<DetectedAction>>, bool), &'static str> {
+        if !self.coverage.actions.is_empty() {
+            return Ok((Arc::clone(&self.coverage.actions), true));
+        }
+        let next_name = self
+            .trace
+            .cached_resolved_next_name
+            .clone()
+            .or_else(|| self.trace.cached_next_name.clone());
+        let Some(next_def) = next_name.and_then(|name| self.module.op_defs.get(&name)) else {
+            return Err("Next could not be resolved");
+        };
+        let actions = detect_actions(next_def);
+        if actions.is_empty() {
+            return Err("Next has no detected actions");
+        }
+        Ok((Arc::new(actions), false))
+    }
+
+    fn router_expr_replay_safe(
+        &self,
+        kind: &str,
+        name: &str,
+        expr: &tla_core::Spanned<tla_core::ast::Expr>,
+    ) -> bool {
+        let (raw_slots, expanded_slots, raw_context, expanded_context) =
+            crate::checker_ops::action_expr_replay_safety_components(&self.ctx, expr);
+        let safe = raw_slots && expanded_slots && raw_context && expanded_context;
+        if !safe
+            && std::env::var("TY_ROUTER_DIAG")
+                .is_ok_and(|value| tla_backend::env_flag_enabled(&value))
+        {
+            let (raw_reason, expanded_reason) =
+                crate::checker_ops::action_expr_replay_context_rejections(&self.ctx, expr);
+            eprintln!(
+                "[router] replay admission rejected kind={kind} name={name} raw_slots={} \
+                 expanded_slots={} raw_context={} expanded_context={} \
+                 raw_reason={:?} expanded_reason={:?}",
+                raw_slots,
+                expanded_slots,
+                raw_context,
+                expanded_context,
+                raw_reason,
+                expanded_reason,
+            );
+        }
+        safe
+    }
+
+    fn router_actions_replay_safe(&self, actions: &[DetectedAction]) -> bool {
+        actions
+            .iter()
+            .all(|action| self.router_expr_replay_safe("action", &action.name, &action.expr))
+    }
+
+    /// Prove that state sources and every BFS state observer remain free of
+    /// evaluation-order-visible effects. Per-action routing preserves the
+    /// successor multiset, but it can change which successor is observed
+    /// first; an invariant that assigns a first-seen TLC token (or reads live
+    /// checker context) could otherwise change later CHOOSE/set ordering.
+    fn router_observers_replay_safe(&self) -> bool {
+        // Initial states have already been generated when routing begins. Walk
+        // their source anyway: it certifies that record fields or other values
+        // reachable through a state variable cannot hide an unassigned TLC
+        // ordering token from the action/invariant expression walks below.
+        if let Some(init_name) = self
+            .trace
+            .cached_init_name
+            .as_deref()
+            .or(self.config.init.as_deref())
+        {
+            let resolved = self.ctx.resolve_op_name(init_name);
+            let Some(def) = self.ctx.get_op(resolved) else {
+                return false;
+            };
+            if !def.params.is_empty()
+                || !self.router_expr_replay_safe("initial-state source", resolved, &def.body)
+            {
+                return false;
+            }
+        }
+
+        // Name-based invariants execute through eval_op(raw_name), which does
+        // not resolve the root through config operator replacement. Inspect
+        // that exact body; the shared walker resolves calls inside it.
+        for name in &self.config.invariants {
+            let Some(def) = self.ctx.get_op(name) else {
+                return false;
+            };
+            if !def.params.is_empty() || !self.router_expr_replay_safe("invariant", name, &def.body)
+            {
+                return false;
+            }
+        }
+        for (name, expr) in &self.compiled.eval_state_invariants {
+            if !self.router_expr_replay_safe("property state invariant", name, expr) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Arm the standalone interpreter action router once per run.
+    ///
+    /// Forced mode publishes the detected-action decomposition immediately.
+    /// AUTO delays even detection/guard extraction until a run has expanded
+    /// enough parents to amortize that one-time work, so short runs retain the
+    /// canonical engine's allocation and startup profile.
+    pub(in crate::check) fn ensure_router_ready(&mut self) {
+        if self.hybrid_dispatch.router_armed {
+            return;
+        }
+        self.hybrid_dispatch.router_armed = true;
+        let request = router_request();
+        if matches!(request, RouterRequest::Disabled) {
+            return;
+        }
+
+        if matches!(request, RouterRequest::Forced) {
+            if self.router_has_existing_route_owner() {
+                self.decline_router(
+                    RouterPhase::Declined,
+                    "forced routing cannot co-own coverage/POR/native/flat/VM/liveness/constraint dispatch",
+                );
+                return;
+            }
+            let (actions, had_actions) = match self.resolve_router_actions() {
+                Ok(resolved) => resolved,
+                Err(reason) => {
+                    self.decline_router(RouterPhase::Declined, reason);
+                    return;
+                }
+            };
+            if !self.router_actions_replay_safe(&actions) {
+                self.decline_router(
+                    RouterPhase::Declined,
+                    "an action body is context-dependent, side-effecting, or not replay-safe",
+                );
+                return;
+            }
+            if !self.router_observers_replay_safe() {
+                self.decline_router(
+                    RouterPhase::Declined,
+                    "an initial-state source or state observer is context-dependent, side-effecting, or not replay-safe",
+                );
+                return;
+            }
+            if !had_actions {
+                self.coverage.actions = Arc::clone(&actions);
+                self.hybrid_dispatch.router_installed_actions = true;
+            }
+            self.hybrid_dispatch.router_actions = Some(actions);
+            self.hybrid_dispatch.router_sole_route_owner = true;
+            self.hybrid_dispatch.router_phase = RouterPhase::Forced;
+            self.hybrid_dispatch.router_decision_reason = Some("forced by TY_ROUTER=1".into());
+            return;
+        }
+
+        if self.router_has_existing_route_owner() {
+            self.decline_router(
+                RouterPhase::Declined,
+                "another coverage/POR/native/flat/VM/liveness route already owns dispatch",
+            );
+            return;
+        }
+        if !action_guard_precheck_enabled() || !router_guard_precheck_enabled() {
+            self.decline_router(
+                RouterPhase::Declined,
+                "an action-guard precheck kill switch disables the only expected benefit",
+            );
+            return;
+        }
+        self.hybrid_dispatch.router_sole_route_owner = true;
+        self.hybrid_dispatch.router_phase = RouterPhase::Pilot;
+        self.hybrid_dispatch.router_decision_reason =
+            Some("16,384-parent allocation-free delay pending".into());
+    }
+
+    /// Whether the standalone router is selecting the interpreter batch path.
+    #[inline]
+    pub(in crate::check) fn router_active(&self) -> bool {
+        matches!(
+            self.hybrid_dispatch.router_phase,
+            RouterPhase::Trial | RouterPhase::Active | RouterPhase::Forced
+        )
+    }
+
+    /// Whether the standalone router is the sole action-boundary route owner.
+    ///
+    /// Flat/native engines use this fence so the standalone router changes only
+    /// the interpreter array/diff route that its parity guard validates.
+    #[inline]
+    pub(in crate::check) fn router_only_detected_actions(&self) -> bool {
+        self.router_active() && self.hybrid_dispatch.router_sole_route_owner
+    }
+
+    /// Check the actual frontier root once before the router evaluates it.
+    ///
+    /// Walking Init is the static source proof, but resumed/checkpointed and
+    /// specialized bulk-init paths can hand the BFS a concrete payload through
+    /// a different representation. This closes that boundary without mutating
+    /// either token registry. Once it passes, the admitted action and observer
+    /// expressions cannot manufacture an unassigned token, so every successor
+    /// preserves the certificate and no per-parent rescan is needed.
+    pub(in crate::check) fn router_parent_tokens_replay_safe(
+        &mut self,
+        state: &crate::state::State,
+    ) -> bool {
+        if !self.router_active() || self.hybrid_dispatch.router_parent_tokens_checked {
+            return true;
+        }
+        if let Some((name, _)) = state.vars().find(|(_, value)| {
+            !value.is_concrete_data() || !value.has_preassigned_tlc_order_tokens()
+        }) {
+            self.decline_router(
+                RouterPhase::Failback,
+                format!(
+                    "frontier variable `{name}` contains executable data or an unassigned TLC ordering token"
+                ),
+            );
+            return false;
+        }
+        self.hybrid_dispatch.router_parent_tokens_checked = true;
+        true
+    }
+
+    /// Count one expanded parent toward AUTO's delayed trial.
+    ///
+    /// No action is detected, retained, evaluated, or enumerated during this
+    /// wait. Runs ending below the threshold therefore stay on their existing
+    /// successor engine with only a parent counter and phase check. Static
+    /// admission, guard rate, parity, and timings are all deferred until the
+    /// run is large enough to plausibly repay them.
+    pub(in crate::check) fn maybe_advance_router_pilot(&mut self) {
+        self.ensure_router_ready();
+        if matches!(
+            self.hybrid_dispatch.router_phase,
+            RouterPhase::Trial | RouterPhase::Active
+        ) && self.router_has_existing_route_owner()
+        {
+            self.decline_router(
+                RouterPhase::Declined,
+                "a higher-priority route became active after router admission",
+            );
+            return;
+        }
+        if !matches!(self.hybrid_dispatch.router_phase, RouterPhase::Pilot) {
+            return;
+        }
+        if self.hybrid_dispatch.router_pilot_parents < ROUTER_PILOT_PARENTS {
+            self.hybrid_dispatch.router_pilot_parents += 1;
+            return;
+        }
+
+        // A lazy native/VM route can appear during the delay. There is no need
+        // to poll the full ownership predicate on every warm-up parent because
+        // the router has not changed dispatch yet; re-check once immediately
+        // before publishing its private action decomposition.
+        if self.router_has_existing_route_owner() {
+            self.decline_router(
+                RouterPhase::Declined,
+                "an existing route became active during the delayed pilot",
+            );
+            return;
+        }
+        if !router_guard_precheck_enabled() {
+            self.decline_router(
+                RouterPhase::Declined,
+                "the router guard-precheck kill switch disables the only expected benefit",
+            );
+            return;
+        }
+        let (actions, _) = match self.resolve_router_actions() {
+            Ok(resolved) => resolved,
+            Err(reason) => {
+                self.decline_router(RouterPhase::Declined, reason);
+                return;
+            }
+        };
+        if actions.len() < 2 {
+            self.decline_router(RouterPhase::Declined, "fewer than two detected actions");
+            return;
+        }
+        for (idx, action) in actions.iter().enumerate() {
+            if self.router_prefix_state_guard(idx, action).is_none() {
+                self.decline_router(
+                    RouterPhase::Declined,
+                    "not every action has an evaluation-order-safe state-only prefix guard",
+                );
+                return;
+            }
+        }
+        if !self.router_actions_replay_safe(&actions) {
+            self.decline_router(
+                RouterPhase::Declined,
+                "an action body is context-dependent, side-effecting, or not replay-safe",
+            );
+            return;
+        }
+        if !self.router_observers_replay_safe() {
+            self.decline_router(
+                RouterPhase::Declined,
+                "an initial-state source or state observer is context-dependent, side-effecting, or not replay-safe",
+            );
+            return;
+        }
+
+        if self.coverage.actions.is_empty() {
+            self.coverage.actions = Arc::clone(&actions);
+            self.hybrid_dispatch.router_installed_actions = true;
+        }
+        self.hybrid_dispatch.router_sole_route_owner = true;
+        self.hybrid_dispatch.router_actions = Some(actions);
+        self.hybrid_dispatch.router_trial_checks_start =
+            self.hybrid_dispatch.perf.guard_precheck_calls;
+        self.hybrid_dispatch.router_trial_skips_start =
+            self.hybrid_dispatch.perf.guard_precheck_skips;
+        self.hybrid_dispatch.router_phase = RouterPhase::Trial;
+        self.hybrid_dispatch.router_decision_reason =
+            Some("64-parent exact parity and timing trial pending".into());
+    }
+
+    /// Whether this routed parent must also run canonical whole-`Next`.
+    pub(in crate::check) fn router_parity_check_due(&mut self) -> bool {
+        if !self.router_active() {
+            return false;
+        }
+        self.hybrid_dispatch.router_active_parents += 1;
+        match self.hybrid_dispatch.router_phase {
+            RouterPhase::Trial => true,
+            RouterPhase::Forced
+                if self.hybrid_dispatch.router_parity_checked < ROUTER_TRIAL_PARENTS =>
+            {
+                true
+            }
+            RouterPhase::Active | RouterPhase::Forced => {
+                self.hybrid_dispatch.router_active_parents % ROUTER_PARITY_SAMPLE_STRIDE == 0
+            }
+            _ => false,
+        }
+    }
+
+    /// Bound the batch route's live per-parent successor set. Streaming remains
+    /// preferable for unusually high-fanout parents even when guard sparsity is
+    /// high, and this cap prevents AUTO from turning that into an unbounded
+    /// memory-policy change.
+    pub(in crate::check) fn router_fanout_admitted(&self, successors: usize) -> bool {
+        successors <= ROUTER_MAX_SUCCESSORS_PER_PARENT
+    }
+
+    /// Whether AUTO currently owns a batch whose fanout is memory-gated.
+    /// Compatible coverage co-ownership does not remove the trial's duplicate
+    /// whole-Next materialization, so it must obey the same cap.
+    #[inline]
+    pub(in crate::check) fn router_auto_memory_cap_active(&self) -> bool {
+        matches!(
+            self.hybrid_dispatch.router_phase,
+            RouterPhase::Trial | RouterPhase::Active
+        )
+    }
+
+    /// Effective raw-successor materialization budget for the split router.
+    ///
+    /// The configured cap is a whole-parent contract, not a per-action cap.
+    /// AUTO also promises a tighter 4,096-successor working-set bound. The
+    /// per-action enumerator consumes this budget cumulatively so it cannot
+    /// transiently materialize `actions × cap` before the post-sum failback.
+    pub(in crate::check) fn router_raw_successor_cap(&self) -> Option<usize> {
+        if !self.router_active() {
+            return None;
+        }
+        let configured = self.ctx.shared().per_state_successor_cap;
+        if self.router_auto_memory_cap_active() {
+            Some(
+                configured
+                    .unwrap_or(ROUTER_MAX_SUCCESSORS_PER_PARENT)
+                    .min(ROUTER_MAX_SUCCESSORS_PER_PARENT),
+            )
+        } else {
+            configured
+        }
+    }
+
+    /// Record a successful exact parity sample and complete AUTO's timing gate.
+    pub(in crate::check) fn note_router_parity_match(
+        &mut self,
+        batch_ns: u128,
+        whole_next_ns: u128,
+    ) {
+        self.hybrid_dispatch.router_parity_checked += 1;
+        if !matches!(self.hybrid_dispatch.router_phase, RouterPhase::Trial) {
+            return;
+        }
+        self.hybrid_dispatch.router_trial_checks = self
+            .hybrid_dispatch
+            .perf
+            .guard_precheck_calls
+            .saturating_sub(self.hybrid_dispatch.router_trial_checks_start);
+        self.hybrid_dispatch.router_trial_skips = self
+            .hybrid_dispatch
+            .perf
+            .guard_precheck_skips
+            .saturating_sub(self.hybrid_dispatch.router_trial_skips_start);
+        self.hybrid_dispatch.router_batch_ns += batch_ns;
+        self.hybrid_dispatch.router_whole_next_ns += whole_next_ns;
+        if self.hybrid_dispatch.router_parity_checked < ROUTER_TRIAL_PARENTS {
+            return;
+        }
+        if !router_skip_rate_admitted(
+            self.hybrid_dispatch.router_trial_skips,
+            self.hybrid_dispatch.router_trial_checks,
+        ) {
+            self.decline_router(
+                RouterPhase::Declined,
+                "exact trial skipped fewer than 80% of action instances",
+            );
+            return;
+        }
+        if router_timing_admitted(
+            self.hybrid_dispatch.router_batch_ns,
+            self.hybrid_dispatch.router_whole_next_ns,
+        ) {
+            self.hybrid_dispatch.router_phase = RouterPhase::Active;
+            self.hybrid_dispatch.router_decision_reason =
+                Some("exact trial passed with at least 40% local generation speedup".into());
+        } else {
+            self.decline_router(
+                RouterPhase::Declined,
+                "exact trial did not show a 40% local generation speedup over whole-Next",
+            );
+        }
+    }
+
+    /// Permanently fail the standalone router back to canonical whole-`Next`.
+    pub(in crate::check) fn failback_router(&mut self, reason: &str) {
+        if self.router_active() {
+            self.decline_router(RouterPhase::Failback, reason);
+        }
+    }
+
     /// Lazily classify actions and build the hybrid flat view (once per run).
     ///
     /// Self-contained so it can run from ANY successor-generation entry point
@@ -1716,6 +2538,7 @@ impl<'a> ModelChecker<'a> {
     /// loop's `action_idx`), otherwise re-detected from `Next` (the diff path
     /// clears `coverage.actions`, but detection is deterministic and order-stable).
     pub(in crate::check) fn ensure_hybrid_dispatch_ready(&mut self) {
+        self.ensure_router_ready();
         if self.hybrid_dispatch.initialized {
             return;
         }
@@ -2074,10 +2897,9 @@ impl<'a> ModelChecker<'a> {
         // return a typed status rather than dereferencing anything.
         let t_exec = self.hybrid_dispatch.perf.start();
         let (buffers, callout_status) = {
-            let _ctx =
-                tla_trust_cg::runtime_abi::compound_read::publish_compound_read_context(
-                    parent.values(),
-                );
+            let _ctx = tla_trust_cg::runtime_abi::compound_read::publish_compound_read_context(
+                parent.values(),
+            );
             let buffers = self.try_trust_cg_hybrid_action_by_keys(&keys, parent_view.buffer());
             // Read the sticky status INSIDE the publication scope: it is reset
             // on publish, so it describes exactly this action's callouts.
@@ -2092,8 +2914,8 @@ impl<'a> ModelChecker<'a> {
             self.hybrid_dispatch.stats.native_errors += 1;
             return None;
         }
-        let mut buffers = match buffers {
-            Some(Ok(buffers)) => buffers,
+        let (mut buffer_slots, buffer_count) = match buffers {
+            Some(Ok(output)) => output,
             Some(Err(())) => {
                 // WP-21: a typed TypeMismatch is the fail-closed shape-guard
                 // class (canonically: a LET def reading a union arm on a
@@ -2135,7 +2957,7 @@ impl<'a> ModelChecker<'a> {
             && !self.hybrid_dispatch.corruption_injected
             && hybrid_inject_sampled_corruption_enabled()
         {
-            if let Some(slot0) = buffers.first_mut().and_then(|b| b.first_mut()) {
+            if let Some(slot0) = buffer_slots.first_mut() {
                 *slot0 ^= 0x5a5a;
                 self.hybrid_dispatch.corruption_injected = true;
                 eprintln!(
@@ -2145,10 +2967,17 @@ impl<'a> ModelChecker<'a> {
             }
         }
 
-        let mut views = Vec::with_capacity(buffers.len());
-        for buffer in buffers {
-            match FlatState::try_from_buffer(buffer.into_boxed_slice(), Arc::clone(&hybrid_layout))
-            {
+        let state_len = parent_view.num_slots();
+        let expected_slots = buffer_count.checked_mul(state_len)?;
+        if buffer_slots.len() != expected_slots {
+            self.hybrid_dispatch.stats.native_errors += 1;
+            return None;
+        }
+        let mut slots = buffer_slots.into_iter();
+        let mut views = Vec::with_capacity(buffer_count);
+        for _ in 0..buffer_count {
+            let buffer: Box<[i64]> = slots.by_ref().take(state_len).collect();
+            match FlatState::try_from_buffer(buffer, Arc::clone(&hybrid_layout)) {
                 Ok(view) => views.push(view),
                 Err(_) => {
                     // Width drift in a native output buffer: decline the whole
@@ -2363,14 +3192,8 @@ impl<'a> ModelChecker<'a> {
         }
         let extracted = {
             let mut bound: Vec<String> = Vec::new();
-            extract_action_state_guard(
-                &self.ctx,
-                &self.module.op_defs,
-                &action.expr,
-                &mut bound,
-                0,
-            )
-            .map(Arc::new)
+            extract_action_state_guard(&self.ctx, &self.module.op_defs, &action.expr, &mut bound, 0)
+                .map(Arc::new)
         };
         if hybrid_guard_debug_enabled() {
             match extracted.as_ref() {
@@ -2392,6 +3215,41 @@ impl<'a> ModelChecker<'a> {
                 .resize(action_idx + 1, None);
         }
         self.hybrid_dispatch.action_state_guards[action_idx] = Some(extracted.clone());
+        extracted
+    }
+
+    /// Evaluation-order-safe guard used by every interpreter-skipping
+    /// precheck, including the standalone router.
+    fn router_prefix_state_guard(
+        &mut self,
+        action_idx: usize,
+        action: &DetectedAction,
+    ) -> Option<Arc<tla_core::Spanned<tla_core::ast::Expr>>> {
+        if let Some(resolved) = self
+            .hybrid_dispatch
+            .router_prefix_state_guards
+            .get(action_idx)
+            .and_then(|slot| slot.as_ref())
+        {
+            return resolved.clone();
+        }
+        let extracted = {
+            let mut bound = Vec::new();
+            extract_router_prefix_state_guard(
+                &self.ctx,
+                &self.module.op_defs,
+                &action.expr,
+                &mut bound,
+                0,
+            )
+            .map(Arc::new)
+        };
+        if self.hybrid_dispatch.router_prefix_state_guards.len() <= action_idx {
+            self.hybrid_dispatch
+                .router_prefix_state_guards
+                .resize(action_idx + 1, None);
+        }
+        self.hybrid_dispatch.router_prefix_state_guards[action_idx] = Some(extracted.clone());
         extracted
     }
 
@@ -2426,15 +3284,15 @@ impl<'a> ModelChecker<'a> {
         parent: &ArrayState,
     ) -> bool {
         let t0 = self.hybrid_dispatch.perf.start();
-        let Some(guard) = self.action_state_guard(action_idx, action) else {
+        // Always use the leftmost prefix. A broad later conjunct can prove the
+        // successor relation empty, but using it here could suppress an error
+        // from an earlier canonical conjunct.
+        let guard = self.router_prefix_state_guard(action_idx, action);
+        let Some(guard) = guard else {
             perf_acc(&mut self.hybrid_dispatch.perf.guard_precheck_ns, t0);
             return false;
         };
-        let verdict = {
-            let _state_guard = self.ctx.bind_state_env_guard(parent.env_ref());
-            crate::eval::eval(&self.ctx, guard.as_ref())
-        };
-        let disabled = matches!(verdict, Ok(crate::Value::Bool(false)));
+        let disabled = guard_proves_disabled(&mut self.ctx, guard.as_ref(), parent);
         let perf = &mut self.hybrid_dispatch.perf;
         perf.guard_precheck_calls += 1;
         if disabled {
@@ -2508,8 +3366,7 @@ impl<'a> ModelChecker<'a> {
                 let raw = v;
                 let v = usize::from(v);
                 (ast.reads.contains(&v) || ast.writes.contains(&v))
-                    && (view.is_var_flat_admissible(v)
-                        || declared_compound_reads.contains(&raw))
+                    && (view.is_var_flat_admissible(v) || declared_compound_reads.contains(&raw))
             }) && writes.iter().all(|&v| {
                 let v = usize::from(v);
                 // Writes stay strictly flat in M1 — the compound-read callout
@@ -2807,6 +3664,7 @@ impl<'a> ModelChecker<'a> {
     /// End-of-run routing summary (stderr), only when the switch is on. G3
     /// evidence: `mismatch_fallback` MUST be 0.
     pub(in crate::check) fn report_hybrid_dispatch_summary(&self) {
+        self.report_router_summary();
         if !self.hybrid_dispatch.enabled {
             // WP-26: the bucket split is still printed on the plain arm, so the
             // streaming engine and the per-action batch engine are directly
@@ -2842,6 +3700,57 @@ impl<'a> ModelChecker<'a> {
             m.failback(),
         );
         self.report_hybrid_perf_buckets();
+    }
+
+    /// End-of-run standalone-router summary. Default AUTO stays silent; the
+    /// explicit force-on mode and `TY_ROUTER_DIAG=1` request diagnostics.
+    fn report_router_summary(&self) {
+        let diagnostic = std::env::var("TY_ROUTER_DIAG")
+            .is_ok_and(|value| tla_backend::env_flag_enabled(&value));
+        if !diagnostic && !matches!(router_request(), RouterRequest::Forced) {
+            return;
+        }
+        let perf = &self.hybrid_dispatch.perf;
+        let trial_skip_rate = if self.hybrid_dispatch.router_trial_checks == 0 {
+            0.0
+        } else {
+            100.0 * self.hybrid_dispatch.router_trial_skips as f64
+                / self.hybrid_dispatch.router_trial_checks as f64
+        };
+        let measured_speedup = if self.hybrid_dispatch.router_whole_next_ns == 0 {
+            0.0
+        } else {
+            100.0
+                * (1.0
+                    - self.hybrid_dispatch.router_batch_ns as f64
+                        / self.hybrid_dispatch.router_whole_next_ns as f64)
+        };
+        eprintln!(
+            "[router] summary: phase={:?} active={} sole_owner={} installed_actions={} \
+             actions={} pilot_parents={} trial_checks={} trial_skips={} \
+             trial_skip_rate={trial_skip_rate:.1}% parity_checks={} \
+             local_generation_speedup={measured_speedup:.1}% batch_parents={} guard_calls={} \
+             guard_skips={} reason={}",
+            self.hybrid_dispatch.router_phase,
+            self.router_active(),
+            self.hybrid_dispatch.router_sole_route_owner,
+            self.hybrid_dispatch.router_installed_actions,
+            self.hybrid_dispatch
+                .router_actions
+                .as_ref()
+                .map_or(0, |actions| actions.len()),
+            self.hybrid_dispatch.router_pilot_parents,
+            self.hybrid_dispatch.router_trial_checks,
+            self.hybrid_dispatch.router_trial_skips,
+            self.hybrid_dispatch.router_parity_checked,
+            perf.batch_parents,
+            perf.guard_precheck_calls,
+            perf.guard_precheck_skips,
+            self.hybrid_dispatch
+                .router_decision_reason
+                .as_deref()
+                .unwrap_or("none"),
+        );
     }
 
     /// WP-17/WP-26: coarse per-bucket wall split (`TY_HYBRID_PERF_DEBUG=1`).
@@ -2997,6 +3906,308 @@ impl<'a> ModelChecker<'a> {
 /// on any non-match, the flip happens exactly at N, sampling is a
 /// deterministic pure function of the hash, and the fail-back is permanent
 /// and global. The machine is pure bookkeeping, so these pin the contract
+#[cfg(test)]
+mod router_policy_tests {
+    use super::{
+        router_request_from, router_skip_rate_admitted, router_timing_admitted, RouterRequest,
+    };
+    use std::ffi::OsStr;
+
+    fn request(raw: Option<&str>, auto: bool) -> RouterRequest {
+        router_request_from(raw.map(OsStr::new), auto)
+    }
+
+    #[test]
+    fn router_request_truth_table() {
+        assert_eq!(request(None, false), RouterRequest::Disabled);
+        assert_eq!(request(None, true), RouterRequest::Auto);
+        assert_eq!(request(Some("1"), false), RouterRequest::Forced);
+        assert_eq!(request(Some(" 1 "), true), RouterRequest::Forced);
+        for raw in ["0", "false", "true", "yes", ""] {
+            assert_eq!(request(Some(raw), true), RouterRequest::Disabled, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn router_skip_rate_boundary_is_exact() {
+        assert!(!router_skip_rate_admitted(0, 0));
+        assert!(!router_skip_rate_admitted(79, 100));
+        assert!(router_skip_rate_admitted(80, 100));
+        assert!(router_skip_rate_admitted(4, 5));
+    }
+
+    #[test]
+    fn router_timing_boundary_is_exact() {
+        assert!(!router_timing_admitted(0, 0));
+        assert!(router_timing_admitted(60, 100));
+        assert!(!router_timing_admitted(61, 100));
+        assert!(!router_timing_admitted(100, 100));
+        assert!(!router_timing_admitted(u128::MAX, u128::MAX));
+    }
+}
+
+/// Soundness boundaries for the enabling-guard extractor. An extractor false
+/// positive can silently drop successors, so action/scope constructs must
+/// fail closed while ordinary state predicates remain useful.
+#[cfg(test)]
+mod guard_extract_tests {
+    use super::{
+        extract_action_state_guard, extract_router_prefix_state_guard, guard_proves_disabled,
+    };
+    use crate::eval::EvalCtx;
+    use crate::state::ArrayState;
+    use crate::Value;
+    use rustc_hash::FxHashMap;
+    use std::sync::Arc;
+
+    const SHAPES: &str = r#"
+---- MODULE guardshapes ----
+EXTENDS Naturals, Sequences
+VARIABLES x, y
+
+Bumped(a) == a + 1
+
+D == {}
+S == {}
+
+SetToSeq(s) == /\ x = 99
+               /\ x' = x + 1
+               /\ y' = y
+
+Primed == /\ x' = x + 1
+          /\ y' = y
+
+EnabledLead == /\ ENABLED (x' = 1)
+               /\ x' = x + 1
+               /\ y' = y
+
+ChooseLead == /\ x = (CHOOSE v \in 0..3 : v > 1)
+              /\ x' = x + 1
+              /\ y' = y
+
+OpaqueCall == /\ Oracle(x) > 2
+              /\ x' = x + 1
+              /\ y' = y
+
+StringSubSeqGuard == /\ SubSeq("router_guard_fresh_string", 2, 8) = "outer_g"
+                     /\ x' = x + 1
+                     /\ y' = y
+
+UnboundedQuant == /\ \E v : v = x
+                  /\ x' = x + 1
+                  /\ y' = y
+
+LetBound == LET k == x + 1 IN
+              /\ k > 3
+              /\ x' = k
+              /\ y' = y
+
+NonConjunct == x' = x + 1
+
+LiteralTrue == /\ TRUE
+               /\ x' = x + 1
+               /\ y' = y
+
+TrueGuard == /\ x >= 0
+             /\ x' = x + 1
+             /\ y' = y
+
+FalseGuard == /\ x = 99
+              /\ x' = x + 1
+              /\ y' = y
+
+DefinedCall == /\ Bumped(x) > 2
+               /\ x' = x + 1
+               /\ y' = y
+
+LateFalseAfterOpaque == /\ x > 0
+                        /\ Oracle(x) > 2
+                        /\ x = 99
+                        /\ x' = x + 1
+                        /\ y' = y
+
+QuantifiedPrefix == \E k \in 1..2:
+                       /\ x = 99
+                       /\ x' = k
+                       /\ y' = y
+
+PrimedDomain == \E k \in {x'}:
+                    /\ x = 99
+                    /\ x' = k
+                    /\ y' = y
+
+LetScopedDomain == LET D == {1} IN
+                      \E k \in D:
+                         /\ x = 99
+                         /\ x' = k
+                         /\ y' = y
+
+FormalScopedDomain(S) == \E k \in S:
+                           /\ x = 99
+                           /\ x' = k
+                           /\ y' = y
+
+FormalScopedDomainCall == FormalScopedDomain({1})
+
+BuiltinOverridePrefix == SetToSeq({1})
+
+Init == x = 1 /\ y = 0
+Next == Primed \/ EnabledLead \/ ChooseLead \/ OpaqueCall \/ UnboundedQuant
+          \/ LetBound \/ NonConjunct \/ LiteralTrue \/ TrueGuard \/ FalseGuard
+          \/ DefinedCall
+====
+"#;
+
+    type OpDefs = FxHashMap<String, tla_core::ast::OperatorDef>;
+
+    fn setup() -> (EvalCtx, OpDefs) {
+        let tree = tla_core::parse_to_syntax_tree(SHAPES);
+        let lowered = tla_core::lower(tla_core::FileId(0), &tree);
+        assert!(
+            lowered.errors.is_empty(),
+            "lowering errors: {:?}",
+            lowered.errors
+        );
+        let module = lowered.module.expect("module lowering produced None");
+        let mut ctx = EvalCtx::new();
+        ctx.load_module(&module);
+        let mut op_defs = OpDefs::default();
+        for unit in &module.units {
+            match &unit.node {
+                tla_core::ast::Unit::Variable(names) => {
+                    for name in names {
+                        ctx.register_var(Arc::from(name.node.as_str()));
+                    }
+                }
+                tla_core::ast::Unit::Operator(def) => {
+                    op_defs.insert(def.name.node.clone(), def.clone());
+                }
+                _ => {}
+            }
+        }
+        (ctx, op_defs)
+    }
+
+    fn guard_for(name: &str) -> Option<tla_core::Spanned<tla_core::ast::Expr>> {
+        let (ctx, op_defs) = setup();
+        let def = op_defs
+            .get(name)
+            .unwrap_or_else(|| panic!("no operator {name}"));
+        let mut bound = Vec::new();
+        extract_action_state_guard(&ctx, &op_defs, &def.body, &mut bound, 0)
+    }
+
+    fn parent() -> ArrayState {
+        ArrayState::from_values(vec![Value::int(1), Value::int(0)])
+    }
+
+    fn precheck_says_disabled(name: &str) -> bool {
+        let (mut ctx, op_defs) = setup();
+        let def = op_defs
+            .get(name)
+            .unwrap_or_else(|| panic!("no operator {name}"));
+        let mut bound = Vec::new();
+        let Some(guard) = extract_action_state_guard(&ctx, &op_defs, &def.body, &mut bound, 0)
+        else {
+            return false;
+        };
+        guard_proves_disabled(&mut ctx, &guard, &parent())
+    }
+
+    fn router_precheck_says_disabled(name: &str) -> bool {
+        let (mut ctx, op_defs) = setup();
+        let def = op_defs
+            .get(name)
+            .unwrap_or_else(|| panic!("no operator {name}"));
+        let mut bound = Vec::new();
+        let Some(guard) =
+            extract_router_prefix_state_guard(&ctx, &op_defs, &def.body, &mut bound, 0)
+        else {
+            return false;
+        };
+        guard_proves_disabled(&mut ctx, &guard, &parent())
+    }
+
+    fn router_guard_for(name: &str) -> Option<tla_core::Spanned<tla_core::ast::Expr>> {
+        let (ctx, op_defs) = setup();
+        let def = op_defs
+            .get(name)
+            .unwrap_or_else(|| panic!("no operator {name}"));
+        let mut bound = Vec::new();
+        extract_router_prefix_state_guard(&ctx, &op_defs, &def.body, &mut bound, 0)
+    }
+
+    #[test]
+    fn action_or_scope_shapes_never_skip() {
+        for name in [
+            "Primed",
+            "EnabledLead",
+            "ChooseLead",
+            "OpaqueCall",
+            "StringSubSeqGuard",
+            "UnboundedQuant",
+            "LetBound",
+            "NonConjunct",
+            "LiteralTrue",
+        ] {
+            assert!(
+                guard_for(name).is_none(),
+                "{name} unexpectedly yielded a guard"
+            );
+            assert!(
+                !precheck_says_disabled(name),
+                "{name} was unsafely declared disabled"
+            );
+        }
+    }
+
+    #[test]
+    fn accepted_guards_skip_only_on_definite_false() {
+        for (name, expected_disabled) in [
+            ("DefinedCall", true),
+            ("TrueGuard", false),
+            ("FalseGuard", true),
+        ] {
+            assert!(guard_for(name).is_some(), "{name} should yield a guard");
+            assert_eq!(precheck_says_disabled(name), expected_disabled, "{name}");
+        }
+    }
+
+    #[test]
+    fn router_prefix_does_not_skip_past_an_earlier_expression() {
+        // The broad guard can ignore the opaque middle conjunct and combine
+        // the later `x = 99`. The router must retain only the leading `x > 0`,
+        // which is true in `parent`, so canonical enumeration still reaches
+        // (and remains authoritative for) the opaque call/error.
+        assert!(!router_precheck_says_disabled("LateFalseAfterOpaque"));
+        assert!(router_precheck_says_disabled("QuantifiedPrefix"));
+
+        // Runtime replaces this same-named TLA definition with the SetToSeq
+        // builtin. A guard extracted from the ignored body would therefore
+        // not be implied by the expression that canonical evaluation sees.
+        let (ctx, op_defs) = setup();
+        let set_to_seq = op_defs.get("SetToSeq").expect("operator exists");
+        assert!(crate::eval::should_prefer_builtin_override(
+            "SetToSeq", set_to_seq, 1, &ctx,
+        ));
+        assert!(router_guard_for("BuiltinOverridePrefix").is_none());
+
+        // A retained quantifier domain executes before the body. Primed (and
+        // likewise effectful) domains are not current-state prechecks.
+        assert!(router_guard_for("PrimedDomain").is_none());
+
+        // Retaining either domain outside its lexical scope would resolve the
+        // same-named global empty set and manufacture a false guard.
+        assert!(router_guard_for("LetScopedDomain").is_none());
+        assert!(router_guard_for("FormalScopedDomainCall").is_none());
+
+        // Characterize why production must not use the broad extractor for
+        // an interpreter-skipping decision: it reaches past Oracle and finds
+        // the later false conjunct, suppressing canonical error semantics.
+        assert!(precheck_says_disabled("LateFalseAfterOpaque"));
+    }
+}
+
 /// directly — no model checker, no env.
 #[cfg(test)]
 mod authoritative_machine_tests {
@@ -3044,7 +4255,10 @@ mod authoritative_machine_tests {
             shadow_clean(&mut m, 0);
         }
         // A dirty differential (no action flipped yet): reset, no fail-back.
-        assert_eq!(m.decide_mode(0, KEYS, UNSAMPLED), HybridInstanceMode::Shadow);
+        assert_eq!(
+            m.decide_mode(0, KEYS, UNSAMPLED),
+            HybridInstanceMode::Shadow
+        );
         assert!(!m.record_result(0, HybridInstanceMode::Shadow, false, true));
         assert!(!m.failback());
         // Three more cleans do NOT flip (count restarted at 0)…
@@ -3077,10 +4291,7 @@ mod authoritative_machine_tests {
         assert_eq!(m.authoritative_action_count(), 1);
         // Same hash, same verdict, every time — no hidden mod-counter.
         for _ in 0..5 {
-            assert_eq!(
-                m.decide_mode(0, KEYS, SAMPLED),
-                HybridInstanceMode::Sampled
-            );
+            assert_eq!(m.decide_mode(0, KEYS, SAMPLED), HybridInstanceMode::Sampled);
             assert!(!m.record_result(0, HybridInstanceMode::Sampled, true, false));
             assert_eq!(
                 m.decide_mode(0, KEYS, UNSAMPLED),
@@ -3115,11 +4326,17 @@ mod authoritative_machine_tests {
         assert!(m.failback());
         assert_eq!(m.authoritative_action_count(), 0);
         // Every action — including the innocent action 1 — is shadow forever.
-        assert_eq!(m.decide_mode(1, KEYS, UNSAMPLED), HybridInstanceMode::Shadow);
+        assert_eq!(
+            m.decide_mode(1, KEYS, UNSAMPLED),
+            HybridInstanceMode::Shadow
+        );
         // No amount of clean evidence re-flips after fail-back…
         for _ in 0..10 {
             assert!(!m.record_result(1, HybridInstanceMode::Shadow, true, false));
-            assert_eq!(m.decide_mode(1, KEYS, UNSAMPLED), HybridInstanceMode::Shadow);
+            assert_eq!(
+                m.decide_mode(1, KEYS, UNSAMPLED),
+                HybridInstanceMode::Shadow
+            );
         }
         assert_eq!(m.authoritative_action_count(), 0);
         // …and a second trip reports "already tripped", not "newly tripped".
@@ -3133,7 +4350,10 @@ mod authoritative_machine_tests {
         assert_eq!(m.authoritative_action_count(), 1);
         // Action 1 is still burning in; its SEMANTIC divergence invalidates
         // trust in the shared machinery — global fail-back.
-        assert_eq!(m.decide_mode(1, KEYS, UNSAMPLED), HybridInstanceMode::Shadow);
+        assert_eq!(
+            m.decide_mode(1, KEYS, UNSAMPLED),
+            HybridInstanceMode::Shadow
+        );
         assert!(m.record_result(1, HybridInstanceMode::Shadow, false, true));
         assert!(m.failback());
         assert_eq!(m.authoritative_action_count(), 0);
@@ -3172,6 +4392,9 @@ mod authoritative_machine_tests {
             m.decide_mode(0, KEYS, UNSAMPLED),
             HybridInstanceMode::Authoritative
         );
-        assert_eq!(m.decide_mode(1, KEYS, UNSAMPLED), HybridInstanceMode::Shadow);
+        assert_eq!(
+            m.decide_mode(1, KEYS, UNSAMPLED),
+            HybridInstanceMode::Shadow
+        );
     }
 }

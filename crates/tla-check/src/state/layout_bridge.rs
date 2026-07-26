@@ -43,12 +43,12 @@
 //!
 //! Part of #3986: Phase 3 flat state buffer layout bridge.
 
-use tla_value::Rp;
 use super::state_layout::{
     ordered_dense_int_domain, FlatScalarValue, FlatValueLayout, SlotType, StateLayout,
     StringKeyedArrayRangeEncoding, TaggedScalarSetRangeProof, TupleKeyedArrayRangeEncoding,
     VarLayoutKind,
 };
+use tla_value::Rp;
 
 /// Convert a tla-check `StateLayout` into the equivalent native ABI `StateLayout`.
 ///
@@ -77,12 +77,30 @@ use super::state_layout::{
 /// (offsets match tla-check's slot packing), not the self-describing
 /// tagged format used by `serialize_value()`.
 #[must_use]
-pub(crate) fn check_layout_to_jit_layout(check_layout: &StateLayout) -> tla_jit_abi::StateLayout {
+fn check_layout_to_jit_layout(check_layout: &StateLayout) -> tla_jit_abi::StateLayout {
     let jit_vars: Vec<tla_jit_abi::VarLayout> = check_layout
         .iter()
         .map(|var| check_var_to_jit_var(&var.kind))
         .collect();
     tla_jit_abi::StateLayout::new(jit_vars)
+}
+
+/// Convert a check-side layout only when the resulting native compact layout
+/// is byte-for-byte and structurally faithful.
+///
+/// Some fixed-width check layouts intentionally have no native ABI carrier. In
+/// particular, a multi-slot recursive value may map to the one-slot
+/// `CompoundLayout::Dynamic` placeholder so native lowering declines accesses
+/// to that variable. That placeholder is safe only when it does not change the
+/// offset of a later variable. Even a one-slot placeholder is not a faithful
+/// carrier for an unsupported recursive value. Production compilation paths
+/// must use this checked entry point and decline native execution on `None`.
+#[must_use]
+pub(crate) fn try_check_layout_to_jit_layout(
+    check_layout: &StateLayout,
+) -> Option<tla_jit_abi::StateLayout> {
+    let jit_layout = check_layout_to_jit_layout(check_layout);
+    layouts_compatible(check_layout, &jit_layout).then_some(jit_layout)
 }
 
 /// Overlay proven function-range / top-level `SetBitmask` universes from the
@@ -280,9 +298,10 @@ fn check_var_to_jit_var(kind: &VarLayoutKind) -> tla_jit_abi::VarLayout {
                 domain_lo: None,
             })
         }
-        VarLayoutKind::Recursive { layout } => {
-            tla_jit_abi::VarLayout::Compound(flat_value_layout_to_jit_compound(layout))
-        }
+        VarLayoutKind::Recursive { layout } => tla_jit_abi::VarLayout::Compound(
+            faithful_flat_value_layout_to_jit_compound(layout)
+                .unwrap_or(tla_jit_abi::CompoundLayout::Dynamic),
+        ),
         VarLayoutKind::Bitmask { .. } => {
             // Bitmask is a single i64 slot — treat as scalar for JIT purposes.
             tla_jit_abi::VarLayout::ScalarInt
@@ -692,14 +711,7 @@ fn flat_value_layout_to_jit_compound(
         // changed, `flat_scalar_to_jit_bitmask_element` would be the choke point
         // to fail closed to `Dynamic`.
         super::state_layout::FlatValueLayout::TaggedScalarUnion { proof } => {
-            tla_jit_abi::CompoundLayout::TaggedScalarUnion {
-                universe: proof
-                    .universe()
-                    .iter()
-                    .map(flat_scalar_to_jit_bitmask_element)
-                    .collect(),
-                proof_source: tla_core::intern_name(proof.source().as_ref()),
-            }
+            tagged_scalar_union_to_jit_compound(proof)
         }
         // WP-ARGS: a finite scalar-or-tuple union (btree's `args`: the model
         // value `NIL`, or `<<k>>` / `<<k,v>>`) crosses the ABI as its ordered
@@ -1680,13 +1692,11 @@ fn flat_layout_compact_compatible(
             tla_jit_abi::CompoundLayout::TaggedUnion { variants, .. },
         ) => {
             proof.variants().len() == variants.len()
-                && proof
-                    .variants()
-                    .iter()
-                    .zip(variants.iter())
-                    .all(|(check_variant, jit_variant)| {
+                && proof.variants().iter().zip(variants.iter()).all(
+                    |(check_variant, jit_variant)| {
                         flat_layout_compact_compatible(check_variant, jit_variant)
-                    })
+                    },
+                )
         }
         (FlatValueLayout::TaggedUnion { .. }, _) => false,
         // A fixed-arity heterogeneous tuple roundtrips iff the JIT `Tuple`
@@ -1699,12 +1709,11 @@ fn flat_layout_compact_compatible(
             },
         ) => {
             element_layouts.len() == jit_layouts.len()
-                && element_layouts
-                    .iter()
-                    .zip(jit_layouts.iter())
-                    .all(|(check_layout, jit_layout)| {
+                && element_layouts.iter().zip(jit_layouts.iter()).all(
+                    |(check_layout, jit_layout)| {
                         flat_layout_compact_compatible(check_layout, jit_layout)
-                    })
+                    },
+                )
         }
         (FlatValueLayout::HeterogeneousTuple { .. }, _) => false,
         _ => false,
@@ -1918,6 +1927,7 @@ mod tests {
     use crate::Value;
     use std::sync::Arc;
     use tla_value::value::IntIntervalFunc;
+    use tla_value::Rp;
 
     #[cfg_attr(test, ntest::timeout(10000))]
     #[test]
@@ -2653,6 +2663,67 @@ mod tests {
             covered >= 30,
             "expected the sweep to cover a meaningful number of layouts, got {covered}"
         );
+    }
+
+    /// A lossy recursive carrier must reject the whole native layout, not
+    /// silently shrink the first variable and shift every later offset.
+    #[cfg_attr(test, ntest::timeout(10000))]
+    #[test]
+    fn test_checked_conversion_rejects_multislot_dynamic_fallback_before_later_var() {
+        use super::super::state_layout::{
+            FlatScalarValue, FlatValueLayout, SetBitmaskUniverseClosure,
+        };
+
+        let registry = VarRegistry::from_names(["nested", "tail"]);
+        let check_layout = StateLayout::new(
+            &registry,
+            vec![
+                VarLayoutKind::Recursive {
+                    layout: FlatValueLayout::NestedSetBitmask {
+                        // 65 outer elements occupy two check-side slots, while
+                        // the unsupported native carrier degrades to one
+                        // `Dynamic` placeholder slot.
+                        outer_universe: vec![0; 65],
+                        inner_universe: vec![FlatScalarValue::Int(0)],
+                        outer_closure: SetBitmaskUniverseClosure::Sampled,
+                        inner_closure: SetBitmaskUniverseClosure::Sampled,
+                    },
+                },
+                VarLayoutKind::Scalar,
+            ],
+        );
+
+        assert!(check_layout.is_fully_flat());
+        assert_eq!(check_layout.var_layout(1).unwrap().offset, 2);
+
+        let lossy = check_layout_to_jit_layout(&check_layout);
+        assert_eq!(lossy.compute_compact_var_offsets(), vec![0, 1]);
+        assert!(layout_geometry_mismatch(&check_layout, &lossy).is_some());
+        assert!(try_check_layout_to_jit_layout(&check_layout).is_none());
+    }
+
+    #[cfg_attr(test, ntest::timeout(10000))]
+    #[test]
+    fn test_checked_conversion_rejects_same_width_unsupported_recursive_layout() {
+        use super::super::state_layout::{FlatValueLayout, SetBitmaskUniverseClosure};
+
+        let registry = VarRegistry::from_names(["nested"]);
+        let check_layout = StateLayout::new(
+            &registry,
+            vec![VarLayoutKind::Recursive {
+                layout: FlatValueLayout::NestedSetBitmask {
+                    outer_universe: vec![0],
+                    inner_universe: Vec::new(),
+                    outer_closure: SetBitmaskUniverseClosure::Sampled,
+                    inner_closure: SetBitmaskUniverseClosure::Sampled,
+                },
+            }],
+        );
+
+        let lossy = check_layout_to_jit_layout(&check_layout);
+        assert_eq!(layout_geometry_mismatch(&check_layout, &lossy), None);
+        assert!(!layouts_compatible(&check_layout, &lossy));
+        assert!(try_check_layout_to_jit_layout(&check_layout).is_none());
     }
 
     #[cfg_attr(test, ntest::timeout(10000))]

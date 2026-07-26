@@ -69,17 +69,17 @@
 
 pub mod artifact_cache;
 
+pub mod bfs_level;
+pub mod compile;
+pub mod compiled_fingerprint;
+pub mod compiled_liveness;
+pub mod emit;
 /// Single blessed choke point for process-environment mutation (test/CLI
 /// plumbing). Always compiled so in-crate `#[cfg(test)]` tests and the crate's
 /// examples reach the same choke point. The one `env_mutation` allow lives on
 /// `env_guard::raw_env_write`.
 #[doc(hidden)]
 pub mod env_guard;
-pub mod bfs_level;
-pub mod compile;
-pub mod compiled_fingerprint;
-pub mod compiled_liveness;
-pub mod emit;
 pub mod error;
 pub mod lower;
 pub mod native_bfs;

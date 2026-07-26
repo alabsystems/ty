@@ -12,16 +12,13 @@
 //! binary-search path.
 
 use super::super::*;
-use num_bigint::BigInt;
 use crate::rp::Rp as Arc;
+use num_bigint::BigInt;
 
 /// Independent reference: linear scan over the original (key, value) entries,
 /// using `Value`'s own equality. This does NOT go through `FuncValue::apply`.
 fn reference_apply<'a>(entries: &'a [(Value, Value)], arg: &Value) -> Option<&'a Value> {
-    entries
-        .iter()
-        .find(|(k, _)| k == arg)
-        .map(|(_, v)| v)
+    entries.iter().find(|(k, _)| k == arg).map(|(_, v)| v)
 }
 
 /// Assert `fv.apply(arg)` equals the linear-scan reference for `arg`.
@@ -191,8 +188,7 @@ fn incomplete_cross_product_is_not_dense_dim2() {
 
 #[test]
 fn apply2_dense_returns_none_for_dim1() {
-    let entries: Vec<(Value, Value)> =
-        (1..=5).map(|n| (Value::int(n), Value::int(n))).collect();
+    let entries: Vec<(Value, Value)> = (1..=5).map(|n| (Value::int(n), Value::int(n))).collect();
     let fv = FuncValue::from_sorted_entries(entries);
     assert!(!fv.dense_is_dim2());
     assert_eq!(fv.apply2_dense(1, 1), None);

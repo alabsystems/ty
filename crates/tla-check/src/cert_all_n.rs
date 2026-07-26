@@ -502,14 +502,10 @@ pub fn certify_all_n_auto(
                             // cover it by the `<=`/`>=` halves instead. Only the
                             // wall shapes qualify — any other decline (not
                             // inductive, untranslatable, ...) stands as-is.
-                            let is_eq = matches!(
-                                cs[i as usize].node,
-                                tla_core::ast::Expr::Eq(..)
-                            );
+                            let is_eq = matches!(cs[i as usize].node, tla_core::ast::Expr::Eq(..));
                             let strict_wall = matches!(
                                 e,
-                                AllNDecline::SelfVerifyFailed(_)
-                                    | AllNDecline::NotStrict { .. }
+                                AllNDecline::SelfVerifyFailed(_) | AllNDecline::NotStrict { .. }
                             );
                             if is_eq && strict_wall {
                                 let le = certify_all_n_core(
@@ -622,8 +618,7 @@ fn safety_conjunct_exprs(
     symbolic: &str,
 ) -> Option<Vec<tla_core::span::Spanned<tla_core::ast::Expr>>> {
     let cfg = config_without_constant(config, symbolic);
-    let inputs =
-        crate::ay_bmc::rederive_obligation_inputs(spec_src, &cfg, CONJUNCT_J_PLACEHOLDER)?;
+    let inputs = crate::ay_bmc::rederive_obligation_inputs(spec_src, &cfg, CONJUNCT_J_PLACEHOLDER)?;
     Some(crate::ay_bmc::flatten_conjuncts(&inputs.safety))
 }
 
@@ -657,8 +652,7 @@ fn certify_all_n_core(
         JSource::Text(_) => None,
         JSource::Conjunct(index) => {
             let conjuncts = crate::ay_bmc::flatten_conjuncts(&inputs.safety);
-            let total =
-                u32::try_from(conjuncts.len()).map_err(|_| AllNDecline::NotRederivable)?;
+            let total = u32::try_from(conjuncts.len()).map_err(|_| AllNDecline::NotRederivable)?;
             let Some(c) = conjuncts.get(index as usize) else {
                 return Err(AllNDecline::ConjunctOutOfRange { index, total });
             };
@@ -668,8 +662,7 @@ fn certify_all_n_core(
         }
         JSource::ConjunctHalf(index, half) => {
             let conjuncts = crate::ay_bmc::flatten_conjuncts(&inputs.safety);
-            let total =
-                u32::try_from(conjuncts.len()).map_err(|_| AllNDecline::NotRederivable)?;
+            let total = u32::try_from(conjuncts.len()).map_err(|_| AllNDecline::NotRederivable)?;
             let Some(c) = conjuncts.get(index as usize) else {
                 return Err(AllNDecline::ConjunctOutOfRange { index, total });
             };
@@ -684,8 +677,7 @@ fn certify_all_n_core(
         }
         JSource::JointConjunct { target, members } => {
             let conjuncts = crate::ay_bmc::flatten_conjuncts(&inputs.safety);
-            let total =
-                u32::try_from(conjuncts.len()).map_err(|_| AllNDecline::NotRederivable)?;
+            let total = u32::try_from(conjuncts.len()).map_err(|_| AllNDecline::NotRederivable)?;
             // Canonical member set: non-empty, strictly ascending (deduplicated)
             // and containing the covered target — the same invariants the
             // offline verifier enforces before rebuilding J.
@@ -922,7 +914,9 @@ pub struct AllNVerifyReport {
 #[cfg(feature = "ay")]
 pub fn verify_all_n_certificate(cert: &AllNCertificate) -> AllNVerifyReport {
     use crate::ay_bmc::SmtObligation;
-    use tla_ay::{re_check_bundle_strict, render_term_canonical, SerializableProofBundle, TermStore};
+    use tla_ay::{
+        re_check_bundle_strict, render_term_canonical, SerializableProofBundle, TermStore,
+    };
 
     let rej = |why: String| AllNVerifyReport {
         verdict: AllNVerdict::Rejected,
@@ -943,11 +937,9 @@ pub fn verify_all_n_certificate(cert: &AllNCertificate) -> AllNVerifyReport {
     } else {
         &cert.invariant_j_tla
     };
-    let Some(mut inputs) = crate::ay_bmc::rederive_obligation_inputs(
-        &cert.spec_src,
-        &cfg,
-        j_for_rederive,
-    ) else {
+    let Some(mut inputs) =
+        crate::ay_bmc::rederive_obligation_inputs(&cert.spec_src, &cfg, j_for_rederive)
+    else {
         return AllNVerifyReport {
             verdict: AllNVerdict::Inconclusive,
             detail: "INCONCLUSIVE: obligations not re-derivable (undecomposable Next or \
@@ -1077,7 +1069,11 @@ pub fn verify_all_n_certificate(cert: &AllNCertificate) -> AllNVerifyReport {
         SmtObligation::Safety,
     ];
     for ob in smt {
-        let Some(emb) = cert.ay_proof_obligations.iter().find(|o| o.name == ob.name()) else {
+        let Some(emb) = cert
+            .ay_proof_obligations
+            .iter()
+            .find(|o| o.name == ob.name())
+        else {
             return AllNVerifyReport {
                 verdict: AllNVerdict::Inconclusive,
                 detail: format!("INCONCLUSIVE: obligation `{}` missing", ob.name()),
@@ -1086,7 +1082,10 @@ pub fn verify_all_n_certificate(cert: &AllNCertificate) -> AllNVerifyReport {
         if emb.bundle_json.is_empty() {
             return AllNVerifyReport {
                 verdict: AllNVerdict::Inconclusive,
-                detail: format!("INCONCLUSIVE: obligation `{}` has no proof bundle", ob.name()),
+                detail: format!(
+                    "INCONCLUSIVE: obligation `{}` has no proof bundle",
+                    ob.name()
+                ),
             };
         }
         // Blocker-2 close: a McCarthy-branch-reduced CONSECUTION carries a JSON
@@ -1095,12 +1094,10 @@ pub fn verify_all_n_certificate(cert: &AllNCertificate) -> AllNVerifyReport {
         // (re-check + assume-coverage + render-binding). `None` here means the
         // mint used the single-bundle array path, handled below.
         if matches!(ob, SmtObligation::Consecution) {
-            if let Some(branch_asserts) =
-                crate::ay_bmc::retranslate_consecution_branches_canonical(
-                    &inputs,
-                    &cert.symbolic_constants,
-                )
-            {
+            if let Some(branch_asserts) = crate::ay_bmc::retranslate_consecution_branches_canonical(
+                &inputs,
+                &cert.symbolic_constants,
+            ) {
                 match crate::cert::verify_multibranch_consecution(&emb.bundle_json, &branch_asserts)
                 {
                     Ok(()) => continue,
@@ -1145,7 +1142,10 @@ pub fn verify_all_n_certificate(cert: &AllNCertificate) -> AllNVerifyReport {
             }
         };
         if !recheck.quality.is_complete() {
-            return rej(format!("obligation `{}` proof not trust/hole-free", ob.name()));
+            return rej(format!(
+                "obligation `{}` proof not trust/hole-free",
+                ob.name()
+            ));
         }
         // Assume-coverage: proof axioms subset of the asserted obligation.
         let assume: std::collections::BTreeSet<u32> =
@@ -1153,7 +1153,10 @@ pub fn verify_all_n_certificate(cert: &AllNCertificate) -> AllNVerifyReport {
         let oblig: std::collections::BTreeSet<u32> =
             bundle.obligation_assertions.iter().map(|t| t.0).collect();
         if !assume.is_subset(&oblig) {
-            return rej(format!("obligation `{}` uses an axiom outside it", ob.name()));
+            return rej(format!(
+                "obligation `{}` uses an axiom outside it",
+                ob.name()
+            ));
         }
         // Render-binding: embedded obligation == TY's no-solve re-translation
         // (with N declared rigid), binding the symbolic proof to the spec.
@@ -1200,11 +1203,8 @@ pub fn verify_all_n_certificate(cert: &AllNCertificate) -> AllNVerifyReport {
                         ob.name()
                     ));
                 };
-                if !crate::cleancic::verify_all_n_kernel_leg(
-                    &shape,
-                    ob.name(),
-                    &emb.clean_cic_term,
-                ) {
+                if !crate::cleancic::verify_all_n_kernel_leg(&shape, ob.name(), &emb.clean_cic_term)
+                {
                     return rej(format!(
                         "obligation `{}` kernel leg failed the Clean-CIC re-check",
                         ob.name()
@@ -1397,10 +1397,7 @@ mod tests {
             .expect("x >= N must be certifiable for ALL N");
         assert_eq!(cert.symbolic_constants, vec!["N".to_string()]);
         assert_eq!(cert.ay_proof_obligations.len(), 4);
-        assert!(cert
-            .ay_proof_obligations
-            .iter()
-            .all(|o| o.strict_verified));
+        assert!(cert.ay_proof_obligations.iter().all(|o| o.strict_verified));
 
         let report = verify_all_n_certificate(&cert);
         assert_eq!(
@@ -1455,7 +1452,9 @@ mod tests {
         let report = verify_all_n_certificate(&cert);
         assert_eq!(report.verdict, AllNVerdict::Accepted, "{}", report.detail);
         assert!(
-            report.detail.contains("3 obligation(s) ALSO KERNEL-CERTIFIED"),
+            report
+                .detail
+                .contains("3 obligation(s) ALSO KERNEL-CERTIFIED"),
             "the verdict must surface the kernel tier honestly: {}",
             report.detail
         );
@@ -1578,12 +1577,11 @@ mod tests {
         }
     }
 
-    /// Mixed EQUALITY + comparison invariant conjunction: `x = N` keeps the
-    /// whole-invariant J outside the strict fragment (its `~J` disjunction
-    /// carries a disequality no signed `la_generic` can print), so the auto
-    /// ladder falls back to per-conjunct coverage — the equality conjunct
-    /// covered by its `<=`/`>=` halves (EqSplit), the comparison conjunct by
-    /// a single honestly-scoped certificate with the PARTIAL COVERAGE note.
+    /// Mixed EQUALITY + comparison invariant conjunction. When the whole
+    /// invariant is in the current strict proof fragment it is preferable and
+    /// covers both conjuncts directly. If the strict fragment declines it, the
+    /// auto ladder must retain complete, honestly scoped per-conjunct coverage:
+    /// the equality via its `<=`/`>=` halves and the comparison via one cert.
     const PARAM3: &str = "---- MODULE Param3 ----\n\
                           EXTENDS Integers\n\
                           CONSTANT N\n\
@@ -1603,12 +1601,11 @@ mod tests {
         }
     }
 
-    /// AUTO-J per-conjunct fallback: whole-Inv declines (its `~J` disjunction
-    /// carries a disequality), the equality conjunct covers via its two
-    /// halves, the comparison conjunct certifies whole; every leg is honestly
-    /// scoped and re-verifies with the PARTIAL COVERAGE note.
+    /// AUTO-J provides full coverage whether the evolving strict fragment can
+    /// certify the mixed whole invariant directly or uses its per-conjunct
+    /// fallback. Every returned certificate independently re-verifies.
     #[test]
-    fn test_auto_j_per_conjunct_full_coverage() {
+    fn test_auto_j_mixed_equality_comparison_full_coverage() {
         match certify_all_n_auto(PARAM3, &cfg3(), "N") {
             Ok(AllNAutoOutcome::PerConjunct {
                 whole_decline,
@@ -1659,8 +1656,7 @@ mod tests {
                         report.detail
                     );
                     // JSON round-trip (new fields serde-stable).
-                    let reloaded =
-                        AllNCertificate::from_json(&cert.to_json()).expect("reload");
+                    let reloaded = AllNCertificate::from_json(&cert.to_json()).expect("reload");
                     assert_eq!(&reloaded, cert);
                     assert_eq!(
                         verify_all_n_certificate(&reloaded).verdict,
@@ -1668,10 +1664,22 @@ mod tests {
                     );
                 }
             }
-            Ok(AllNAutoOutcome::Whole(cert)) => panic!(
-                "a mixed equality/comparison invariant must NOT certify whole: {}",
-                cert.verdict
-            ),
+            Ok(AllNAutoOutcome::Whole(cert)) => {
+                assert_eq!(cert.safety_conjunct, None, "whole-invariant scope");
+                let report = verify_all_n_certificate(&cert);
+                assert_eq!(report.verdict, AllNVerdict::Accepted, "{}", report.detail);
+                assert!(
+                    !report.detail.contains("PARTIAL COVERAGE"),
+                    "a whole certificate must report whole coverage: {}",
+                    report.detail
+                );
+                let reloaded = AllNCertificate::from_json(&cert.to_json()).expect("reload");
+                assert_eq!(reloaded, cert);
+                assert_eq!(
+                    verify_all_n_certificate(&reloaded).verdict,
+                    AllNVerdict::Accepted
+                );
+            }
             Err(e) => panic!("per-conjunct coverage must succeed: {e}"),
         }
     }
@@ -1730,10 +1738,9 @@ mod tests {
         match certify_all_n_auto(TWIN, &config, "N") {
             Err(AllNDecline::NotInductive { .. }) => {}
             Err(e) => panic!("auto-J must also decline as not-inductive, got: {e}"),
-            Ok(AllNAutoOutcome::Whole(cert)) => panic!(
-                "SOUNDNESS FAILURE (auto-J): {}",
-                cert.verdict
-            ),
+            Ok(AllNAutoOutcome::Whole(cert)) => {
+                panic!("SOUNDNESS FAILURE (auto-J): {}", cert.verdict)
+            }
             Ok(AllNAutoOutcome::PerConjunct { legs, .. }) => {
                 assert!(
                     legs.iter()
@@ -1852,7 +1859,10 @@ mod tests {
         );
         let cert = certify_all_n(MULTI, &cfg(), "N", "x >= N")
             .expect("multi-module first-module spec must certify (first-terminator anchoring)");
-        assert_eq!(verify_all_n_certificate(&cert).verdict, AllNVerdict::Accepted);
+        assert_eq!(
+            verify_all_n_certificate(&cert).verdict,
+            AllNVerdict::Accepted
+        );
     }
 
     /// BUG B. Last unit is a function whose body is a CASE — it ends in `]`, so a
@@ -1875,7 +1885,10 @@ mod tests {
         );
         let cert = certify_all_n(CASE_LAST, &cfg(), "N", "x >= N")
             .expect("CASE-last-unit scalar spec must certify (leading-letter sentinel)");
-        assert_eq!(verify_all_n_certificate(&cert).verdict, AllNVerdict::Accepted);
+        assert_eq!(
+            verify_all_n_certificate(&cert).verdict,
+            AllNVerdict::Accepted
+        );
     }
 
     /// BUG B, headline. A scalar spec whose LAST unit is a RECORD (`[…]`) — the old
@@ -1894,7 +1907,10 @@ mod tests {
                                 ====\n";
         let cert = certify_all_n(REC_LAST, &cfg(), "N", "x >= N")
             .expect("record-last-unit scalar spec must certify (no `]`+`_` subscript drop)");
-        assert_eq!(verify_all_n_certificate(&cert).verdict, AllNVerdict::Accepted);
+        assert_eq!(
+            verify_all_n_certificate(&cert).verdict,
+            AllNVerdict::Accepted
+        );
         let reloaded = AllNCertificate::from_json(&cert.to_json()).expect("reload");
         assert_eq!(
             verify_all_n_certificate(&reloaded).verdict,
@@ -1921,7 +1937,10 @@ mod tests {
         );
         let cert = certify_all_n(TUP_LAST, &cfg(), "N", "x >= N")
             .expect("tuple-last-unit scalar spec must certify (leading-letter sentinel)");
-        assert_eq!(verify_all_n_certificate(&cert).verdict, AllNVerdict::Accepted);
+        assert_eq!(
+            verify_all_n_certificate(&cert).verdict,
+            AllNVerdict::Accepted
+        );
     }
 
     /// FAIL-CLOSED. The fix only governs WHERE/UNDER-WHAT-NAME `J` is placed for
@@ -2113,7 +2132,8 @@ mod tests {
                 );
                 assert!(
                     !(verified
-                        && dl.map(|o| o.strict_verified && !o.bundle_json.is_empty())
+                        && dl
+                            .map(|o| o.strict_verified && !o.bundle_json.is_empty())
                             .unwrap_or(false)),
                     "a spec with a genuine deadlock at x=N must NOT certify+verify a \
                      bundled deadlock-freedom claim"
@@ -2180,14 +2200,20 @@ mod tests {
             invariants: vec!["TypeInvariant".to_string()],
             ..Default::default()
         };
-        config.add_constant("MaxBeanCount".to_string(), crate::config::ConstantValue::Value("5".to_string()));
+        config.add_constant(
+            "MaxBeanCount".to_string(),
+            crate::config::ConstantValue::Value("5".to_string()),
+        );
         let cert = crate::explicit_fixpoint_cert::certify_explicit_state_spec(CC, &config)
             .expect("CoffeeCan@5 must certify via the concrete-config explicit-state lane");
         assert!(
             crate::explicit_fixpoint_cert::verify_explicit_state_cert(&cert),
             "the CoffeeCan@5 explicit-state certificate must kernel-re-verify"
         );
-        assert!(!cert.reachable.is_empty(), "the reachable set must be non-empty");
+        assert!(
+            !cert.reachable.is_empty(),
+            "the reachable set must be non-empty"
+        );
     }
 
     /// ★ CORPUS SWEEP (concrete-config lane, R0/R1 deployed): certify a batch of REAL
@@ -2202,7 +2228,9 @@ mod tests {
     /// SlidingPuzzles' set-valued state are the current concrete-lane boundary.)
     #[test]
     fn test_corpus_concrete_sweep() {
-        let Ok(home) = std::env::var("HOME") else { return };
+        let Ok(home) = std::env::var("HOME") else {
+            return;
+        };
         let base = std::path::Path::new(&home).join("tlaplus-examples/specifications");
         if !base.exists() {
             eprintln!("[corpus-sweep] ~/tlaplus-examples absent — skipping");
@@ -2212,14 +2240,48 @@ mod tests {
         // (relpath, Init, Next, invariant, constant bindings) — self-contained specs
         // whose finite state space certifies + kernel-verifies via the concrete lane.
         let specs: Vec<(&str, &str, &str, &str, Vec<(&str, CV)>)> = vec![
-            ("SpecifyingSystems/HourClock/HourClock.tla", "HCini", "HCnxt", "HCini", vec![]),
+            (
+                "SpecifyingSystems/HourClock/HourClock.tla",
+                "HCini",
+                "HCnxt",
+                "HCini",
+                vec![],
+            ),
             ("DieHard/DieHard.tla", "Init", "Next", "TypeOK", vec![]),
-            ("SpecifyingSystems/AsynchronousInterface/Channel.tla", "Init", "Next", "TypeInvariant",
-             vec![("Data", CV::ModelValueSet(vec!["d1".into(), "d2".into(), "d3".into()]))]),
-            ("SpecifyingSystems/AsynchronousInterface/AsynchInterface.tla", "Init", "Next", "TypeInvariant",
-             vec![("Data", CV::ModelValueSet(vec!["d1".into(), "d2".into(), "d3".into()]))]),
-            ("barriers/Barrier.tla", "Init", "Next", "TypeOK", vec![("N", CV::Value("6".into()))]),
-            ("TeachingConcurrency/Simple.tla", "Init", "Next", "TypeOK", vec![("N", CV::Value("5".into()))]),
+            (
+                "SpecifyingSystems/AsynchronousInterface/Channel.tla",
+                "Init",
+                "Next",
+                "TypeInvariant",
+                vec![(
+                    "Data",
+                    CV::ModelValueSet(vec!["d1".into(), "d2".into(), "d3".into()]),
+                )],
+            ),
+            (
+                "SpecifyingSystems/AsynchronousInterface/AsynchInterface.tla",
+                "Init",
+                "Next",
+                "TypeInvariant",
+                vec![(
+                    "Data",
+                    CV::ModelValueSet(vec!["d1".into(), "d2".into(), "d3".into()]),
+                )],
+            ),
+            (
+                "barriers/Barrier.tla",
+                "Init",
+                "Next",
+                "TypeOK",
+                vec![("N", CV::Value("6".into()))],
+            ),
+            (
+                "TeachingConcurrency/Simple.tla",
+                "Init",
+                "Next",
+                "TypeOK",
+                vec![("N", CV::Value("5".into()))],
+            ),
         ];
         let mut certified = 0usize;
         for (rel, init, next, inv, consts) in &specs {
@@ -2238,7 +2300,9 @@ mod tests {
                 config.add_constant(n.to_string(), v.clone());
             }
             let cert = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                crate::explicit_fixpoint_cert::certify_explicit_state_spec_bounded(&src, &config, 100_000)
+                crate::explicit_fixpoint_cert::certify_explicit_state_spec_bounded(
+                    &src, &config, 100_000,
+                )
             }))
             .unwrap_or(None)
             .unwrap_or_else(|| panic!("corpus spec {rel} must certify via the concrete lane"));
@@ -2246,10 +2310,17 @@ mod tests {
                 crate::explicit_fixpoint_cert::verify_explicit_state_cert(&cert),
                 "corpus spec {rel} certificate must kernel-re-verify"
             );
-            eprintln!("[corpus-sweep] {rel}: CERT ({} states) + verified", cert.reachable.len());
+            eprintln!(
+                "[corpus-sweep] {rel}: CERT ({} states) + verified",
+                cert.reachable.len()
+            );
             certified += 1;
         }
-        assert_eq!(certified, specs.len(), "every listed corpus spec must certify + verify");
+        assert_eq!(
+            certified,
+            specs.len(),
+            "every listed corpus spec must certify + verify"
+        );
     }
 
     /// Strip TLA+/TLC-config comments: `(* … *)` blocks and `\* …` line comments.
@@ -2293,9 +2364,13 @@ mod tests {
         let lines: Vec<&str> = clean.lines().collect();
         for (li, line) in lines.iter().enumerate() {
             let l = line.trim();
-            let Some(rest) = l.strip_prefix(spec_op) else { continue };
+            let Some(rest) = l.strip_prefix(spec_op) else {
+                continue;
+            };
             let rest = rest.trim_start();
-            let Some(first) = rest.strip_prefix("==") else { continue };
+            let Some(first) = rest.strip_prefix("==") else {
+                continue;
+            };
             // Join the body across lines until a terminator (blank / ---- / new def).
             let mut body = first.trim().to_string();
             if !body.contains("[][") {
@@ -2310,7 +2385,9 @@ mod tests {
                     }
                     body.push(' ');
                     body.push_str(c);
-                    if body.contains("[][") && body.split("[][").nth(1).is_some_and(|t| t.contains("]_")) {
+                    if body.contains("[][")
+                        && body.split("[][").nth(1).is_some_and(|t| t.contains("]_"))
+                    {
                         break;
                     }
                 }
@@ -2363,7 +2440,11 @@ mod tests {
                     }
                     v.clone()
                 } else if let Ok(n) = t.parse::<i64>() {
-                    if n >= 3 { CV::Value("2".to_string()) } else { v.clone() }
+                    if n >= 3 {
+                        CV::Value("2".to_string())
+                    } else {
+                        v.clone()
+                    }
                 } else {
                     v.clone()
                 }
@@ -2375,10 +2456,24 @@ mod tests {
 
     fn parse_tlc_cfg(
         cfg: &str,
-    ) -> (Option<String>, Option<String>, Option<String>, Vec<String>, Vec<(String, crate::config::ConstantValue)>) {
+    ) -> (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Vec<String>,
+        Vec<(String, crate::config::ConstantValue)>,
+    ) {
         type CV = crate::config::ConstantValue;
         #[derive(PartialEq, Clone, Copy)]
-        enum Sec { None, Spec, Init, Next, Inv, Const, Other }
+        enum Sec {
+            None,
+            Spec,
+            Init,
+            Next,
+            Inv,
+            Const,
+            Other,
+        }
         let clean = strip_cfg_comments(cfg);
         let (mut spec_op, mut init, mut next) = (None, None, None);
         let mut invs: Vec<String> = Vec::new();
@@ -2403,10 +2498,19 @@ mod tests {
                 (Some(Sec::Const), r)
             } else if let Some(r) = l.strip_prefix("CONSTANT") {
                 (Some(Sec::Const), r)
-            } else if ["PROPERTIES", "PROPERTY", "CONSTRAINT", "ACTION_CONSTRAINT", "SYMMETRY",
-                       "VIEW", "ALIAS", "CHECK_DEADLOCK", "POSTCONDITION"]
-                .iter()
-                .any(|k| l.starts_with(k))
+            } else if [
+                "PROPERTIES",
+                "PROPERTY",
+                "CONSTRAINT",
+                "ACTION_CONSTRAINT",
+                "SYMMETRY",
+                "VIEW",
+                "ALIAS",
+                "CHECK_DEADLOCK",
+                "POSTCONDITION",
+            ]
+            .iter()
+            .any(|k| l.starts_with(k))
             {
                 (Some(Sec::Other), "")
             } else {
@@ -2420,16 +2524,23 @@ mod tests {
                 continue;
             }
             match sec {
-                Sec::Spec => spec_op = Some(content.split_whitespace().next().unwrap_or("").to_string()),
-                Sec::Init => init = Some(content.split_whitespace().next().unwrap_or("").to_string()),
-                Sec::Next => next = Some(content.split_whitespace().next().unwrap_or("").to_string()),
+                Sec::Spec => {
+                    spec_op = Some(content.split_whitespace().next().unwrap_or("").to_string())
+                }
+                Sec::Init => {
+                    init = Some(content.split_whitespace().next().unwrap_or("").to_string())
+                }
+                Sec::Next => {
+                    next = Some(content.split_whitespace().next().unwrap_or("").to_string())
+                }
                 Sec::Inv => invs.extend(content.split_whitespace().map(|x| x.to_string())),
                 Sec::Const => {
                     if let Some(arrow) = content.find("<-") {
                         let name = content[..arrow].trim();
                         let op = content[arrow + 2..].trim();
                         // Module-scoped overrides `X <-[M] Op` are out of scope.
-                        if !name.is_empty() && !op.starts_with('[')
+                        if !name.is_empty()
+                            && !op.starts_with('[')
                             && name.chars().all(|c| c.is_alphanumeric() || c == '_')
                         {
                             consts.push((name.to_string(), CV::Replacement(op.to_string())));
@@ -2467,17 +2578,32 @@ mod tests {
         if std::env::var("TY_CORPUS_SWEEP").is_err() {
             return; // opt-in: slow (real state enumeration over many specs)
         }
-        let Ok(home) = std::env::var("HOME") else { return };
+        let Ok(home) = std::env::var("HOME") else {
+            return;
+        };
         let base = std::path::Path::new(&home).join("tlaplus-examples/specifications");
-        if !base.exists() { return; }
+        if !base.exists() {
+            return;
+        }
         let is_selfcontained = |tla: &str| -> bool {
-            if tla.contains("INSTANCE") { return false; }
+            if tla.contains("INSTANCE") {
+                return false;
+            }
             for line in tla.lines() {
                 let l = line.trim();
                 if let Some(rest) = l.strip_prefix("EXTENDS") {
                     return rest.split(',').all(|m| {
-                        matches!(m.trim(), "Naturals" | "Integers" | "Sequences" | "FiniteSets"
-                            | "TLC" | "Reals" | "Bags" | "")
+                        matches!(
+                            m.trim(),
+                            "Naturals"
+                                | "Integers"
+                                | "Sequences"
+                                | "FiniteSets"
+                                | "TLC"
+                                | "Reals"
+                                | "Bags"
+                                | ""
+                        )
                     });
                 }
             }
@@ -2485,7 +2611,9 @@ mod tests {
         };
         let (mut certified, mut declined, mut skipped) = (0usize, 0usize, 0usize);
         let mut timeouts = 0usize;
-        let mut leaked: Vec<std::sync::mpsc::Receiver<Option<crate::explicit_fixpoint_cert::ExplicitFixpointCert>>> = Vec::new();
+        let mut leaked: Vec<
+            std::sync::mpsc::Receiver<Option<crate::explicit_fixpoint_cert::ExplicitFixpointCert>>,
+        > = Vec::new();
         let mut abort_sweep = false;
         let mut forever_leaked = 0usize;
         let mut certified_specs: Vec<String> = Vec::new();
@@ -2493,7 +2621,9 @@ mod tests {
         let mut cfgs: Vec<std::path::PathBuf> = Vec::new();
         let mut stack = vec![base.clone()];
         while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
             for e in entries.flatten() {
                 let p = e.path();
                 if p.is_dir() {
@@ -2507,12 +2637,19 @@ mod tests {
         // small; the pathological enumeration monsters (EinsteinRiddle-class) sort
         // last so they can never starve the certifiers of the timeout budget.
         cfgs.sort_by_key(|c| {
-            let sz = std::fs::metadata(c.with_extension("tla")).map(|m| m.len()).unwrap_or(u64::MAX);
+            let sz = std::fs::metadata(c.with_extension("tla"))
+                .map(|m| m.len())
+                .unwrap_or(u64::MAX);
             (sz, c.clone())
         });
         for cfg_path in &cfgs {
             let tla_path = cfg_path.with_extension("tla");
-            let (Ok(cfg), Ok(tla)) = (std::fs::read_to_string(cfg_path), std::fs::read_to_string(&tla_path)) else { continue };
+            let (Ok(cfg), Ok(tla)) = (
+                std::fs::read_to_string(cfg_path),
+                std::fs::read_to_string(&tla_path),
+            ) else {
+                continue;
+            };
             let (spec_op, mut init, mut next, invs, consts) = parse_tlc_cfg(&cfg);
             if init.is_none() || next.is_none() {
                 if let Some(op) = &spec_op {
@@ -2522,13 +2659,28 @@ mod tests {
                     }
                 }
             }
-            let (Some(init), Some(next)) = (init, next) else { skipped += 1; continue };
-            if invs.is_empty() { skipped += 1; continue }
-            let mut config = crate::config::Config {
-                init: Some(init), next: Some(next), invariants: invs, ..Default::default()
+            let (Some(init), Some(next)) = (init, next) else {
+                skipped += 1;
+                continue;
             };
-            for (n, v) in consts { config.add_constant(n, v); }
-            let name = tla_path.strip_prefix(&base).unwrap_or(&tla_path).display().to_string();
+            if invs.is_empty() {
+                skipped += 1;
+                continue;
+            }
+            let mut config = crate::config::Config {
+                init: Some(init),
+                next: Some(next),
+                invariants: invs,
+                ..Default::default()
+            };
+            for (n, v) in consts {
+                config.add_constant(n, v);
+            }
+            let name = tla_path
+                .strip_prefix(&base)
+                .unwrap_or(&tla_path)
+                .display()
+                .to_string();
             let selfc = is_selfcontained(&tla);
             // Per-spec WALL-CLOCK timeout with BACKPRESSURE on leaked workers: a
             // timed-out worker keeps enumerating until it hits the (20k) state cap,
@@ -2542,7 +2694,10 @@ mod tests {
             // (cap-resistant pathological spec) aborts the remainder of the sweep.
             while leaked.len() >= 2 {
                 let oldest = leaked.remove(0);
-                if oldest.recv_timeout(std::time::Duration::from_secs(120)).is_err() {
+                if oldest
+                    .recv_timeout(std::time::Duration::from_secs(120))
+                    .is_err()
+                {
                     // Permanently stuck (cap-resistant Init-constraint blowup —
                     // EinsteinRiddle-class). Tolerate up to 2 forever-leaks (memory
                     // for 2 is bounded; the observed OOM had 9), then abort.
@@ -2576,7 +2731,9 @@ mod tests {
                     .iter()
                     .map(|(k, v)| (k.clone(), reduce_constant(v)))
                     .collect();
-                for (k, v) in reduced { c.constants.insert(k, v); }
+                for (k, v) in reduced {
+                    c.constants.insert(k, v);
+                }
                 c
             };
             let (tx, rx) = std::sync::mpsc::channel();
@@ -2590,9 +2747,16 @@ mod tests {
                 let dl = Some(std::time::Instant::now() + std::time::Duration::from_secs(45));
                 let attempt = |cfg: &crate::config::Config, dl| {
                     if selfc {
-                        crate::explicit_fixpoint_cert::certify_explicit_state_spec_bounded_deadline(&tla_owned, cfg, 70_000, dl)
+                        crate::explicit_fixpoint_cert::certify_explicit_state_spec_bounded_deadline(
+                            &tla_owned, cfg, 70_000, dl,
+                        )
                     } else {
-                        crate::explicit_fixpoint_cert::certify_explicit_state_spec_from_dir_deadline(&path_owned, cfg, 70_000, dl)
+                        crate::explicit_fixpoint_cert::certify_explicit_state_spec_from_dir_deadline(
+                            &path_owned,
+                            cfg,
+                            70_000,
+                            dl,
+                        )
                     }
                 };
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2601,7 +2765,9 @@ mod tests {
                     match attempt(&cfg_owned, dl) {
                         Some(c) => Some(c),
                         None => {
-                            let dl2 = Some(std::time::Instant::now() + std::time::Duration::from_secs(40));
+                            let dl2 = Some(
+                                std::time::Instant::now() + std::time::Duration::from_secs(40),
+                            );
                             attempt(&cfg_reduced, dl2)
                         }
                     }
@@ -2614,7 +2780,10 @@ mod tests {
                     certified += 1;
                     certified_specs.push(format!("{name} ({} states)", c.reachable.len()));
                 }
-                Ok(_) => { declined += 1; declined_names.push(name.clone()); }
+                Ok(_) => {
+                    declined += 1;
+                    declined_names.push(name.clone());
+                }
                 Err(_) => {
                     timeouts += 1;
                     eprintln!("  ⏱ {name}: TIMEOUT (>45s)");
@@ -2623,13 +2792,17 @@ mod tests {
             }
         }
         eprintln!("[auto-sweep] {certified} CERTIFIED, {declined} declined, {timeouts} timeouts, {skipped} skipped (unresolved cfg / timeout budget)");
-        for s in &certified_specs { eprintln!("  ✓ {s}"); }
-                if std::env::var("TY_SWEEP_DECLINES").is_ok() {
+        for s in &certified_specs {
+            eprintln!("  ✓ {s}");
+        }
+        if std::env::var("TY_SWEEP_DECLINES").is_ok() {
             declined_names.sort();
             eprintln!("[auto-sweep] DECLINED ({}):", declined_names.len());
-            for n in &declined_names { eprintln!("  ✗ {n}"); }
+            for n in &declined_names {
+                eprintln!("  ✗ {n}");
+            }
         }
-assert!(certified >= 16, "auto-sweep floor (22 measured at 70k/45s with reduced-constant retry; 16 allows timeout-order variance)");
+        assert!(certified >= 16, "auto-sweep floor (22 measured at 70k/45s with reduced-constant retry; 16 allows timeout-order variance)");
     }
 
     /// ★ FIRST MULTI-MODULE corpus cert: MCConsensus (PaxosHowToWinATuringAward —
@@ -2642,7 +2815,9 @@ assert!(certified >= 16, "auto-sweep floor (22 measured at 70k/45s with reduced-
     /// configured constants + kernel-re-verifies. Skips when the corpus is absent.
     #[test]
     fn test_mcconsensus_multimodule_certifies() {
-        let Ok(home) = std::env::var("HOME") else { return };
+        let Ok(home) = std::env::var("HOME") else {
+            return;
+        };
         let base = std::path::Path::new(&home).join("tlaplus-examples/specifications");
         let path = base.join("PaxosHowToWinATuringAward/MCConsensus.tla");
         if !path.exists() {
@@ -2659,9 +2834,14 @@ assert!(certified >= 16, "auto-sweep floor (22 measured at 70k/45s with reduced-
         for mv in ["a", "b", "c"] {
             config.add_constant(mv.to_string(), CV::Value(mv.to_string()));
         }
-        config.add_constant("Value".to_string(), CV::Replacement("const_156017750645611000".to_string()));
-        let cert = crate::explicit_fixpoint_cert::certify_explicit_state_spec_from_dir(&path, &config, 100_000)
-            .expect("MCConsensus must certify via the multi-module lane");
+        config.add_constant(
+            "Value".to_string(),
+            CV::Replacement("const_156017750645611000".to_string()),
+        );
+        let cert = crate::explicit_fixpoint_cert::certify_explicit_state_spec_from_dir(
+            &path, &config, 100_000,
+        )
+        .expect("MCConsensus must certify via the multi-module lane");
         assert!(
             crate::explicit_fixpoint_cert::verify_explicit_state_cert(&cert),
             "MCConsensus certificate must kernel-re-verify"
@@ -2678,20 +2858,31 @@ assert!(certified >= 16, "auto-sweep floor (22 measured at 70k/45s with reduced-
     /// Multi-module (MCConsensus EXTENDS Consensus). Skips when the corpus is absent.
     #[test]
     fn test_paxos_mcconsensus_string_set_certifies() {
-        let Ok(home) = std::env::var("HOME") else { return };
+        let Ok(home) = std::env::var("HOME") else {
+            return;
+        };
         let base = std::path::Path::new(&home).join("tlaplus-examples/specifications");
         let path = base.join("Paxos/MCConsensus.tla");
-        if !path.exists() { return; }
+        if !path.exists() {
+            return;
+        }
         let mut config = crate::config::Config {
             init: Some("Inv".to_string()),
             next: Some("Next".to_string()),
             invariants: vec!["Inv".to_string()],
             ..Default::default()
         };
-        config.add_constant("Value".to_string(), crate::config::ConstantValue::Value("{\"a\", \"b\", \"c\"}".to_string()));
-        let cert = crate::explicit_fixpoint_cert::certify_explicit_state_spec_from_dir(&path, &config, 100_000)
-            .expect("Paxos/MCConsensus must certify (string-set Value + subseteq init-generator)");
-        assert!(crate::explicit_fixpoint_cert::verify_explicit_state_cert(&cert));
+        config.add_constant(
+            "Value".to_string(),
+            crate::config::ConstantValue::Value("{\"a\", \"b\", \"c\"}".to_string()),
+        );
+        let cert = crate::explicit_fixpoint_cert::certify_explicit_state_spec_from_dir(
+            &path, &config, 100_000,
+        )
+        .expect("Paxos/MCConsensus must certify (string-set Value + subseteq init-generator)");
+        assert!(crate::explicit_fixpoint_cert::verify_explicit_state_cert(
+            &cert
+        ));
         assert_eq!(cert.reachable.len(), 4, "R = {{}}, {{a}}, {{b}}, {{c}}");
     }
 
@@ -2701,11 +2892,17 @@ assert!(certified >= 16, "auto-sweep floor (22 measured at 70k/45s with reduced-
     /// in-fragment); ~21s in a debug build, so gated with the sweep opt-in.
     #[test]
     fn test_tokenring_concrete_certifies() {
-        if std::env::var("TY_CORPUS_SWEEP").is_err() { return; }
-        let Ok(home) = std::env::var("HOME") else { return };
+        if std::env::var("TY_CORPUS_SWEEP").is_err() {
+            return;
+        }
+        let Ok(home) = std::env::var("HOME") else {
+            return;
+        };
         let base = std::path::Path::new(&home).join("tlaplus-examples/specifications");
         let path = base.join("ewd426/TokenRing.tla");
-        if !path.exists() { return; }
+        if !path.exists() {
+            return;
+        }
         let tla = std::fs::read_to_string(&path).unwrap();
         let mut config = crate::config::Config {
             init: Some("Init".to_string()),
@@ -2713,11 +2910,21 @@ assert!(certified >= 16, "auto-sweep floor (22 measured at 70k/45s with reduced-
             invariants: vec!["TypeOK".to_string()],
             ..Default::default()
         };
-        config.add_constant("N".to_string(), crate::config::ConstantValue::Value("6".to_string()));
-        config.add_constant("M".to_string(), crate::config::ConstantValue::Value("6".to_string()));
-        let cert = crate::explicit_fixpoint_cert::certify_explicit_state_spec_bounded(&tla, &config, 70_000)
-            .expect("TokenRing@6,6 must certify (in-fragment, pure scale)");
-        assert!(crate::explicit_fixpoint_cert::verify_explicit_state_cert(&cert));
+        config.add_constant(
+            "N".to_string(),
+            crate::config::ConstantValue::Value("6".to_string()),
+        );
+        config.add_constant(
+            "M".to_string(),
+            crate::config::ConstantValue::Value("6".to_string()),
+        );
+        let cert = crate::explicit_fixpoint_cert::certify_explicit_state_spec_bounded(
+            &tla, &config, 70_000,
+        )
+        .expect("TokenRing@6,6 must certify (in-fragment, pure scale)");
+        assert!(crate::explicit_fixpoint_cert::verify_explicit_state_cert(
+            &cert
+        ));
         assert_eq!(cert.reachable.len(), 46_656, "6^6 ring configurations");
     }
 
@@ -2729,32 +2936,48 @@ assert!(certified >= 16, "auto-sweep floor (22 measured at 70k/45s with reduced-
     /// evaluate into. The adversarial twin below pins the fail-closed side.
     #[test]
     fn test_twophase_and_ewd840_certify() {
-        let Ok(home) = std::env::var("HOME") else { return };
+        let Ok(home) = std::env::var("HOME") else {
+            return;
+        };
         let base = std::path::Path::new(&home).join("tlaplus-examples/specifications");
-        if !base.exists() { return; }
+        if !base.exists() {
+            return;
+        }
         type CV = crate::config::ConstantValue;
         // TwoPhase @ RM = {r1, r2, r3} (its .cfg).
         let mut c1 = crate::config::Config {
-            init: Some("TPInit".into()), next: Some("TPNext".into()),
-            invariants: vec!["TPTypeOK".into()], ..Default::default()
+            init: Some("TPInit".into()),
+            next: Some("TPNext".into()),
+            invariants: vec!["TPTypeOK".into()],
+            ..Default::default()
         };
-        c1.add_constant("RM".into(), CV::ModelValueSet(vec!["r1".into(), "r2".into(), "r3".into()]));
+        c1.add_constant(
+            "RM".into(),
+            CV::ModelValueSet(vec!["r1".into(), "r2".into(), "r3".into()]),
+        );
         let p1 = base.join("transaction_commit/TwoPhase.tla");
-        let cert1 = crate::explicit_fixpoint_cert::certify_explicit_state_spec_from_dir(&p1, &c1, 100_000)
-            .expect("TwoPhase must certify (theorem-only instance dropped)");
-        assert!(crate::explicit_fixpoint_cert::verify_explicit_state_cert(&cert1));
+        let cert1 =
+            crate::explicit_fixpoint_cert::certify_explicit_state_spec_from_dir(&p1, &c1, 100_000)
+                .expect("TwoPhase must certify (theorem-only instance dropped)");
+        assert!(crate::explicit_fixpoint_cert::verify_explicit_state_cert(
+            &cert1
+        ));
         assert_eq!(cert1.reachable.len(), 288);
         // EWD840 @ N = 3, all three configured invariants conjoined.
         let mut c2 = crate::config::Config {
-            init: Some("Init".into()), next: Some("Next".into()),
+            init: Some("Init".into()),
+            next: Some("Next".into()),
             invariants: vec!["TypeOK".into(), "TerminationDetection".into(), "Inv".into()],
             ..Default::default()
         };
         c2.add_constant("N".into(), CV::Value("3".into()));
         let p2 = base.join("ewd840/EWD840.tla");
-        let cert2 = crate::explicit_fixpoint_cert::certify_explicit_state_spec_from_dir(&p2, &c2, 100_000)
-            .expect("EWD840 must certify (theorem-only instance dropped)");
-        assert!(crate::explicit_fixpoint_cert::verify_explicit_state_cert(&cert2));
+        let cert2 =
+            crate::explicit_fixpoint_cert::certify_explicit_state_spec_from_dir(&p2, &c2, 100_000)
+                .expect("EWD840 must certify (theorem-only instance dropped)");
+        assert!(crate::explicit_fixpoint_cert::verify_explicit_state_cert(
+            &cert2
+        ));
         assert_eq!(cert2.reachable.len(), 302);
     }
 
@@ -2765,16 +2988,25 @@ assert!(certified >= 16, "auto-sweep floor (22 measured at 70k/45s with reduced-
     /// never certify against a partial model.
     #[test]
     fn test_referencing_instance_still_declines() {
-        let Ok(home) = std::env::var("HOME") else { return };
+        let Ok(home) = std::env::var("HOME") else {
+            return;
+        };
         let base = std::path::Path::new(&home).join("tlaplus-examples/specifications");
         let path = base.join("DieHard/MCDieHardest.tla");
-        if !path.exists() { return; }
+        if !path.exists() {
+            return;
+        }
         let config = crate::config::Config {
-            init: Some("Init".into()), next: Some("NextInterleaved".into()),
-            invariants: vec!["NotSolved".into()], ..Default::default()
+            init: Some("Init".into()),
+            next: Some("NextInterleaved".into()),
+            invariants: vec!["NotSolved".into()],
+            ..Default::default()
         };
         assert!(
-            crate::explicit_fixpoint_cert::certify_explicit_state_spec_from_dir(&path, &config, 100_000).is_none(),
+            crate::explicit_fixpoint_cert::certify_explicit_state_spec_from_dir(
+                &path, &config, 100_000
+            )
+            .is_none(),
             "a spec whose obligations reference un-merged instance content must DECLINE"
         );
     }
@@ -2789,26 +3021,41 @@ assert!(certified >= 16, "auto-sweep floor (22 measured at 70k/45s with reduced-
     fn test_tiera_identity_instance_merge_certifies() {
         let dir = std::env::temp_dir().join(format!("ty_tiera_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("Base.tla"), "---- MODULE Base ----\n\
+        std::fs::write(
+            dir.join("Base.tla"),
+            "---- MODULE Base ----\n\
 EXTENDS Naturals\n\
 VARIABLE x\n\
 Init == x = 0\n\
 Next == x' = IF x < 3 THEN x + 1 ELSE 0\n\
-====\n").unwrap();
-        std::fs::write(dir.join("Wrapper.tla"), "---- MODULE Wrapper ----\n\
+====\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("Wrapper.tla"),
+            "---- MODULE Wrapper ----\n\
 EXTENDS Naturals\n\
 VARIABLE x\n\
 INSTANCE Base\n\
 WTypeOK == x >= 0 /\\ x <= 3\n\
-====\n").unwrap();
+====\n",
+        )
+        .unwrap();
         let config = crate::config::Config {
-            init: Some("Init".into()), next: Some("Next".into()),
-            invariants: vec!["WTypeOK".into()], ..Default::default()
+            init: Some("Init".into()),
+            next: Some("Next".into()),
+            invariants: vec!["WTypeOK".into()],
+            ..Default::default()
         };
         let cert = crate::explicit_fixpoint_cert::certify_explicit_state_spec_from_dir(
-            &dir.join("Wrapper.tla"), &config, 1_000)
-            .expect("identity-INSTANCE wrapper must certify via the Tier-A merge");
-        assert!(crate::explicit_fixpoint_cert::verify_explicit_state_cert(&cert));
+            &dir.join("Wrapper.tla"),
+            &config,
+            1_000,
+        )
+        .expect("identity-INSTANCE wrapper must certify via the Tier-A merge");
+        assert!(crate::explicit_fixpoint_cert::verify_explicit_state_cert(
+            &cert
+        ));
         assert_eq!(cert.reachable.len(), 4, "x cycles 0..3");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2820,18 +3067,33 @@ WTypeOK == x >= 0 /\\ x <= 3\n\
     /// sweep's reduced-constant retry.
     #[test]
     fn test_barriers_certifies() {
-        let Ok(home) = std::env::var("HOME") else { return };
-        let path = std::path::Path::new(&home).join("tlaplus-examples/specifications/barriers/Barriers.tla");
-        if !path.exists() { return; }
+        let Ok(home) = std::env::var("HOME") else {
+            return;
+        };
+        let path = std::path::Path::new(&home)
+            .join("tlaplus-examples/specifications/barriers/Barriers.tla");
+        if !path.exists() {
+            return;
+        }
         let mut config = crate::config::Config {
-            init: Some("Init".into()), next: Some("Next".into()),
-            invariants: vec!["TypeOK".into(), "LockInv".into(), "Inv".into(), "FlushInv".into()],
+            init: Some("Init".into()),
+            next: Some("Next".into()),
+            invariants: vec![
+                "TypeOK".into(),
+                "LockInv".into(),
+                "Inv".into(),
+                "FlushInv".into(),
+            ],
             ..Default::default()
         };
         config.add_constant("N".into(), crate::config::ConstantValue::Value("2".into()));
-        let cert = crate::explicit_fixpoint_cert::certify_explicit_state_spec_from_dir(&path, &config, 70_000)
-            .expect("Barriers@N=2 must certify (4-invariant conjunction)");
-        assert!(crate::explicit_fixpoint_cert::verify_explicit_state_cert(&cert));
+        let cert = crate::explicit_fixpoint_cert::certify_explicit_state_spec_from_dir(
+            &path, &config, 70_000,
+        )
+        .expect("Barriers@N=2 must certify (4-invariant conjunction)");
+        assert!(crate::explicit_fixpoint_cert::verify_explicit_state_cert(
+            &cert
+        ));
         assert_eq!(cert.reachable.len(), 75);
     }
 
@@ -2854,7 +3116,9 @@ WTypeOK == x >= 0 /\\ x <= 3\n\
     fn test_funcenum_unobserved_label_exact_both_directions() {
         let dir = std::env::temp_dir().join(format!("ty_ful_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("FUL.tla"), "---- MODULE FUL ----\n\
+        std::fs::write(
+            dir.join("FUL.tla"),
+            "---- MODULE FUL ----\n\
 EXTENDS Naturals\n\
 CONSTANT D\n\
 VARIABLE f\n\
@@ -2863,24 +3127,40 @@ Next == f' = [d \\in D |-> IF f[d] = \"a\" THEN \"b\" ELSE \"a\"]\n\
 TypeOK == f \\in [D -> {\"a\", \"b\"}]\n\
 NotC == \\A d \\in D : f[d] /= \"c\"\n\
 IsC == \\A d \\in D : f[d] = \"c\"\n\
-====\n").unwrap();
+====\n",
+        )
+        .unwrap();
         type CV = crate::config::ConstantValue;
         let mv = |xs: &[&str]| CV::ModelValueSet(xs.iter().map(|s| s.to_string()).collect());
         let base_cfg = |invs: Vec<&str>| {
             let mut c = crate::config::Config {
-                init: Some("Init".into()), next: Some("Next".into()),
-                invariants: invs.iter().map(|s| s.to_string()).collect(), ..Default::default() };
+                init: Some("Init".into()),
+                next: Some("Next".into()),
+                invariants: invs.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            };
             c.add_constant("D".into(), mv(&["d1"]));
             c
         };
         let p = dir.join("FUL.tla");
         // `f[d] /= "c"` — true on every reachable state ⇒ certifies (with TypeOK).
-        let cert = crate::explicit_fixpoint_cert::certify_explicit_state_spec_from_dir(&p, &base_cfg(vec!["TypeOK", "NotC"]), 1_000)
-            .expect("f[d] /= \"c\" is always true ⇒ must certify");
-        assert!(crate::explicit_fixpoint_cert::verify_explicit_state_cert(&cert));
+        let cert = crate::explicit_fixpoint_cert::certify_explicit_state_spec_from_dir(
+            &p,
+            &base_cfg(vec!["TypeOK", "NotC"]),
+            1_000,
+        )
+        .expect("f[d] /= \"c\" is always true ⇒ must certify");
+        assert!(crate::explicit_fixpoint_cert::verify_explicit_state_cert(
+            &cert
+        ));
         // `f[d] = "c"` — FALSE on every reachable state ⇒ the kernel refuses it.
         assert!(
-            crate::explicit_fixpoint_cert::certify_explicit_state_spec_from_dir(&p, &base_cfg(vec!["IsC"]), 1_000).is_none(),
+            crate::explicit_fixpoint_cert::certify_explicit_state_spec_from_dir(
+                &p,
+                &base_cfg(vec!["IsC"]),
+                1_000
+            )
+            .is_none(),
             "f[d] = \"c\" is FALSE on the reachable set ⇒ must DECLINE (no false cert)"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -2888,9 +3168,13 @@ IsC == \\A d \\in D : f[d] = \"c\"\n\
 
     #[test]
     fn test_byihive_voucher_family_certifies() {
-        let Ok(home) = std::env::var("HOME") else { return };
+        let Ok(home) = std::env::var("HOME") else {
+            return;
+        };
         let base = std::path::Path::new(&home).join("tlaplus-examples/specifications");
-        if !base.exists() { return; }
+        if !base.exists() {
+            return;
+        }
         type CV = crate::config::ConstantValue;
         let mv = |xs: &[&str]| CV::ModelValueSet(xs.iter().map(|s| s.to_string()).collect());
         // The full VTP voucher family — each with its OWN configured constants
@@ -2906,22 +3190,50 @@ IsC == \\A d \\in D : f[d] = \"c\"\n\
         // FALSE on the cross-checked safety leg (see func_enum_eq_form's
         // `labels_complete_over_r`).
         let cases: Vec<(&str, Vec<(&str, &[&str])>)> = vec![
-            ("VoucherIssue", vec![("V", &["v1"] as &[&str]), ("H", &["holder1"]), ("I", &["issuer1"])]),
-            ("VoucherCancel", vec![("V", &["v1"]), ("H", &["holder1"]), ("I", &["issuer1"])]),
-            ("VoucherRedeem", vec![("V", &["v1"]), ("H", &["holder1"]), ("C", &["collector1"])]),
-            ("VoucherTransfer", vec![("V", &["v1"]), ("SH", &["src1"]), ("DH", &["dst1"])]),
+            (
+                "VoucherIssue",
+                vec![
+                    ("V", &["v1"] as &[&str]),
+                    ("H", &["holder1"]),
+                    ("I", &["issuer1"]),
+                ],
+            ),
+            (
+                "VoucherCancel",
+                vec![("V", &["v1"]), ("H", &["holder1"]), ("I", &["issuer1"])],
+            ),
+            (
+                "VoucherRedeem",
+                vec![("V", &["v1"]), ("H", &["holder1"]), ("C", &["collector1"])],
+            ),
+            (
+                "VoucherTransfer",
+                vec![("V", &["v1"]), ("SH", &["src1"]), ("DH", &["dst1"])],
+            ),
         ];
         for (rel, consts) in &cases {
             let path = base.join(format!("byihive/{rel}.tla"));
-            if !path.exists() { continue; }
+            if !path.exists() {
+                continue;
+            }
             let mut config = crate::config::Config {
-                init: Some("VTPInit".into()), next: Some("VTPNext".into()),
-                invariants: vec!["VTPTypeOK".into(), "VTPConsistent".into()], ..Default::default()
+                init: Some("VTPInit".into()),
+                next: Some("VTPNext".into()),
+                invariants: vec!["VTPTypeOK".into(), "VTPConsistent".into()],
+                ..Default::default()
             };
-            for (n, vs) in consts { config.add_constant(n.to_string(), mv(vs)); }
-            let cert = crate::explicit_fixpoint_cert::certify_explicit_state_spec_from_dir(&path, &config, 50_000)
-                .unwrap_or_else(|| panic!("{rel} must certify (setmask union arm + configured constants)"));
-            assert!(crate::explicit_fixpoint_cert::verify_explicit_state_cert(&cert));
+            for (n, vs) in consts {
+                config.add_constant(n.to_string(), mv(vs));
+            }
+            let cert = crate::explicit_fixpoint_cert::certify_explicit_state_spec_from_dir(
+                &path, &config, 50_000,
+            )
+            .unwrap_or_else(|| {
+                panic!("{rel} must certify (setmask union arm + configured constants)")
+            });
+            assert!(crate::explicit_fixpoint_cert::verify_explicit_state_cert(
+                &cert
+            ));
             assert_eq!(cert.reachable.len(), 21, "{rel}");
         }
     }
@@ -2937,26 +3249,37 @@ IsC == \\A d \\in D : f[d] = \"c\"\n\
         std::fs::create_dir_all(&dir).unwrap();
         // `s` ranges over SUBSET (A ∪ B) so the SetMask column establishes the
         // full {a1,b1} universe (both union sides observed); Next stutters.
-        std::fs::write(dir.join("SMU.tla"), "---- MODULE SMU ----\n\
+        std::fs::write(
+            dir.join("SMU.tla"),
+            "---- MODULE SMU ----\n\
 EXTENDS Naturals, FiniteSets\n\
 CONSTANTS A, B\n\
 VARIABLE s\n\
 Init == s \\in SUBSET (A \\cup B)\n\
 Next == s' = s\n\
 TypeOK == s \\subseteq A \\cup B\n\
-====\n").unwrap();
+====\n",
+        )
+        .unwrap();
         type CV = crate::config::ConstantValue;
         let mv = |xs: &[&str]| CV::ModelValueSet(xs.iter().map(|s| s.to_string()).collect());
         let mut config = crate::config::Config {
-            init: Some("Init".into()), next: Some("Next".into()),
-            invariants: vec!["TypeOK".into()], ..Default::default()
+            init: Some("Init".into()),
+            next: Some("Next".into()),
+            invariants: vec!["TypeOK".into()],
+            ..Default::default()
         };
         config.add_constant("A".into(), mv(&["a1"]));
         config.add_constant("B".into(), mv(&["b1"]));
         let cert = crate::explicit_fixpoint_cert::certify_explicit_state_spec_from_dir(
-            &dir.join("SMU.tla"), &config, 1_000)
-            .expect("s ⊆ A ∪ B over the empty set must certify");
-        assert!(crate::explicit_fixpoint_cert::verify_explicit_state_cert(&cert));
+            &dir.join("SMU.tla"),
+            &config,
+            1_000,
+        )
+        .expect("s ⊆ A ∪ B over the empty set must certify");
+        assert!(crate::explicit_fixpoint_cert::verify_explicit_state_cert(
+            &cert
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2968,18 +3291,28 @@ TypeOK == s \\subseteq A \\cup B\n\
     /// end-to-end through the kernel. N=2 (the .cfg N=5 reduced), 13 states.
     #[test]
     fn test_teaching_simple_full_cfg_certifies() {
-        let Ok(home) = std::env::var("HOME") else { return };
-        let path = std::path::Path::new(&home).join("tlaplus-examples/specifications/TeachingConcurrency/Simple.tla");
-        if !path.exists() { return; }
+        let Ok(home) = std::env::var("HOME") else {
+            return;
+        };
+        let path = std::path::Path::new(&home)
+            .join("tlaplus-examples/specifications/TeachingConcurrency/Simple.tla");
+        if !path.exists() {
+            return;
+        }
         let mut config = crate::config::Config {
-            init: Some("Init".into()), next: Some("Next".into()),
+            init: Some("Init".into()),
+            next: Some("Next".into()),
             invariants: vec!["PCorrect".into(), "TypeOK".into(), "Inv".into()],
             ..Default::default()
         };
         config.add_constant("N".into(), crate::config::ConstantValue::Value("2".into()));
-        let cert = crate::explicit_fixpoint_cert::certify_explicit_state_spec_from_dir(&path, &config, 50_000)
-            .expect("Simple@N=2 must certify the full cfg invariant PCorrect ∧ TypeOK ∧ Inv");
-        assert!(crate::explicit_fixpoint_cert::verify_explicit_state_cert(&cert));
+        let cert = crate::explicit_fixpoint_cert::certify_explicit_state_spec_from_dir(
+            &path, &config, 50_000,
+        )
+        .expect("Simple@N=2 must certify the full cfg invariant PCorrect ∧ TypeOK ∧ Inv");
+        assert!(crate::explicit_fixpoint_cert::verify_explicit_state_cert(
+            &cert
+        ));
         assert_eq!(cert.reachable.len(), 13);
     }
 
@@ -2993,7 +3326,9 @@ TypeOK == s \\subseteq A \\cup B\n\
     fn test_funcsetmask_powerset_codomain_sound() {
         let dir = std::env::temp_dir().join(format!("ty_fsm_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("FSM.tla"), "---- MODULE FSM ----\n\
+        std::fs::write(
+            dir.join("FSM.tla"),
+            "---- MODULE FSM ----\n\
 EXTENDS Naturals, FiniteSets\n\
 CONSTANT D\n\
 VARIABLE x\n\
@@ -3001,23 +3336,40 @@ Init == x = [d \\in D |-> {0}]\n\
 Next == x' = [d \\in D |-> IF x[d] = {0} THEN {0, 1} ELSE {0}]\n\
 Good == x \\in [D -> SUBSET {0, 1}]\n\
 Bad == x \\in [D -> SUBSET {0}]\n\
-====\n").unwrap();
+====\n",
+        )
+        .unwrap();
         type CV = crate::config::ConstantValue;
         let mv = |xs: &[&str]| CV::ModelValueSet(xs.iter().map(|s| s.to_string()).collect());
         let cfg = |inv: &str| {
-            let mut c = crate::config::Config { init: Some("Init".into()), next: Some("Next".into()),
-                invariants: vec![inv.to_string()], ..Default::default() };
+            let mut c = crate::config::Config {
+                init: Some("Init".into()),
+                next: Some("Next".into()),
+                invariants: vec![inv.to_string()],
+                ..Default::default()
+            };
             c.add_constant("D".into(), mv(&["d1"]));
             c
         };
         let p = dir.join("FSM.tla");
         // Good: cells ⊆ {0,1} ⇒ x ∈ [D -> SUBSET {0,1}] is a tautology ⇒ certifies.
-        let cert = crate::explicit_fixpoint_cert::certify_explicit_state_spec_from_dir(&p, &cfg("Good"), 1_000)
-            .expect("x ∈ [D -> SUBSET {0,1}] must certify (cell universe ⊆ S)");
-        assert!(crate::explicit_fixpoint_cert::verify_explicit_state_cert(&cert));
+        let cert = crate::explicit_fixpoint_cert::certify_explicit_state_spec_from_dir(
+            &p,
+            &cfg("Good"),
+            1_000,
+        )
+        .expect("x ∈ [D -> SUBSET {0,1}] must certify (cell universe ⊆ S)");
+        assert!(crate::explicit_fixpoint_cert::verify_explicit_state_cert(
+            &cert
+        ));
         // Bad: a reachable cell {0,1} ⊄ {0} ⇒ x ∈ [D -> SUBSET {0}] is FALSE ⇒ DECLINE.
         assert!(
-            crate::explicit_fixpoint_cert::certify_explicit_state_spec_from_dir(&p, &cfg("Bad"), 1_000).is_none(),
+            crate::explicit_fixpoint_cert::certify_explicit_state_spec_from_dir(
+                &p,
+                &cfg("Bad"),
+                1_000
+            )
+            .is_none(),
             "x ∈ [D -> SUBSET {{0}}] is FALSE on the reachable set ⇒ must DECLINE (no false cert)"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -3036,31 +3388,54 @@ Bad == x \\in [D -> SUBSET {0}]\n\
     fn test_solo_field_record_elision_sound() {
         let dir = std::env::temp_dir().join(format!("ty_eld_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("ELD.tla"), "---- MODULE ELD ----\n\
+        std::fs::write(
+            dir.join("ELD.tla"),
+            "---- MODULE ELD ----\n\
 CONSTANT D\n\
 VARIABLE flag\n\
 Init == flag = [d \\in D |-> [on |-> FALSE]]\n\
 Next == flag' = [d \\in D |-> [on |-> ~flag[d].on]]\n\
 TypeOK == flag \\in [D -> [on: BOOLEAN]]\n\
 AlwaysOn == \\A d \\in D : flag[d].on = TRUE\n\
-====\n").unwrap();
+====\n",
+        )
+        .unwrap();
         type CV = crate::config::ConstantValue;
         let mv = |xs: &[&str]| CV::ModelValueSet(xs.iter().map(|s| s.to_string()).collect());
         let cfg = |inv: &str| {
-            let mut c = crate::config::Config { init: Some("Init".into()), next: Some("Next".into()),
-                invariants: vec![inv.to_string()], ..Default::default() };
+            let mut c = crate::config::Config {
+                init: Some("Init".into()),
+                next: Some("Next".into()),
+                invariants: vec![inv.to_string()],
+                ..Default::default()
+            };
             c.add_constant("D".into(), mv(&["d1"]));
             c
         };
         let p = dir.join("ELD.tla");
         // Good: post-elision `flag ∈ [D -> BOOLEAN]` is the plain Bool-cell shape ⇒ certifies.
-        let cert = crate::explicit_fixpoint_cert::certify_explicit_state_spec_from_dir(&p, &cfg("TypeOK"), 1_000)
-            .expect("solo-field record cells `[D -> [on: BOOLEAN]]` must certify via the elision");
-        assert!(crate::explicit_fixpoint_cert::verify_explicit_state_cert(&cert));
-        assert_eq!(cert.reachable.len(), 2, "all-FALSE ↔ all-TRUE toggle at |D|=1");
+        let cert = crate::explicit_fixpoint_cert::certify_explicit_state_spec_from_dir(
+            &p,
+            &cfg("TypeOK"),
+            1_000,
+        )
+        .expect("solo-field record cells `[D -> [on: BOOLEAN]]` must certify via the elision");
+        assert!(crate::explicit_fixpoint_cert::verify_explicit_state_cert(
+            &cert
+        ));
+        assert_eq!(
+            cert.reachable.len(),
+            2,
+            "all-FALSE ↔ all-TRUE toggle at |D|=1"
+        );
         // Bad: the initial state has flag[d].on = FALSE ⇒ AlwaysOn is FALSE ⇒ DECLINE.
         assert!(
-            crate::explicit_fixpoint_cert::certify_explicit_state_spec_from_dir(&p, &cfg("AlwaysOn"), 1_000).is_none(),
+            crate::explicit_fixpoint_cert::certify_explicit_state_spec_from_dir(
+                &p,
+                &cfg("AlwaysOn"),
+                1_000
+            )
+            .is_none(),
             "`∀d: flag[d].on = TRUE` is FALSE on the reachable set ⇒ must DECLINE (no false cert)"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -3078,17 +3453,30 @@ AlwaysOn == \\A d \\in D : flag[d].on = TRUE\n\
     /// tautology by func_set_membership_form's FuncSetMask arm.
     #[test]
     fn test_simpleregular_full_cfg_certifies() {
-        let Ok(home) = std::env::var("HOME") else { return };
-        let path = std::path::Path::new(&home).join("tlaplus-examples/specifications/TeachingConcurrency/SimpleRegular.tla");
-        if !path.exists() { return; }
+        let Ok(home) = std::env::var("HOME") else {
+            return;
+        };
+        let path = std::path::Path::new(&home)
+            .join("tlaplus-examples/specifications/TeachingConcurrency/SimpleRegular.tla");
+        if !path.exists() {
+            return;
+        }
         let mut config = crate::config::Config {
-            init: Some("Init".into()), next: Some("Next".into()),
-            invariants: vec!["PCorrect".into(), "TypeOK".into(), "Inv".into()], ..Default::default()
+            init: Some("Init".into()),
+            next: Some("Next".into()),
+            invariants: vec!["PCorrect".into(), "TypeOK".into(), "Inv".into()],
+            ..Default::default()
         };
         config.add_constant("N".into(), crate::config::ConstantValue::Value("2".into()));
-        let cert = crate::explicit_fixpoint_cert::certify_explicit_state_spec_from_dir(&path, &config, 50_000)
-            .expect("SimpleRegular@N=2 must certify the FULL cfg (function-to-non-empty-powerset TypeOK)");
-        assert!(crate::explicit_fixpoint_cert::verify_explicit_state_cert(&cert));
+        let cert = crate::explicit_fixpoint_cert::certify_explicit_state_spec_from_dir(
+            &path, &config, 50_000,
+        )
+        .expect(
+            "SimpleRegular@N=2 must certify the FULL cfg (function-to-non-empty-powerset TypeOK)",
+        );
+        assert!(crate::explicit_fixpoint_cert::verify_explicit_state_cert(
+            &cert
+        ));
         assert_eq!(cert.reachable.len(), 22);
     }
 
@@ -3101,14 +3489,22 @@ AlwaysOn == \\A d \\in D : flag[d].on = TRUE\n\
     /// because Solution is genuinely false on a reachable state.
     #[test]
     fn test_unsafe_puzzle_solution_invariant_declines() {
-        let Ok(home) = std::env::var("HOME") else { return };
-        let path = std::path::Path::new(&home).join("tlaplus-examples/specifications/MissionariesAndCannibals/MissionariesAndCannibals.tla");
-        if !path.exists() { return; }
+        let Ok(home) = std::env::var("HOME") else {
+            return;
+        };
+        let path = std::path::Path::new(&home).join(
+            "tlaplus-examples/specifications/MissionariesAndCannibals/MissionariesAndCannibals.tla",
+        );
+        if !path.exists() {
+            return;
+        }
         type CV = crate::config::ConstantValue;
         let mv = |xs: &[&str]| CV::ModelValueSet(xs.iter().map(|s| s.to_string()).collect());
         let mut config = crate::config::Config {
-            init: Some("Init".into()), next: Some("Next".into()),
-            invariants: vec!["TypeOK".into(), "Solution".into()], ..Default::default()
+            init: Some("Init".into()),
+            next: Some("Next".into()),
+            invariants: vec!["TypeOK".into(), "Solution".into()],
+            ..Default::default()
         };
         config.add_constant("Missionaries".into(), mv(&["m1"]));
         config.add_constant("Cannibals".into(), mv(&["c1"]));
@@ -3150,11 +3546,18 @@ AlwaysOn == \\A d \\in D : flag[d].on = TRUE\n\
             .iter()
             .find(|o| o.name == "deadlock_freedom")
             .expect("deadlock obligation present");
-        assert!(dl.strict_verified, "the DNF deadlock cases must all strict-verify");
+        assert!(
+            dl.strict_verified,
+            "the DNF deadlock cases must all strict-verify"
+        );
         // Multi-case bundle: a JSON array of >1 per-clause bundles.
         let arr: Vec<String> =
             serde_json::from_str(&dl.bundle_json).expect("deadlock bundle is a JSON array");
-        assert!(arr.len() > 1, "disjunctive coverage must carry >1 DNF-case bundles, got {}", arr.len());
+        assert!(
+            arr.len() > 1,
+            "disjunctive coverage must carry >1 DNF-case bundles, got {}",
+            arr.len()
+        );
         assert_eq!(
             verify_all_n_certificate(&cert).verdict,
             AllNVerdict::Accepted,
@@ -3318,15 +3721,35 @@ AlwaysOn == \\A d \\in D : flag[d].on = TRUE\n\
             \\/ Termination\n\
         ====\n";
 
-    // Minimal RECORD probe (isolates record support from set-membership): a record
-    // state var, field access in J, a guarded field-EXCEPT write, NO membership.
+    // Minimal RECORD probe (isolates record support from set-membership): the
+    // self-reconstruction equality proves r's exact closed field set, while the
+    // direct field equalities determine the field sorts (including symbolic N).
+    // The terminal stutter makes Next enabled after the counter reaches N (and
+    // immediately when N <= 0), so the all-N deadlock obligation is genuine.
     const RECMIN: &str = "---- MODULE RecMin ----\n\
         EXTENDS Integers\n\
         CONSTANT N\n\
         VARIABLE r\n\
-        Init == r.a = 0 /\\ r.b = N\n\
-        Next == r.a < N /\\ r' = [r EXCEPT !.a = @ + 1]\n\
+        Init == /\\ r = [a |-> r.a, b |-> r.b]\n\
+                /\\ r.a = 0\n\
+                /\\ r.b = N\n\
+        Advance == r.a < N /\\ r' = [r EXCEPT !.a = @ + 1]\n\
+        Terminal == r.a >= N /\\ UNCHANGED r\n\
+        Next == Advance \\/ Terminal\n\
         Safety == r.a >= 0\n\
+        ====\n";
+
+    // Exact record-DOMAIN soundness twin. Every Init state has fields {a, b},
+    // so it is NEVER equal to the one-field record `[a |-> 0]`, regardless of
+    // field values or N. A field-only equality translation would erase `b`,
+    // negate `r.a = 0` in the initiation obligation, and falsely certify.
+    const RECORD_DOMAIN_BAD: &str = "---- MODULE RecordDomainBad ----\n\
+        EXTENDS Integers\n\
+        CONSTANT N\n\
+        VARIABLE r\n\
+        Init == r = [a |-> 0, b |-> N]\n\
+        Next == UNCHANGED r\n\
+        Safety == r = [a |-> 0]\n\
         ====\n";
 
     // RECORD-STATE all-N cert (the record slice): a record state var `r = {a, b}`,
@@ -3398,23 +3821,32 @@ AlwaysOn == \\A d \\in D : flag[d].on = TRUE\n\
         );
     }
 
-    /// Record STRUCTURE-INFERENCE limit (ASPIRATIONAL). This spec constrains `r`
-    /// ONLY through field accesses (`r.a`, `r.b`) — there is no `RecordSet`
-    /// membership or record-literal to reveal the field structure, so sort
-    /// inference cannot bootstrap `r`'s Record sort (field access on an unknown
-    /// sort is circular) and it defaults to `Int`. A real spec always pins the
-    /// structure via a TypeInvariant / Init (see [`test_record_state_certifies_all_n`]);
-    /// this documents the one shape the record slice does NOT cover.
+    /// Direct-field record inference, end-to-end. The exact self-reconstruction
+    /// witness rules out hidden fields, direct equalities infer `a: Int, b: Int`,
+    /// and the terminal stutter discharges deadlock-freedom for every rigid N.
     #[test]
-    #[ignore = "record structure not inferable from field-access-only constraints (needs a RecordSet membership or record literal)"]
     fn test_record_minimal_certifies() {
         let mut config = cfg();
         config.init = Some("Init".to_string());
         config.next = Some("Next".to_string());
         config.invariants = vec!["Safety".to_string()];
         let cert = certify_all_n(RECMIN, &config, "N", "r.a >= 0")
-            .expect("would certify if r's record structure were inferable");
-        assert_eq!(verify_all_n_certificate(&cert).verdict, AllNVerdict::Accepted);
+            .expect("closed record structure and direct field sorts must certify");
+        assert_eq!(
+            verify_all_n_certificate(&cert).verdict,
+            AllNVerdict::Accepted
+        );
+    }
+
+    /// A record literal with a different DOMAIN is not equal even when every
+    /// shared field matches. The all-N lane must find the violating Init state
+    /// and decline rather than proving a partial per-field encoding.
+    #[test]
+    fn test_record_literal_domain_mismatch_false_invariant_declines() {
+        assert!(
+            certify_all_n(RECORD_DOMAIN_BAD, &cfg(), "N", "r = [a |-> 0]").is_none(),
+            "a two-field record must never certify equal to a one-field literal"
+        );
     }
 
     /// ★ THE FIRST REAL CORPUS SPEC THAT CERTIFIES (CoffeeCan, tlaplus/Examples).
@@ -3508,14 +3940,8 @@ AlwaysOn == \\A d \\in D : flag[d].on = TRUE\n\
                 assert_eq!(legs.len(), 1);
                 match &legs[0] {
                     ConjunctCoverage::EqSplit { le, ge } => {
-                        assert_eq!(
-                            verify_all_n_certificate(le).verdict,
-                            AllNVerdict::Accepted
-                        );
-                        assert_eq!(
-                            verify_all_n_certificate(ge).verdict,
-                            AllNVerdict::Accepted
-                        );
+                        assert_eq!(verify_all_n_certificate(le).verdict, AllNVerdict::Accepted);
+                        assert_eq!(verify_all_n_certificate(ge).verdict, AllNVerdict::Accepted);
                     }
                     ConjunctCoverage::Cert(cert) => {
                         assert_eq!(
@@ -3887,8 +4313,7 @@ AlwaysOn == \\A d \\in D : flag[d].on = TRUE\n\
                         report.detail
                     );
                     // JSON round-trip (joint_members serde-stable).
-                    let reloaded =
-                        AllNCertificate::from_json(&cert.to_json()).expect("reload");
+                    let reloaded = AllNCertificate::from_json(&cert.to_json()).expect("reload");
                     assert_eq!(&reloaded, cert.as_ref());
                     assert_eq!(
                         verify_all_n_certificate(&reloaded).verdict,
@@ -4082,7 +4507,10 @@ AlwaysOn == \\A d \\in D : flag[d].on = TRUE\n\
         )
         .expect("the arith joint must certify `d \\in Nat`");
         assert_eq!(cert.joint_members, Some(vec![1, 2, 3]));
-        assert_eq!(verify_all_n_certificate(&cert).verdict, AllNVerdict::Accepted);
+        assert_eq!(
+            verify_all_n_certificate(&cert).verdict,
+            AllNVerdict::Accepted
+        );
 
         // (1) Mutated members WITHOUT recomputing the digest -> digest wall.
         let mut t = cert.clone();
@@ -4519,10 +4947,7 @@ AlwaysOn == \\A d \\in D : flag[d].on = TRUE\n\
         // McCarthy reduction (array-free branches, no ay/checker change).
         for name in ["initiation", "safety", "consecution"] {
             let o = obligations.iter().find(|o| o.name == name).unwrap();
-            assert!(
-                o.strict_verified,
-                "obligation {name} must strict-verify"
-            );
+            assert!(o.strict_verified, "obligation {name} must strict-verify");
         }
     }
 

@@ -123,6 +123,10 @@ pub(super) fn aggregate_stats(total: &mut WorkerStats, stats: &WorkerStats) {
     total.idle_ns += stats.idle_ns;
     total.steal_latency_ns += stats.steal_latency_ns;
     total.states_generated += stats.states_generated;
+    total.raw_successors_generated = total
+        .raw_successors_generated
+        .checked_add(stats.raw_successors_generated)
+        .expect("aggregated raw successor generation count overflowed usize");
     // Part of #3285: Aggregate intern attribution counters
     if let Some(ic) = &stats.intern_counters {
         let total_ic = total.intern_counters.get_or_insert_with(Default::default);

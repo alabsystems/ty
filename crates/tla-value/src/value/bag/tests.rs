@@ -11,10 +11,9 @@ use super::super::{FuncValue, Value};
 use super::BagValue;
 use crate::dedup_fingerprint::state_value_fingerprint;
 use crate::fingerprint::FP64_INIT;
+use crate::rp::Rp;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use crate::rp::Rp as Arc;
-use crate::rp::Rp;
 fn std_hash(v: &Value) -> u64 {
     let mut h = DefaultHasher::new();
     v.hash(&mut h);

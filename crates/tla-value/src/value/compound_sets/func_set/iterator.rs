@@ -10,9 +10,21 @@ use num_traits::ToPrimitive;
 
 use super::super::super::*;
 
+enum FuncSetDomain {
+    EmptyOrUnused,
+    IntInterval {
+        min: i64,
+        max: i64,
+    },
+    General {
+        shared: Arc<FuncDomain>,
+        sorted_positions: Vec<usize>,
+    },
+}
+
 /// Iterator over function set elements
 pub(crate) struct FuncSetIterator {
-    domain_elems: Vec<Value>,
+    domain: FuncSetDomain,
     codomain_elems: Vec<Value>,
     indices: Vec<usize>,
     done: bool,
@@ -27,55 +39,67 @@ impl FuncSetIterator {
     pub fn from_elems(domain_elems: Vec<Value>, codomain_elems: Vec<Value>) -> Self {
         let n = domain_elems.len();
         let done = codomain_elems.is_empty() && !domain_elems.is_empty();
+        let domain = if done || domain_elems.is_empty() {
+            FuncSetDomain::EmptyOrUnused
+        } else if let Some((min, max)) = int_interval_domain(&domain_elems) {
+            FuncSetDomain::IntInterval { min, max }
+        } else {
+            let mut sorted_positions: Vec<usize> = (0..n).collect();
+            sorted_positions
+                .sort_unstable_by(|&left, &right| domain_elems[left].cmp(&domain_elems[right]));
+            debug_assert!(
+                sorted_positions
+                    .windows(2)
+                    .all(|w| domain_elems[w[0]] < domain_elems[w[1]]),
+                "FuncSetIterator domain elements must be unique"
+            );
+            let keys: Arc<[Value]> = sorted_positions
+                .iter()
+                .map(|&position| domain_elems[position].clone())
+                .collect();
+            let shared = FuncDomain::from_sorted_keys(keys);
+            FuncSetDomain::General {
+                shared,
+                sorted_positions,
+            }
+        };
+
         FuncSetIterator {
             indices: vec![0; n],
-            domain_elems,
+            domain,
             codomain_elems,
             done,
         }
     }
 
-    /// Check if domain elements form a consecutive integer interval.
-    /// Returns Some((min, max)) if so, None otherwise.
-    fn is_int_interval_domain(&self) -> Option<(i64, i64)> {
-        if self.domain_elems.is_empty() {
+    #[cfg(test)]
+    pub(crate) fn has_shared_domain(&self) -> bool {
+        matches!(&self.domain, FuncSetDomain::General { .. })
+    }
+}
+
+/// Check whether pre-ordered domain elements form a consecutive integer interval.
+fn int_interval_domain(domain_elems: &[Value]) -> Option<(i64, i64)> {
+    fn to_i64(value: &Value) -> Option<i64> {
+        match value {
+            Value::SmallInt(n) => Some(*n),
+            Value::Int(n) => n.to_i64(),
+            _ => None,
+        }
+    }
+
+    let min = to_i64(domain_elems.first()?)?;
+    let max = to_i64(domain_elems.last()?)?;
+    if checked_interval_len(min, max) != Some(domain_elems.len()) {
+        return None;
+    }
+    for (offset, elem) in domain_elems.iter().enumerate() {
+        let offset = i64::try_from(offset).ok()?;
+        if to_i64(elem)? != min.checked_add(offset)? {
             return None;
         }
-
-        // All elements must be integers
-        let mut ints: Vec<i64> = Vec::with_capacity(self.domain_elems.len());
-        for elem in &self.domain_elems {
-            match elem {
-                Value::SmallInt(n) => ints.push(*n),
-                Value::Int(n) => {
-                    if let Some(i) = n.to_i64() {
-                        ints.push(i);
-                    } else {
-                        return None; // Out of i64 range
-                    }
-                }
-                _ => return None, // Non-integer domain element
-            }
-        }
-
-        // Must be sorted (domain_elems comes from OrdSet which is sorted)
-        // Check if consecutive integers: min, min+1, min+2, ..., max
-        let min = ints[0];
-        let max = ints[ints.len() - 1];
-        if checked_interval_len(min, max) != Some(ints.len()) {
-            return None; // Not consecutive or overflow
-        }
-
-        // Verify all are consecutive (sorted + size check should be enough,
-        // but let's be explicit)
-        for (i, &n) in ints.iter().enumerate() {
-            if n != min + i as i64 {
-                return None;
-            }
-        }
-
-        Some((min, max))
     }
+    Some((min, max))
 }
 
 impl Iterator for FuncSetIterator {
@@ -87,7 +111,7 @@ impl Iterator for FuncSetIterator {
         }
 
         // Handle empty domain case: [{}->T] = {[]}
-        if self.domain_elems.is_empty() {
+        if self.indices.is_empty() {
             self.done = true;
             return Some(Value::Func(Rp::new(FuncValue::from_sorted_entries(
                 Vec::new(),
@@ -97,21 +121,35 @@ impl Iterator for FuncSetIterator {
         // Check if domain is a consecutive integer sequence starting at some min
         // If so, use IntFunc for better EXCEPT performance
         // IMPORTANT: If domain is 1..n, create Seq instead (functions 1..n are sequences in TLA+)
-        let func = if let Some((min, max)) = self.is_int_interval_domain() {
-            // Build IntFunc/Seq with array of values
-            let values: Vec<Value> = (0..self.domain_elems.len())
-                .map(|i| self.codomain_elems[self.indices[i]].clone())
-                .collect();
-            // If domain is 1..n, this is semantically a sequence
-            if min == 1 {
-                Value::Seq(Rp::new(values.into()))
-            } else {
-                Value::IntFunc(Rp::new(IntIntervalFunc::new(min, max, values)))
+        let func = match &self.domain {
+            FuncSetDomain::IntInterval { min, max } => {
+                // Build IntFunc/Seq with array of values.
+                let values: Vec<Value> = (0..self.indices.len())
+                    .map(|i| self.codomain_elems[self.indices[i]].clone())
+                    .collect();
+                // If domain is 1..n, this is semantically a sequence.
+                if *min == 1 {
+                    Value::Seq(Rp::new(values.into()))
+                } else {
+                    Value::IntFunc(Rp::new(IntIntervalFunc::new(*min, *max, values)))
+                }
             }
-        } else {
-            let entries =
-                build_func_entries(&self.domain_elems, &self.codomain_elems, &self.indices);
-            Value::Func(Rp::new(FuncValue::from_sorted_entries(entries)))
+            FuncSetDomain::General {
+                shared,
+                sorted_positions,
+            } => {
+                let values = sorted_positions
+                    .iter()
+                    .map(|&position| self.codomain_elems[self.indices[position]].clone())
+                    .collect();
+                Value::Func(Rp::new(FuncValue::from_shared_domain_values(
+                    Arc::clone(shared),
+                    values,
+                )))
+            }
+            FuncSetDomain::EmptyOrUnused => {
+                unreachable!("active nonempty function set must have a classified domain")
+            }
         };
 
         // Increment indices (like counting in base |T|).
@@ -135,23 +173,4 @@ impl Iterator for FuncSetIterator {
 
         Some(func)
     }
-}
-
-fn build_func_entries(
-    domain_elems: &[Value],
-    codomain_elems: &[Value],
-    indices: &[usize],
-) -> Vec<(Value, Value)> {
-    let mut entries = Vec::with_capacity(domain_elems.len());
-    for (key, &value_idx) in domain_elems.iter().zip(indices.iter()) {
-        entries.push((key.clone(), codomain_elems[value_idx].clone()));
-    }
-    // `domain_elems` may arrive in TLC-normalized order rather than Value::cmp
-    // order (e.g. `iter_set_tlc_normalized` on `[SUBSET S -> T]` feeds subsets
-    // in SubsetIterator's cardinality-first order). FuncValue requires entries
-    // strictly sorted by Value::cmp, so sort here; for already-sorted domains
-    // this is a cheap linear pass. The odometer's enumeration order of the
-    // function SET is unaffected — only each function's internal layout.
-    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    entries
 }

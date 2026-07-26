@@ -57,6 +57,60 @@ pub(in crate::check) fn trust_cg_setup_timing_enabled() -> bool {
     trust_cg_env_flag_enabled(TRUST_CG_SETUP_TIMING_ENV)
 }
 
+/// Env override for the native action/invariant/state-constraint callout compile
+/// optimization level.
+pub(super) const TRUST_CG_ACTION_OPT_LEVEL_ENV: &str = "TY_TRUST_CG_ACTION_OPT_LEVEL";
+
+/// Optimization level used to compile native action / invariant / state-constraint
+/// callouts.
+///
+/// Defaults to `O1`. The `TY_TRUST_CG_ACTION_OPT_LEVEL` env var overrides it with
+/// one of `O0`/`O1`/`O2`/`O3` (case-insensitive) so the compile-time vs BFS-runtime
+/// trade-off can be measured and tuned without a rebuild (e.g. `=O3` restores the
+/// historic default). Every level is value-preserving — trust-cg's opt passes
+/// (CSE/GVN already omitted, plus the O2+-only post-RA opt and pressure-aware
+/// scheduling) only change generated-code quality and compile throughput, never the
+/// computed successors — so the BFS result and verdict are byte-identical across
+/// levels. An unrecognized value is logged and falls back to the `O1` default.
+///
+/// # Why O1 (was O3)
+///
+/// The former O3 default paid trust-cg's O2+-only post-RA optimization and
+/// pressure-aware scheduling on every per-action codegen pass. For the
+/// action-callout kernels those passes are a large, serial compile cost with **no
+/// runtime benefit** — measured on `MCLamportMutex` (27 native actions, single-core
+/// `taskset -c 9`, 724274/2496350 exact state graph):
+///
+/// | level | action compile | BFS wall | total | verdict/states |
+/// |-------|---------------:|---------:|------:|----------------|
+/// | O3    | ~18.4s         | ~10.1s   | ~28.5s| 724274, no error |
+/// | O1    | ~3.6s          | ~5.7s    | ~9.4s | 724274, no error |
+///
+/// O1 is ~5x cheaper to compile AND (surprisingly) ~1.75x faster at runtime — the
+/// O3 scheduler pessimizes this spec's hot next-state loop. Native coverage is
+/// identical (27 compiled / 9 fallback / 3 invariants at both levels). On specs
+/// whose native compile is already cheap (`btree` ~0ms, `MCBakery` ~1s) O1 ties O3
+/// on wall and is byte-identical on states (64685 / 655200), so the default flip is
+/// a strict win-or-tie on the measured corpus while flipping MCLamportMutex from a
+/// 28.5s loss to a 9.4s win vs the 15.3s TLC single-thread reference.
+pub(in crate::check) fn trust_cg_action_compile_opt_level() -> tla_trust_cg::OptLevel {
+    match std::env::var(TRUST_CG_ACTION_OPT_LEVEL_ENV) {
+        Ok(value) => match value.trim().to_ascii_uppercase().as_str() {
+            "O0" => tla_trust_cg::OptLevel::O0,
+            "" | "O1" => tla_trust_cg::OptLevel::O1,
+            "O2" => tla_trust_cg::OptLevel::O2,
+            "O3" => tla_trust_cg::OptLevel::O3,
+            other => {
+                eprintln!(
+                    "[trust-cg] ignoring {TRUST_CG_ACTION_OPT_LEVEL_ENV}={other:?}; expected O0/O1/O2/O3"
+                );
+                tla_trust_cg::OptLevel::O1
+            }
+        },
+        Err(_) => tla_trust_cg::OptLevel::O1,
+    }
+}
+
 /// Whether per-action runtime native-vs-interp wall-clock telemetry is enabled
 /// (un-darkening STEP 1). Observability-only: the timing reads in the compiled
 /// BFS loop are gated behind this, so default runs pay zero clock overhead.
@@ -102,7 +156,6 @@ pub(in crate::check) fn trust_cg_fused_level_defer_threshold() -> usize {
             .unwrap_or(TRUST_CG_FUSED_LEVEL_DEFER_THRESHOLD_DEFAULT)
     })
 }
-
 
 pub(super) const FUSED_INVARIANT_MIN_STATES_ENV: &str = "TY_FUSED_INVARIANT_MIN_STATES";
 
@@ -156,7 +209,6 @@ pub(in crate::check) fn trust_cg_fused_invariant_min_states() -> usize {
             .unwrap_or(FUSED_INVARIANT_MIN_STATES_DEFAULT)
     })
 }
-
 
 pub(super) const TRUST_CG_LAZY_COMPILE_THRESHOLD_ENV: &str = "TY_TRUST_CG_LAZY_COMPILE_THRESHOLD";
 
@@ -373,10 +425,10 @@ pub(super) fn trust_cg_native_callout_compile_jobs(task_count: usize) -> usize {
                 1
             }
         },
-        Err(_) => std::thread::available_parallelism()
-            .map(std::num::NonZeroUsize::get)
-            .unwrap_or(1)
-            .clamp(1, task_count),
+        // Native compilation is part of the measured TY process. Keep its
+        // production default single-job so `--workers 1` cannot silently turn
+        // into a many-core compile advantage over single-worker TLC.
+        Err(_) => 1,
     }
 }
 

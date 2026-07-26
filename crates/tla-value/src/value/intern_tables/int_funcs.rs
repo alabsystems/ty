@@ -4,11 +4,11 @@
 
 use super::super::{parallel_intern, Value};
 use super::shared::{record_counted_insert, reset_counted_table, MAX_INTERN_TABLE_ENTRIES};
+use crate::rp::Rp as Arc;
 use dashmap::DashMap;
 use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{OnceLock};
-use crate::rp::Rp as Arc;
+use std::sync::OnceLock;
 
 /// Global intern table for IntIntervalFunc values.
 /// Key: FNV-1a hash of (min, max, elements)

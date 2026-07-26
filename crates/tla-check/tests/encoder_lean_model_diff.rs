@@ -58,7 +58,7 @@
 // (`positional_encoding_injective` = S1, etc.) each leg differential-checks against.
 #![allow(non_snake_case)]
 
-use std::sync::Arc;
+use tla_value::Rp;
 
 use tla_check::explicit_fixpoint_cert::{
     value_cell_encode_at, ColSort, RECORD_FUNC_BASE, SEQ_MAX_LEN, SET_UNIVERSE_BITS,
@@ -71,31 +71,31 @@ fn vint(n: i64) -> Value {
     Value::int(n)
 }
 fn vstr(s: &str) -> Value {
-    Value::String(Arc::from(s))
+    Value::String(Rp::from(s))
 }
 fn vmodel(s: &str) -> Value {
-    Value::ModelValue(Arc::from(s))
+    Value::ModelValue(Rp::from(s))
 }
 fn vset(elems: &[Value]) -> Value {
-    Value::Set(Arc::new(SortedSet::from_vec(elems.to_vec())))
+    Value::Set(Rp::new(SortedSet::from_vec(elems.to_vec())))
 }
 fn vtuple(elems: &[Value]) -> Value {
-    Value::Tuple(Arc::from(elems.to_vec()))
+    Value::Tuple(Rp::from(elems.to_vec()))
 }
 fn vseq(elems: &[Value]) -> Value {
-    Value::Seq(Arc::new(SeqValue::from_vec(elems.to_vec())))
+    Value::Seq(Rp::new(SeqValue::from_vec(elems.to_vec())))
 }
 fn vfunc(pairs: &[(Value, Value)]) -> Value {
     let mut b = FuncBuilder::new();
     for (k, v) in pairs {
         b.insert(k.clone(), v.clone());
     }
-    Value::Func(Arc::new(b.build()))
+    Value::Func(Rp::new(b.build()))
 }
 /// `[0..len-1 |-> values]` — an `IntFunc` over the encodable 0-based prefix.
 fn vintfunc(values: &[Value]) -> Value {
     let max = values.len() as i64 - 1;
-    Value::IntFunc(Arc::new(IntIntervalFunc::new(0, max, values.to_vec())))
+    Value::IntFunc(Rp::new(IntIntervalFunc::new(0, max, values.to_vec())))
 }
 
 // ─────────────── INDEPENDENT Lean-model closed forms (hand-written MATH) ───────────────

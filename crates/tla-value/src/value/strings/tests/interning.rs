@@ -4,9 +4,9 @@
 
 use super::super::intern::intern_string_with_cap;
 use super::super::{clear_string_intern_table, intern_string};
+use crate::rp::Rp as Arc;
 use dashmap::DashMap;
 use std::sync::atomic::AtomicUsize;
-use crate::rp::Rp as Arc;
 /// Verify the intern-table size cap: the boundary insert clears the table and
 /// leaves only the newly inserted string behind.
 /// Part of #1331: memory safety audit -- unbounded intern tables.

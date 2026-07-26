@@ -446,15 +446,16 @@ impl Transys {
         eprintln!("{preproc_stats}");
 
         let compacted = preprocessed.compact_vars();
+        let reduction_percent = compacted
+            .max_var
+            .saturating_mul(100)
+            .checked_div(preprocessed.max_var)
+            .map_or(0, |retained_percent| {
+                100u32.saturating_sub(retained_percent)
+            });
         eprintln!(
             "Compaction: max_var {}->{} ({}% reduction)",
-            preprocessed.max_var,
-            compacted.max_var,
-            if preprocessed.max_var > 0 {
-                100 - (compacted.max_var * 100 / preprocessed.max_var)
-            } else {
-                0
-            },
+            preprocessed.max_var, compacted.max_var, reduction_percent,
         );
         (compacted, stats)
     }

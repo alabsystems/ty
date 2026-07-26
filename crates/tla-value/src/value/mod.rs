@@ -35,13 +35,13 @@
 //! `seq`, `set_builders`, `sorted_set`, `strings`, `test_support`, `tlc_cmp`,
 //! `value_fingerprint`.
 
+use crate::rp::Rp;
 use num_bigint::BigInt;
 use num_traits::{One, ToPrimitive, Zero};
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use crate::rp::Rp;
 // Descendant `value::*` modules reach the runtime shared pointer via `Arc`
 // (glob-imported from here). `Arc` is aliased to `Rp` so those modules build
 // unchanged while the enum stores `Rp`; `Rp` in atomic mode == `Arc`.
@@ -96,6 +96,7 @@ mod ordering;
 pub(crate) mod parallel_intern;
 mod permute;
 mod permute_cmp;
+mod permute_memo;
 mod record;
 mod record_impls;
 mod seq;
@@ -128,20 +129,26 @@ pub use intern_tables::{
 pub(crate) use lazy_set::LazySet;
 pub use model_values::{
     clear_model_value_registry, get_or_assign_model_value_index, interned_model_value,
-    lookup_model_value_index, model_value_count, MVPerm,
+    lookup_model_value_index, lookup_model_value_index_str, model_value_count, MVPerm,
 };
+pub use permute_memo::clear_permute_memo;
 pub use seq::SeqValue;
 pub use set_builders::{big_union, boolean_set, cartesian_product, powerset, range_set};
 pub use sorted_set::{val_false, val_int, val_true, SetBuilder, SortedSet};
-pub use strings::tlc_string_token;
 pub use strings::{clear_string_intern_table, intern_string};
 pub use strings::{clear_tlc_string_tokens, tlc_string_len, tlc_string_subseq_utf16_offsets};
+pub use strings::{lookup_tlc_string_token, tlc_string_token};
 
 pub use bag::{compact_bags_enabled, BagValue};
 pub use closure::{ClosureValue, TirBody};
+pub(in crate::value) use functions::FuncDomain;
 pub use functions::{checked_interval_len, FuncBuilder, FuncTakeSource, FuncValue};
 pub use int_interval_func::IntIntervalFunc;
 pub use lazy_func::{CapturedChain, ComponentDomain, LazyDomain, LazyFuncCaptures, LazyFuncValue};
+pub use record::intern::{
+    canonicalize_records_along_path, canonicalize_records_along_paths, clear_record_intern_table,
+    print_record_intern_stats, RecordCanonPathElem,
+};
 pub use record::RecordValue;
 pub use record_impls::RecordBuilder;
 
@@ -181,8 +188,9 @@ pub enum Value {
     /// Lazy tuple set (S1 \X S2 \X ...) without allocating all |S1|*|S2|*... tuples
     /// Arc-wrapped to reduce Value enum size from 56B to 24B (#3445).
     TupleSet(Rp<TupleSetValue>),
-    /// Lazy set union (S1 \cup S2) without eager enumeration
-    SetCup(SetCupValue),
+    /// Lazy set union (S1 \cup S2) without eager enumeration.
+    /// Reference-counted so cloning cached constant union trees is O(1).
+    SetCup(Rp<SetCupValue>),
     /// Lazy set intersection (S1 \cap S2) without eager enumeration
     SetCap(SetCapValue),
     /// Lazy set difference (S1 \ S2) without eager enumeration

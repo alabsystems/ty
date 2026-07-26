@@ -7,9 +7,9 @@ mod overlay;
 mod zero_arg_cache;
 
 use self::guard::try_guard_first_shortcircuit;
-use tla_value::Rp;
 use self::overlay::eval_let_all_zero_arg;
 use self::zero_arg_cache::eval_zero_arg_let_body;
+use tla_value::Rp;
 // Re-export for child modules (overlay.rs needs build_lazy_func_from_ctx).
 pub(in crate::eval_let) use super::build_lazy_func_from_ctx;
 use super::{eval, EvalCtx, EvalError, EvalResult, Expr, LazyDomain, Span, Spanned, Value};
@@ -82,8 +82,8 @@ pub(super) fn eval_let(
     // identities) — see cache/openv_memo.rs. Non-inserted zero-arg defs are
     // eagerly evaluated and bound in local_stack below (avoiding the broken
     // ZERO_ARG_OP_CACHE).
-    let (ops, id, recursive) = crate::cache::merged_let_env_memoized(
-        ctx.local_ops.as_ref(),
+    let (ops, id, recursive) = crate::cache::merged_let_env_memoized_with_ctx(
+        ctx,
         defs,
         crate::cache::MergedLetSite::EvalLet,
         |def| {

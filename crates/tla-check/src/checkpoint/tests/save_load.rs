@@ -15,6 +15,10 @@ fn test_checkpoint_save_load() {
 
     let mut checkpoint = Checkpoint::new();
     checkpoint.fingerprints = vec![Fingerprint(100), Fingerprint(200), Fingerprint(300)];
+    checkpoint.metadata.stats.initial_states = 2;
+    checkpoint.metadata.stats.raw_initial_states_generated = 5;
+    checkpoint.metadata.stats.transitions = 7;
+    checkpoint.metadata.stats.raw_successors_generated = 11;
 
     let mut state = State::new();
     state = state.with_var("x", Value::int(42));
@@ -39,6 +43,10 @@ fn test_checkpoint_save_load() {
     assert_eq!(loaded.frontier.len(), 1);
     assert_eq!(loaded.parents.len(), 2);
     assert_eq!(loaded.depths.len(), 3);
+    assert_eq!(loaded.metadata.stats.initial_states, 2);
+    assert_eq!(loaded.metadata.stats.raw_initial_states_generated, 5);
+    assert_eq!(loaded.metadata.stats.transitions, 7);
+    assert_eq!(loaded.metadata.stats.raw_successors_generated, 11);
 
     assert_eq!(
         loaded.parents.get(&Fingerprint(200)),

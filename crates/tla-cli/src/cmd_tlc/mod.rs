@@ -20,6 +20,14 @@
 //! `cmd_supremacy/compare.rs`): `<dest>/tytools.jar` and
 //! `<dest>/CommunityModules.jar`.
 //!
+//! A third, optional artifact completes the TLC-comparable toolchain:
+//!   * `tla-library/` — the **upstream** TLA+ proof-system module library
+//!     (`tlaplus/tlapm`'s `library/`, pinned per-file by sha256). 25 of the 141
+//!     eligible corpus rows `EXTENDS TLAPS`/`FiniteSetTheorems`/
+//!     `NaturalsInduction` and do not parse without it. Installed by
+//!     `ty install-tlc proof-library` (or `install --with-proof-library`); see
+//!     [`proof_library`].
+//!
 //! Follows the repo convention of shelling out to `curl`/`tar`/`java` rather
 //! than adding an HTTP client dependency (cf. `cmd_corpus`).
 
@@ -29,6 +37,8 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 
 use crate::cli_schema::TlcAction;
+
+pub(crate) mod proof_library;
 
 /// The working TLC distribution. The stable release jar is broken, so we use
 /// the nightly channel; this URL rolls, so it is NOT sha-pinned (we verify it
@@ -48,13 +58,29 @@ const COMMUNITY_MODULES_NAME: &str = "CommunityModules.jar";
 /// Dispatch the `ty install-tlc <action>` subcommand.
 pub(crate) fn cmd_tlc(action: TlcAction) -> Result<()> {
     match action {
-        TlcAction::Install { dest, force } => do_install(dest, force),
+        TlcAction::Install {
+            dest,
+            force,
+            with_proof_library,
+        } => do_install(dest, force, with_proof_library),
         TlcAction::Path { dest } => {
             println!("{}", resolve_dest(dest).display());
             Ok(())
         }
         TlcAction::Verify { dest } => do_verify(resolve_dest(dest)),
+        TlcAction::ProofLibrary { dest, force } => {
+            proof_library::do_install(&resolve_dest(dest), force)
+        }
+        TlcAction::VerifyProofLibrary { dest } => proof_library::do_verify(&resolve_dest(dest)),
     }
+}
+
+/// Resolve the default proof-library directory (`~/tlaplus/tla-library`).
+///
+/// Exposed so the TLA-library resolution chain and `ty corpus doctor` name the
+/// same path this installer writes.
+pub(crate) fn default_proof_library() -> PathBuf {
+    proof_library::proof_library_path(&resolve_dest(None))
 }
 
 /// Resolve the install directory: explicit `--dest`, else `$HOME/tlaplus`.
@@ -83,28 +109,41 @@ pub(crate) fn probe_default() -> (PathBuf, bool) {
     (jar, present)
 }
 
-fn do_install(dest: Option<PathBuf>, force: bool) -> Result<()> {
+fn do_install(dest: Option<PathBuf>, force: bool, with_proof_library: bool) -> Result<()> {
     let dest = resolve_dest(dest);
     let tlc_jar = tlc_jar_path(&dest);
     let community = community_modules_path(&dest);
 
-    if tlc_jar.is_file() && community.is_file() && !force {
+    let jars_present = tlc_jar.is_file() && community.is_file();
+    if jars_present && !force {
         println!(
             "TLC already installed at {} (tytools.jar + CommunityModules.jar); use --force to re-install",
             dest.display()
         );
-        return Ok(());
+    } else {
+        std::fs::create_dir_all(&dest)
+            .with_context(|| format!("creating TLC install dir {}", dest.display()))?;
+
+        install_tlc_jar(&tlc_jar)?;
+        install_community_modules(&community)?;
+
+        println!("TLC installed:");
+        println!("  TLC jar:           {}", tlc_jar.display());
+        println!("  CommunityModules:  {}", community.display());
     }
 
-    std::fs::create_dir_all(&dest)
-        .with_context(|| format!("creating TLC install dir {}", dest.display()))?;
+    if with_proof_library {
+        proof_library::do_install(&dest, force)?;
+    } else {
+        // Say the quiet part out loud: these two jars alone do not cover the
+        // corpus. Silence here is what let a first-party stub mediate 18% of it.
+        println!(
+            "note: 25 of the 141 eligible corpus rows also need the TLA+ proof library\n      \
+             (TLAPS / FiniteSetTheorems / NaturalsInduction). Install it with\n      \
+             `ty install-tlc proof-library`, then check with `ty corpus doctor`."
+        );
+    }
 
-    install_tlc_jar(&tlc_jar)?;
-    install_community_modules(&community)?;
-
-    println!("TLC installed:");
-    println!("  TLC jar:           {}", tlc_jar.display());
-    println!("  CommunityModules:  {}", community.display());
     println!(
         "now run: ty supremacy compare --examples-dir ~/tlaplus-examples/specifications <spec>.tla"
     );
@@ -253,7 +292,7 @@ fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
     Ok(())
 }
 
-fn sha256_hex(path: &Path) -> Result<String> {
+pub(crate) fn sha256_hex(path: &Path) -> Result<String> {
     for (bin, args) in [("shasum", vec!["-a", "256"]), ("sha256sum", vec![])] {
         let mut cmd = Command::new(bin);
         cmd.args(&args).arg(path);
@@ -269,7 +308,7 @@ fn sha256_hex(path: &Path) -> Result<String> {
     bail!("no usable sha256 tool found (need `shasum` or `sha256sum` on PATH)")
 }
 
-fn run(cmd: &mut Command, what: &str) -> Result<()> {
+pub(crate) fn run(cmd: &mut Command, what: &str) -> Result<()> {
     let status = cmd
         .status()
         .with_context(|| format!("failed to spawn for {what}"))?;

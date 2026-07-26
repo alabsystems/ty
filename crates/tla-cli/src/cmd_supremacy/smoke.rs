@@ -52,7 +52,7 @@ const TRUST_CG_SMOKE_ENV: &[(&str, &str)] = &[
     ("TY_DISABLE_ARTIFACT_CACHE", "1"),
     (STRICT_SELFTEST_ENV, "strict"),
     (STRICT_NATIVE_FUSED_ENV, "1"),
-    ("TY_TRUST_CG_NATIVE_CALLOUT_COMPILE_JOBS", "27"),
+    ("TY_TRUST_CG_NATIVE_CALLOUT_COMPILE_JOBS", "1"),
     ("TY_TRUST_CG_NATIVE_FUSED_ENABLE_LOCAL_DEDUP", "1"),
 ];
 
@@ -473,7 +473,7 @@ fn smoke_env_with_overrides(
     require_env_value(&env, STRICT_SELFTEST_ENV, "strict")?;
     require_env_value(&env, STRICT_NATIVE_FUSED_ENV, "1")?;
     require_env_value(&env, "TY_DISABLE_ARTIFACT_CACHE", "1")?;
-    require_env_value(&env, "TY_TRUST_CG_NATIVE_CALLOUT_COMPILE_JOBS", "27")?;
+    require_env_value(&env, "TY_TRUST_CG_NATIVE_CALLOUT_COMPILE_JOBS", "1")?;
     require_env_value(&env, "TY_TRUST_CG_NATIVE_FUSED_ENABLE_LOCAL_DEDUP", "1")?;
     Ok(env)
 }
@@ -2455,14 +2455,14 @@ mod tests {
         let mut overrides = BTreeMap::new();
         overrides.insert(
             "TY_TRUST_CG_NATIVE_CALLOUT_COMPILE_JOBS".to_string(),
-            "1".to_string(),
+            "27".to_string(),
         );
 
         let error = smoke_env_with_overrides(&overrides).unwrap_err();
 
         assert!(error
             .to_string()
-            .contains("TY_TRUST_CG_NATIVE_CALLOUT_COMPILE_JOBS=27"));
+            .contains("TY_TRUST_CG_NATIVE_CALLOUT_COMPILE_JOBS=1"));
     }
 
     #[test]

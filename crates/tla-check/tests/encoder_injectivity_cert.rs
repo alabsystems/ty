@@ -58,7 +58,7 @@
 #![cfg(feature = "clean-cic")]
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use tla_value::Rp;
 
 use tla_check::explicit_fixpoint_cert::{
     record_value_key, value_cell_encode, value_cell_encode_at, ColSort, RECORD_FUNC_BASE,
@@ -75,19 +75,19 @@ fn vbool(b: bool) -> Value {
     Value::Bool(b)
 }
 fn vstr(s: &str) -> Value {
-    Value::String(Arc::from(s))
+    Value::String(Rp::from(s))
 }
 fn vmodel(s: &str) -> Value {
-    Value::ModelValue(Arc::from(s))
+    Value::ModelValue(Rp::from(s))
 }
 fn vset(elems: &[Value]) -> Value {
-    Value::Set(Arc::new(SortedSet::from_vec(elems.to_vec())))
+    Value::Set(Rp::new(SortedSet::from_vec(elems.to_vec())))
 }
 fn vtuple(elems: &[Value]) -> Value {
-    Value::Tuple(Arc::from(elems.to_vec()))
+    Value::Tuple(Rp::from(elems.to_vec()))
 }
 fn vseq(elems: &[Value]) -> Value {
-    Value::Seq(Arc::new(SeqValue::from_vec(elems.to_vec())))
+    Value::Seq(Rp::new(SeqValue::from_vec(elems.to_vec())))
 }
 fn vrecord(fields: &[(&str, Value)]) -> Value {
     let mut b = RecordBuilder::new();
@@ -101,12 +101,12 @@ fn vfunc(pairs: &[(Value, Value)]) -> Value {
     for (k, v) in pairs {
         b.insert(k.clone(), v.clone());
     }
-    Value::Func(Arc::new(b.build()))
+    Value::Func(Rp::new(b.build()))
 }
 /// `[min..min+len-1 |-> values]` — an `IntFunc` (min=0 is the encodable 0-based prefix).
 fn vintfunc(min: i64, values: &[Value]) -> Value {
     let max = min + values.len() as i64 - 1;
-    Value::IntFunc(Arc::new(IntIntervalFunc::new(min, max, values.to_vec())))
+    Value::IntFunc(Rp::new(IntIntervalFunc::new(min, max, values.to_vec())))
 }
 
 // ─────────────────────────── injectivity engine ───────────────────────────

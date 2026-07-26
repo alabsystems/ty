@@ -59,6 +59,9 @@ fn view_config() -> Config {
     }
 }
 
+/// Fingerprint set that admits the first member of a prepared batch and then
+/// reports a storage fault. This exercises prefix preservation at the exact
+/// boundary where a bulk backend fails.
 struct FaultAfterFirstInsertSet {
     len: AtomicUsize,
 }
@@ -98,9 +101,6 @@ impl tla_mc_core::FingerprintSet<Fingerprint> for FaultAfterFirstInsertSet {
 }
 
 impl crate::storage::FingerprintSet for FaultAfterFirstInsertSet {
-    // The fp-only batch admit-first path calls the prechecked-absent batch hook
-    // (see fingerprint_only.rs::admit_successor_batch_into), so inject the fault
-    // there: admit index 0, then fault, exercising prefix-admit + fail-closed stop.
     fn insert_prechecked_absent_batch_inserted_indices_checked_into(
         &self,
         fingerprints: &[Fingerprint],
@@ -431,6 +431,46 @@ fn fp_only_admit_payload_confirmed_duplicate_returns_none() {
         !mc.state_storage.seen.contains_key(&fp),
         "fp-only duplicate witnesses should not populate full-state storage"
     );
+}
+
+#[test]
+fn fp_only_batch_admit_storage_fault_stops_before_faulted_candidate() {
+    let module = minimal_module();
+    let config = minimal_config();
+    let mut mc = ModelChecker::new(&module, &config);
+    mc.state_storage.seen_fps = Arc::new(FaultAfterFirstInsertSet::new());
+
+    let bulk = BulkStateStorage::empty(1);
+    let mut storage = FingerprintOnlyStorage::new(bulk, 1);
+    let mut candidates = vec![
+        BfsAdmissionCandidate {
+            fp: Fingerprint(42),
+            state: ArrayState::from_values(vec![Value::int(7)]),
+            parent_fp: Some(Fingerprint(1)),
+            depth: 1,
+        },
+        BfsAdmissionCandidate {
+            fp: Fingerprint(43),
+            state: ArrayState::from_values(vec![Value::int(8)]),
+            parent_fp: Some(Fingerprint(1)),
+            depth: 1,
+        },
+        BfsAdmissionCandidate {
+            fp: Fingerprint(44),
+            state: ArrayState::from_values(vec![Value::int(9)]),
+            parent_fp: Some(Fingerprint(1)),
+            depth: 1,
+        },
+    ];
+    let mut result = BfsBatchAdmissionResult::with_capacity(candidates.len());
+
+    storage.admit_successor_batch_into(&mut candidates, None, &mut result, &mut mc);
+
+    assert_eq!(result.entries.len(), 1);
+    assert!(result.entries[0].entry.is_some());
+    assert!(result.fault.is_some());
+    assert!(candidates.is_empty());
+    assert_eq!(mc.states_count(), 1);
 }
 
 #[test]

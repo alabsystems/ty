@@ -83,6 +83,25 @@ impl Clone for BindingChain {
     }
 }
 
+impl BindingChain {
+    /// Identity of this chain as raw addresses: `(arena_head, heap_head)`
+    /// (0 for absent parts). Used as a memo key by the INSTANCE-substitution
+    /// chain memo (`cache::subst_chain_memo`); see its module docs for the
+    /// pinning/generation argument that makes pointer identity sound there.
+    /// The pointers are compared, never dereferenced.
+    #[cfg(test)]
+    #[inline]
+    #[must_use]
+    pub(crate) fn identity_parts(&self) -> (usize, usize) {
+        (
+            self.arena_head as usize,
+            self.heap_head
+                .as_ref()
+                .map_or(0, |arc| Arc::as_ptr(arc) as usize),
+        )
+    }
+}
+
 struct BindingNode {
     name: NameId,
     value: BindingValue,
@@ -133,6 +152,7 @@ impl<'a> From<&'a BindingValue> for BindingValueRef<'a> {
         match value {
             BindingValue::Eager(value) => Self::Eager(value),
             BindingValue::Lazy(lazy) => Self::Lazy(lazy.as_ref()),
+            BindingValue::SharedLazy(lazy) => Self::Lazy(lazy.as_ref()),
         }
     }
 }

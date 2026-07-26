@@ -10,6 +10,7 @@
 //! Part of #2744 decomposition from eval_cache.rs.
 
 use super::dep_tracking::{propagate_cached_deps, OpEvalDeps};
+use super::op_result_cache::NaryOpCacheKey;
 use crate::tlc_types::TlcActionContext;
 use crate::value::Value;
 use crate::EvalCtx;
@@ -116,7 +117,15 @@ pub(crate) struct SmallCaches {
     pub(crate) param_let_deps: FxHashMap<LetScopeKey, Vec<NameId>>,
     pub(crate) param_let_cache: FxHashMap<LetScopeKey, Vec<ParamLetCacheEntry>>,
     pub(crate) raw_subst_scope_cache: FxHashMap<RawSubstScopeKey, (Arc<Vec<Substitution>>, u64)>,
-    pub(crate) instance_lazy_cache: FxHashMap<usize, (u8, Value)>,
+    /// Forced INSTANCE lazy-binding results, keyed by `LazyBinding` address.
+    /// Entry: `(mode, value, deps captured during that forcing)`. The deps
+    /// ride the SAME epoch lifecycle as the value (cleared at every state and
+    /// scope boundary) because `OpEvalDeps` embeds read *values* — they must
+    /// never outlive the epoch that produced them. This replaced the
+    /// per-`LazyBinding` `forced_deps` OnceLocks so that the subst-chain memo
+    /// (`cache::subst_chain_memo`) can share `LazyBinding` allocations across
+    /// states without leaking first-force deps into later states.
+    pub(crate) instance_lazy_cache: FxHashMap<usize, (u8, Value, Option<Box<OpEvalDeps>>)>,
     pub(crate) choose_cache: FxHashMap<(usize, u64, usize), Value>,
     pub(crate) choose_deep_cache: FxHashMap<ChooseDeepKey, Value>,
     /// Part of #3962: Consolidated from helpers/recursive_fold.rs FOLD_RESULT_CACHE.
@@ -124,6 +133,24 @@ pub(crate) struct SmallCaches {
     /// Key: (operator def pointer, evaluated argument values).
     /// Cap at 100K entries to bound memory; cleared entirely when exceeded.
     pub(crate) fold_result_cache: FxHashMap<(usize, Vec<Value>), Value>,
+    /// Memoization cache for linear/chain-recursive operators (e.g. NanoBlockchain's
+    /// `PublicKeyOf` / `BalanceAt` / `ValueOfSendBlock`, which walk a ledger chain via
+    /// `block.previous`). Unlike `fold_result_cache` these are NOT set-folds, so the
+    /// fold path returns `None` and they otherwise re-walk the whole chain on every
+    /// call (O(D) per call × O(D) blocks = O(D²) per state).
+    ///
+    /// Key: the established n-ary operator context key plus exact evaluated argument
+    /// values. The context key discriminates shared evaluator identity, local-operator
+    /// and INSTANCE-substitution scopes, resolved operator identity/location,
+    /// current-vs-next lookup mode, and parametrized INSTANCE arguments. The exact
+    /// values resolve argument-hash collisions.
+    ///
+    /// An entry is inserted ONLY after runtime dependency tracking proves the
+    /// operator read NO state variable and the returned value does not capture a
+    /// state environment. Such results are valid for the whole run, so this is a
+    /// PerRun (process-long) cache. Cap at 131072 entries; cleared entirely when
+    /// exceeded and on run reset.
+    pub(crate) recursive_result_cache: FxHashMap<(NaryOpCacheKey, Vec<Value>), Value>,
     /// Part of #3962: Consolidated from eval_ctx_ops/mutation.rs ACTION_CTX_CACHE.
     /// Thread-local cache for `TlcActionContext` per `OperatorDef` pointer.
     /// Part of #3364: avoids rebuilding context on every action evaluation.
@@ -161,6 +188,7 @@ impl SmallCaches {
             choose_cache: FxHashMap::default(),
             choose_deep_cache: FxHashMap::default(),
             fold_result_cache: FxHashMap::default(),
+            recursive_result_cache: FxHashMap::default(),
             action_ctx_cache: FxHashMap::default(),
             lambda_tir_body_cache: FxHashMap::default(),
         }
@@ -285,32 +313,66 @@ pub(crate) fn propagate_thunk_deps(ctx: &EvalCtx, closure_id: u64) {
     });
 }
 
-/// Look up a cached INSTANCE lazy binding value for the current state.
-/// Returns `Some(&Value)` if a matching entry exists for this pointer+mode.
-#[inline]
-pub(crate) fn instance_lazy_cache_get(lazy_ptr: usize, mode_discriminant: u8) -> Option<Value> {
-    SMALL_CACHES.with(|sc| {
-        sc.borrow()
-            .instance_lazy_cache
-            .get(&lazy_ptr)
-            .and_then(|(m, v)| {
-                if *m == mode_discriminant {
-                    Some(v.clone())
-                } else {
-                    None
-                }
-            })
-    })
-}
-
 /// Store a forced INSTANCE lazy binding value for within-state reuse.
+/// Deps captured during that forcing are attached separately via
+/// [`instance_lazy_cache_set_deps`] (the force path stores the value before
+/// its dep guard resolves).
 #[inline]
 pub(crate) fn instance_lazy_cache_store(lazy_ptr: usize, mode_discriminant: u8, value: Value) {
     SMALL_CACHES.with(|sc| {
         sc.borrow_mut()
             .instance_lazy_cache
-            .insert(lazy_ptr, (mode_discriminant, value));
+            .insert(lazy_ptr, (mode_discriminant, value, None));
     });
+}
+
+/// Attach the deps captured while forcing an INSTANCE lazy binding to its
+/// cache entry (no-op if the entry is gone or the mode changed — the deps
+/// then simply aren't reused, and cache hits fall back to conservative
+/// tainting). Epoch-scoped by construction: lives and dies with the entry.
+#[inline]
+pub(crate) fn instance_lazy_cache_set_deps(
+    lazy_ptr: usize,
+    mode_discriminant: u8,
+    deps: OpEvalDeps,
+) {
+    SMALL_CACHES.with(|sc| {
+        if let Some(entry) = sc.borrow_mut().instance_lazy_cache.get_mut(&lazy_ptr) {
+            if entry.0 == mode_discriminant {
+                entry.2 = Some(Box::new(deps));
+            }
+        }
+    });
+}
+
+/// Fused lookup: cached value AND (optionally) its stored deps in ONE TLS
+/// access. When `want_deps` is true and an entry matches, `use_deps` runs
+/// under the borrow with the entry's deps (`None` = forcing captured none —
+/// callers taint conservatively). `use_deps` must not touch `SMALL_CACHES`;
+/// the dep-propagation callers only touch `ctx.runtime_state`.
+///
+/// This exists so the INSTANCE lazy hit path pays exactly ONE map lookup —
+/// the same count as before deps moved from the per-LazyBinding OnceLock
+/// into the cache entry (a second lookup per hit measurably regressed
+/// MCNanoMedium).
+#[inline]
+pub(crate) fn instance_lazy_cache_get_with_deps(
+    lazy_ptr: usize,
+    mode_discriminant: u8,
+    want_deps: bool,
+    use_deps: impl FnOnce(Option<&OpEvalDeps>),
+) -> Option<Value> {
+    SMALL_CACHES.with(|sc| {
+        let sc = sc.borrow();
+        let (m, v, d) = sc.instance_lazy_cache.get(&lazy_ptr)?;
+        if *m != mode_discriminant {
+            return None;
+        }
+        if want_deps {
+            use_deps(d.as_deref());
+        }
+        Some(v.clone())
+    })
 }
 
 /// Look up a cached CHOOSE result for the given expression pointer and INSTANCE scope.
@@ -320,15 +382,16 @@ pub(crate) fn choose_cache_lookup(
     instance_subs_id: u64,
     state_identity: usize,
 ) -> Option<Value> {
-    SMALL_CACHES.with(|sc| {
-        sc.borrow()
-            .choose_cache
-            .get(&(expr_ptr, instance_subs_id, state_identity))
-            .cloned()
-    })
-    .inspect(|_| {
-        tla_value::churn_stats::churn_count(tla_value::churn_stats::ChurnSite::ChooseCacheHit);
-    })
+    SMALL_CACHES
+        .with(|sc| {
+            sc.borrow()
+                .choose_cache
+                .get(&(expr_ptr, instance_subs_id, state_identity))
+                .cloned()
+        })
+        .inspect(|_| {
+            tla_value::churn_stats::churn_count(tla_value::churn_stats::ChurnSite::ChooseCacheHit);
+        })
 }
 
 /// Store a CHOOSE result for within-state reuse.

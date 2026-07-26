@@ -11,9 +11,9 @@
 //! Part of #3753, #3781.
 
 use anyhow::{bail, Result};
-use tla_value::Rp;
 use serde_json::json;
 use tla_check::{CheckResult, Trace};
+use tla_value::Rp;
 
 // Re-export the canonical value_to_itf from tla-value for callers that need it.
 #[allow(unused_imports)]
@@ -129,8 +129,8 @@ pub(crate) fn report_check_itf(result: &CheckResult) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
-    use std::sync::Arc;
     use tla_check::{liveness_trace_to_itf, trace_to_itf, State, Trace, Value};
+    use tla_value::Rp;
 
     /// Shorthand for creating a `Value::SmallInt` in tests.
     fn int(n: i64) -> Value {

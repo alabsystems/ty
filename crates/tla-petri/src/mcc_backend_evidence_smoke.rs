@@ -285,9 +285,9 @@ pub const TRUST_IR_NATIVE_BUNDLE_IDENTITY_CONTRACT_SCHEMA_VERSION: &str = "1";
 /// Schema version of the trust-ir native bundle.
 pub const TRUST_IR_NATIVE_BUNDLE_SCHEMA_VERSION: &str = "3";
 /// Schema name for the trust-ir native transport identity.
-pub const TRUST_IR_NATIVE_TRANSPORT_IDENTITY_SCHEMA: &str = "trust_ir.native.transport_identity.v1";
+pub const TRUST_IR_NATIVE_TRANSPORT_IDENTITY_SCHEMA: &str = "trust_ir.native.transport_identity.v2";
 /// Schema version of the trust-ir native transport identity.
-pub const TRUST_IR_NATIVE_TRANSPORT_IDENTITY_SCHEMA_VERSION: &str = "1";
+pub const TRUST_IR_NATIVE_TRANSPORT_IDENTITY_SCHEMA_VERSION: &str = "2";
 
 /// Deterministic placeholder SHA-256 of the accepted BTOR2 replay-evidence
 /// identity used in the smoke sidecar.
@@ -2896,7 +2896,7 @@ fn petri_envelope() -> Value {
         "Petri native_jit trust_ir_transport_identity available \
          required_trust_ir_rev=4e38cb current_trust_ir_rev=4e38cb cargo_dependency=true \
          api=NativeVerificationBundle::transport_identity \
-         schema=trust_ir.native.transport_identity.v1 schema_version=1 \
+         schema=trust_ir.native.transport_identity.v2 schema_version=2 \
          bundle_schema_version=1 transport_digest=trust-ir-stable128:transport \
          source_digest=none module_digest=trust-ir-stable128:module \
          compiler_facts_digest=trust-ir-stable128:compiler lineage_digest=trust-ir-stable128:lineage \

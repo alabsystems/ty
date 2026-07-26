@@ -6,11 +6,10 @@
 
 #[cfg(kani)]
 mod kani_proofs {
-    use tla_value::Rp;
     use super::super::kani_generators::*;
     use crate::state::{value_fingerprint, State};
     use crate::value::{IntervalValue, Value};
-    use std::sync::Arc;
+    use tla_value::Rp;
 
     // P1: Fingerprint Determinism
 
@@ -179,11 +178,10 @@ mod kani_proofs {
 
 #[cfg(test)]
 mod tests {
-    use tla_value::Rp;
     use crate::state::{value_fingerprint, State};
     use crate::value::{IntervalValue, SortedSet, Value};
     use num_bigint::BigInt;
-    use std::sync::Arc;
+    use tla_value::Rp;
 
     use super::super::test_helpers::make_func;
 

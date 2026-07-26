@@ -374,8 +374,12 @@ mod tests {
     fn walk_satisfied_property_returns_none() {
         let net = toggle_net();
         let atoms = vec![atom_ge_one(0)];
+        // The toggle net has one enabled transition at every marking, hence one
+        // unique infinite path. Four 16-step walks still cross dozens of
+        // repeated markings and exercise the lasso oracle non-vacuously without
+        // multiplying its O(depth^2) work into billions of redundant checks.
         let verdict =
-            try_ltl_witness_walk_params(&net, &globally_finally_atom0(), &atoms, None, 500, 500);
+            try_ltl_witness_walk_params(&net, &globally_finally_atom0(), &atoms, None, 4, 16);
         assert_eq!(
             verdict, None,
             "A(G F (p0 >= 1)) holds; the walk must not emit a false FALSE"

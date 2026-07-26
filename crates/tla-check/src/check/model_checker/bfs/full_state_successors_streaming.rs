@@ -257,7 +257,9 @@ impl ModelChecker<'_> {
 
             // ClosureSink: fingerprint + dedup inline, collect only new states.
             let mut sink = ClosureSink::new(|diff: DiffSuccessor| -> ControlFlow<()> {
-                total_count += 1;
+                total_count = total_count
+                    .checked_add(1)
+                    .expect("raw successor generation count overflowed usize");
 
                 // Nested-set A6: the per-successor escape MONITOR on the HOT
                 // full-state streaming path — unbypassable. Observes the board
@@ -379,6 +381,7 @@ impl ModelChecker<'_> {
 
         prof.count_successors(total_count);
         self.record_transitions(total_count);
+        self.record_raw_successors_generated(total_count);
 
         self.ctx.set_tlc_level(succ_level);
 

@@ -74,10 +74,19 @@ pub(crate) fn compute_cli_soundness_provenance(
     // fail the gate — enforce_soundness_gate ranks only `mode`.
     if symmetry_with_properties {
         provenance.features_used.push("symmetry".to_string());
+        // Phrased as the POLICY, not as an outcome. This function is given only
+        // the config predicate (SYMMETRY declared alongside PROPERTY), never the
+        // checker's actual decision, so it cannot say which branch was taken.
+        // The previous wording asserted "the run is checked without symmetry",
+        // which is wrong for every pure-safety PROPERTY spec — where symmetry is
+        // retained — and reading it as the outcome inverts the answer on rows
+        // like FastPaxos/Paxos/MCVoting/MCPaxos.
         provenance.deviations.push(
-            "declared SYMMETRY is ignored when any PROPERTY requires genuine liveness/temporal \
-             checking (the run is checked without symmetry — sound verdicts, larger state \
-             space); pure-safety PROPERTY and INVARIANT checking still uses symmetry."
+            "declared SYMMETRY is present alongside PROPERTY checking. Policy: symmetry is \
+             dropped if any PROPERTY requires the genuine liveness checker (that orbit quotient \
+             is unsound for liveness — sound verdict, larger state space), and retained for \
+             pure-safety PROPERTY/INVARIANT checking. Either way the verdict is sound; the run's \
+             own stderr states which branch was taken."
                 .to_string(),
         );
     }
